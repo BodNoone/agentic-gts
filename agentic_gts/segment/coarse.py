@@ -56,7 +56,8 @@ def superpoint_over_segmentation(scene: Scene, voxel: float = MERGE_PRIMARY_VOXE
 
 
 def merge_to_boxes(scene: Scene, yaw: float = 0.0,
-                   min_side: float = 0.4, max_gap_merge: float = 0.2) -> list[OrientedBox]:
+                   min_side: float = 0.4, max_gap_merge: float = 0.2,
+                   max_row_len: float = 15.0) -> list[OrientedBox]:
     """Merge superpoint voxels into device boxes along row direction.
 
     Voxels are clustered by (a) cross-axis position (row membership) and
@@ -91,7 +92,12 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
     lo_b, hi_b = crs.min() - bin_w, crs.max() + bin_w
     n_bins = max(4, int((hi_b - lo_b) / bin_w))
     hist, edges = np.histogram(crs, bins=n_bins, range=(lo_b, hi_b))
-    thr = max(3, int(0.25 * hist.max()))
+    # threshold from histogram *median*, not max: in real 3DGS clouds walls
+    # can be much denser than device surfaces; a max-based threshold lets one
+    # strong wall band drown out all (sparser) device-row bands.
+    med = float(np.median(hist[hist > 0])) if np.any(hist > 0) else 0.0
+    thr = max(3, int(1.5 * med))
+    print(f"[diag][A] cross-axis hist: max={hist.max()} median={med:.0f} thr={thr}")
     dense = hist >= thr
     # group consecutive dense bins into row bands
     bands: list[tuple[float, float]] = []
@@ -186,6 +192,13 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
             height = float(z_pts.max()) + 0.1
             if length < min_side:
                 continue
+            if length > max_row_len:
+                # a run longer than any plausible rack row is a wall (or a
+                # wall fused with a row); walls survive the height band
+                # because they are 3m tall and real 3DGS wall points are dense.
+                print(f"[diag][A] dropping wall-like run: length={length:.1f}m > "
+                      f"max_row_len={max_row_len}m")
+                continue
             along_c = float((a_pts.max() + a_pts.min()) / 2)
             crs_c = float((cr_pts.max() + cr_pts.min()) / 2)
             world_xy = axis * along_c + cross * crs_c
@@ -206,6 +219,8 @@ def coarse_segment(scene: Scene, opts: dict | None = None) -> list[OrientedBox]:
     """Stage A entry point."""
     opts = opts or {}
     yaw = float(opts.get("yaw", scene.meta.get("yaw", 0.0)))
-    axes = merge_to_boxes(scene, yaw=yaw)
+    axes = merge_to_boxes(scene, yaw=yaw,
+                           max_row_len=float(opts.get("max_row_len", 15.0)),
+                           max_gap_merge=float(opts.get("max_gap_merge", 0.2)))
     scene.boxes = axes
     return axes
