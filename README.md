@@ -115,11 +115,24 @@ python -m agentic_gts.cli synth --seed 42 --out runs/synth
 
 ```
 runs/xxx/
-├── boxes.json          最终 box（带置信度：high 自动接受 / mid / low 建议人工复核）
-├── layout.svg          矢量布局图（按置信度着色）
-├── layout.png          预览图
-├── agent_report.json   agent 决策记录（issue → 动作 → 结果）
-└── eval.json           分阶段评测（提供 --gt 时）
+├── boxes.json            最终 box（带置信度：high 自动接受 / mid / low 建议人工复核）
+├── layout.svg            矢量布局图（按置信度着色）
+├── layout.png            布局预览图
+├── overlay.png           点云 + 检测框叠加图（点云按高度着色；框按置信度着色；
+│                         提供 --gt 时真值框以蓝色虚线叠加，可直观对比偏差）
+├── cloud_with_boxes.ply  点云 + box 线框合并 PLY（CloudCompare/MeshLab 直接打开做 3D 检查）
+├── agent_report.json     agent 决策记录（issue → 动作 → 结果）
+└── eval.json             分阶段评测（提供 --gt 时）
+```
+
+### 3D 交互查看
+
+```bash
+# 打开 Open3D 窗口：点云 + 3D 线框框（绿=high / 黄=mid / 红=low，蓝=真值）
+python -m agentic_gts.cli view --point-cloud room.ply --boxes runs/room1/boxes.json
+
+# 或直接用任意点云软件打开合并 PLY
+# CloudCompare runs/room1/cloud_with_boxes.ply
 ```
 
 ## 评测指标
@@ -139,8 +152,9 @@ agentic_gts/
 ├── agent/loop.py         阶段C：agent 修复循环（诊断→动作→验证→回滚）
 ├── eval/metrics.py       贴边准确率评测
 ├── output/render.py      SVG/PNG 布局图
+├── output/visualize.py   点云+框联合可视化（2D叠加 / 3D交互 / PLY导出）
 ├── pipeline.py           全流程编排
-└── cli.py                命令行入口
+└── cli.py                命令行入口（demo / run / synth / view）
 tests/test_pipeline.py    单元 + 端到端测试（7 项）
 docs/                     设计方案文档
 ```

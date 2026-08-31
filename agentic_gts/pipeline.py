@@ -83,6 +83,16 @@ def run_pipeline(scene: Scene,
         f.write(boxes_to_svg(scene.boxes, title="Data-center layout"))
     with open(os.path.join(out_dir, "layout.png"), "wb") as f:
         f.write(boxes_to_png(scene.boxes, title="Data-center layout"))
+    # point cloud + boxes overlays (2D PNG + merged PLY for 3D viewers)
+    try:
+        from agentic_gts.output.visualize import export_ply, overlay_topdown
+        with open(os.path.join(out_dir, "overlay.png"), "wb") as f:
+            f.write(overlay_topdown(scene, gt_boxes=gt_boxes,
+                                    title="point cloud + detected boxes"))
+        export_ply(scene, os.path.join(out_dir, "cloud_with_boxes.ply"),
+                   gt_boxes=gt_boxes)
+    except Exception as e:  # visualization must never break the pipeline
+        print(f"[warn] visualization failed: {type(e).__name__}: {e}")
     with open(os.path.join(out_dir, "agent_report.json"), "w", encoding="utf-8") as f:
         json.dump(report.to_dict(), f, ensure_ascii=False, indent=2)
     if evals:

@@ -61,6 +61,20 @@ def cmd_demo(args):
     print(json.dumps(res.stage_evals, ensure_ascii=False, indent=2))
 
 
+def cmd_view(args):
+    """Open the 3D interactive viewer: point cloud + wireframe boxes."""
+    from agentic_gts.output.visualize import view_3d
+    scene = Scene(points=load_point_cloud(args.point_cloud))
+    if args.boxes:
+        scene.load_boxes(args.boxes)
+    gt_boxes = None
+    if args.gt:
+        gs = Scene(points=scene.points)
+        gs.load_boxes(args.gt)
+        gt_boxes = gs.boxes
+    view_3d(scene, gt_boxes=gt_boxes)
+
+
 def main():
     p = argparse.ArgumentParser(prog="agentic-gts")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -87,6 +101,12 @@ def main():
     d.add_argument("--vlm-base", default=None)
     d.add_argument("--edge-thr", type=float, default=0.05)
     d.set_defaults(fn=cmd_demo)
+
+    v = sub.add_parser("view", help="open 3D viewer: cloud + boxes")
+    v.add_argument("--point-cloud", required=True)
+    v.add_argument("--boxes", default=None)
+    v.add_argument("--gt", default=None)
+    v.set_defaults(fn=cmd_view)
 
     args = p.parse_args()
     args.fn(args)
