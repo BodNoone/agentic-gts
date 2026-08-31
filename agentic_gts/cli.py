@@ -35,7 +35,15 @@ def cmd_synth(args):
 
 
 def cmd_run(args):
-    scene = Scene(points=load_point_cloud(args.point_cloud))
+    pts = load_point_cloud(args.point_cloud)
+    if args.boxes or args.gt:
+        # external boxes share the cloud's coordinate frame; transforming the
+        # cloud alone would desynchronize them. Caller must pre-align.
+        print("[diag][ground] external boxes/gt given -> skipping auto ground alignment")
+    else:
+        from agentic_gts.pipeline import align_to_ground
+        pts = align_to_ground(pts)
+    scene = Scene(points=pts)
     if args.boxes:
         scene.load_boxes(args.boxes)
     gt_boxes = None
