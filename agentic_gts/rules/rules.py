@@ -45,6 +45,9 @@ def apply_rules(scene: Scene, opts: dict | None = None) -> tuple[list[OrientedBo
     issues: list[Issue] = []
 
     boxes = list(scene.boxes)
+    _sz = [tuple(round(s, 2) for s in b.size) for b in boxes[:10]]
+    _more = "..." if len(boxes) > 10 else ""
+    print(f"[diag][B] input boxes: {len(boxes)}  (sizes={_sz}{_more})")
 
     # 0) wall filter: a box whose points form a single thin sheet in the
     # cross (depth) direction is a wall fragment, not a device. Devices have
@@ -56,15 +59,20 @@ def apply_rules(scene: Scene, opts: dict | None = None) -> tuple[list[OrientedBo
                                 detail="wall sheet"))
             continue
         non_wall.append(b)
+    print(f"[diag][B] wall filter: dropped {len(boxes) - len(non_wall)}, kept {len(non_wall)}")
     scene.boxes = non_wall
     boxes = non_wall
 
     # 1) point-support + aspect filter (drop empty / implausible)
     kept: list[OrientedBox] = []
+    n_low, n_aspect = 0, 0
+    drop_sup_detail: list[str] = []
     for b in boxes:
         sup = geo.support_fraction(scene, b)
         aspect = max(b.size[0], b.size[1]) / max(min(b.size[0], b.size[1]), 1e-3)
         if sup < min_support:
+            n_low += 1
+            drop_sup_detail.append(f"{sup:.2f}")
             issue_region = _box_region(b)
             issues.append(Issue(IssueType.LOW_SUPPORT, [b.box_id], issue_region,
                                 detail=f"support={sup:.2f}"))
@@ -85,11 +93,19 @@ def apply_rules(scene: Scene, opts: dict | None = None) -> tuple[list[OrientedBo
                 kept.append(refit)
             continue
         kept.append(b)
+    if n_low:
+        print(f"[diag][B] support filter: dropped {n_low} "
+              f"(supports={drop_sup_detail[:15]}{'...' if len(drop_sup_detail) > 15 else ''}, "
+              f"thr={min_support})")
+    if n_aspect:
+        print(f"[diag][B] aspect filter: split/refit {n_aspect} oversized boxes")
+    print(f"[diag][B] after support/aspect filter: kept {len(kept)}/{len(boxes)}")
     scene.boxes = kept
     boxes = kept
 
     # 2) row alignment: snap each box's yaw to the dominant row direction
     rows = geo.row_structure(scene, yaw=yaw)
+    print(f"[diag][B] row structure: {len(rows)} rows (yaw={math.degrees(yaw):.1f} deg)")
     for r in rows:
         axis = np.asarray(r["axis"])
         fixed_yaw = math.atan2(axis[1], axis[0])
@@ -110,13 +126,16 @@ def apply_rules(scene: Scene, opts: dict | None = None) -> tuple[list[OrientedBo
                 filled.append(nb)
                 issues.append(Issue(IssueType.MISSING, [], _row_region(r, yaw),
                                     detail=f"gap filled at row={r['id']}"))
+    print(f"[diag][B] gap completion: filled {len(filled)} boxes")
 
     # 4) merged-row detection & split via center-field completeness
     split_new: list[OrientedBox] = []
+    n_split = 0
     for b in scene.boxes:
         n_clusters, dom, _ = geo.center_field_clusters(scene, b)
         if n_clusters >= 2:
             # more than one coherent slab -> likely multiple racks fused
+            n_split += 1
             k = min(n_clusters, int(round(b.size[0] / width_unit)) or n_clusters)
             k = max(k, 2)
             split_new.extend(geo.split_box(scene, b, k, width_unit))
@@ -128,6 +147,7 @@ def apply_rules(scene: Scene, opts: dict | None = None) -> tuple[list[OrientedBo
 
     final = scene.boxes + filled
     scene.boxes = final
+    print(f"[diag][B] merged-row split: {n_split} boxes split; final boxes: {len(final)}")
     return final, issues
 
 

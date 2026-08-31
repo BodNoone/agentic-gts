@@ -33,7 +33,44 @@ def load_point_cloud(path: str) -> np.ndarray:
         return np.load(path)
     import open3d as o3d
     pcd = o3d.io.read_point_cloud(path)
-    return np.asarray(pcd.points)
+    pts = np.asarray(pcd.points)
+    if len(pts) == 0:
+        print(f"[diag][load] WARNING: open3d read 0 points from {path} "
+              f"(file unreadable / unsupported PLY variant)")
+    return pts
+
+
+def diag_point_cloud(points: np.ndarray) -> None:
+    """Print stats to diagnose coordinate-system / scale / density problems."""
+    if len(points) == 0:
+        print("[diag][cloud] empty point cloud!")
+        return
+    lo, hi = points.min(axis=0), points.max(axis=0)
+    span = hi - lo
+    z = points[:, 2]
+    q01, q10, q50, q90, q99 = np.percentile(z, [1, 10, 50, 90, 99])
+    dev = ((z > 0.5) & (z < 2.4)).mean()
+    n_vox = len(np.unique(np.floor(points[:, :2] / 0.1).astype(np.int64), axis=0))
+    print(f"[diag][cloud] n={len(points)}  span={span.round(2)}  "
+          f"bbox min={lo.round(2)} max={hi.round(2)}")
+    print(f"[diag][cloud] z pct 1/10/50/90/99 = {q01:.2f}/{q10:.2f}/{q50:.2f}/"
+          f"{q90:.2f}/{q99:.2f}  |  frac in (0.5,2.4) = {dev:.1%}  |  "
+          f"0.1m xy voxels = {n_vox}")
+    if span.max() > 100 or 0 < span.min() < 0.5:
+        print("[diag][cloud] WARNING: span not meter-scale? (machine room expect 5~30m)")
+    if abs(q10) > 1.0:
+        print("[diag][cloud] WARNING: floor (z p10) far from 0 -> ground not at z~0")
+    if dev < 0.05:
+        print("[diag][cloud] WARNING: almost no points in device band (0.5,2.4) -> z-axis/scale suspect")
+
+
+def _diag_support(scene: Scene) -> None:
+    if not scene.boxes:
+        return
+    from agentic_gts.tools import geometry as geo
+    sups = sorted(geo.support_fraction(scene, b) for b in scene.boxes)
+    n = len(sups)
+    print(f"[diag][support] n={n}  min={sups[0]:.2f}  med={sups[n // 2]:.2f}  max={sups[-1]:.2f}")
 
 
 def run_pipeline(scene: Scene,
@@ -49,6 +86,7 @@ def run_pipeline(scene: Scene,
     os.makedirs(out_dir, exist_ok=True)
     evals: dict = {}
     t0 = time.time()
+    diag_point_cloud(scene.points)
 
     # --- stage 0: dominant orientation estimation ---
     # The pipeline reasons in a row-aligned frame. If the caller didn't pin a
@@ -73,11 +111,13 @@ def run_pipeline(scene: Scene,
         print(f"[stageA] coarse segmentation -> {len(scene.boxes)} candidate boxes")
     else:
         print(f"[stageA] skipped (using {len(scene.boxes)} provided boxes)")
+    _diag_support(scene)
     _eval("stageA")
 
     # --- stage B: deterministic rules ---
     _, issues = apply_rules(scene, opts)
     print(f"[stageB] rules applied -> {len(scene.boxes)} boxes, {len(issues)} issues noted")
+    _diag_support(scene)
     _eval("stageB")
 
     # --- stage C: agent loop ---
@@ -87,6 +127,7 @@ def run_pipeline(scene: Scene,
     n_res = len(report.resolved)
     n_unres = len(report.unresolved)
     print(f"[stageC] agent loop -> {n_res} issues resolved, {n_unres} flagged for human review")
+    _diag_support(scene)
     _eval("stageC")
 
     # --- outputs ---

@@ -36,7 +36,9 @@ def superpoint_over_segmentation(scene: Scene, voxel: float = MERGE_PRIMARY_VOXE
     pts = scene.points
     z = pts[:, 2]
     above = pts[z > 0.05]
+    print(f"[diag][A] points z>0.05: {len(above)}/{len(pts)}")
     if len(above) < 50:
+        print("[diag][A] too few above-floor points -> 0 superpoints")
         return np.zeros(0, dtype=int), np.zeros((0, 3))
     xy = above[:, :2]
     key = np.floor(xy / voxel).astype(np.int64)
@@ -49,6 +51,7 @@ def superpoint_over_segmentation(scene: Scene, voxel: float = MERGE_PRIMARY_VOXE
     np.add.at(sums, inv, above)
     np.add.at(cnts, inv, 1.0)
     centroids = sums / cnts[:, None]
+    print(f"[diag][A] superpoint voxels: {len(centroids)}")
     return inv.astype(np.int64), centroids
 
 
@@ -74,7 +77,9 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
     # restrict to plausible device heights (racks), dropping walls & floor
     height_ok = (z > 0.5) & (z < 2.4)
     c = centroids[height_ok]
+    print(f"[diag][A] centroids in height band (0.5,2.4): {len(c)}/{len(centroids)}")
     if len(c) < 3:
+        print("[diag][A] too few device-height voxels -> no candidates")
         return []
     z = z[height_ok]
     along = c[:, :2] @ axis
@@ -100,6 +105,10 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
             i = j + 1
         else:
             i += 1
+    print(f"[diag][A] cross-axis dense bands: {len(bands)}  "
+          f"ranges={[(round(lo, 2), round(hi, 2)) for lo, hi in bands]}")
+    if not bands:
+        print("[diag][A] WARNING: no dense bands (point density too low, or wrong yaw/scale)")
 
     # Each dense band is a candidate device *face* (front or back of a row),
     # or a wall. Pair up bands whose cross gap matches a plausible rack depth
@@ -145,6 +154,8 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
         else:
             used.add(i)
             rows.append(band_stats[i]["idx"])
+    print(f"[diag][A] row groups after band pairing: {len(rows)} "
+          f"(sizes={[len(r) for r in rows]})")
 
     boxes: list[OrientedBox] = []
     row_id = 0
@@ -186,6 +197,8 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
                 row_id=row_id,
             ))
         row_id += 1
+    print(f"[diag][A] candidate boxes produced: {len(boxes)} "
+          f"(lengths={[round(b.size[0], 2) for b in boxes]})")
     return boxes
 
 

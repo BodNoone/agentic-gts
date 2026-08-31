@@ -28,7 +28,9 @@ def estimate_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
     z = points[:, 2]
     m = (z > z_range[0]) & (z < z_range[1])
     pts = points[m][:, :2]
+    print(f"[diag][yaw] points in z({z_range[0]},{z_range[1]}): {int(m.sum())}/{len(points)}")
     if len(pts) < 100:
+        print("[diag][yaw] too few device-height points -> fallback yaw=0")
         return 0.0
 
     # subsample for speed
@@ -45,14 +47,18 @@ def estimate_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
     np.add.at(sums, inv, pts)
     np.add.at(cnts, inv, 1.0)
     cells = sums / cnts[:, None]
+    print(f"[diag][yaw] voxel cells: {len(cells)}")
     if len(cells) < 12:
+        print("[diag][yaw] too few cells -> fallback yaw=0")
         return 0.0
 
     # local direction per cell: PCA over neighboring cells within radius
     from scipy.spatial import cKDTree
     tree = cKDTree(cells)
     pairs = tree.query_pairs(r=voxel * 2.2, output_type="ndarray")
+    print(f"[diag][yaw] neighbor pairs: {len(pairs)}")
     if len(pairs) < 10:
+        print("[diag][yaw] too few pairs -> fallback global PCA")
         return _global_pca_yaw(cells)
     d = cells[pairs[:, 1]] - cells[pairs[:, 0]]
     ang = np.arctan2(d[:, 1], d[:, 0])          # [-pi, pi]
@@ -80,7 +86,9 @@ def estimate_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
             cands.append(float(a))
         if len(cands) >= 3:
             break
+    print(f"[diag][yaw] candidate angles (deg): {[round(math.degrees(a), 1) for a in cands]}")
     if not cands:
+        print("[diag][yaw] no candidates -> fallback global PCA")
         return _global_pca_yaw(cells)
 
     best_yaw, best_score = 0.0, -1.0
@@ -89,6 +97,9 @@ def estimate_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
             score = _row_band_score(cells, yaw_c)
             if score > best_score:
                 best_score, best_yaw = score, yaw_c
+    print(f"[diag][yaw] chosen yaw = {math.degrees(best_yaw):.1f} deg (band score={best_score:.0f})")
+    if best_score <= 0:
+        print("[diag][yaw] WARNING: band score 0 -> no row-like structure at this yaw")
     # map to [-pi/4, pi/4) minimal rotation
     yaw = math.remainder(best_yaw, math.pi / 2)
     if yaw >= math.pi / 4:

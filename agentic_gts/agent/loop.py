@@ -84,6 +84,9 @@ class LayoutAgent:
     def run(self, scene: Scene) -> AgentReport:
         report = AgentReport()
         issues = self.detect_issues(scene)
+        from collections import Counter
+        cnt = Counter(i.issue_type.value for i in issues)
+        print(f"[diag][C] issues detected: {dict(cnt) if cnt else 'none'}")
         for issue in issues:
             ok = self._handle_issue(scene, issue, report)
             entry = {"issue": issue.to_dict(), "ok": ok}
