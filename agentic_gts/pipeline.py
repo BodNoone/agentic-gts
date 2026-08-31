@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -48,6 +49,17 @@ def run_pipeline(scene: Scene,
     os.makedirs(out_dir, exist_ok=True)
     evals: dict = {}
     t0 = time.time()
+
+    # --- stage 0: dominant orientation estimation ---
+    # The pipeline reasons in a row-aligned frame. If the caller didn't pin a
+    # yaw (opts or scene.meta), estimate it from the point cloud so arbitrary
+    # oriented scans work (no axis-aligned assumption).
+    if "yaw" not in opts and "yaw" not in scene.meta:
+        from agentic_gts.segment.orientation import estimate_yaw
+        yaw = estimate_yaw(scene.points)
+        scene.meta["yaw"] = yaw
+        print(f"[stage0] estimated dominant yaw = {math.degrees(yaw):.1f} deg")
+    opts.setdefault("yaw", float(scene.meta.get("yaw", 0.0)))
 
     def _eval(tag: str):
         if gt_boxes is not None:

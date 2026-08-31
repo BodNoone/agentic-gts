@@ -84,6 +84,31 @@ def test_eval_edge_error():
     assert r_bad.edge_accuracy < r_ok.edge_accuracy
 
 
+def test_yaw_estimation_rotated_scene():
+    import math
+    from agentic_gts.segment.orientation import estimate_yaw
+    for deg in (0, 15, 30, 60):
+        scene, _, _ = generate(SynthConfig(seed=42, room_yaw_deg=deg))
+        est = estimate_yaw(scene.points)
+        true = math.remainder(math.radians(deg), math.pi / 2)
+        if true >= math.pi / 4:
+            true -= math.pi / 2
+        err = abs(math.degrees(true - est))
+        err = min(err, 90 - err)
+        assert err < 3.0, f"yaw error {err:.1f}deg for input {deg}deg"
+
+
+def test_pipeline_rotated_scene():
+    from agentic_gts.core.models import Scene as _Scene
+    scene, gt, corrupt = generate(SynthConfig(seed=42, room_yaw_deg=30))
+    s = _Scene(points=scene.points, boxes=corrupt)   # external cloud: no meta yaw
+    res = run_pipeline(s, gt_boxes=gt, use_coarse_seg=False,
+                       vlm_backend="mock", out_dir="runs/test_rot")
+    after = evaluate(s.boxes, gt, edge_threshold_m=0.05)
+    assert after.recall > 0.9
+    assert after.edge_accuracy > 0.8
+
+
 if __name__ == "__main__":
     fns = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed = 0
