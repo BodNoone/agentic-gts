@@ -51,6 +51,34 @@ def structure_top_per_label(z: np.ndarray, labels: np.ndarray, n: int,
     return top
 
 
+def wall_column_mask(z: np.ndarray, labels: np.ndarray, n: int,
+                     tall_z: float = TALL_Z, high_span_thr: float = 0.5,
+                     gap_thr: float = 1.0) -> np.ndarray:
+    """Per-column wall test, robust to overhead structure welded onto racks.
+
+    A column is a wall when BOTH:
+      1. its structure top (lowest contiguous run, cut at a >gap_thr z-gap)
+         reaches above tall_z, AND
+      2. its points above tall_z span >= high_span_thr vertically.
+
+    (2) is the cable-tray guard: real machine rooms carry trays/conduits/
+    floaters 0.3-1m above the rack tops. When that gap is under gap_thr the
+    tray welds onto the rack column and (1) alone would condemn the whole
+    row as a wall. A tray is a thin layer (span ~0.2m) while a wall's
+    upper part runs to the ceiling (span >1m), so requiring the HIGH part
+    itself to be thick keeps racks with overhead trays classified as racks.
+    """
+    top = structure_top_per_label(z, labels, n, gap_thr)
+    hi = z > tall_z
+    hmax = np.full(n, -np.inf)
+    hmin = np.full(n, np.inf)
+    if hi.any():
+        np.maximum.at(hmax, labels[hi], z[hi])
+        np.minimum.at(hmin, labels[hi], z[hi])
+    span = np.where(np.isfinite(hmax) & np.isfinite(hmin), hmax - hmin, 0.0)
+    return (top > tall_z) & (span >= high_span_thr)
+
+
 def superpoint_over_segmentation(scene: Scene, voxel: float = MERGE_PRIMARY_VOXEL) \
         -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Voxelize floor-projected points; return superpoint labels, centroids
@@ -82,9 +110,8 @@ def superpoint_over_segmentation(scene: Scene, voxel: float = MERGE_PRIMARY_VOXE
     np.add.at(sums, inv, above)
     np.add.at(cnts, inv, 1.0)
     centroids = sums / cnts[:, None]
-    # per-voxel structure top -> wall indicator (see structure_top_per_label)
-    top = structure_top_per_label(above[:, 2], inv, n_clusters)
-    tall = top > TALL_Z
+    # per-voxel wall test (see wall_column_mask)
+    tall = wall_column_mask(above[:, 2], inv, n_clusters)
     print(f"[diag][A] superpoint voxels: {len(centroids)} "
           f"(wall/ceiling-reaching: {int(tall.sum())})")
     return inv.astype(np.int64), centroids, tall
@@ -138,9 +165,19 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
     # background median (drowning the sparser device-row bands below the
     # dense-band threshold) and pair up as fake rows -- a thick 3DGS wall's
     # two surfaces are separated by a gap that matches rack depth.
+    # Also drop voxels within 0.35m of a wall column: the gaussian tails of
+    # a noisy wall surface survive the column test (thin high part) but sit
+    # right next to the confirmed wall columns.
     dev = ~tall
+    n_adj = 0
+    if tall.any() and (~tall).any():
+        from scipy.spatial import cKDTree
+        d, _ = cKDTree(c[tall][:, :2]).query(c[:, :2], k=1)
+        adj = (~tall) & (d <= 0.35)
+        n_adj = int(adj.sum())
+        dev = (~tall) & (~adj)
     print(f"[diag][A] wall columns excluded from row histogram: "
-          f"{int(tall.sum())}/{len(c)}")
+          f"{int(tall.sum())}/{len(c)} (+{n_adj} adjacent)")
     c, z = c[dev], z[dev]
     if len(c) < 3:
         print("[diag][A] too few non-wall device voxels -> no candidates")

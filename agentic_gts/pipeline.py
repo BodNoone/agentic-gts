@@ -206,6 +206,23 @@ def _diag_support(scene: Scene) -> None:
     print(f"[diag][support] n={n}  min={sups[0]:.2f}  med={sups[n // 2]:.2f}  max={sups[-1]:.2f}")
 
 
+def _render_stage(scene: Scene, tag: str, out_dir: str,
+                  gt_boxes: list[OrientedBox] | None = None) -> None:
+    """Save a top-down overlay PNG of the current scene state (per-stage QA).
+
+    Rendered after every pipeline stage so regressions localize at a glance:
+    stage0_align_yaw -> stageA_coarse -> stageB_rules -> stageC_agent.
+    """
+    try:
+        from agentic_gts.output.visualize import overlay_topdown
+        path = os.path.join(out_dir, f"{tag}.png")
+        with open(path, "wb") as f:
+            f.write(overlay_topdown(scene, gt_boxes=gt_boxes, title=tag))
+        print(f"[viz] {tag} -> {path}")
+    except Exception as e:  # stage renders must never break the pipeline
+        print(f"[warn] stage render failed ({tag}): {type(e).__name__}: {e}")
+
+
 def run_pipeline(scene: Scene,
                  gt_boxes: list[OrientedBox] | None = None,
                  use_coarse_seg: bool = True,
@@ -239,6 +256,7 @@ def run_pipeline(scene: Scene,
         except Exception as e:  # diagnosis render must never break the run
             print(f"[warn] yaw diagnosis render failed: {type(e).__name__}: {e}")
     opts.setdefault("yaw", float(scene.meta.get("yaw", 0.0)))
+    _render_stage(scene, "stage0_align_yaw", out_dir, gt_boxes)
 
     def _eval(tag: str):
         if gt_boxes is not None:
@@ -254,12 +272,14 @@ def run_pipeline(scene: Scene,
         print(f"[stageA] skipped (using {len(scene.boxes)} provided boxes)")
     _diag_support(scene)
     _eval("stageA")
+    _render_stage(scene, "stageA_coarse", out_dir, gt_boxes)
 
     # --- stage B: deterministic rules ---
     _, issues = apply_rules(scene, opts)
     print(f"[stageB] rules applied -> {len(scene.boxes)} boxes, {len(issues)} issues noted")
     _diag_support(scene)
     _eval("stageB")
+    _render_stage(scene, "stageB_rules", out_dir, gt_boxes)
 
     # --- stage C: agent loop ---
     judge = VLMJudge(backend=vlm_backend, api_base=vlm_api_base)
@@ -270,6 +290,7 @@ def run_pipeline(scene: Scene,
     print(f"[stageC] agent loop -> {n_res} issues resolved, {n_unres} flagged for human review")
     _diag_support(scene)
     _eval("stageC")
+    _render_stage(scene, "stageC_agent", out_dir, gt_boxes)
 
     # --- outputs ---
     scene.save_boxes(os.path.join(out_dir, "boxes.json"))

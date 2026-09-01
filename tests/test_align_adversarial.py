@@ -110,6 +110,11 @@ def test_stageA_rejects_thick_noisy_wall():
     whose gap (0.5-1.5m) matches the rack-depth pairing window, so a wall
     becomes a "row" of boxes. Height is the robust discriminator: wall
     columns reach the ceiling, rack columns stop at ~2.4m.
+
+    Includes the cable-tray trap: a thin tray layer 0.5m above the rack
+    tops welds onto the rack columns (gap < 1m) and must NOT turn the whole
+    rack row into "wall" -- the tray's high part is thin (<0.5m span),
+    while a wall's high part runs to the ceiling.
     """
     rng = np.random.default_rng(11)
     pts = []
@@ -126,6 +131,10 @@ def test_stageA_rejects_thick_noisy_wall():
     pts.append(np.column_stack([
         rng.uniform(-1, 8, 20000), rng.uniform(-3, 6, 20000),
         np.abs(rng.normal(0, 0.01, 20000))]))
+    # cable tray 0.5m above rack tops: thin (0.2m), covers the rack row
+    pts.append(np.column_stack([
+        rng.uniform(0.7, 6.0, 8000), rng.uniform(-0.6, 0.6, 8000),
+        rng.uniform(2.5, 2.7, 8000)]))
     # THICK noisy wall at y~3.8..4.7: two sheets 0.9m apart, full height 4m
     for wy in (3.8, 4.7):
         n = 12000
@@ -142,7 +151,10 @@ def test_stageA_rejects_thick_noisy_wall():
 
     wall_boxes = [b for b in boxes if 3.5 < b.center[1] < 5.0]
     assert not wall_boxes, f"{len(wall_boxes)} boxes on the thick wall"
-    assert any(abs(b.center[1]) < 1.0 for b in boxes), "rack row missing"
+    rack_boxes = [b for b in boxes if abs(b.center[1]) < 1.0]
+    assert rack_boxes, "rack row missing (killed as wall?)"
+    assert sum(b.size[0] for b in rack_boxes) > 4.0, \
+        f"rack row too short: {[round(b.size[0], 2) for b in rack_boxes]}"
 
 
 if __name__ == "__main__":
