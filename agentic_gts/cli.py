@@ -41,7 +41,8 @@ def cmd_run(args):
         # cloud alone would desynchronize them. Caller must pre-align.
         print("[diag][ground] external boxes/gt given -> skipping auto ground alignment")
     else:
-        from agentic_gts.pipeline import align_to_ground
+        from agentic_gts.pipeline import align_to_ground, denoise_cloud
+        pts = denoise_cloud(pts)
         pts = align_to_ground(pts)
     scene = Scene(points=pts)
     if args.boxes:

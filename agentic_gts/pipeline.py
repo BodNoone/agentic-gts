@@ -40,8 +40,37 @@ def load_point_cloud(path: str) -> np.ndarray:
     return pts
 
 
+def denoise_cloud(points: np.ndarray, nb_neighbors: int = 20,
+                  std_ratio: float = 2.0) -> np.ndarray:
+    """Stage -1a: statistical outlier removal for 3DGS reconstruction noise.
+
+    3DGS exports contain floaters near the floor and stray splats. They fill
+    the z (0.4, 2.5) device band with diffuse mass, inflating every band in
+    the yaw histogram (device direction loses contrast) and polluting Stage A
+    row detection. Real surfaces are locally dense; isolated noise is not.
+    """
+    if len(points) < 1000:
+        return points
+    import open3d as o3d
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    try:
+        pcd, _ = pcd.remove_statistical_outlier(
+            nb_neighbors=nb_neighbors, std_ratio=std_ratio)
+    except Exception as e:
+        print(f"[diag][denoise] SOR failed ({type(e).__name__}) -> keep raw cloud")
+        return points
+    kept = np.asarray(pcd.points)
+    if len(kept) < 100:
+        print("[diag][denoise] SOR removed almost everything -> keep raw cloud")
+        return points
+    print(f"[diag][denoise] SOR: {len(points)} -> {len(kept)} "
+          f"(removed {1.0 - len(kept) / len(points):.1%})")
+    return kept
+
+
 def align_to_ground(points: np.ndarray) -> np.ndarray:
-    """Stage -1: level the cloud so the floor plane is horizontal at z=0.
+    """Stage -1b: level the cloud so the floor plane is horizontal at z=0.
 
     Real 3DGS exports have arbitrary up-axes. A tilted floor leaks large
     amounts of floor points into the z (0.4, 2.5) device band; the floor
@@ -49,21 +78,33 @@ def align_to_ground(points: np.ndarray) -> np.ndarray:
     estimation and Stage A row detection (30 m "rows", wall-direction yaw).
 
     Fits the largest RANSAC plane (open3d) and accepts it as the floor only
-    if its normal is within 30 deg of +z; otherwise returns the input
-    unchanged.
+    if its normal is within 30 deg of +z. Ceilings are equally horizontal:
+    a plane whose inliers sit in the upper half of the cloud is treated as
+    ceiling — its points are excluded and the fit retried.
     """
     if len(points) < 100:
         return points
     import open3d as o3d
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
-    try:
-        (a, b, c, d), inliers = pcd.segment_plane(0.05, 3, 200)
-    except Exception as e:
-        print(f"[diag][ground] plane fit failed ({type(e).__name__}) -> skip alignment")
+    z_median = float(np.median(points[:, 2]))
+    for attempt in range(3):
+        try:
+            (a, b, c, d), inliers = pcd.segment_plane(0.05, 3, 200)
+        except Exception as e:
+            print(f"[diag][ground] plane fit failed ({type(e).__name__}) -> skip alignment")
+            return points
+        if c < 0:  # normal must point up
+            a, b, c, d = -a, -b, -c, -d
+        inlier_z = float(np.median(points[inliers][:, 2]))
+        if inlier_z <= z_median + 0.5:   # lower half of the cloud -> floor
+            break
+        print(f"[diag][ground] plane #{attempt} at z~{inlier_z:.2f} is ceiling-like "
+              f"(cloud median z={z_median:.2f}) -> excluding and refitting")
+        pcd = pcd.select_by_index(inliers, invert=True)
+    else:
+        print("[diag][ground] no floor-like plane found -> skip alignment")
         return points
-    if c < 0:  # normal must point up
-        a, b, c, d = -a, -b, -c, -d
     tilt = math.degrees(math.acos(min(1.0, abs(c))))
     print(f"[diag][ground] largest plane: tilt={tilt:.1f} deg from +z, "
           f"inliers={len(inliers)} ({len(inliers) / len(points):.0%})")
