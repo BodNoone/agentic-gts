@@ -57,6 +57,16 @@ def cmd_run(args):
         import math as _math
         opts["yaw"] = _math.radians(args.yaw)
         print(f"[cli] yaw pinned by user: {args.yaw} deg (estimation skipped)")
+    for kv in args.stage_a_opts or []:
+        if "=" not in kv:
+            print(f"[cli] ignoring malformed --stage-a-opt '{kv}' (want key=value)")
+            continue
+        k, v = kv.split("=", 1)
+        try:
+            opts[k] = int(v) if v.lstrip("-").isdigit() else float(v)
+        except ValueError:
+            opts[k] = v
+        print(f"[cli] stage-A knob: {k}={opts[k]}")
     res = run_pipeline(scene, gt_boxes=gt_boxes,
                        use_coarse_seg=not args.boxes,
                        vlm_backend=args.vlm,
@@ -137,6 +147,12 @@ def main():
     r.add_argument("--edge-thr", type=float, default=0.05)
     r.add_argument("--yaw", type=float, default=None,
                    help="pin device row yaw in degrees (skips estimation)")
+    r.add_argument("--stage-a-opt", dest="stage_a_opts", action="append", default=[],
+                   metavar="KEY=VALUE",
+                   help="Stage-A recall knob, repeatable. E.g. "
+                        "--stage-a-opt hist_med_factor=0.6 "
+                        "--stage-a-opt hist_max_frac=0.15 "
+                        "(others: min_side, max_gap_merge, min_pts_per_voxel, max_row_len)")
     r.set_defaults(fn=cmd_run)
 
     d = sub.add_parser("demo", help="synthetic data -> full pipeline -> eval")

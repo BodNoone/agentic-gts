@@ -53,20 +53,19 @@ def structure_top_per_label(z: np.ndarray, labels: np.ndarray, n: int,
 
 def wall_column_mask(z: np.ndarray, labels: np.ndarray, n: int,
                      tall_z: float = TALL_Z, high_span_thr: float = 0.5,
-                     gap_thr: float = 1.0) -> np.ndarray:
+                     gap_thr: float = 1.0, internal_gap_thr: float = 0.3) -> np.ndarray:
     """Per-column wall test, robust to overhead structure welded onto racks.
 
-    A column is a wall when BOTH:
-      1. its structure top (lowest contiguous run, cut at a >gap_thr z-gap)
-         reaches above tall_z, AND
-      2. its points above tall_z span >= high_span_thr vertically.
+    A column is a wall when its structure top (lowest contiguous run, cut at
+    a >gap_thr z-gap) reaches above tall_z AND either:
+      a. its points above tall_z span >= high_span_thr vertically, OR
+      b. the column is vertically CONTINUOUS (no internal z-gap >
+         internal_gap_thr).
 
-    (2) is the cable-tray guard: real machine rooms carry trays/conduits/
-    floaters 0.3-1m above the rack tops. When that gap is under gap_thr the
-    tray welds onto the rack column and (1) alone would condemn the whole
-    row as a wall. A tray is a thin layer (span ~0.2m) while a wall's
-    upper part runs to the ceiling (span >1m), so requiring the HIGH part
-    itself to be thick keeps racks with overhead trays classified as racks.
+    (a) separates tall-ceiling walls (high part >1m thick) from racks. (b)
+    catches short ~3m walls whose high part is thin BUT which run
+    uninterrupted from floor to top -- unlike a rack column with an
+    overhead cable tray, which has a void between rack top and tray.
     """
     top = structure_top_per_label(z, labels, n, gap_thr)
     hi = z > tall_z
@@ -76,7 +75,16 @@ def wall_column_mask(z: np.ndarray, labels: np.ndarray, n: int,
         np.maximum.at(hmax, labels[hi], z[hi])
         np.minimum.at(hmin, labels[hi], z[hi])
     span = np.where(np.isfinite(hmax) & np.isfinite(hmin), hmax - hmin, 0.0)
-    return (top > tall_z) & (span >= high_span_thr)
+    # (b): internal continuity -- any same-column z-gap above the threshold
+    # marks the column as non-continuous (tray void, dropout, etc.)
+    order = np.lexsort((z, labels))
+    zs, ls = z[order], labels[order]
+    cont = np.ones(n, dtype=bool)
+    if len(zs) > 1:
+        g = (ls[1:] == ls[:-1]) & (zs[1:] - zs[:-1] > internal_gap_thr)
+        if g.any():
+            cont[ls[1:][g]] = False
+    return (top > tall_z) & ((span >= high_span_thr) | cont)
 
 
 def superpoint_over_segmentation(scene: Scene, voxel: float = MERGE_PRIMARY_VOXEL) \
@@ -118,8 +126,10 @@ def superpoint_over_segmentation(scene: Scene, voxel: float = MERGE_PRIMARY_VOXE
 
 
 def merge_to_boxes(scene: Scene, yaw: float = 0.0,
-                   min_side: float = 0.4, max_gap_merge: float = 0.2,
-                   max_row_len: float = 15.0) -> list[OrientedBox]:
+                   min_side: float = 0.3, max_gap_merge: float = 0.2,
+                   max_row_len: float = 15.0,
+                   hist_med_factor: float = 1.0, hist_max_frac: float = 0.25,
+                   min_pts_per_voxel: int = 4) -> list[OrientedBox]:
     """Merge superpoint voxels into device boxes along row direction.
 
     Voxels are clustered by (a) cross-axis position (row membership) and
@@ -127,9 +137,10 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
     that are wide enough become candidate rack boxes. Conservative: larger
     merge tolerance to favour recall.
 
-    Only device-surface voxels are considered: height in [0.5, 2.4] and
-    bounded footprint near the room's device cluster, which excludes walls
-    and floor noise.
+    Stage A is the recall ceiling of the whole pipeline: stages B/C only
+    prune, split or fill gaps WITHIN detected rows -- a row missed here is
+    unrecoverable downstream. Thresholds are therefore deliberately loose;
+    wall exclusion (not density) is what keeps false positives out.
     """
     labels, centroids, tall = superpoint_over_segmentation(scene)
     if len(centroids) == 0:
@@ -138,7 +149,7 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
     # (e.g. the gaussian tails of a noisy GS wall surface). Their structure
     # top is meaningless and they pollute the row histogram.
     cnts = np.bincount(labels, minlength=len(centroids))
-    solid = cnts >= 8
+    solid = cnts >= min_pts_per_voxel
     if not solid.all():
         print(f"[diag][A] speckle voxels dropped: {int((~solid).sum())}/{len(centroids)}")
         centroids, tall = centroids[solid], tall[solid]
@@ -151,10 +162,10 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
     axis = np.array([math.cos(yaw), math.sin(yaw)])
     cross = np.array([-math.sin(yaw), math.cos(yaw)])
     z = centroids[:, 2]
-    # restrict to plausible device heights (racks), dropping walls & floor
-    height_ok = (z > 0.5) & (z < 2.4)
+    # restrict to plausible device heights, dropping floor & ceiling
+    height_ok = (z > 0.3) & (z < 2.6)
     c = centroids[height_ok]
-    print(f"[diag][A] centroids in height band (0.5,2.4): {len(c)}/{len(centroids)}")
+    print(f"[diag][A] centroids in height band (0.3,2.6): {len(c)}/{len(centroids)}")
     if len(c) < 3:
         print("[diag][A] too few device-height voxels -> no candidates")
         return []
@@ -195,9 +206,11 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
     # rows from aisle background when background dominates; the max-fraction
     # term keeps the threshold proportional to the strongest row when there
     # is little background (a median alone would then sit ON the row bins
-    # and cut them off).
+    # and cut them off). Recall-biased: walls are already excluded by column
+    # tests, so a low threshold admits rows at the cost of some aisle noise
+    # that stages B/C prune.
     med = float(np.median(hist[hist > 0])) if np.any(hist > 0) else 0.0
-    thr = max(3, min(int(1.5 * med), int(0.35 * hist.max())))
+    thr = max(2, min(int(hist_med_factor * med), int(hist_max_frac * hist.max())))
     print(f"[diag][A] cross-axis hist: max={hist.max()} median={med:.0f} thr={thr}")
     dense = hist >= thr
     # group consecutive dense bins into row bands
@@ -252,9 +265,9 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
             if j in used:
                 continue
             gap = band_stats[j]["center"] - band_stats[i]["center"]
-            if 0.5 <= gap <= 1.5:
+            if 0.4 <= gap <= 1.8:
                 ov = _overlap(band_stats[i], band_stats[j])
-                if ov > 0.6 and ov > best_score:
+                if ov > 0.45 and ov > best_score:
                     best_j, best_score = j, ov
         if best_j is not None:
             used.update([i, best_j])
@@ -318,11 +331,22 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
 
 
 def coarse_segment(scene: Scene, opts: dict | None = None) -> list[OrientedBox]:
-    """Stage A entry point."""
+    """Stage A entry point.
+
+    Recall knobs (all optional in opts): `hist_med_factor` /
+    `hist_max_frac` lower -> more/larger cross-axis dense bands (more
+    candidates); `min_pts_per_voxel` lower -> sparser voxels survive;
+    `min_side` lower -> shorter runs become boxes; `max_gap_merge` larger ->
+    gaps along a row merge into one box.
+    """
     opts = opts or {}
     yaw = float(opts.get("yaw", scene.meta.get("yaw", 0.0)))
     axes = merge_to_boxes(scene, yaw=yaw,
-                           max_row_len=float(opts.get("max_row_len", 15.0)),
-                           max_gap_merge=float(opts.get("max_gap_merge", 0.2)))
+                          max_row_len=float(opts.get("max_row_len", 15.0)),
+                          max_gap_merge=float(opts.get("max_gap_merge", 0.2)),
+                          min_side=float(opts.get("min_side", 0.3)),
+                          hist_med_factor=float(opts.get("hist_med_factor", 1.0)),
+                          hist_max_frac=float(opts.get("hist_max_frac", 0.25)),
+                          min_pts_per_voxel=int(opts.get("min_pts_per_voxel", 4)))
     scene.boxes = axes
     return axes
