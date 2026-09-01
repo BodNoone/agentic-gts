@@ -88,7 +88,7 @@ def align_to_ground(points: np.ndarray) -> np.ndarray:
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
     z_median = float(np.median(points[:, 2]))
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             (a, b, c, d), inliers = pcd.segment_plane(0.05, 3, 200)
         except Exception as e:
@@ -96,11 +96,14 @@ def align_to_ground(points: np.ndarray) -> np.ndarray:
             return points
         if c < 0:  # normal must point up
             a, b, c, d = -a, -b, -c, -d
+        up_ok = abs(c) >= math.cos(math.radians(30))
         inlier_z = float(np.median(points[inliers][:, 2]))
-        if inlier_z <= z_median + 0.5:   # lower half of the cloud -> floor
-            break
-        print(f"[diag][ground] plane #{attempt} at z~{inlier_z:.2f} is ceiling-like "
-              f"(cloud median z={z_median:.2f}) -> excluding and refitting")
+        ceiling_like = inlier_z > z_median + 0.5
+        if up_ok and not ceiling_like:
+            break   # plausible floor
+        why = "ceiling-like (upper half)" if ceiling_like else "not floor-like (normal far from +z)"
+        print(f"[diag][ground] plane #{attempt} at z~{inlier_z:.2f} is {why} "
+              f"-> excluding and refitting")
         pcd = pcd.select_by_index(inliers, invert=True)
     else:
         print("[diag][ground] no floor-like plane found -> skip alignment")

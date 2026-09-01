@@ -23,6 +23,56 @@ _CONF_COLOR = {  # RGB in [0,1]
 }
 
 
+# ------------------------------------------------------- yaw diagnosis render
+def render_yaw_diagnosis(device_pts: np.ndarray, candidates: list,
+                         chosen_yaw: float, path: str,
+                         max_points: int = 80_000) -> None:
+    """Save a top-down PNG of device-band points with candidate yaw arrows.
+
+    Gray scatter = points in the device height band (after denoise/align).
+    Thin blue arrows = scored candidate directions (length ~ alpha by score);
+    the thick red double arrow = the chosen yaw. If the red arrow does not
+    follow the device rows in the scatter, yaw estimation is being hijacked
+    by another structure -- the PNG shows which one.
+    """
+    import math as _math
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pts = device_pts
+    if len(pts) > max_points:
+        sel = np.random.default_rng(0).choice(len(pts), max_points, replace=False)
+        pts = pts[sel]
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.scatter(pts[:, 0], pts[:, 1], s=0.4, c="#999", alpha=0.25, linewidths=0)
+    ax.set_aspect("equal")
+
+    if len(pts):
+        c0 = pts.mean(axis=0)
+        span = float(np.ptp(pts, axis=0).max())
+        L = 0.35 * span
+        scores = [s for _, s in candidates] or [1.0]
+        smax = max(scores)
+        for deg, score in candidates:
+            a = _math.radians(float(deg))
+            d = np.array([_math.cos(a), _math.sin(a)])
+            ax.annotate("", xy=c0 + L * d, xytext=c0 - L * d,
+                        arrowprops=dict(arrowstyle="<->", color="#4a90d9",
+                                        alpha=0.35 + 0.6 * score / smax, lw=1.2))
+        d = np.array([_math.cos(chosen_yaw), _math.sin(chosen_yaw)])
+        ax.annotate("", xy=c0 + L * d, xytext=c0 - L * d,
+                    arrowprops=dict(arrowstyle="<->", color="#d93025", lw=3))
+        ax.text(c0[0], c0[1] + 0.05 * span,
+                f"chosen yaw = {_math.degrees(chosen_yaw):.1f} deg",
+                color="#d93025", fontsize=13, ha="center", weight="bold")
+    cand_txt = "  ".join(f"{d:.1f}deg:{s:.0f}" for d, s in candidates[:6])
+    ax.set_title(f"yaw diagnosis | candidates: {cand_txt or 'none'}", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------- 2D overlay
 def overlay_topdown(scene: Scene, gt_boxes: list[OrientedBox] | None = None,
                     max_points: int = 200_000, point_size: float = 0.4,

@@ -25,13 +25,26 @@ def estimate_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
     distinguish rows along x from rows along y; the row detector handles both
     once the scene is axis-aligned.
     """
+    return float(estimate_yaw_detailed(points, z_range, voxel)["yaw"])
+
+
+def estimate_yaw_detailed(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
+                          voxel: float = 0.25) -> dict:
+    """Same as estimate_yaw but returns intermediate results for diagnosis.
+
+    Returns dict with:
+      yaw        float          chosen yaw in [-pi/4, pi/4)
+      candidates list           [(deg, score)] scored Manhattan candidates
+      cells      ndarray | None occupancy cells after boundary removal
+      device_pts ndarray        2D points in the device height band
+    """
     z = points[:, 2]
     m = (z > z_range[0]) & (z < z_range[1])
     pts = points[m][:, :2]
     print(f"[diag][yaw] points in z({z_range[0]},{z_range[1]}): {int(m.sum())}/{len(points)}")
     if len(pts) < 100:
         print("[diag][yaw] too few device-height points -> fallback yaw=0")
-        return 0.0
+        return {"yaw": 0.0, "candidates": [], "cells": None, "device_pts": pts}
 
     # subsample for speed
     if len(pts) > 150_000:
@@ -51,7 +64,7 @@ def estimate_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
     cells = _remove_boundary_cells(cells)
     if len(cells) < 12:
         print("[diag][yaw] too few cells after boundary removal -> fallback yaw=0")
-        return 0.0
+        return {"yaw": 0.0, "candidates": [], "cells": None, "device_pts": pts}
 
     # local direction per cell: PCA over neighboring cells within radius
     from scipy.spatial import cKDTree
@@ -60,7 +73,8 @@ def estimate_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
     print(f"[diag][yaw] neighbor pairs: {len(pairs)}")
     if len(pairs) < 10:
         print("[diag][yaw] too few pairs -> fallback global PCA")
-        return _global_pca_yaw(cells)
+        return {"yaw": _global_pca_yaw(cells), "candidates": [], "cells": cells,
+                "device_pts": pts}
     d = cells[pairs[:, 1]] - cells[pairs[:, 0]]
     ang = np.arctan2(d[:, 1], d[:, 0])          # [-pi, pi]
     ang = np.mod(ang, math.pi / 2)              # fold to [0, pi/2): Manhattan
@@ -90,7 +104,8 @@ def estimate_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
     print(f"[diag][yaw] candidate angles (deg): {[round(math.degrees(a), 1) for a in cands]}")
     if not cands:
         print("[diag][yaw] no candidates -> fallback global PCA")
-        return _global_pca_yaw(cells)
+        return {"yaw": _global_pca_yaw(cells), "candidates": [], "cells": cells,
+                "device_pts": pts}
 
     best_yaw, best_score = 0.0, -1.0
     cand_scores: list[tuple[float, float]] = []
@@ -119,7 +134,8 @@ def estimate_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
         yaw -= math.pi / 2
     elif yaw < -math.pi / 4:
         yaw += math.pi / 2
-    return float(yaw)
+    return {"yaw": float(yaw), "candidates": cand_scores, "cells": cells,
+            "device_pts": pts}
 
 
 def _ang_dist(a: float, b: float) -> float:

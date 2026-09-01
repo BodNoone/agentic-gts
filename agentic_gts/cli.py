@@ -70,6 +70,34 @@ def cmd_demo(args):
     print(json.dumps(res.stage_evals, ensure_ascii=False, indent=2))
 
 
+def cmd_diagnose(args):
+    """Preprocess a cloud, estimate yaw, render a yaw-diagnosis PNG.
+
+    Use this when the pipeline output looks wrong (e.g. axis-aligned boxes
+    on a rotated room): the PNG shows the device-band points with all
+    candidate yaw arrows and the chosen one, so a hijacked estimate is
+    visible at a glance.
+    """
+    import os
+    from agentic_gts.pipeline import align_to_ground, denoise_cloud
+    from agentic_gts.segment.orientation import estimate_yaw_detailed
+    from agentic_gts.output.visualize import render_yaw_diagnosis
+
+    pts = load_point_cloud(args.point_cloud)
+    if len(pts) == 0:
+        print("[diagnose] empty point cloud, nothing to do")
+        return
+    os.makedirs(args.out, exist_ok=True)
+    pts = denoise_cloud(pts)
+    pts = align_to_ground(pts)
+    info = estimate_yaw_detailed(pts)
+    png = os.path.join(args.out, "yaw_check.png")
+    render_yaw_diagnosis(info["device_pts"], info["candidates"], info["yaw"], png)
+    print(f"[diagnose] chosen yaw = {__import__('math').degrees(info['yaw']):.1f} deg")
+    print(f"[diagnose] visualization -> {png}")
+    print("[diagnose] check: does the RED arrow follow your device rows?")
+
+
 def cmd_view(args):
     """Open the 3D interactive viewer: point cloud + wireframe boxes."""
     from agentic_gts.output.visualize import view_3d
@@ -110,6 +138,11 @@ def main():
     d.add_argument("--vlm-base", default=None)
     d.add_argument("--edge-thr", type=float, default=0.05)
     d.set_defaults(fn=cmd_demo)
+
+    g = sub.add_parser("diagnose", help="preprocess + yaw check visualization")
+    g.add_argument("--point-cloud", required=True)
+    g.add_argument("--out", default="runs/diag")
+    g.set_defaults(fn=cmd_diagnose)
 
     v = sub.add_parser("view", help="open 3D viewer: cloud + boxes")
     v.add_argument("--point-cloud", required=True)
