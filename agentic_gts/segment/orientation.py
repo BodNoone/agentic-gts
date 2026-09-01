@@ -40,16 +40,36 @@ def estimate_yaw_detailed(points: np.ndarray, z_range: tuple[float, float] = (0.
     """
     z = points[:, 2]
     m = (z > z_range[0]) & (z < z_range[1])
-    pts = points[m][:, :2]
+    band = points[m]
+    pts = band[:, :2]
     print(f"[diag][yaw] points in z({z_range[0]},{z_range[1]}): {int(m.sum())}/{len(points)}")
     if len(pts) < 100:
         print("[diag][yaw] too few device-height points -> fallback yaw=0")
         return {"yaw": 0.0, "candidates": [], "cells": None, "device_pts": pts}
 
     # subsample for speed
-    if len(pts) > 150_000:
-        sel = np.random.default_rng(0).choice(len(pts), 150_000, replace=False)
-        pts = pts[sel]
+    if len(band) > 150_000:
+        sel = np.random.default_rng(0).choice(len(band), 150_000, replace=False)
+        band = band[sel]
+
+    # keep only VERTICAL surfaces: rack side faces carry the row direction,
+    # while horizontal planes (rack-top fields, ceilings, floors, pipe runs)
+    # pollute the direction histogram and can hijack the estimate. Normals
+    # from local PCA (kNN=20); falls back to all points if too few survive.
+    if len(band) > 2_000:
+        try:
+            import open3d as o3d
+            pc = o3d.geometry.PointCloud()
+            pc.points = o3d.utility.Vector3dVector(band)
+            pc.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(knn=20))
+            nz = np.abs(np.asarray(pc.normals)[:, 2])
+            vert = band[nz < 0.5]
+            print(f"[diag][yaw] vertical-surface filter: {len(vert)}/{len(band)}")
+            if len(vert) > 1_000:
+                band = vert
+        except Exception as e:
+            print(f"[diag][yaw] normal estimation skipped ({type(e).__name__})")
+    pts = band[:, :2]
 
     # voxel-average to build a sparse occupancy set (removes density bias)
     key = np.floor(pts / voxel).astype(np.int64)

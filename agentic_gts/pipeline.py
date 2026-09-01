@@ -72,22 +72,27 @@ def denoise_cloud(points: np.ndarray, nb_neighbors: int = 20,
 def align_to_ground(points: np.ndarray) -> np.ndarray:
     """Stage -1b: level the cloud so the floor plane is horizontal at z=0.
 
-    Real 3DGS exports have arbitrary up-axes. A tilted floor leaks large
-    amounts of floor points into the z (0.4, 2.5) device band; the floor
-    then becomes the dominant interior structure and hijacks both yaw
-    estimation and Stage A row detection (30 m "rows", wall-direction yaw).
+    Two decoupled steps, because in big 3DGS scenes the *largest* horizontal
+    plane is often NOT the floor:
 
-    Fits the largest RANSAC plane (open3d) and accepts it as the floor only
-    if its normal is within 30 deg of +z. Ceilings are equally horizontal:
-    a plane whose inliers sit in the upper half of the cloud is treated as
-    ceiling — its points are excluded and the fit retried.
+      1. TILT correction from the largest horizontal-ish plane (ceiling,
+         rack-top field or floor all share the building tilt, so any of
+         them gives the up-direction).
+      2. Z OFFSET from the largest plane inside the bottom slice of the
+         (now level) cloud — that is the actual floor. Using the global
+         largest plane here mislabels e.g. a coplanar field of rack tops
+         as "floor", shifting the device height band onto the ceiling.
+
+    Falls back to the 2nd z-percentile as floor when no bottom plane fits.
     """
     if len(points) < 100:
         return points
     import open3d as o3d
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
-    z_median = float(np.median(points[:, 2]))
+
+    # ---- phase 1: tilt from the first horizontal-ish dominant plane ----
+    tilt_n = None
     for attempt in range(4):
         try:
             (a, b, c, d), inliers = pcd.segment_plane(0.05, 3, 200)
@@ -96,48 +101,68 @@ def align_to_ground(points: np.ndarray) -> np.ndarray:
             return points
         if c < 0:  # normal must point up
             a, b, c, d = -a, -b, -c, -d
-        up_ok = abs(c) >= math.cos(math.radians(30))
-        inlier_z = float(np.median(points[inliers][:, 2]))
-        ceiling_like = inlier_z > z_median + 0.5
-        if up_ok and not ceiling_like:
-            break   # plausible floor
-        why = "ceiling-like (upper half)" if ceiling_like else "not floor-like (normal far from +z)"
-        print(f"[diag][ground] plane #{attempt} at z~{inlier_z:.2f} is {why} "
-              f"-> excluding and refitting")
+        if abs(c) >= math.cos(math.radians(30)):
+            tilt_n = np.array([a, b, c], dtype=float)
+            tilt_n /= float(np.linalg.norm(tilt_n))
+            print(f"[diag][ground] tilt reference plane: inliers={len(inliers)} "
+                  f"({len(inliers) / len(points):.0%}), "
+                  f"tilt={math.degrees(math.acos(min(1.0, abs(tilt_n[2])))):.1f} deg")
+            break
+        print(f"[diag][ground] plane #{attempt} is vertical-ish (wall) -> excluding, refitting")
         pcd = pcd.select_by_index(inliers, invert=True)
-    else:
-        print("[diag][ground] no floor-like plane found -> skip alignment")
+    if tilt_n is None:
+        print("[diag][ground] no horizontal plane found -> skip alignment")
         return points
-    tilt = math.degrees(math.acos(min(1.0, abs(c))))
-    print(f"[diag][ground] largest plane: tilt={tilt:.1f} deg from +z, "
-          f"inliers={len(inliers)} ({len(inliers) / len(points):.0%})")
-    if abs(c) < math.cos(math.radians(30)):
-        print("[diag][ground] WARNING: largest plane not floor-like (normal far "
-              "from +z) -> skip alignment")
-        return points
-    n = np.array([a, b, c], dtype=float)
-    L = float(np.linalg.norm(n))
-    n /= L
-    d_n = d / L
-    if tilt < 0.2 and abs(d_n) < 0.05:
-        print("[diag][ground] floor already level at z~0 -> no change")
-        return points
-    # Rodrigues rotation mapping the floor normal to +z
+
+    # Rodrigues rotation mapping the reference normal to +z
     z_axis = np.array([0.0, 0.0, 1.0])
-    v = np.cross(n, z_axis)
+    v = np.cross(tilt_n, z_axis)
     s = float(np.linalg.norm(v))
     if s < 1e-9:
-        R = np.eye(3)  # n is already +z
+        R = np.eye(3)
     else:
         k = v / s
         K = np.array([[0.0, -k[2], k[1]],
                       [k[2], 0.0, -k[0]],
                       [-k[1], k[0], 0.0]])
-        theta = math.atan2(s, float(n @ z_axis))
+        theta = math.atan2(s, float(tilt_n @ z_axis))
         R = np.eye(3) + math.sin(theta) * K + (1.0 - math.cos(theta)) * (K @ K)
     pts = points @ R.T
-    pts[:, 2] += d_n   # plane n.p + d = 0 -> floor z becomes 0
-    print(f"[diag][ground] aligned: corrected tilt {tilt:.1f} deg, floor set to z=0")
+
+    # ---- phase 2: floor z from the lowest density spike in the bottom region ----
+    # The floor concentrates at one z (a histogram spike); device sides and
+    # walls are ~uniform in z and produce no spike. RANSAC in the bottom
+    # region is unreliable there (vertical rack faces and smeared diagonal
+    # fits win the inlier count), so detect the spike directly: take the
+    # lowest smoothed-z-histogram bin that clearly exceeds the regional
+    # median density. Falls back to the 2nd percentile when the floor is
+    # not reconstructed at all (walls/racks still extend down to it).
+    z = pts[:, 2]
+    zb = z[z <= float(np.percentile(z, 25))]
+    floor_z = None
+    if len(zb) > 500:
+        edges = np.arange(zb.min(), zb.max() + 0.05, 0.05)
+        hist, _ = np.histogram(zb, bins=edges)
+        if len(hist) >= 3:
+            ext = np.concatenate([[hist[0]], hist, [hist[-1]]])
+            sm = (ext[:-2] + 2.0 * ext[1:-1] + ext[2:]) / 4.0
+            pos = sm[sm > 0]
+            if len(pos):
+                thr = max(50.0, 2.0 * float(np.median(pos)))
+                low_i = next((i for i, v in enumerate(sm) if v >= thr), None)
+                if low_i is not None:
+                    zc = float(edges[low_i])
+                    near = zb[(zb >= zc - 0.05) & (zb <= zc + 0.15)]
+                    if len(near) > 50:
+                        floor_z = float(np.median(near))
+                        print(f"[diag][ground] floor spike: z={floor_z:.2f} "
+                              f"(bin count {int(sm[low_i])}, thr={thr:.0f})")
+    if floor_z is None:
+        floor_z = float(np.percentile(z, 2))
+        print(f"[diag][ground] no floor spike found -> using z p2={floor_z:.2f} as floor")
+    pts[:, 2] -= floor_z
+    print(f"[diag][ground] aligned: tilt corrected, floor set to z=0 "
+          f"(shift={-floor_z:+.2f} m)")
     return pts
 
 

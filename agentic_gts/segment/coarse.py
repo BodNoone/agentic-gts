@@ -72,6 +72,12 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
     labels, centroids = superpoint_over_segmentation(scene)
     if len(centroids) == 0:
         return []
+    # scale the wall-run threshold with the room: big halls legitimately have
+    # rows longer than the fixed default (15 m), while walls span nearly the
+    # full room diagonal
+    if scene is not None and len(scene.points):
+        span = float(np.ptp(scene.points[:, :2], axis=0).max())
+        max_row_len = max(max_row_len, 0.8 * span)
     axis = np.array([math.cos(yaw), math.sin(yaw)])
     cross = np.array([-math.sin(yaw), math.cos(yaw)])
     z = centroids[:, 2]

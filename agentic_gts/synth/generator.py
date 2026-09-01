@@ -62,7 +62,11 @@ class SynthConfig:
 
 def _sample_box_surface(box: OrientedBox, pts_per_m2: float, rng: np.random.Generator,
                         top: bool = True) -> np.ndarray:
-    """Sample points on the 4 side faces (+optional top) of an oriented box."""
+    """Sample points on the 4 side faces (+optional top) of an oriented box.
+
+    Local coordinates use the box's CENTERED convention (local_to_world adds
+    the box center), so faces live at +/- size/2 in their normal direction.
+    """
     L, W, H = box.size
     faces = []
     # each face: (u_len, v_len, generator of local coords)
@@ -77,15 +81,15 @@ def _sample_box_surface(box: OrientedBox, pts_per_m2: float, rng: np.random.Gene
         u = rng.uniform(-ul / 2, ul / 2, n)
         v = rng.uniform(-vl / 2, vl / 2, n)
         if name == "front":
-            local = np.stack([u, np.full(n, -W / 2), v + H / 2], axis=1)
+            local = np.stack([u, np.full(n, -W / 2), v], axis=1)
         elif name == "back":
-            local = np.stack([u, np.full(n, W / 2), v + H / 2], axis=1)
+            local = np.stack([u, np.full(n, W / 2), v], axis=1)
         elif name == "left":
-            local = np.stack([np.full(n, -L / 2), u, v + H / 2], axis=1)
+            local = np.stack([np.full(n, -L / 2), u, v], axis=1)
         elif name == "right":
-            local = np.stack([np.full(n, L / 2), u, v + H / 2], axis=1)
+            local = np.stack([np.full(n, L / 2), u, v], axis=1)
         else:  # top
-            local = np.stack([u, v, np.full(n, H)], axis=1)
+            local = np.stack([u, v, np.full(n, H / 2)], axis=1)
         faces.append((name, local))
     return faces
 

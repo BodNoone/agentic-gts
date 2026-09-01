@@ -52,10 +52,16 @@ def cmd_run(args):
         gs = Scene(points=scene.points)
         gs.load_boxes(args.gt)
         gt_boxes = gs.boxes
+    opts = {}
+    if args.yaw is not None:
+        import math as _math
+        opts["yaw"] = _math.radians(args.yaw)
+        print(f"[cli] yaw pinned by user: {args.yaw} deg (estimation skipped)")
     res = run_pipeline(scene, gt_boxes=gt_boxes,
                        use_coarse_seg=not args.boxes,
                        vlm_backend=args.vlm,
                        vlm_api_base=args.vlm_base,
+                       opts=opts,
                        out_dir=args.out,
                        edge_threshold_m=args.edge_thr)
     return res
@@ -129,6 +135,8 @@ def main():
     r.add_argument("--vlm", default="mock", choices=["mock", "qwen"])
     r.add_argument("--vlm-base", default=None)
     r.add_argument("--edge-thr", type=float, default=0.05)
+    r.add_argument("--yaw", type=float, default=None,
+                   help="pin device row yaw in degrees (skips estimation)")
     r.set_defaults(fn=cmd_run)
 
     d = sub.add_parser("demo", help="synthetic data -> full pipeline -> eval")
