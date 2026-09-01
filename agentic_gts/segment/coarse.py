@@ -89,6 +89,13 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
         print("[diag][A] too few device-height voxels -> no candidates")
         return []
     z = z[height_ok]
+    # walls lie ON the boundary of the occupied area; device rows are
+    # interior. We do NOT strip boundary voxels before the histogram (that
+    # deflates row bands against the background median); instead we reject
+    # detected bands whose voxels are predominantly hull-boundary-near.
+    from agentic_gts.segment.orientation import boundary_keep_mask
+    interior = boundary_keep_mask(c[:, :2], dist=0.5)
+    print(f"[diag][A] boundary (wall) voxels: {int((~interior).sum())}/{len(c)}")
     along = c[:, :2] @ axis
     crs = c[:, :2] @ cross
 
@@ -130,6 +137,13 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
     for (blo, bhi) in bands:
         idx = np.where((crs >= blo) & (crs <= bhi))[0]
         if len(idx) < 3:
+            continue
+        # wall band: most of its voxels hug the hull boundary of the
+        # occupied area (device rows are interior structure)
+        bfrac = float((~interior[idx]).mean())
+        if bfrac > 0.6:
+            print(f"[diag][A] dropping wall band at cross~{(blo + bhi) / 2:.1f} "
+                  f"(boundary frac={bfrac:.0%}, n={len(idx)})")
             continue
         band_stats.append({
             "lo": blo, "hi": bhi, "idx": idx,

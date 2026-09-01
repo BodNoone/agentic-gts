@@ -149,7 +149,10 @@ def align_to_ground(points: np.ndarray) -> np.ndarray:
             pos = sm[sm > 0]
             if len(pos):
                 thr = max(50.0, 2.0 * float(np.median(pos)))
-                low_i = next((i for i, v in enumerate(sm) if v >= thr), None)
+                # strongest spike, NOT the lowest one: 3DGS floaters under
+                # the floor form marginal low bins that win a bottom-up
+                # first-above-threshold scan and shift the whole cloud up
+                low_i = int(np.argmax(sm)) if sm.max() >= thr else None
                 if low_i is not None:
                     zc = float(edges[low_i])
                     near = zb[(zb >= zc - 0.05) & (zb <= zc + 0.15)]

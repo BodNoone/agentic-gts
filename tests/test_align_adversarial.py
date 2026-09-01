@@ -71,6 +71,40 @@ def test_align_and_yaw_on_adversarial_cloud():
     assert err < 3.0, f"yaw error {err:.1f} deg"
 
 
+def test_align_with_subfloor_noise():
+    """Regression: marginal noise spike BELOW the floor must not win.
+
+    Real 3DGS exports carry floaters under the floor; a bottom-up
+    first-above-threshold scan latches onto them and shifts the whole cloud
+    up (floor lands inside the device height band, drowning Stage A rows).
+    """
+    rng = np.random.default_rng(7)
+    scene, _, _ = generate(SynthConfig(seed=42))
+    pts = scene.points
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+
+    # diffuse floater layer + a concentrated spike below the floor
+    n = 40_000
+    noise = np.column_stack([
+        rng.uniform(lo[0], hi[0], n), rng.uniform(lo[1], hi[1], n),
+        rng.uniform(-2.0, -0.3, n)])
+    spike = np.column_stack([
+        rng.uniform(lo[0], hi[0], 5_000), rng.uniform(lo[1], hi[1], 5_000),
+        rng.uniform(-0.65, -0.60, 5_000)])
+    R = _rot_axis([1, 0, 0], 3.0) @ _rot_axis([0, 1, 0], 1.0)
+    adversarial = np.vstack([pts, noise, spike]) @ R.T + np.array([0, 0, 0.5])
+
+    fixed = align_to_ground(adversarial)
+
+    # strongest spike below 0.4 m must be the floor at z~0, not the noise layer
+    h, e = np.histogram(fixed[:, 2], bins=np.arange(-3.0, 3.0, 0.05))
+    m = e[:-1] < 0.4
+    zc = float(e[:-1][m][int(np.argmax(h[m]))])
+    assert abs(zc) < 0.15, f"floor mode at z={zc:.2f}, expected ~0"
+
+
 if __name__ == "__main__":
     test_align_and_yaw_on_adversarial_cloud()
     print("PASS  test_align_and_yaw_on_adversarial_cloud")
+    test_align_with_subfloor_noise()
+    print("PASS  test_align_with_subfloor_noise")

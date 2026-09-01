@@ -164,22 +164,19 @@ def _ang_dist(a: float, b: float) -> float:
     return min(d, math.pi / 2 - d)
 
 
-def _remove_boundary_cells(cells: np.ndarray, dist: float = 0.35) -> np.ndarray:
-    """Drop cells near the convex-hull boundary of the occupied area.
+def boundary_keep_mask(cells: np.ndarray, dist: float = 0.35) -> np.ndarray:
+    """Boolean mask of cells farther than `dist` from the convex-hull boundary.
 
-    Walls lie on the room boundary; device rows are interior. In real 3DGS
-    clouds walls are denser than device surfaces and their direction would
-    otherwise dominate the yaw histogram (walls axis-aligned, devices
-    rotated). Removing a boundary strip suppresses wall bands while leaving
-    the row bands intact.
+    Walls lie on the room boundary; device rows are interior. Shared by yaw
+    estimation and Stage A to suppress wall structure.
     """
     if len(cells) < 12:
-        return cells
+        return np.ones(len(cells), dtype=bool)
     from scipy.spatial import ConvexHull
     try:
         hull = ConvexHull(cells)
     except Exception:
-        return cells
+        return np.ones(len(cells), dtype=bool)
     verts = cells[hull.vertices]
     keep = np.ones(len(cells), dtype=bool)
     for i in range(len(verts)):
@@ -191,9 +188,19 @@ def _remove_boundary_cells(cells: np.ndarray, dist: float = 0.35) -> np.ndarray:
             continue
         t = np.clip((cells - a) @ ab / L, 0.0, 1.0)
         proj = a + t[:, None] * ab
-        d = np.linalg.norm(cells - proj, axis=1)
-        keep &= d > dist
-    kept = cells[keep]
+        keep &= np.linalg.norm(cells - proj, axis=1) > dist
+    return keep
+
+
+def _remove_boundary_cells(cells: np.ndarray, dist: float = 0.35) -> np.ndarray:
+    """Drop cells near the convex-hull boundary of the occupied area.
+
+    In real 3DGS clouds walls are denser than device surfaces and their
+    direction would otherwise dominate the yaw histogram (walls axis-aligned,
+    devices rotated). Removing a boundary strip suppresses wall bands while
+    leaving the row bands intact.
+    """
+    kept = cells[boundary_keep_mask(cells, dist)]
     print(f"[diag][yaw] boundary (wall) cell removal: {len(cells)} -> {len(kept)}")
     return kept
 
