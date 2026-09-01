@@ -23,15 +23,46 @@ from agentic_gts.core.models import (
 )
 
 MERGE_PRIMARY_VOXEL = 0.12
+TALL_Z = 2.8  # structure tops above this are walls/pillars, not racks (~2.4m)
+
+
+def structure_top_per_label(z: np.ndarray, labels: np.ndarray, n: int,
+                            gap_thr: float = 1.0) -> np.ndarray:
+    """Per-column 'structure top': max z of the lowest contiguous vertical run.
+
+    Cut each column's points at the first z-gap > gap_thr and take the max z
+    below it. A wall is continuous floor->ceiling, so its top is the ceiling
+    height; a rack under a (reconstructed) ceiling has a void between rack
+    top and ceiling, so its top is the rack height. This separates walls
+    from devices regardless of wall thickness, and does not misfire when the
+    ceiling itself is reconstructed above the devices.
+    """
+    order = np.lexsort((z, labels))
+    zs, ls = z[order], labels[order]
+    top = np.full(n, -np.inf)
+    np.maximum.at(top, ls, zs)
+    same = ls[1:] == ls[:-1]
+    cand = np.where(same & (zs[1:] - zs[:-1] > gap_thr))[0]
+    if len(cand):
+        first_cut = np.full(n, len(zs), dtype=np.int64)
+        np.minimum.at(first_cut, ls[cand], cand)
+        m = first_cut < len(zs)
+        top[m] = zs[first_cut[m]]
+    return top
 
 
 def superpoint_over_segmentation(scene: Scene, voxel: float = MERGE_PRIMARY_VOXEL) \
-        -> tuple[np.ndarray, np.ndarray]:
-    """Voxelize floor-projected points and return superpoint labels + centroids.
+        -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Voxelize floor-projected points; return superpoint labels, centroids
+    and a per-voxel `tall` mask.
 
     We only care about candidate *device* points: those above a small height
     (racks are vertical volumes) and off the floor plane. Floor/ground points
     are filtered to keep the row structure clean.
+
+    The tall mask marks voxels whose point column reaches above TALL_Z:
+    walls/pillars go to the ceiling, devices stop at ~2.4m. This is robust
+    to 3DGS wall thickness/noise, unlike footprint-based wall tests.
     """
     pts = scene.points
     z = pts[:, 2]
@@ -39,7 +70,7 @@ def superpoint_over_segmentation(scene: Scene, voxel: float = MERGE_PRIMARY_VOXE
     print(f"[diag][A] points z>0.05: {len(above)}/{len(pts)}")
     if len(above) < 50:
         print("[diag][A] too few above-floor points -> 0 superpoints")
-        return np.zeros(0, dtype=int), np.zeros((0, 3))
+        return np.zeros(0, dtype=int), np.zeros((0, 3)), np.zeros(0, dtype=bool)
     xy = above[:, :2]
     key = np.floor(xy / voxel).astype(np.int64)
     # collapse voxel keys to compact integer labels
@@ -51,8 +82,12 @@ def superpoint_over_segmentation(scene: Scene, voxel: float = MERGE_PRIMARY_VOXE
     np.add.at(sums, inv, above)
     np.add.at(cnts, inv, 1.0)
     centroids = sums / cnts[:, None]
-    print(f"[diag][A] superpoint voxels: {len(centroids)}")
-    return inv.astype(np.int64), centroids
+    # per-voxel structure top -> wall indicator (see structure_top_per_label)
+    top = structure_top_per_label(above[:, 2], inv, n_clusters)
+    tall = top > TALL_Z
+    print(f"[diag][A] superpoint voxels: {len(centroids)} "
+          f"(wall/ceiling-reaching: {int(tall.sum())})")
+    return inv.astype(np.int64), centroids, tall
 
 
 def merge_to_boxes(scene: Scene, yaw: float = 0.0,
@@ -69,9 +104,17 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
     bounded footprint near the room's device cluster, which excludes walls
     and floor noise.
     """
-    labels, centroids = superpoint_over_segmentation(scene)
+    labels, centroids, tall = superpoint_over_segmentation(scene)
     if len(centroids) == 0:
         return []
+    # speckle filter: voxels backed by only a handful of points are noise
+    # (e.g. the gaussian tails of a noisy GS wall surface). Their structure
+    # top is meaningless and they pollute the row histogram.
+    cnts = np.bincount(labels, minlength=len(centroids))
+    solid = cnts >= 8
+    if not solid.all():
+        print(f"[diag][A] speckle voxels dropped: {int((~solid).sum())}/{len(centroids)}")
+        centroids, tall = centroids[solid], tall[solid]
     # scale the wall-run threshold with the room: big halls legitimately have
     # rows longer than the fixed default (15 m), while walls span nearly the
     # full room diagonal
@@ -89,27 +132,35 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
         print("[diag][A] too few device-height voxels -> no candidates")
         return []
     z = z[height_ok]
-    # walls lie ON the boundary of the occupied area; device rows are
-    # interior. We do NOT strip boundary voxels before the histogram (that
-    # deflates row bands against the background median); instead we reject
-    # detected bands whose voxels are predominantly hull-boundary-near.
-    from agentic_gts.segment.orientation import boundary_keep_mask
-    interior = boundary_keep_mask(c[:, :2], dist=0.5)
-    print(f"[diag][A] boundary (wall) voxels: {int((~interior).sum())}/{len(c)}")
+    tall = tall[height_ok]
+    # Walls/pillars are continuous floor-to-ceiling columns. Exclude them
+    # from the histogram input itself: left in, they both inflate the
+    # background median (drowning the sparser device-row bands below the
+    # dense-band threshold) and pair up as fake rows -- a thick 3DGS wall's
+    # two surfaces are separated by a gap that matches rack depth.
+    dev = ~tall
+    print(f"[diag][A] wall columns excluded from row histogram: "
+          f"{int(tall.sum())}/{len(c)}")
+    c, z = c[dev], z[dev]
+    if len(c) < 3:
+        print("[diag][A] too few non-wall device voxels -> no candidates")
+        return []
     along = c[:, :2] @ axis
     crs = c[:, :2] @ cross
 
     # --- density-based row extraction on the cross axis ---
-    # Rows appear as high-density peaks; aisles and walls are low-density.
+    # Rows appear as high-density peaks; aisles are low-density.
     bin_w = 0.15
     lo_b, hi_b = crs.min() - bin_w, crs.max() + bin_w
     n_bins = max(4, int((hi_b - lo_b) / bin_w))
     hist, edges = np.histogram(crs, bins=n_bins, range=(lo_b, hi_b))
-    # threshold from histogram *median*, not max: in real 3DGS clouds walls
-    # can be much denser than device surfaces; a max-based threshold lets one
-    # strong wall band drown out all (sparser) device-row bands.
+    # threshold = min(median-based, max-fraction): the median term separates
+    # rows from aisle background when background dominates; the max-fraction
+    # term keeps the threshold proportional to the strongest row when there
+    # is little background (a median alone would then sit ON the row bins
+    # and cut them off).
     med = float(np.median(hist[hist > 0])) if np.any(hist > 0) else 0.0
-    thr = max(3, int(1.5 * med))
+    thr = max(3, min(int(1.5 * med), int(0.35 * hist.max())))
     print(f"[diag][A] cross-axis hist: max={hist.max()} median={med:.0f} thr={thr}")
     dense = hist >= thr
     # group consecutive dense bins into row bands
@@ -129,21 +180,15 @@ def merge_to_boxes(scene: Scene, yaw: float = 0.0,
     if not bands:
         print("[diag][A] WARNING: no dense bands (point density too low, or wrong yaw/scale)")
 
-    # Each dense band is a candidate device *face* (front or back of a row),
-    # or a wall. Pair up bands whose cross gap matches a plausible rack depth
-    # (0.6..1.4m) AND whose along-axis extents overlap strongly -> one row.
-    # Unpaired bands become thin candidates that later stages can prune.
+    # Each dense band is a candidate device *face* (front or back of a row;
+    # wall columns were already excluded from the histogram). Pair up bands
+    # whose cross gap matches a plausible rack depth (0.6..1.4m) AND whose
+    # along-axis extents overlap strongly -> one row. Unpaired bands become
+    # thin candidates that later stages can prune.
     band_stats = []
     for (blo, bhi) in bands:
         idx = np.where((crs >= blo) & (crs <= bhi))[0]
         if len(idx) < 3:
-            continue
-        # wall band: most of its voxels hug the hull boundary of the
-        # occupied area (device rows are interior structure)
-        bfrac = float((~interior[idx]).mean())
-        if bfrac > 0.6:
-            print(f"[diag][A] dropping wall band at cross~{(blo + bhi) / 2:.1f} "
-                  f"(boundary frac={bfrac:.0%}, n={len(idx)})")
             continue
         band_stats.append({
             "lo": blo, "hi": bhi, "idx": idx,

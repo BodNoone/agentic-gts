@@ -183,13 +183,31 @@ def _is_wall_sheet(scene: Scene, box: OrientedBox, depth_thr: float = 0.35) -> b
     along the cross (depth) axis is either wide (>0.5m) or bimodal. A wall
     gives a single narrow slab. We additionally require the box to be flat
     (depth << along length) to avoid killing short AC units.
+
+    The tall-column test catches what the thin-sheet test misses: thick /
+    noisy 3DGS walls whose depth spread exceeds depth_thr. We voxelize the
+    box footprint and compare each column's STRUCTURE TOP (max z of the
+    lowest contiguous vertical run, cut at the first >1m z-gap) against
+    TALL_Z: walls are continuous floor->ceiling, devices stop at ~2.4m
+    with a void below the ceiling. A wall box has nearly all columns tall;
+    a rack next to a wall only has the thin wall-slice columns tall.
     """
-    if box.size[0] < 2.0 and box.size[1] < 2.0:
-        return False  # small boxes are never walls
+    from agentic_gts.segment.coarse import TALL_Z, structure_top_per_label
     region = _box_region(box)
     pts = scene.points_in_region(region)
+    big = box.size[0] >= 2.0 or box.size[1] >= 2.0
     if len(pts) < 20:
-        return True  # no support -> treat as empty (prune)
+        return big  # no support -> prune big empty boxes, keep small ones
+    # tall-column test (applies to all sizes; robust to wall thickness)
+    p = pts[pts[:, 2] > 0.3]  # drop floor points
+    if len(p) >= 20:
+        key = np.floor(p[:, :2] / 0.15).astype(np.int64)
+        uniq, inv = np.unique(key, axis=0, return_inverse=True)
+        top = structure_top_per_label(p[:, 2], inv, len(uniq))
+        if len(top) and float(np.mean(top > TALL_Z)) > 0.5:
+            return True
+    if not big:
+        return False  # small boxes are never thin-sheet walls
     local = box.world_to_local(pts)
     # cross axis = local y (the depth axis)
     ydepth = local[:, 1]

@@ -92,23 +92,27 @@ def align_to_ground(points: np.ndarray) -> np.ndarray:
     pcd.points = o3d.utility.Vector3dVector(points)
 
     # ---- phase 1: tilt from the first horizontal-ish dominant plane ----
+    # Real floors/ceilings are level within a few degrees; a plane tilted
+    # more than ~10 deg is a diagonal RANSAC fit through noise, and rotating
+    # by it would smear the floor across the z histogram.
     tilt_n = None
-    for attempt in range(4):
+    for attempt in range(6):
         try:
-            (a, b, c, d), inliers = pcd.segment_plane(0.05, 3, 200)
+            (a, b, c, d), inliers = pcd.segment_plane(0.05, 3, 1000)
         except Exception as e:
             print(f"[diag][ground] plane fit failed ({type(e).__name__}) -> skip alignment")
             return points
         if c < 0:  # normal must point up
             a, b, c, d = -a, -b, -c, -d
-        if abs(c) >= math.cos(math.radians(30)):
+        tilt_deg = math.degrees(math.acos(min(1.0, abs(c))))
+        if tilt_deg <= 10.0:
             tilt_n = np.array([a, b, c], dtype=float)
             tilt_n /= float(np.linalg.norm(tilt_n))
             print(f"[diag][ground] tilt reference plane: inliers={len(inliers)} "
-                  f"({len(inliers) / len(points):.0%}), "
-                  f"tilt={math.degrees(math.acos(min(1.0, abs(tilt_n[2])))):.1f} deg")
+                  f"({len(inliers) / len(points):.0%}), tilt={tilt_deg:.1f} deg")
             break
-        print(f"[diag][ground] plane #{attempt} is vertical-ish (wall) -> excluding, refitting")
+        print(f"[diag][ground] plane #{attempt} too tilted ({tilt_deg:.1f} deg; "
+              f"wall or diagonal noise fit) -> excluding, refitting")
         pcd = pcd.select_by_index(inliers, invert=True)
     if tilt_n is None:
         print("[diag][ground] no horizontal plane found -> skip alignment")
