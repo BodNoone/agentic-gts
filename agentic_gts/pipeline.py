@@ -219,10 +219,18 @@ def run_pipeline(scene: Scene,
     # yaw (opts or scene.meta), estimate it from the point cloud so arbitrary
     # oriented scans work (no axis-aligned assumption).
     if "yaw" not in opts and "yaw" not in scene.meta:
-        from agentic_gts.segment.orientation import estimate_yaw
-        yaw = estimate_yaw(scene.points)
+        from agentic_gts.segment.orientation import estimate_yaw_detailed
+        info = estimate_yaw_detailed(scene.points)
+        yaw = info["yaw"]
         scene.meta["yaw"] = yaw
         print(f"[stage0] estimated dominant yaw = {math.degrees(yaw):.1f} deg")
+        try:
+            from agentic_gts.output.visualize import render_yaw_diagnosis
+            png = os.path.join(out_dir, "yaw_check.png")
+            render_yaw_diagnosis(info["device_pts"], info["candidates"], yaw, png)
+            print(f"[stage0] yaw diagnosis -> {png}")
+        except Exception as e:  # diagnosis render must never break the run
+            print(f"[warn] yaw diagnosis render failed: {type(e).__name__}: {e}")
     opts.setdefault("yaw", float(scene.meta.get("yaw", 0.0)))
 
     def _eval(tag: str):
