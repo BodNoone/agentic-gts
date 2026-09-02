@@ -287,6 +287,117 @@ def is_aligned(box: OrientedBox, row_axis: np.ndarray, tol_deg: float = 12.0) ->
     return ang <= tol_deg
 
 
+# --------------------------------------------------------------- B0: fragments
+def merge_fragments(scene: Scene, yaw: float = 0.0,
+                    overlap_thr: float = 0.35,
+                    max_depth: float = 1.6,
+                    max_width: float = 0.9,
+                    max_merge_size: float = 1.2) -> tuple[list[OrientedBox], int]:
+    """Merge fragment boxes that observe the SAME device (Stage B0).
+
+    Input boxes coming from per-view mask back-projection are fragments:
+    the same device yields several small boxes, each covering the visible
+    face from one viewpoint. Two boxes belong to the same device when,
+    projected onto the row frame (yaw):
+
+      a) their footprints overlap substantially -- same-spot fragments
+         (intersection over the SMALLER footprint >= overlap_thr), or
+      b) they cover complementary front/back halves -- the along extents
+         overlap nearly fully while the cross extents are disjoint and
+         their union stays within one plausible rack depth (<= max_depth), or
+      c) they cover complementary left/right halves -- the cross extents
+         overlap nearly fully while the along extents are disjoint and
+         their union stays within one plausible rack width (<= max_width).
+
+    Deliberately NOT merged: adjacent racks in a row (along union spans two
+    devices > max_width) and back-to-back racks (cross union > max_depth)
+    -- those stay separate and are handled by gap completion /
+    merged-row split. Known limitation: two adjacent sub-0.45m devices
+    sitting flush would satisfy (c) and wrongly merge.
+
+    Returns (boxes, n_merges). n_merges counts absorbed boxes.
+    """
+    axis = np.array([math.cos(yaw), math.sin(yaw)])
+    cross = np.array([-math.sin(yaw), math.cos(yaw)])
+    boxes = list(scene.boxes)
+
+    def _extents(b: OrientedBox):
+        cs = np.asarray(b.corners_2d())          # 4x2 world
+        a = cs @ axis
+        c = cs @ cross
+        return float(a.min()), float(a.max()), float(c.min()), float(c.max())
+
+    def _merge_pair(a: OrientedBox, b: OrientedBox) -> OrientedBox:
+        # union extent in the row frame, snapped to the global yaw
+        ea, eb = _extents(a), _extents(b)
+        a0, a1 = min(ea[0], eb[0]), max(ea[1], eb[1])
+        c0, c1 = min(ea[2], eb[2]), max(ea[3], eb[3])
+        along = a1 - a0
+        depth = c1 - c0
+        height = max(a.size[2], b.size[2])
+        ca = (a0 + a1) / 2.0
+        cc = (c0 + c1) / 2.0
+        ctr = axis * ca + cross * cc
+        merged = OrientedBox(
+            center=(float(ctr[0]), float(ctr[1]), height / 2),
+            size=(max(along, 0.2), max(depth, 0.3), max(height, 0.4)),
+            yaw=yaw,
+            device_type=a.device_type if a.device_type != DeviceType.UNKNOWN else b.device_type,
+            source=BoxSource.RULE_FIX, confidence=Confidence.MID,
+            row_id=a.row_id,
+            meta={"merged_from": [a.box_id, b.box_id]},
+        )
+        # refit to actual points so edges land on surfaces, not on the
+        # union of noisy fragment bounds
+        refit = fit_box_to_points(scene, merged.center[:2], merged.size, yaw)
+        if refit is not None and max(refit.size[:2]) <= max_merge_size:
+            refit.source = BoxSource.RULE_FIX
+            refit.confidence = Confidence.MID
+            refit.row_id = a.row_id
+            refit.meta = merged.meta
+            return refit
+        return merged
+
+    n_absorbed = 0
+    changed = True
+    while changed and len(boxes) > 1:
+        changed = False
+        exts = [_extents(b) for b in boxes]
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                a0, a1, c0, c1 = exts[i]
+                b0, b1, d0, d1 = exts[j]
+                area_i = max((a1 - a0) * (c1 - c0), 1e-6)
+                area_j = max((b1 - b0) * (d1 - d0), 1e-6)
+                a_ov = min(a1, b1) - max(a0, b0)          # along overlap
+                c_ov = min(c1, d1) - max(c0, d0)          # cross overlap
+                inter = max(a_ov, 0.0) * max(c_ov, 0.0)
+                same_spot = inter / min(area_i, area_j) >= overlap_thr
+                # front/back complementary halves: full along overlap, cross
+                # disjoint but union within one rack depth
+                along_frac = a_ov / max(min(a1 - a0, b1 - b0), 1e-6) \
+                    if a_ov > 0 else 0.0
+                cross_union = max(c1, d1) - min(c0, d0)
+                fb_complementary = (along_frac >= 0.8 and c_ov <= 0.02 * cross_union
+                                    and cross_union <= max_depth)
+                # left/right complementary halves: full cross overlap, along
+                # union within one rack width (small along overlap allowed --
+                # half-fragments of one device often overlap slightly)
+                cross_frac = c_ov / max(min(c1 - c0, d1 - d0), 1e-6) \
+                    if c_ov > 0 else 0.0
+                along_union = max(a1, b1) - min(a0, b0)
+                lr_complementary = (cross_frac >= 0.8 and along_union <= max_width)
+                if same_spot or fb_complementary or lr_complementary:
+                    boxes[i] = _merge_pair(boxes[i], boxes[j])
+                    boxes.pop(j)
+                    n_absorbed += 1
+                    changed = True
+                    break
+            if changed:
+                break
+    return boxes, n_absorbed
+
+
 def _region_of_box(box: OrientedBox, expand: float) -> tuple[float, float, float, float]:
     c = np.asarray(box.center[:2])
     half = np.asarray(box.size[:2]) / 2.0 + expand

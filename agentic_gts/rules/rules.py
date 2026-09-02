@@ -5,6 +5,8 @@ cheapest and highest-leverage stage; it should absorb 40-60% of errors
 before the agent is even consulted.
 
 Rules:
+  0. fragment merging (B0)                 -> fuses per-view back-projection
+                                             fragments of the same device
   1. size/large-aspect filter              -> removes false positives / oversized
   2. row alignment                         -> fixes slight misalignment
   3. point-support check                   -> removes empty boxes
@@ -48,6 +50,17 @@ def apply_rules(scene: Scene, opts: dict | None = None) -> tuple[list[OrientedBo
     _sz = [tuple(round(s, 2) for s in b.size) for b in boxes[:10]]
     _more = "..." if len(boxes) > 10 else ""
     print(f"[diag][B] input boxes: {len(boxes)}  (sizes={_sz}{_more})")
+
+    # 0) fragment merge (B0): per-view back-projection fragments of the
+    # same device are fused before any filtering -- a fragment alone often
+    # fails the wall/support tests below and would be wrongly deleted.
+    # Deliberately NOT recorded as an Issue: issues feed the agent, which
+    # would try to "fix" (split) exactly what we just merged.
+    boxes, n_absorbed = geo.merge_fragments(scene, yaw=yaw)
+    if n_absorbed:
+        print(f"[diag][B] fragment merge (B0): absorbed {n_absorbed} -> "
+              f"{len(boxes)} boxes")
+    scene.boxes = boxes
 
     # 0) wall filter: a box whose points form a single thin sheet in the
     # cross (depth) direction is a wall fragment, not a device. Devices have
