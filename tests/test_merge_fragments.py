@@ -102,6 +102,32 @@ def test_back_to_back_racks_not_merged():
     print("PASS back-to-back racks kept separate")
 
 
+def test_face_support_rescues_single_view_fragment():
+    """A full-depth box with only ONE observed face: interior support is
+    structurally low, face support must rescue it; a floating box with no
+    observation gets nothing."""
+    rng = np.random.default_rng(5)
+    a = rng.uniform(-0.3, 0.3, 3000)
+    z = rng.uniform(0, 2.0, 3000)
+    c = np.full(3000, 0.55)                     # only the front face observed
+    scene = Scene(points=np.stack([a, c, z], axis=1))
+    frag = _mk(0.0, 0.0, 0.6, 1.1, 2.0)
+    interior = geo.support_fraction(scene, frag)
+    face = geo.face_support_fraction(scene, frag)
+    assert interior < 0.15, f"interior {interior:.2f} (expected structurally low)"
+    assert face > 0.5, f"face {face:.2f} (observed face should be covered)"
+    # floor-backed false positive must NOT be rescued via the bottom face
+    floor = np.stack([rng.uniform(3.0, 5.0, 2000),
+                      rng.uniform(3.0, 5.0, 2000),
+                      np.zeros(2000)], axis=1)
+    scene2 = Scene(points=floor)
+    fp = _mk(4.0, 4.0, 0.6, 1.1, 2.0)           # sits on the floor, empty
+    assert geo.face_support_fraction(scene2, fp) < 0.1, \
+        "floor points leaked through the bottom-face rescue"
+    print(f"PASS face-support: fragment interior={interior:.2f} -> face={face:.2f}; "
+          f"floor-backed FP face={geo.face_support_fraction(scene2, fp):.2f}")
+
+
 def _mk(cx: float, cy: float, L: float, W: float, H: float):
     from agentic_gts.core.models import OrientedBox
     return OrientedBox(center=(cx, cy, H / 2), size=(L, W, H), yaw=0.0)

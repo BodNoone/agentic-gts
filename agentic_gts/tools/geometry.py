@@ -76,6 +76,55 @@ def support_fraction(scene: Scene, box: OrientedBox, expand: float = 0.0) -> flo
     return float(occupied.sum() / max(nb.prod(), 1))
 
 
+def face_support_fraction(scene: Scene, box: OrientedBox, cell: float = 0.1,
+                          dilate: int = 1) -> float:
+    """Coverage of the box's BEST-covered face by nearby points.
+
+    Interior-volume support (support_fraction) is structurally biased
+    against single-view fragments: a fragment box observes one face, so
+    most of its interior is empty and occupancy lands below any reasonable
+    threshold even though the observation is perfectly real. Real devices
+    always have at least one face backed by points; a floating false
+    positive has none.
+
+    Returns the max over the 6 faces of the fraction of that face's cells
+    having a point within `dilate` cells (holes in sparse clouds are
+    bridged by the dilation).
+    """
+    region = _region_of_box(box, 0.0)
+    pts = scene.points_in_region(region)
+    if len(pts) == 0:
+        return 0.0
+    local = box.world_to_local(pts)
+    half = np.asarray(box.size) / 2.0
+    m = np.all(np.abs(local) <= half + cell, axis=1)
+    inside = local[m]
+    if len(inside) < 5:
+        return 0.0
+    nb = np.maximum((np.asarray(box.size) / cell).astype(int), 1)
+    idx = np.clip(((inside + half) / cell).astype(int), 0, nb - 1)
+    occ = np.zeros(nb, dtype=bool)
+    occ[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+    from scipy.ndimage import binary_dilation
+    occ_d = binary_dilation(occ, iterations=dilate)
+    best = 0.0
+    # skip the bottom 0.2m of SIDE faces: floor points sit under every
+    # floor-touching box and would otherwise rescue false positives
+    z_keep = 2
+    for axis in range(3):
+        if axis < 2:                      # side faces: +x, -x, +y, -y
+            for side in (0, -1):
+                face = np.take(occ_d, side, axis=axis)   # (other_axis, z)
+                sel = face[:, z_keep:] if face.shape[1] > z_keep else face
+                if sel.size:
+                    best = max(best, float(sel.mean()))
+        else:                            # top face only (bottom excluded)
+            face = np.take(occ_d, -1, axis=axis)
+            if face.size:
+                best = max(best, float(face.mean()))
+    return best
+
+
 def center_field_clusters(scene: Scene, box: OrientedBox,
                           dbscan_eps: float = 0.05,
                           min_pts: int = 10) -> tuple[int, float, np.ndarray]:

@@ -57,22 +57,28 @@ def apply_rules(scene: Scene, opts: dict | None = None) -> tuple[list[OrientedBo
     # Deliberately NOT recorded as an Issue: issues feed the agent, which
     # would try to "fix" (split) exactly what we just merged.
     boxes, n_absorbed = geo.merge_fragments(scene, yaw=yaw)
-    if n_absorbed:
-        print(f"[diag][B] fragment merge (B0): absorbed {n_absorbed} -> "
-              f"{len(boxes)} boxes")
+    print(f"[diag][B] fragment merge (B0): absorbed {n_absorbed} -> "
+          f"{len(boxes)} boxes")
     scene.boxes = boxes
 
     # 0) wall filter: a box whose points form a single thin sheet in the
     # cross (depth) direction is a wall fragment, not a device. Devices have
     # front+back faces (bimodal depth) or full depth >= ~0.5m.
     non_wall: list[OrientedBox] = []
+    drop_wall_detail: list[str] = []
     for b in boxes:
         if _is_wall_sheet(scene, b):
+            drop_wall_detail.append(
+                f"{b.box_id[:4]}@({b.center[0]:.1f},{b.center[1]:.1f}) "
+                f"{b.size[0]:.2f}x{b.size[1]:.2f}x{b.size[2]:.2f}")
             issues.append(Issue(IssueType.FALSE_POSITIVE, [b.box_id], _box_region(b),
                                 detail="wall sheet"))
             continue
         non_wall.append(b)
-    print(f"[diag][B] wall filter: dropped {len(boxes) - len(non_wall)}, kept {len(non_wall)}")
+    print(f"[diag][B] wall filter: dropped {len(boxes) - len(non_wall)}, "
+          f"kept {len(non_wall)}")
+    for d in drop_wall_detail[:15]:
+        print(f"[diag][B]   wall-dropped: {d}")
     scene.boxes = non_wall
     boxes = non_wall
 
@@ -81,11 +87,20 @@ def apply_rules(scene: Scene, opts: dict | None = None) -> tuple[list[OrientedBo
     n_low, n_aspect = 0, 0
     drop_sup_detail: list[str] = []
     for b in boxes:
+        # interior-volume support, rescued by best-face coverage: a
+        # single-view back-projection fragment observes only one face, so
+        # its interior is mostly empty and volume occupancy is structurally
+        # low -- but its observed face is fully backed by points. A floating
+        # false positive has neither.
         sup = geo.support_fraction(scene, b)
+        if sup < min_support:
+            sup = max(sup, geo.face_support_fraction(scene, b))
         aspect = max(b.size[0], b.size[1]) / max(min(b.size[0], b.size[1]), 1e-3)
         if sup < min_support:
             n_low += 1
-            drop_sup_detail.append(f"{sup:.2f}")
+            drop_sup_detail.append(
+                f"{b.box_id[:4]}@({b.center[0]:.1f},{b.center[1]:.1f}) "
+                f"{b.size[0]:.2f}x{b.size[1]:.2f}x{b.size[2]:.2f} sup={sup:.2f}")
             issue_region = _box_region(b)
             issues.append(Issue(IssueType.LOW_SUPPORT, [b.box_id], issue_region,
                                 detail=f"support={sup:.2f}"))
