@@ -6,6 +6,11 @@ discrete verdict. Precise coordinates always come from the geometry tools.
 
 Two backends:
   - "qwen"   : Qwen3-VL-8B served via an OpenAI-compatible endpoint.
+  - "local"  : in-process HuggingFace transformers model. Loaded ONCE on the
+               first adjudication and kept in memory; the agent loop then
+               only pays per-call inference. Use when you don't want a
+               separate server process (costs ~1-2 min model load at startup
+               and the GPU memory is held for the whole pipeline run).
   - "mock"   : deterministic rule-based fallback (no network), so the whole
                pipeline runs without any model. This is also the reliability
                floor / baseline.
@@ -86,6 +91,7 @@ class VLMJudge:
                          "http://127.0.0.1:8000/v1")
         self.api_key = api_key or os.environ.get("VLM_API_KEY", "EMPTY")
         self.timeout = timeout
+        self._local_model = None   # lazy: (processor, model), loaded once
 
     # ---- backend-agnostic interface ----
     def adjudicate_box(self, scene, box, question: str,
@@ -93,6 +99,8 @@ class VLMJudge:
         """Ask the VLM a multiple-choice question about a candidate box."""
         if self.backend == "mock":
             return self._mock_adjudicate(box, question)
+        if self.backend == "local":
+            return self._local_adjudicate(scene, box, question, options)
         return self._qwen_adjudicate(scene, box, question, options)
 
     # ---- mock (rule) fallback ----
@@ -106,6 +114,77 @@ class VLMJudge:
         if "missing" in q or "存在" in question:
             return Verdict(action="keep", confidence=0.5, detail="mock: assume fine")
         return Verdict(action="keep", confidence=0.5, detail="mock default")
+
+    # ---- local in-process transformers model ----
+    def _ensure_local_model(self):
+        """Load the model once; subsequent adjudications reuse it."""
+        if self._local_model is not None:
+            return
+        import torch
+        import transformers
+        from transformers import AutoProcessor
+        try:  # Qwen3-VL needs a recent transformers; fall back to the
+              # generic auto class for other VL families (Qwen2-VL, ...)
+            from transformers import Qwen3VLForConditionalGeneration as ModelCls
+        except ImportError:
+            from transformers import AutoModelForImageTextToText as ModelCls
+        print(f"[vlm][local] loading {self.model} (transformers "
+              f"{transformers.__version__}) ... first call only")
+        processor = AutoProcessor.from_pretrained(self.model)
+        model = ModelCls.from_pretrained(
+            self.model, torch_dtype=torch.bfloat16, device_map="auto")
+        model.eval()
+        self._local_model = (processor, model)
+
+    def _local_adjudicate(self, scene, box, question: str,
+                          options: list[str]) -> Verdict:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from PIL import Image
+
+            self._ensure_local_model()
+            processor, model = self._local_model
+
+            img_arr = render_topdown_image(scene.points, [box])
+            buf = io.BytesIO()
+            plt.imsave(buf, img_arr, format="png")
+            image = Image.open(buf).convert("RGB")
+
+            prompt = (
+                f"You are an auditor in a data-center layout tool. Decide the best "
+                f"answer for this question by looking at the top-down point cloud "
+                f"image (red = a candidate box).\n\n"
+                f"QUESTION: {question}\n"
+                f"OPTIONS:\n" + "\n".join(f"- {o}" for o in options) +
+                f"\n\nReply with the exact option text only."
+            )
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt},
+                ],
+            }]
+            text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
+            inputs = processor(text=[text], images=[image],
+                                return_tensors="pt").to(model.device)
+            import torch
+            with torch.inference_mode():
+                out = model.generate(**inputs, max_new_tokens=64,
+                                      do_sample=False)
+            trimmed = [o[len(i):] for i, o in zip(inputs.input_ids, out)]
+            answer = processor.batch_decode(
+                trimmed, skip_special_tokens=True)[0].strip()
+            matched = self._match_option(answer, options)
+            return Verdict(action="answer", params={"choice": matched},
+                           confidence=0.8, detail=answer, raw=answer)
+        except Exception as e:
+            print(f"[vlm][local] inference failed ({type(e).__name__}: {e}) "
+                  f"-> falling back to mock")
+            return self._mock_adjudicate(box, question)
 
     # ---- Qwen (OpenAI-compatible chat completions with image) ----
     def _qwen_adjudicate(self, scene, box, question: str,

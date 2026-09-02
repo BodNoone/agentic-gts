@@ -143,13 +143,14 @@ def main():
     r.add_argument("--boxes", default=None, help="optional pre-detected boxes json")
     r.add_argument("--gt", default=None, help="optional ground-truth boxes json")
     r.add_argument("--out", default="runs/latest")
-    r.add_argument("--vlm", default="mock", choices=["mock", "qwen"])
+    r.add_argument("--vlm", default="mock", choices=["mock", "qwen", "local"])
     r.add_argument("--vlm-base", default=None,
                    help="OpenAI-compatible API base, e.g. http://127.0.0.1:8000/v1 "
                         "(also env VLM_API_BASE)")
     r.add_argument("--vlm-model", default=None,
-                   help="served model name/path, e.g. Qwen/Qwen3-VL-8B-Instruct "
-                        "or a local path (also env VLM_MODEL)")
+                   help="served model name (qwen) or local checkpoint dir (local), "
+                        "e.g. Qwen/Qwen3-VL-8B-Instruct or /models/qwen3-vl "
+                        "(also env VLM_MODEL)")
     r.add_argument("--edge-thr", type=float, default=0.05)
     r.add_argument("--yaw", type=float, default=None,
                    help="pin device row yaw in degrees (skips estimation)")
