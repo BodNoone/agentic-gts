@@ -228,6 +228,7 @@ def run_pipeline(scene: Scene,
                  use_coarse_seg: bool = True,
                  vlm_backend: str = "mock",
                  vlm_api_base: str | None = None,
+                 vlm_model: str | None = None,
                  opts: dict | None = None,
                  out_dir: str = "runs/latest",
                  edge_threshold_m: float = 0.05) -> PipelineResult:
@@ -282,7 +283,8 @@ def run_pipeline(scene: Scene,
     _render_stage(scene, "stageB_rules", out_dir, gt_boxes)
 
     # --- stage C: agent loop ---
-    judge = VLMJudge(backend=vlm_backend, api_base=vlm_api_base)
+    judge = VLMJudge(backend=vlm_backend, api_base=vlm_api_base,
+                     model=vlm_model)
     agent = LayoutAgent(judge=judge, opts=opts)
     report = agent.run(scene)
     n_res = len(report.resolved)

@@ -71,6 +71,7 @@ def cmd_run(args):
                        use_coarse_seg=not args.boxes,
                        vlm_backend=args.vlm,
                        vlm_api_base=args.vlm_base,
+                       vlm_model=args.vlm_model,
                        opts=opts,
                        out_dir=args.out,
                        edge_threshold_m=args.edge_thr)
@@ -143,7 +144,12 @@ def main():
     r.add_argument("--gt", default=None, help="optional ground-truth boxes json")
     r.add_argument("--out", default="runs/latest")
     r.add_argument("--vlm", default="mock", choices=["mock", "qwen"])
-    r.add_argument("--vlm-base", default=None)
+    r.add_argument("--vlm-base", default=None,
+                   help="OpenAI-compatible API base, e.g. http://127.0.0.1:8000/v1 "
+                        "(also env VLM_API_BASE)")
+    r.add_argument("--vlm-model", default=None,
+                   help="served model name/path, e.g. Qwen/Qwen3-VL-8B-Instruct "
+                        "or a local path (also env VLM_MODEL)")
     r.add_argument("--edge-thr", type=float, default=0.05)
     r.add_argument("--yaw", type=float, default=None,
                    help="pin device row yaw in degrees (skips estimation)")

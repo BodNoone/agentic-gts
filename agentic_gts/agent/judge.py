@@ -75,11 +75,13 @@ def _png_to_b64(png_bytes: bytes) -> str:
 
 
 class VLMJudge:
-    def __init__(self, backend: str = "mock", model: str = "Qwen/Qwen3-VL-8B-Instruct",
+    def __init__(self, backend: str = "mock",
+                 model: str | None = None,
                  api_base: str | None = None, api_key: str | None = None,
                  timeout: int = 60):
         self.backend = backend
-        self.model = model
+        self.model = (model or os.environ.get("VLM_MODEL") or
+                      "Qwen/Qwen3-VL-8B-Instruct")
         self.api_base = (api_base or os.environ.get("VLM_API_BASE") or
                          "http://127.0.0.1:8000/v1")
         self.api_key = api_key or os.environ.get("VLM_API_KEY", "EMPTY")
