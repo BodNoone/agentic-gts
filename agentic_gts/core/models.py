@@ -186,7 +186,57 @@ class Scene:
 
     def load_boxes(self, path: str) -> None:
         with open(path, "r", encoding="utf-8") as f:
-            self.boxes = [OrientedBox.from_dict(d) for d in json.load(f)]
+            data = json.load(f)
+        if isinstance(data, dict) and "objects" in data:
+            data = [_object_entry_to_box(d) for d in data["objects"]]
+            print(f"[io] converted {len(data)} 'objects'-format entries to oriented boxes")
+        self.boxes = [OrientedBox.from_dict(d) for d in data]
+
+
+def _object_entry_to_box(o: dict) -> dict:
+    """Convert a detector-style object entry to an OrientedBox dict.
+
+    Expected per-object schema (common 3D detector output):
+        {"name": ..., "centroid": {"x","y","z"},
+         "dimensions": {"length","width","height"},
+         "rotations": {"x","y","z"},            # degrees
+         "rotation matrix": [[...],[...],[...]]  # optional, 3x3 local->world
+        }
+    Mapping: center=centroid, size=(length,width,height), yaw from the
+    rotation matrix (atan2 of the first column, robust) falling back to
+    rotations.z in degrees. Pitch/roll (rotations.x/y) are ignored -- the
+    pipeline assumes z-up boxes -- but warned about when large.
+    """
+    c = o.get("centroid") or {}
+    d = o.get("dimensions") or {}
+    r = o.get("rotations") or {}
+    m = (o.get("rotation matrix") or o.get("rotation_matrix")
+         or o.get("matrix"))
+    yaw = 0.0
+    if m and len(m) >= 2 and len(m[0]) >= 2 and len(m[1]) >= 2:
+        yaw = math.atan2(float(m[1][0]), float(m[0][0]))
+    else:
+        yaw = math.radians(float(r.get("z", 0.0)))
+    tilt = max(abs(float(r.get("x", 0.0))), abs(float(r.get("y", 0.0))))
+    if tilt > 2.0:
+        print(f"[io] WARNING: object {o.get('name', '?')} tilt {tilt:.1f} deg "
+              f"ignored (pipeline assumes z-up boxes)")
+    name = str(o.get("name", "")).lower()
+    if "crac" in name or "air" in name or name in ("ac", "ac_unit"):
+        dtype = "ac"
+    elif "ups" in name:
+        dtype = "ups"
+    else:
+        dtype = "rack"
+    return {
+        "center": [float(c["x"]), float(c["y"]), float(c["z"])],
+        "size": [float(d["length"]), float(d["width"]), float(d["height"])],
+        "yaw": yaw,
+        "device_type": dtype,
+        "source": "manual",
+        "confidence": "mid",
+        "meta": {"object_name": o.get("name", "")},
+    }
 
 
 # Standard rack dimensions (meters). Optional priors -- the pipeline
