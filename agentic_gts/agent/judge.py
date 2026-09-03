@@ -55,6 +55,11 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
     hi = c + extent
     m = ((stage_points[:, 0] >= lo[0]) & (stage_points[:, 0] <= hi[0]) &
          (stage_points[:, 1] >= lo[1]) & (stage_points[:, 1] <= hi[1]))
+    # lift the ceiling locally too: cut at the candidate's own top, so
+    # overhead structure never buries the box being adjudicated
+    cut = _render_cut_z(stage_points, boxes)
+    if np.isfinite(cut):
+        m &= stage_points[:, 2] < cut
     pts = stage_points[m][:, :2]
 
     fig, ax = plt.subplots(figsize=(4, 4), dpi=size // 4)
@@ -75,6 +80,54 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
     return np.array(plt.imread(buf))  # HxWx4
 
 
+def _auto_ceiling_z(z: np.ndarray, gap: float = 0.3, frac: float = 0.05) -> float:
+    """Find the z where a separated ceiling slab begins; inf if none.
+
+    A top-down render must exclude the ceiling: it is the highest, fully
+    covering layer and would visually bury every device below it. A ceiling
+    exists iff the topmost dense z-segment is separated from the structure
+    below by a near-empty vertical gap (racks ~2.4m, ceiling 3-5m). Tall
+    structures that reach the ceiling leave no gap and are kept whole.
+    """
+    if len(z) < 200:
+        return float("inf")
+    edges = np.arange(z.min(), z.max() + 0.1, 0.1)
+    if len(edges) < 5:
+        return float("inf")
+    hist, _ = np.histogram(z, bins=edges)
+    pos = hist[hist > 0]
+    if len(pos) == 0:
+        return float("inf")
+    # median-based (NOT max-based): a very dense ceiling must not raise the
+    # bar so high that the sparser device layer reads as an empty gap
+    thr = max(20.0, 0.3 * float(np.median(pos)))
+    occ = hist >= thr
+    segs = []
+    s = None
+    for i, v in enumerate(occ):
+        if v and s is None:
+            s = i
+        if not v and s is not None:
+            segs.append((s, i))
+            s = None
+    if s is not None:
+        segs.append((s, len(occ)))
+    if len(segs) >= 2:
+        top_start, below_end = segs[-1][0], segs[-2][1]
+        if (top_start - below_end) * 0.1 >= gap:
+            return float(edges[below_end])
+    return float("inf")
+
+
+def _render_cut_z(points: np.ndarray, boxes, margin: float = 0.3) -> float:
+    """Ceiling cut for top-down renders. Trusted box heights win: anything
+    above the tallest device is ceiling/overhead structure by definition.
+    Falls back to the z-histogram gap when no boxes are given."""
+    if boxes:
+        return max(b.center[2] + b.size[2] / 2.0 for b in boxes) + margin
+    return _auto_ceiling_z(points[:, 2])
+
+
 def render_godview_png(points: np.ndarray, boxes, max_points: int = 250_000,
                        dpi: int = 130) -> bytes:
     """Full-scene top-down render for the god-view pass: height-colored
@@ -89,6 +142,11 @@ def render_godview_png(points: np.ndarray, boxes, max_points: int = 250_000,
     from matplotlib.patches import Polygon as MplPolygon
 
     pts = points
+    # lift the ceiling: everything above the tallest trusted box top is
+    # ceiling/overhead structure and would bury the layout below it
+    cut = _render_cut_z(pts, boxes)
+    if np.isfinite(cut):
+        pts = pts[pts[:, 2] < cut]
     if len(pts) > max_points:
         sel = np.random.default_rng(0).choice(len(pts), max_points, replace=False)
         pts = pts[sel]

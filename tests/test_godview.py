@@ -42,6 +42,48 @@ def test_godview_render_produces_png():
     print(f"PASS godview render: {len(png) // 1024} KB png")
 
 
+def test_ceiling_autocut():
+    """A separated dense top slab (ceiling) must be cut; a bare scene with
+    no ceiling must not be."""
+    from agentic_gts.agent.judge import _auto_ceiling_z
+    rng = np.random.default_rng(1)
+    floor = np.zeros(4000)                     # dense floor z=0
+    racks = rng.uniform(0, 2.0, 8000)          # devices 0..2m
+    no_ceiling = np.concatenate([floor, racks])
+    assert not np.isfinite(_auto_ceiling_z(no_ceiling)), \
+        "bare scene wrongly cut"
+    ceiling = rng.uniform(4.0, 4.3, 50000)     # dense slab at 4m (big gap)
+    with_ceiling = np.concatenate([no_ceiling, ceiling])
+    cut = _auto_ceiling_z(with_ceiling)
+    assert np.isfinite(cut) and 1.9 < cut < 2.3, f"cut={cut}"
+    print(f"PASS ceiling autocut: cut at z={cut:.1f} (ceiling 4.0-4.3 kept out)")
+
+
+def test_godview_render_drops_ceiling():
+    """With boxes given, the cut is the tallest box top + margin: the dense
+    4m ceiling slab must be excluded, the 2m racks kept."""
+    from agentic_gts.agent.judge import _render_cut_z
+    from agentic_gts.core.models import OrientedBox
+    scene = _scene_with_racks()
+    rng = np.random.default_rng(2)
+    cx = rng.uniform(-1, 4, 60000)
+    cy = rng.uniform(-1, 7, 60000)
+    cz = rng.uniform(4.0, 4.2, 60000)          # dense ceiling slab at 4m
+    pts = np.vstack([scene.points, np.stack([cx, cy, cz], axis=1)])
+    boxes = [OrientedBox(center=(k * 0.62, r * 2.4, 1.0),
+                         size=(0.6, 1.1, 2.0), yaw=0.0)
+             for r in range(3) for k in range(4)]
+    cut = _render_cut_z(pts, boxes)
+    assert 2.0 < cut < 2.5, f"cut={cut} (expected just above box tops)"
+    kept = pts[pts[:, 2] < cut]
+    assert (kept[:, 2] < 2.5).all(), "ceiling points leaked into the render"
+    assert len(kept) < len(pts), "nothing was cut"
+    png = render_godview_png(pts, boxes)
+    assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 20_000
+    print(f"PASS ceiling cut from box heights: cut={cut:.1f}, "
+          f"{len(pts) - len(kept)} of {len(pts)} points removed")
+
+
 def test_extract_json_variants():
     assert _extract_json('{"suspicious": []}') == {"suspicious": []}
     assert _extract_json('Here it is:\n{"suspicious": [{"index": 2, '
