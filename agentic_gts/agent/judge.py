@@ -75,6 +75,55 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
     return np.array(plt.imread(buf))  # HxWx4
 
 
+def render_godview_png(points: np.ndarray, boxes, max_points: int = 250_000,
+                       dpi: int = 130) -> bytes:
+    """Full-scene top-down render for the god-view pass: height-colored
+    point cloud (dark = low, bright = high) + numbered box footprints.
+
+    Numbering matches the index the VLM is asked about, so its answers map
+    directly back to boxes. Returns PNG bytes.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon as MplPolygon
+
+    pts = points
+    if len(pts) > max_points:
+        sel = np.random.default_rng(0).choice(len(pts), max_points, replace=False)
+        pts = pts[sel]
+
+    fig, ax = plt.subplots(figsize=(11, 9), dpi=dpi)
+    sc = ax.scatter(pts[:, 0], pts[:, 1], c=pts[:, 2], s=0.3, cmap="viridis",
+                    alpha=0.45, linewidths=0, rasterized=True)
+    fig.colorbar(sc, ax=ax, label="height z (m)", shrink=0.7)
+    for i, b in enumerate(boxes):
+        color = "#d93025" if b.confidence.value != "low" else "#f2a900"
+        ax.add_patch(MplPolygon(b.corners_2d(), closed=True, fill=False,
+                                edgecolor=color, linewidth=1.4))
+        ax.text(b.center[0], b.center[1], str(i), fontsize=7, ha="center",
+                va="center", color=color, weight="bold")
+    ax.set_aspect("equal")
+    ax.set_title(f"top-down view | {len(boxes)} candidate boxes (numbered)", fontsize=10)
+    ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def _extract_json(text: str):
+    """Best-effort JSON object extraction from a VLM reply."""
+    import re
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
 def _png_to_b64(png_bytes: bytes) -> str:
     return base64.b64encode(png_bytes).decode("ascii")
 
@@ -103,6 +152,59 @@ class VLMJudge:
             return self._local_adjudicate(scene, box, question, options)
         return self._qwen_adjudicate(scene, box, question, options)
 
+    # ---- god-view global audit ----
+    _GODVIEW_PROMPT = (
+        "You are auditing a data-center layout. This is a TOP-DOWN view of the "
+        "room: the colored scatter is the point cloud (colorbar on the right = "
+        "height in meters; devices are tall ~2m structures, the floor is dark "
+        "and low). The numbered rectangles are candidate device boxes.\n\n"
+        "Look at the GLOBAL spatial structure: devices in machine rooms form "
+        "parallel rows separated by aisles. Identify boxes that are clearly "
+        "NOT real devices, e.g. a box floating in the middle of an aisle with "
+        "no point structure, a box far away from every device row, or a box "
+        "on the room boundary where only a wall exists.\n\n"
+        "Be conservative: only flag a box when the evidence is clear. Do not "
+        "flag boxes that sit inside a device row.\n\n"
+        "Reply with ONLY a JSON object, no other text:\n"
+        '{"suspicious": [{"index": <box number>, "reason": "<short reason>"}, ...]}\n'
+        'If no box looks suspicious, reply exactly {"suspicious": []}'
+    )
+
+    def adjudicate_godview(self, scene, boxes) -> list[dict]:
+        """One global VLM call over the whole scene. Returns the suspicious
+        list ([{"index": i, "reason": str}]) with indices clamped to valid
+        box indices. Mock backend / any failure -> empty list (pipeline
+        continues with rule-detected issues only)."""
+        if self.backend == "mock" or not boxes:
+            return []
+        png = render_godview_png(scene.points, boxes)
+        try:
+            if self.backend == "local":
+                text = self._local_image_call(png, self._GODVIEW_PROMPT,
+                                              max_new_tokens=400)
+            else:
+                text = self._qwen_image_call(png, self._GODVIEW_PROMPT,
+                                              max_tokens=400)
+        except Exception as e:
+            print(f"[vlm][godview] failed ({type(e).__name__}: {e}) -> skipped")
+            return []
+        data = _extract_json(text)
+        if not isinstance(data, dict):
+            print(f"[vlm][godview] unparseable reply -> skipped: {text[:120]!r}")
+            return []
+        out = []
+        seen: set[int] = set()
+        for item in data.get("suspicious", []) or []:
+            try:
+                idx = int(item.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < len(boxes) and idx not in seen:
+                seen.add(idx)
+                out.append({"index": idx,
+                           "reason": str(item.get("reason", ""))[:80]})
+        return out
+
     # ---- mock (rule) fallback ----
     def _mock_adjudicate(self, box, question: str) -> Verdict:
         q = question.lower()
@@ -114,6 +216,57 @@ class VLMJudge:
         if "missing" in q or "存在" in question:
             return Verdict(action="keep", confidence=0.5, detail="mock: assume fine")
         return Verdict(action="keep", confidence=0.5, detail="mock default")
+
+    # ---- shared image-call helpers (used by godview and box adjudication) ----
+    def _local_image_call(self, png_bytes: bytes, prompt: str,
+                          max_new_tokens: int = 64) -> str:
+        """In-process transformers call with a PNG image + text prompt."""
+        from PIL import Image
+        self._ensure_local_model()
+        processor, model = self._local_model
+        image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": prompt},
+            ],
+        }]
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=[text], images=[image],
+                           return_tensors="pt").to(model.device)
+        import torch
+        with torch.inference_mode():
+            out = model.generate(**inputs, max_new_tokens=max_new_tokens,
+                                  do_sample=False)
+        trimmed = [o[len(i):] for i, o in zip(inputs.input_ids, out)]
+        return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
+
+    def _qwen_image_call(self, png_bytes: bytes, prompt: str,
+                         max_tokens: int = 64) -> str:
+        """OpenAI-compatible chat call with a base64 PNG image."""
+        b64 = base64.b64encode(png_bytes).decode("ascii")
+        r = requests.post(
+            self.api_base + "/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                    ],
+                }],
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+            },
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
 
     # ---- local in-process transformers model ----
     def _ensure_local_model(self):

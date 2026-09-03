@@ -80,10 +80,37 @@ class LayoutAgent:
                                         severity=0.6))
         return issues
 
+    # ---------------- god-view global audit ----------------
+    def godview_pass(self, scene: Scene) -> list[Issue]:
+        """One global VLM call over the whole scene (top-down, all boxes).
+
+        Returns FALSE_POSITIVE issues for boxes the VLM finds globally
+        suspicious (e.g. floating in an aisle, off every row). Each flagged
+        box then goes through the normal per-box local adjudication before
+        any deletion happens -- the god-view only nominates, it never
+        executes. Mock/failure -> no issues (rule-detected ones remain).
+        """
+        try:
+            flagged = self.judge.adjudicate_godview(scene, scene.boxes)
+        except Exception as e:
+            print(f"[diag][C] godview pass error ({type(e).__name__}) -> skipped")
+            return []
+        issues: list[Issue] = []
+        for f in flagged:
+            b = scene.boxes[f["index"]]
+            print(f"[diag][C] godview flagged #{f['index']} "
+                  f"@({b.center[0]:.1f},{b.center[1]:.1f}): {f['reason']}")
+            issues.append(Issue(IssueType.FALSE_POSITIVE, [b.box_id],
+                                self._region(b),
+                                detail=f"godview: {f['reason']}", severity=0.7))
+        if not flagged:
+            print("[diag][C] godview pass: no global suspicions")
+        return issues
+
     # ---------------- repair loop ----------------
     def run(self, scene: Scene) -> AgentReport:
         report = AgentReport()
-        issues = self.detect_issues(scene)
+        issues = self.godview_pass(scene) + self.detect_issues(scene)
         from collections import Counter
         cnt = Counter(i.issue_type.value for i in issues)
         print(f"[diag][C] issues detected: {dict(cnt) if cnt else 'none'}")
