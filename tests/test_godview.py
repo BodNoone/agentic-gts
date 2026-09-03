@@ -133,6 +133,34 @@ def test_godview_flag_becomes_issue():
     print("PASS godview flag -> issue")
 
 
+def test_local_evidence_saved():
+    """The per-box local crop must be persisted during the repair loop."""
+    import glob
+    import tempfile
+    import shutil
+    class FlaggingJudge(VLMJudge):
+        def adjudicate_godview(self, scene, boxes):
+            return [{"index": 0, "reason": "in aisle"}]
+        def adjudicate_box(self, scene, box, question, options):
+            return type("V", (), {"action": "keep", "params": {"choice": "real device"},
+                                  "confidence": 0.8, "detail": "stub", "raw": ""})()
+
+    scene = _scene_with_racks()
+    from agentic_gts.core.models import OrientedBox
+    scene.boxes = [OrientedBox(center=(0, 0, 1), size=(0.6, 1.1, 2.0), yaw=0.0)
+                   for _ in range(3)]
+    out = tempfile.mkdtemp(prefix="godview_ev_")
+    try:
+        agent = LayoutAgent(judge=FlaggingJudge(backend="qwen"), out_dir=out)
+        agent.run(scene)
+        ev = glob.glob(os.path.join(out, "evidence_*.png"))
+        assert ev, f"no evidence png saved to {out}"
+        assert os.path.getsize(ev[0]) > 1_000
+        print(f"PASS local evidence saved: {os.path.basename(ev[0])}")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed = 0

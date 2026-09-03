@@ -192,6 +192,29 @@ class LayoutAgent:
         return False
 
     # ---------------- decision ----------------
+    def _save_local_evidence(self, scene: Scene, box: OrientedBox,
+                             issue: Issue) -> None:
+        """Save the per-box local crop the VLM adjudicates on (PNG).
+
+        Best-effort: never lets an I/O problem break the repair loop.
+        """
+        if not self.out_dir:
+            return
+        try:
+            from agentic_gts.agent.judge import render_topdown_image
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import os as _os
+            _os.makedirs(self.out_dir, exist_ok=True)
+            img = render_topdown_image(scene.points, [box])
+            path = _os.path.join(self.out_dir,
+                                 f"evidence_{box.box_id[:8]}.png")
+            plt.imsave(path, img)
+            print(f"[diag][C] local evidence -> {path} ({issue.detail[:40]})")
+        except Exception as e:
+            print(f"[diag][C] local evidence save failed ({type(e).__name__})")
+
     def _decide(self, scene: Scene, issue: Issue) -> Verdict:
         box = scene.get_box(issue.box_ids[0]) if issue.box_ids else None
         if issue.issue_type == IssueType.MERGED_ROW and box is not None:
@@ -209,6 +232,11 @@ class LayoutAgent:
                 return Verdict(action="split", params={"n": n, "width_unit": width_unit})
             return Verdict(action="keep")
         if issue.issue_type == IssueType.FALSE_POSITIVE and box is not None:
+            # persist the exact per-box evidence image the VLM sees: when
+            # the global pass nominates a box, this local crop is what the
+            # confirm/refuse decision was made on -- the key artifact for
+            # auditing (and tuning) that decision
+            self._save_local_evidence(scene, box, issue)
             verdict = self.judge.adjudicate_box(
                 scene, box,
                 question="Is there truly a device at the red box, or is it empty space?",
