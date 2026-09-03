@@ -208,7 +208,11 @@ class LayoutAgent:
             import matplotlib.pyplot as plt
             import os as _os
             _os.makedirs(self.out_dir, exist_ok=True)
-            img = render_topdown_image(scene.points, [box])
+            # MUST match what adjudicate_box() feeds the VLM: pass gs_ply so
+            # the saved evidence is a true Gaussian render (same image the
+            # judge based its verdict on), not a scatter view.
+            img = render_topdown_image(scene.points, [box],
+                                       gs_ply=scene.meta.get("gs_ply"))
             path = _os.path.join(self.out_dir,
                                  f"evidence_{box.box_id[:8]}.png")
             plt.imsave(path, img)
