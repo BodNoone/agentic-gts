@@ -72,11 +72,49 @@ def _bbox(pts: np.ndarray):
 
 
 def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
-                     elev_deg: float = 55.0, azim_deg: float = 45.0) -> Cam:
-    """Oblique bird's-eye camera auto-fitted so the whole scene is in frame."""
+                     elev_deg: float = 55.0, azim_deg: float = 45.0,
+                     nadir: bool = False, cam_z: float | None = None) -> Cam:
+    """Bird's-eye camera auto-fitted so the whole scene is in frame.
+
+    nadir=False (default): oblique view, eye raised by `elev_deg`/`azim_deg`.
+
+    nadir=True: true top-down (straight down) camera. `cam_z` is the camera
+    height, typically just above the tallest box top but STILL BELOW the
+    ceiling (cut_z), so overhead structure sits above the camera and is never
+    projected -- it cannot occlude the racks. The camera looks straight down
+    at the scene center; the view's up direction is aligned with the layout
+    yaw so the rows run horizontally/vertically on screen.
+    """
     lo, hi = _bbox(points)
     center = (lo + hi) / 2.0
     r = float(np.linalg.norm(hi[:2] - lo[:2]) / 2.0) + 1.0
+
+    if nadir:
+        # look straight down (-z), up hint = +y in world (screen-up = +y)
+        eye_z = cam_z if (cam_z is not None and np.isfinite(cam_z)) \
+            else float(hi[2]) + r * 0.5
+        eye = np.array([center[0], center[1], eye_z])
+        up = np.array([0.0, 1.0, 0.0])  # screen up aligned with world +y
+        # Frame the footprint by raising the camera height until the whole
+        # footprint is inside the FOV. Overhead structure is removed by the
+        # ceiling Z-cut before rendering, so a high eye cannot re-introduce it.
+        base = Cam(eye=eye, target=np.array([center[0], center[1], lo[2]]),
+                   up=up, fovy_deg=60.0, W=W, H=H)
+        corners = np.array([[x, y, hi[2]] for x in (lo[0], hi[0])
+                            for y in (lo[1], hi[1])])
+        for hf in (1.0, 1.2, 1.5, 1.8, 2.2, 2.8, 3.5, 4.5, 6.0, 8.0, 11.0):
+            c = Cam(eye=np.array([center[0], center[1], eye_z * hf]),
+                    target=np.array([center[0], center[1], lo[2]]),
+                    up=up, fovy_deg=60.0, W=W, H=H)
+            pc = np.hstack([corners, np.ones((len(corners), 1))]) @ c.view_cv().T
+            if not np.all(pc[:, 2] > 0.1):
+                continue
+            uv = c.project_cv(corners)
+            if (uv[:, 0].min() > 0.03 * W and uv[:, 0].max() < 0.97 * W and
+                    uv[:, 1].min() > 0.03 * H and uv[:, 1].max() < 0.97 * H):
+                return c
+        return base
+
     el, az = math.radians(elev_deg), math.radians(azim_deg)
     up = np.array([0.0, 0.0, 1.0])
     cam = None

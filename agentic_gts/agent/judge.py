@@ -165,14 +165,20 @@ def render_godview_png(points: np.ndarray, boxes, max_points: int = 250_000,
                                                       render_gs_view, png_bytes)
             gs = read_gaussian_ply(gs_ply)
             cut = _render_cut_z(points, boxes)
+            # True top-down camera. cam_z sits just above the tallest box top
+            # but BELOW the ceiling cut, so overhead structure is above the
+            # camera and never projected -> it cannot occlude the racks.
+            cam_z = None
+            if np.isfinite(cut):
+                cam_z = float(cut - 0.1)
             pts_for_cam = points[points[:, 2] < cut] if np.isfinite(cut) else points
             if len(pts_for_cam) < 100:
                 pts_for_cam = points
-            cam = make_godview_cam(pts_for_cam)
+            cam = make_godview_cam(pts_for_cam, boxes, nadir=True, cam_z=cam_z)
             img = render_gs_view(gs, boxes, cam, cut_z=cut)
             if img is not None:
                 print(f"[gs][godview] true 3DGS render "
-                      f"({len(gs)} gaussians, oblique view)")
+                      f"({len(gs)} gaussians, top-down view)")
                 return png_bytes(img)
         except Exception as e:
             print(f"[gs][godview] true render failed ({type(e).__name__}: {e}) "
