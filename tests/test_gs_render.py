@@ -140,6 +140,33 @@ def test_godview_nadir_camera():
     print("PASS godview nadir camera (frame + orientation + height)")
 
 
+def test_godview_frames_box_footprint():
+    """Godview must frame the DEVICE footprint, not the (wall-inflated) point
+    cloud bbox -- otherwise racks end up a small patch in the middle of the
+    frame when walls/floor surround them."""
+    from agentic_gts.output.gs_render import make_godview_cam
+    from agentic_gts.core.models import OrientedBox
+    W, H = 1280, 1024
+    # room walls far out (40x30m); racks occupy only an 8x6m inner patch
+    pts = np.array([[0, 0, 0], [40, 0, 0], [40, 30, 0], [0, 30, 0],
+                    [16, 12, 2.3], [24, 12, 2.3], [24, 18, 2.3], [16, 18, 2.3]])
+    boxes = [OrientedBox(center=(16 + c * 0.7, 12 + r * 1.2, 1.15),
+                         size=(0.6, 1.1, 2.3), yaw=0.0)
+             for r in range(5) for c in range(12)]
+    cam = make_godview_cam(pts, boxes, nadir=True, W=W, H=H)
+    gp = np.array([[16, 12, 2.3], [24, 12, 2.3], [24, 18, 2.3], [16, 18, 2.3]])
+    uv = cam.project_cv(gp)
+    # the rack patch must fill most of the frame, not a tiny central patch
+    w_frac = (uv[:, 0].max() - uv[:, 0].min()) / W
+    h_frac = (uv[:, 1].max() - uv[:, 1].min()) / H
+    assert w_frac > 0.5 and h_frac > 0.5, \
+        f"racks only fill {w_frac:.0%}/{h_frac:.0%} of frame"
+    # and it must be fully inside (no clipping)
+    assert (uv[:, 0].min() > 0 and uv[:, 0].max() < W and
+            uv[:, 1].min() > 0 and uv[:, 1].max() < H)
+    print("PASS godview frames box footprint (not wall bbox)")
+
+
 def test_prep_cuts_ceiling():
     """Gaussians above cut_z must be excluded from the render input so the
     ceiling cannot occlude the racks in a top-down view."""
@@ -160,5 +187,6 @@ if __name__ == "__main__":
     test_render_falls_back_without_cuda()
     test_camera_projection_sanity()
     test_godview_nadir_camera()
+    test_godview_frames_box_footprint()
     test_prep_cuts_ceiling()
     print("ALL GS TESTS PASSED")

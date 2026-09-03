@@ -139,12 +139,23 @@ def _auto_ceiling_z(z: np.ndarray, gap: float = 0.3, frac: float = 0.05) -> floa
     return float("inf")
 
 
-def _render_cut_z(points: np.ndarray, boxes, margin: float = 0.3) -> float:
-    """Ceiling cut for top-down renders. Trusted box heights win: anything
-    above the tallest device is ceiling/overhead structure by definition.
-    Falls back to the z-histogram gap when no boxes are given."""
+def _render_cut_z(points: np.ndarray, boxes, margin: float = 0.3,
+                  cut_above_rack: bool = True) -> float:
+    """Ceiling/overhead cut for top-down renders.
+
+    Trusted box heights win: anything above the tallest device top is
+    overhead structure (cable trays, pipes, ceiling) by definition. The cut
+    sits just above the highest box top; overhead structure above it is
+    removed before rasterization so it cannot occlude the racks in a
+    top-down view. Falls back to the z-histogram gap when no boxes are given.
+    """
     if boxes:
-        return max(b.center[2] + b.size[2] / 2.0 for b in boxes) + margin
+        top = max(b.center[2] + b.size[2] / 2.0 for b in boxes)
+        if cut_above_rack:
+            # tight: a small margin keeps the rack's own top face but drops
+            # cable-tray / duct runs that float just above the racks
+            return top + margin
+        return top
     return _auto_ceiling_z(points[:, 2])
 
 
@@ -164,7 +175,10 @@ def render_godview_png(points: np.ndarray, boxes, max_points: int = 250_000,
             from agentic_gts.output.gs_render import (make_godview_cam,
                                                       render_gs_view, png_bytes)
             gs = read_gaussian_ply(gs_ply)
-            cut = _render_cut_z(points, boxes)
+            # Tight cut: margin 0.05 sits just above the highest rack top so
+            # the rack tops stay but cable trays / ducts floating above the
+            # racks are removed (they would bury the layout in top-down view).
+            cut = _render_cut_z(points, boxes, margin=0.05)
             # True top-down camera. Height is auto-derived from the room
             # footprint (a god-view overlooks the whole layout), so it sits
             # well above every rack. Overhead structure is removed by the

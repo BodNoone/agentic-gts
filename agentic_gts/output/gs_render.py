@@ -71,65 +71,99 @@ def _bbox(pts: np.ndarray):
     return lo, hi
 
 
+def _footprint(points: np.ndarray, boxes, pad_frac: float = 0.03):
+    """(center, half_diag, loft, lohi) framing the DEVICE LAYOUT.
+
+    Favours the boxes' footprint when available (that is what the god-view
+    must show), falling back to the point-cloud bbox. The margin is a
+    FRACTION of the layout size (pad_frac, default 3%) so the racks fill
+    most of the frame instead of a small central patch.
+    """
+    if boxes:
+        cs = np.vstack([b.corners_2d() for b in boxes]).astype(np.float64)
+        lo = cs.min(axis=0)
+        hi = cs.max(axis=0)
+        z_top = max((np.asarray(b.center[2]) + b.size[2] / 2.0 for b in boxes),
+                    default=float("nan"))
+    else:
+        lo = points[:, :2].min(axis=0)
+        hi = points[:, :2].max(axis=0)
+        z_top = float("nan")
+    pad = pad_frac * float(np.linalg.norm(hi - lo) / 2.0)
+    lo = lo - pad
+    hi = hi + pad
+    center = (lo + hi) / 2.0
+    half_diag = float(np.linalg.norm(hi - lo) / 2.0)
+    return center, half_diag, lo, hi, z_top
+
+
 def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
                      elev_deg: float = 55.0, azim_deg: float = 45.0,
                      nadir: bool = False, cam_z: float | None = None) -> Cam:
-    """Bird's-eye camera auto-fitted so the whole scene is in frame.
+    """Bird's-eye camera auto-fitted so the whole DEVICE LAYOUT is in frame.
 
     nadir=False (default): oblique view, eye raised by `elev_deg`/`azim_deg`.
 
-    nadir=True: true top-down (straight down) camera. `cam_z` is the camera
-    height, typically just above the tallest box top but STILL BELOW the
-    ceiling (cut_z), so overhead structure sits above the camera and is never
-    projected -- it cannot occlude the racks. The camera looks straight down
-    at the scene center; the view's up direction is aligned with the layout
-    yaw so the rows run horizontally/vertically on screen.
+    nadir=True: true top-down (straight down) camera. The framing footprint
+    is the BOXES' footprint (not the raw point-cloud bbox, which walls and
+    floor smear across the whole room) so the racks fill the frame instead
+    of a small patch in the middle. The camera height is derived from that
+    footprint and raised until it is framed -- so it sits well above the
+    racks. (The eye may end up above the ceiling; the Z cut removes ceiling
+    gaussians before rasterization, so they cannot reappear overhead.)
     """
-    lo, hi = _bbox(points)
-    center = (lo + hi) / 2.0
-    r = float(np.linalg.norm(hi[:2] - lo[:2]) / 2.0) + 1.0
+    center, half_diag, lo, hi, z_top = _footprint(points, boxes)
 
     if nadir:
         # look straight down (-z), up hint = +y in world (screen-up = +y)
-        # Camera height is driven by the FOOTPRINT size, not by box tops:
-        # a god-view must overlook the whole room layout, so it sits well
-        # above every structure. (The eye may end up above the ceiling --
-        # that's fine, ceiling gaussians are removed by the Z cut before
-        # rasterization, so they can never reappear overhead.)
-        half_diag = float(np.linalg.norm(hi[:2] - lo[:2]) / 2.0)
-        eye_z = 0.0 if (cam_z is None or not np.isfinite(cam_z)) else float(cam_z)
-        # scale the base height with the room so a big room -> high camera
-        eye_z = max(eye_z, half_diag * 1.15 + float(hi[2]))
+        z_ref = float(z_top) if np.isfinite(z_top) else float(points[:, 2].max())
+        z_floor = float(points[:, 2].min())
         up = np.array([0.0, 1.0, 0.0])  # screen up aligned with world +y
-        base = Cam(eye=np.array([center[0], center[1], eye_z]),
-                   target=np.array([center[0], center[1], lo[2]]),
-                   up=up, fovy_deg=60.0, W=W, H=H)
-        corners = np.array([[x, y, hi[2]] for x in (lo[0], hi[0])
+        # Analytic first guess for the height, then nudge up until the whole
+        # footprint (including its rack-top corners) projects inside the frame.
+        fov_half = math.radians(60.0 / 2.0)
+        span_x = float(hi[0] - lo[0])
+        span_y = float(hi[1] - lo[1])
+        # vertical half-angle at the same 60 deg fovy: pixels are square
+        fy_half = math.atan(math.tan(fov_half) * (H / W))
+        need_h = max(span_x / 2.0 / math.tan(fov_half),
+                     span_y / 2.0 / math.tan(fy_half))
+        base_z = max(float(cam_z) if (cam_z is not None and np.isfinite(cam_z)) else 0.0,
+                     need_h * 1.08 + z_ref)
+        # 4 footprint corners at rack-top height (worst case for overhang)
+        corners = np.array([[x, y, z_ref] for x in (lo[0] , hi[0])
                             for y in (lo[1], hi[1])])
-        # raise the camera until the whole footprint is inside the FOV
-        for hf in (1.0, 1.15, 1.3, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.5, 8.0):
-            c = Cam(eye=np.array([center[0], center[1], eye_z * hf]),
-                    target=np.array([center[0], center[1], lo[2]]),
+        # Frame tightly (target ~2% border) so the racks fill the frame;
+        # nudge up only as far as needed.
+        for hf in (1.0, 1.03, 1.06, 1.1, 1.15, 1.22, 1.3, 1.4, 1.55, 1.75, 2.0):
+            eye_z = base_z * hf
+            c = Cam(eye=np.array([center[0], center[1], eye_z]),
+                    target=np.array([center[0], center[1], z_floor]),
                     up=up, fovy_deg=60.0, W=W, H=H)
             pc = np.hstack([corners, np.ones((len(corners), 1))]) @ c.view_cv().T
             if not np.all(pc[:, 2] > 0.1):
                 continue
             uv = c.project_cv(corners)
-            if (uv[:, 0].min() > 0.03 * W and uv[:, 0].max() < 0.97 * W and
-                    uv[:, 1].min() > 0.03 * H and uv[:, 1].max() < 0.97 * H):
+            if (uv[:, 0].min() > 0.01 * W and uv[:, 0].max() < 0.99 * W and
+                    uv[:, 1].min() > 0.01 * H and uv[:, 1].max() < 0.99 * H):
                 return c
-        return base
+        return Cam(eye=np.array([center[0], center[1], base_z * 2.0]),
+                   target=np.array([center[0], center[1], z_floor]),
+                   up=up, fovy_deg=60.0, W=W, H=H)
 
     el, az = math.radians(elev_deg), math.radians(azim_deg)
     up = np.array([0.0, 0.0, 1.0])
     cam = None
-    # all 8 corners of the scene bbox must end up inside the frame
+    z_floor = float(points[:, 2].min())
+    # 8 corners of the framing footprint (floor + rack-top heights)
+    zc = z_ref if np.isfinite(z_ref) else float(points[:, 2].max())
     corners = np.array([[x, y, z] for x in (lo[0], hi[0])
-                        for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
-    for dist in [r * f for f in (1.0, 1.2, 1.5, 1.8, 2.2, 2.8, 3.5, 4.5, 6.0, 8.0, 11.0)]:
+                        for y in (lo[1], hi[1]) for z in (z_floor, zc)])
+    for dist in [(half_diag + 1.0) * f for f in (1.0, 1.2, 1.5, 1.8, 2.2, 2.8, 3.5, 4.5, 6.0, 8.0, 11.0)]:
         eye = center + dist * np.array(
             [math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el)])
-        c = Cam(eye=eye, target=center, up=up, fovy_deg=60.0, W=W, H=H)
+        c = Cam(eye=eye, target=np.array([center[0], center[1], z_floor]),
+                up=up, fovy_deg=60.0, W=W, H=H)
         cam = cam or c
         pc = np.hstack([corners, np.ones((len(corners), 1))]) @ c.view_cv().T
         if not np.all(pc[:, 2] > 0.1):       # some corner behind the camera
