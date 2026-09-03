@@ -91,18 +91,23 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
 
     if nadir:
         # look straight down (-z), up hint = +y in world (screen-up = +y)
-        eye_z = cam_z if (cam_z is not None and np.isfinite(cam_z)) \
-            else float(hi[2]) + r * 0.5
-        eye = np.array([center[0], center[1], eye_z])
+        # Camera height is driven by the FOOTPRINT size, not by box tops:
+        # a god-view must overlook the whole room layout, so it sits well
+        # above every structure. (The eye may end up above the ceiling --
+        # that's fine, ceiling gaussians are removed by the Z cut before
+        # rasterization, so they can never reappear overhead.)
+        half_diag = float(np.linalg.norm(hi[:2] - lo[:2]) / 2.0)
+        eye_z = 0.0 if (cam_z is None or not np.isfinite(cam_z)) else float(cam_z)
+        # scale the base height with the room so a big room -> high camera
+        eye_z = max(eye_z, half_diag * 1.15 + float(hi[2]))
         up = np.array([0.0, 1.0, 0.0])  # screen up aligned with world +y
-        # Frame the footprint by raising the camera height until the whole
-        # footprint is inside the FOV. Overhead structure is removed by the
-        # ceiling Z-cut before rendering, so a high eye cannot re-introduce it.
-        base = Cam(eye=eye, target=np.array([center[0], center[1], lo[2]]),
+        base = Cam(eye=np.array([center[0], center[1], eye_z]),
+                   target=np.array([center[0], center[1], lo[2]]),
                    up=up, fovy_deg=60.0, W=W, H=H)
         corners = np.array([[x, y, hi[2]] for x in (lo[0], hi[0])
                             for y in (lo[1], hi[1])])
-        for hf in (1.0, 1.2, 1.5, 1.8, 2.2, 2.8, 3.5, 4.5, 6.0, 8.0, 11.0):
+        # raise the camera until the whole footprint is inside the FOV
+        for hf in (1.0, 1.15, 1.3, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.5, 8.0):
             c = Cam(eye=np.array([center[0], center[1], eye_z * hf]),
                     target=np.array([center[0], center[1], lo[2]]),
                     up=up, fovy_deg=60.0, W=W, H=H)

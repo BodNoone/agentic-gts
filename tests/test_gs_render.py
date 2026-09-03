@@ -116,25 +116,28 @@ def test_camera_projection_sanity():
 
 def test_godview_nadir_camera():
     """True top-down godview: frames the whole footprint, no flip, and the
-    on-screen axes are axis-aligned with world x/y (no mirroring)."""
+    on-screen axes are axis-aligned with world x/y (no mirroring). The camera
+    must sit well above the scene structure (not hugging the floor)."""
     from agentic_gts.output.gs_render import make_godview_cam
     W, H = 640, 480
+    # room footprint 8 x 6 m, racks up to ~2.4 m tall
     pts = np.array([[0, 0, 0], [8, 0, 0], [8, 6, 0], [0, 6, 0],
-                    [0, 0, 1.2], [8, 0, 1.2], [8, 6, 1.2], [0, 6, 1.2]])
-    cam = make_godview_cam(pts, nadir=True, cam_z=3.0, W=W, H=H)
-    assert cam.eye[2] > 3.0          # camera raised to frame the room
+                    [0, 0, 2.4], [8, 0, 2.4], [8, 6, 2.4], [0, 6, 2.4]])
+    cam = make_godview_cam(pts, nadir=True, W=W, H=H)
+    # camera must overlook the room: well above the rack tops (~2.4m)
+    assert cam.eye[2] > 3.0, f"camera too low: eye_z={cam.eye[2]:.2f}"
     assert cam.up[2] == 0            # screen up is horizontal (not +z)
-    corners = np.array([[0, 0, 1.2], [8, 0, 1.2], [8, 6, 1.2], [0, 6, 1.2]])
+    corners = np.array([[0, 0, 2.4], [8, 0, 2.4], [8, 6, 2.4], [0, 6, 2.4]])
     uv = cam.project_cv(corners)
     in_frame = (uv[:, 0].min() > 0.03 * W and uv[:, 0].max() < 0.97 * W and
                 uv[:, 1].min() > 0.03 * H and uv[:, 1].max() < 0.97 * H)
     assert in_frame, f"footprint not framed: uv={uv}"
     # world +x stays on a horizontal screen line, +y on a vertical line
-    uvx = cam.project_cv(np.array([[2, 3, 1.2], [6, 3, 1.2]]))
-    uvy = cam.project_cv(np.array([[4, 1, 1.2], [4, 5, 1.2]]))
+    uvx = cam.project_cv(np.array([[2, 3, 2.4], [6, 3, 2.4]]))
+    uvy = cam.project_cv(np.array([[4, 1, 2.4], [4, 5, 2.4]]))
     assert abs(uvx[0, 1] - uvx[1, 1]) < 1.0      # horizontal
     assert abs(uvy[0, 0] - uvy[1, 0]) < 1.0      # vertical
-    print("PASS godview nadir camera (frame + orientation)")
+    print("PASS godview nadir camera (frame + orientation + height)")
 
 
 def test_prep_cuts_ceiling():
