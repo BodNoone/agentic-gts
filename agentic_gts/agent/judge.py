@@ -145,16 +145,21 @@ def _render_cut_z(points: np.ndarray, boxes, margin: float = 0.3,
 
     Trusted box heights win: anything above the tallest device top is
     overhead structure (cable trays, pipes, ceiling) by definition. The cut
-    sits just above the highest box top; overhead structure above it is
+    sits at the highest box top + `margin`; overhead structure above it is
     removed before rasterization so it cannot occlude the racks in a
-    top-down view. Falls back to the z-histogram gap when no boxes are given.
+    top-down view.
+
+    `margin` may be NEGATIVE to cut slightly INTO the rack tops. That is
+    deliberate: cable trays / ducts often sit flush against the rack top and
+    survive a cut at `top + small`, so dipping a little below the rack top
+    removes them. Losing a sliver of the rack's top face is acceptable for a
+    global layout view. Falls back to the z-histogram gap when no boxes are
+    given.
     """
     if boxes:
         top = max(b.center[2] + b.size[2] / 2.0 for b in boxes)
         if cut_above_rack:
-            # tight: a small margin keeps the rack's own top face but drops
-            # cable-tray / duct runs that float just above the racks
-            return top + margin
+            return top + margin      # margin < 0 -> cut into the rack tops
         return top
     return _auto_ceiling_z(points[:, 2])
 
@@ -175,10 +180,12 @@ def render_godview_png(points: np.ndarray, boxes, max_points: int = 250_000,
             from agentic_gts.output.gs_render import (make_godview_cam,
                                                       render_gs_view, png_bytes)
             gs = read_gaussian_ply(gs_ply)
-            # Tight cut: margin 0.05 sits just above the highest rack top so
-            # the rack tops stay but cable trays / ducts floating above the
-            # racks are removed (they would bury the layout in top-down view).
-            cut = _render_cut_z(points, boxes, margin=0.05)
+            # Cut slightly INTO the rack tops (negative margin): cable trays
+            # often sit flush against the rack top and survive a cut at
+            # 'top + small'. Dipping ~0.15m below the highest rack top removes
+            # them; losing a sliver of the rack's top face is fine for a
+            # global layout view.
+            cut = _render_cut_z(points, boxes, margin=-0.15)
             # True top-down camera. Height is auto-derived from the room
             # footprint (a god-view overlooks the whole layout), so it sits
             # well above every rack. Overhead structure is removed by the
