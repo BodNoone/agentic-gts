@@ -27,10 +27,27 @@ class PipelineResult:
 
 
 def load_point_cloud(path: str) -> np.ndarray:
-    """Load PLY/PCD/NPY point cloud."""
+    """Load PLY/PCD/NPY point cloud.
+
+    3DGS exports (PLY with f_dc/opacity/scale/rot) are parsed with our own
+    reader and reduced to their Gaussian centers — open3d may silently
+    return 0 points for this PLY variant.
+    """
     ext = os.path.splitext(path)[1].lower()
     if ext == ".npy":
         return np.load(path)
+    if ext == ".ply":
+        try:
+            from agentic_gts.tools.gs_io import is_gaussian_ply, read_gaussian_ply
+            if is_gaussian_ply(path):
+                gs = read_gaussian_ply(path)
+                print(f"[diag][load] 3DGS ply detected: {len(gs)} gaussians "
+                      f"(means used as point cloud; full attrs kept for "
+                      f"true-render passes)")
+                return gs.means.astype(np.float64)
+        except Exception as e:
+            print(f"[diag][load] GS ply parse failed ({type(e).__name__}: {e}) "
+                  f"-> falling back to open3d")
     import open3d as o3d
     pcd = o3d.io.read_point_cloud(path)
     pts = np.asarray(pcd.points)

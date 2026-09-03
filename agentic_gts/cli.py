@@ -45,6 +45,17 @@ def cmd_run(args):
         pts = denoise_cloud(pts)
         pts = align_to_ground(pts)
     scene = Scene(points=pts)
+    # remember the 3DGS source so VLM evidence renders are TRUE splat renders
+    # (needs gsplat / diff_gaussian_rasterization at render time; scatter
+    # fallback otherwise)
+    try:
+        from agentic_gts.tools.gs_io import is_gaussian_ply
+        if is_gaussian_ply(args.point_cloud):
+            scene.meta["gs_ply"] = args.point_cloud
+            print("[cli] 3DGS input: god-view / local evidence will be "
+                  "rendered via Gaussian splatting")
+    except Exception as e:
+        print(f"[cli] GS detection failed ({type(e).__name__}: {e})")
     if args.boxes:
         scene.load_boxes(args.boxes)
     gt_boxes = None

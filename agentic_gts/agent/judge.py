@@ -39,8 +39,28 @@ class Verdict:
 # ---------- image rendering helpers ----------
 
 def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
-                         size: int = 320) -> np.ndarray:
-    """Render a top-down 2D density image + box overlay for the VLM."""
+                         size: int = 320, gs_ply: str | None = None) -> np.ndarray:
+    """Render the local evidence image the VLM adjudicates on.
+
+    If the scene comes from a 3DGS model (gs_ply set and a CUDA rasterizer
+    is available), this is a TRUE Gaussian-splat render from a nadir camera
+    over the box; otherwise it falls back to the 2D scatter density view.
+    """
+    # ---- 3DGS true render (preferred when available) ----
+    if gs_ply and boxes:
+        try:
+            from agentic_gts.tools.gs_io import read_gaussian_ply
+            from agentic_gts.output.gs_render import make_local_cam, render_gs_view
+            gs = read_gaussian_ply(gs_ply)
+            cut = _render_cut_z(stage_points, boxes)
+            cam = make_local_cam(boxes[0], extent=extent * 2)
+            img = render_gs_view(gs, boxes, cam, cut_z=cut)
+            if img is not None:
+                return img
+        except Exception as e:
+            print(f"[gs][local] true render failed ({type(e).__name__}: {e}) "
+                  f"-> scatter fallback")
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -129,13 +149,35 @@ def _render_cut_z(points: np.ndarray, boxes, margin: float = 0.3) -> float:
 
 
 def render_godview_png(points: np.ndarray, boxes, max_points: int = 250_000,
-                       dpi: int = 130) -> bytes:
-    """Full-scene top-down render for the god-view pass: height-colored
-    point cloud (dark = low, bright = high) + numbered box footprints.
+                       dpi: int = 130, gs_ply: str | None = None) -> bytes:
+    """Full-scene bird's-eye render for the god-view pass.
 
-    Numbering matches the index the VLM is asked about, so its answers map
-    directly back to boxes. Returns PNG bytes.
+    With a 3DGS input (gs_ply set) this is a TRUE Gaussian-splat render from
+    an oblique virtual camera + numbered box wireframes. Falls back to the
+    height-colored scatter plot when no CUDA rasterizer is available.
+    Returns PNG bytes.
     """
+    # ---- 3DGS true render (preferred when available) ----
+    if gs_ply:
+        try:
+            from agentic_gts.tools.gs_io import read_gaussian_ply
+            from agentic_gts.output.gs_render import (make_godview_cam,
+                                                      render_gs_view, png_bytes)
+            gs = read_gaussian_ply(gs_ply)
+            cut = _render_cut_z(points, boxes)
+            pts_for_cam = points[points[:, 2] < cut] if np.isfinite(cut) else points
+            if len(pts_for_cam) < 100:
+                pts_for_cam = points
+            cam = make_godview_cam(pts_for_cam)
+            img = render_gs_view(gs, boxes, cam, cut_z=cut)
+            if img is not None:
+                print(f"[gs][godview] true 3DGS render "
+                      f"({len(gs)} gaussians, oblique view)")
+                return png_bytes(img)
+        except Exception as e:
+            print(f"[gs][godview] true render failed ({type(e).__name__}: {e}) "
+                  f"-> scatter fallback")
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -212,14 +254,15 @@ class VLMJudge:
 
     # ---- god-view global audit ----
     _GODVIEW_PROMPT = (
-        "You are auditing a data-center layout. This is a TOP-DOWN view of the "
-        "room: the colored scatter is the point cloud (colorbar on the right = "
-        "height in meters; devices are tall ~2m structures, the floor is dark "
-        "and low). The numbered rectangles are candidate device boxes.\n\n"
-        "Look at the GLOBAL spatial structure: devices in machine rooms form "
-        "parallel rows separated by aisles. Identify boxes that are clearly "
+        "You are auditing a data-center layout. The image is a bird's-eye "
+        "view of the room: either a photorealistic 3D Gaussian-splatting "
+        "render or a height-colored point-cloud scatter (colorbar = height in "
+        "meters). Devices are tall rack structures (~2 m) that form parallel "
+        "rows separated by aisles. The numbered rectangles are candidate "
+        "device boxes.\n\n"
+        "Look at the GLOBAL spatial structure: identify boxes that are clearly "
         "NOT real devices, e.g. a box floating in the middle of an aisle with "
-        "no point structure, a box far away from every device row, or a box "
+        "no structure under it, a box far away from every device row, or a box "
         "on the room boundary where only a wall exists.\n\n"
         "Be conservative: only flag a box when the evidence is clear. Do not "
         "flag boxes that sit inside a device row.\n\n"
@@ -235,7 +278,8 @@ class VLMJudge:
         continues with rule-detected issues only)."""
         if self.backend == "mock" or not boxes:
             return []
-        png = render_godview_png(scene.points, boxes)
+        png = render_godview_png(scene.points, boxes,
+                                 gs_ply=scene.meta.get("gs_ply"))
         try:
             if self.backend == "local":
                 text = self._local_image_call(png, self._GODVIEW_PROMPT,
@@ -358,15 +402,17 @@ class VLMJudge:
             self._ensure_local_model()
             processor, model = self._local_model
 
-            img_arr = render_topdown_image(scene.points, [box])
+            img_arr = render_topdown_image(scene.points, [box],
+                                           gs_ply=scene.meta.get("gs_ply"))
             buf = io.BytesIO()
             plt.imsave(buf, img_arr, format="png")
             image = Image.open(buf).convert("RGB")
 
             prompt = (
                 f"You are an auditor in a data-center layout tool. Decide the best "
-                f"answer for this question by looking at the top-down point cloud "
-                f"image (red = a candidate box).\n\n"
+                f"answer for this question by looking at the bird's-eye view "
+                f"image (red wireframe = the candidate box; photorealistic "
+                f"3DGS render or point-cloud scatter).\n\n"
                 f"QUESTION: {question}\n"
                 f"OPTIONS:\n" + "\n".join(f"- {o}" for o in options) +
                 f"\n\nReply with the exact option text only."
@@ -400,12 +446,14 @@ class VLMJudge:
     # ---- Qwen (OpenAI-compatible chat completions with image) ----
     def _qwen_adjudicate(self, scene, box, question: str,
                          options: list[str]) -> Verdict:
-        img_arr = render_topdown_image(scene.points, [box])  # HxWx4
+        img_arr = render_topdown_image(scene.points, [box],
+                                       gs_ply=scene.meta.get("gs_ply"))
         b64 = self._array_to_png_b64(img_arr)
         prompt = (
             f"You are an auditor in a data-center layout tool. Decide the best "
-            f"answer for this question by looking at the top-down point cloud "
-            f"image (red = a candidate box).\n\n"
+            f"answer for this question by looking at the bird's-eye view "
+            f"image (red wireframe = the candidate box; photorealistic "
+            f"3DGS render or point-cloud scatter).\n\n"
             f"QUESTION: {question}\n"
             f"OPTIONS:\n" + "\n".join(f"- {o}" for o in options) +
             f"\n\nReply with the exact option text only."

@@ -101,7 +101,8 @@ class LayoutAgent:
                 _os.makedirs(self.out_dir, exist_ok=True)
                 path = _os.path.join(self.out_dir, "godview.png")
                 with open(path, "wb") as f:
-                    f.write(render_godview_png(scene.points, scene.boxes))
+                    f.write(render_godview_png(scene.points, scene.boxes,
+                                               gs_ply=scene.meta.get("gs_ply")))
                 print(f"[diag][C] godview render -> {path}")
             except Exception as e:
                 print(f"[diag][C] godview render save failed ({type(e).__name__})")
