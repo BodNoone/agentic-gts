@@ -53,6 +53,11 @@ def cmd_run(args):
         gs.load_boxes(args.gt)
         gt_boxes = gs.boxes
     opts = {}
+    if args.boxes:
+        # external boxes are semantic (detector/classifier output) -- the
+        # geometric wall-sheet prior doesn't apply to them, and single-view
+        # fragments are legitimately thin sheets
+        opts["trust_input_boxes"] = True
     if args.yaw is not None:
         import math as _math
         opts["yaw"] = _math.radians(args.yaw)

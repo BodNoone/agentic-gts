@@ -64,23 +64,31 @@ def apply_rules(scene: Scene, opts: dict | None = None) -> tuple[list[OrientedBo
     # 0) wall filter: a box whose points form a single thin sheet in the
     # cross (depth) direction is a wall fragment, not a device. Devices have
     # front+back faces (bimodal depth) or full depth >= ~0.5m.
-    non_wall: list[OrientedBox] = []
-    drop_wall_detail: list[str] = []
-    for b in boxes:
-        if _is_wall_sheet(scene, b):
-            drop_wall_detail.append(
-                f"{b.box_id[:4]}@({b.center[0]:.1f},{b.center[1]:.1f}) "
-                f"{b.size[0]:.2f}x{b.size[1]:.2f}x{b.size[2]:.2f}")
-            issues.append(Issue(IssueType.FALSE_POSITIVE, [b.box_id], _box_region(b),
-                                detail="wall sheet"))
-            continue
-        non_wall.append(b)
-    print(f"[diag][B] wall filter: dropped {len(boxes) - len(non_wall)}, "
-          f"kept {len(non_wall)}")
-    for d in drop_wall_detail[:15]:
-        print(f"[diag][B]   wall-dropped: {d}")
-    scene.boxes = non_wall
-    boxes = non_wall
+    # SKIPPED for trusted external input (trust_input_boxes): the wall prior
+    # exists to clean Stage A geometric candidates. Mask-detector boxes are
+    # already semantic ("this is a device"), and a single-view fragment is
+    # legitimately a thin sheet -- running the wall test on fragments kills
+    # exactly the boxes the user vouched for.
+    if opts.get("trust_input_boxes"):
+        print("[diag][B] wall filter: skipped (trusted external input boxes)")
+    else:
+        non_wall: list[OrientedBox] = []
+        drop_wall_detail: list[str] = []
+        for b in boxes:
+            if _is_wall_sheet(scene, b):
+                drop_wall_detail.append(
+                    f"{b.box_id[:4]}@({b.center[0]:.1f},{b.center[1]:.1f}) "
+                    f"{b.size[0]:.2f}x{b.size[1]:.2f}x{b.size[2]:.2f}")
+                issues.append(Issue(IssueType.FALSE_POSITIVE, [b.box_id], _box_region(b),
+                                    detail="wall sheet"))
+                continue
+            non_wall.append(b)
+        print(f"[diag][B] wall filter: dropped {len(boxes) - len(non_wall)}, "
+              f"kept {len(non_wall)}")
+        for d in drop_wall_detail[:15]:
+            print(f"[diag][B]   wall-dropped: {d}")
+        boxes = non_wall
+        scene.boxes = non_wall
 
     # 1) point-support + aspect filter (drop empty / implausible)
     kept: list[OrientedBox] = []

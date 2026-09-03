@@ -128,6 +128,37 @@ def test_face_support_rescues_single_view_fragment():
           f"floor-backed FP face={geo.face_support_fraction(scene2, fp):.2f}")
 
 
+def test_trust_input_boxes_skips_wall_filter():
+    """A single-view thin-sheet fragment must survive the wall filter when
+    the boxes are trusted external input, while the wall filter still runs
+    (and drops the same sheet) for geometric Stage-A candidates."""
+    rng = np.random.default_rng(7)
+    # one long thin vertical sheet: indistinguishable from a wall fragment
+    # by geometry alone -- only the input's provenance separates them
+    a = rng.uniform(-2.0, 2.0, 8000)
+    z = rng.uniform(0, 2.2, 8000)
+    c = np.zeros(8000) + rng.normal(0, 0.05, 8000)
+    scene = Scene(points=np.stack([a, c, z], axis=1))
+    from agentic_gts.rules.rules import apply_rules
+    from agentic_gts.core.models import OrientedBox as OB
+    # 2.5m sheet: big enough to be classified as a wall sheet by the default
+    # path. In the trusted path it survives the wall filter (the aspect
+    # splitter may cut it into rack-width pieces -- correct, allowed).
+    frag = OB(center=(0.0, 0.0, 1.1), size=(2.5, 0.3, 2.2), yaw=0.0)
+
+    scene.boxes = [frag]
+    _, _ = apply_rules(scene, opts={"yaw": 0.0, "trust_input_boxes": True})
+    kept_trusted = len(scene.boxes)
+    assert kept_trusted >= 1, f"trusted fragment was dropped ({kept_trusted} left)"
+
+    scene.boxes = [OB(center=(0.0, 0.0, 1.1), size=(2.5, 0.3, 2.2), yaw=0.0)]
+    _, _ = apply_rules(scene, opts={"yaw": 0.0})
+    kept_default = len(scene.boxes)
+    assert kept_default == 0, f"untrusted wall-like sheet survived ({kept_default} left)"
+    print(f"PASS trust-input: thin sheet kept={kept_trusted} (trusted) vs "
+          f"kept={kept_default} (default path)")
+
+
 def _mk(cx: float, cy: float, L: float, W: float, H: float):
     from agentic_gts.core.models import OrientedBox
     return OrientedBox(center=(cx, cy, H / 2), size=(L, W, H), yaw=0.0)
