@@ -129,9 +129,13 @@ def _try_gsplat(means, quats, scales, opac, rgb, V_cv, K, W, H):
     from gsplat.rendering import rasterization
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     t = lambda a: torch.tensor(a, dtype=torch.float32, device=dev)
+    # gsplat's rasterization expects opacities shaped (N,) in current versions.
+    # Squeeze to a 1-D opac so shape mismatches from older (N,1) conventions
+    # don't silently break; rasterization broadcasts a 1-D opacity fine.
+    op = t(opac).squeeze(-1)
     out = rasterization(
         t(means), t(quats), t(scales),
-        t(opac).unsqueeze(1), t(rgb),
+        op, t(rgb),
         viewmats=t(V_cv).unsqueeze(0), Ks=t(K).unsqueeze(0),
         width=W, height=H, render_mode="RGB",
     )
