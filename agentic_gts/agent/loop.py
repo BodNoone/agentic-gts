@@ -46,10 +46,11 @@ class AgentReport:
 
 class LayoutAgent:
     def __init__(self, judge: VLMJudge | None = None, max_retries: int = 2,
-                 opts: dict | None = None):
+                 opts: dict | None = None, out_dir: str | None = None):
         self.judge = judge or VLMJudge(backend="mock")
         self.max_retries = max_retries
         self.opts = opts or {}
+        self.out_dir = out_dir
 
     # ---------------- issue detection ----------------
     def detect_issues(self, scene: Scene) -> list[Issue]:
@@ -90,6 +91,20 @@ class LayoutAgent:
         any deletion happens -- the god-view only nominates, it never
         executes. Mock/failure -> no issues (rule-detected ones remain).
         """
+        # persist the exact image the VLM sees: it is the single most
+        # useful artifact when auditing why the agent flagged (or missed)
+        # a box -- no guessing from logs
+        if self.out_dir:
+            try:
+                from agentic_gts.agent.judge import render_godview_png
+                import os as _os
+                _os.makedirs(self.out_dir, exist_ok=True)
+                path = _os.path.join(self.out_dir, "godview.png")
+                with open(path, "wb") as f:
+                    f.write(render_godview_png(scene.points, scene.boxes))
+                print(f"[diag][C] godview render -> {path}")
+            except Exception as e:
+                print(f"[diag][C] godview render save failed ({type(e).__name__})")
         try:
             flagged = self.judge.adjudicate_godview(scene, scene.boxes)
         except Exception as e:

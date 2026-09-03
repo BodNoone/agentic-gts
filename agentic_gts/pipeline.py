@@ -285,7 +285,7 @@ def run_pipeline(scene: Scene,
     # --- stage C: agent loop ---
     judge = VLMJudge(backend=vlm_backend, api_base=vlm_api_base,
                      model=vlm_model)
-    agent = LayoutAgent(judge=judge, opts=opts)
+    agent = LayoutAgent(judge=judge, opts=opts, out_dir=out_dir)
     report = agent.run(scene)
     n_res = len(report.resolved)
     n_unres = len(report.unresolved)
