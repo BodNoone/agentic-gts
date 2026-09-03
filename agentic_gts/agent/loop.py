@@ -57,9 +57,16 @@ class LayoutAgent:
         """Audit current boxes and produce an issue list."""
         issues: list[Issue] = []
         width_unit = float(self.opts.get("width_unit", 0.6))
+        trust = bool(self.opts.get("trust_input_boxes"))
         for b in scene.boxes:
             sup = geo.support_fraction(scene, b)
+            # a single-view back-projection fragment has an empty interior but
+            # a fully-backed face; rescue it the same way the rule layer does,
+            # and for trusted input never flag low interior support alone as a
+            # false positive -- the detector vouched for it.
             if sup < 0.12:
+                sup = max(sup, geo.face_support_fraction(scene, b))
+            if sup < 0.12 and not trust:
                 issues.append(Issue(IssueType.FALSE_POSITIVE, [b.box_id],
                                     self._region(b), detail=f"support={sup:.2f}",
                                     severity=0.8))
@@ -231,7 +238,14 @@ class LayoutAgent:
                 options=["one rack", "multiple racks"],
             )
             choice = (verdict.params or {}).get("choice", "")
-            if verdict.action == "split" or choice == "multiple racks" or n_clusters >= 2:
+            # Trust the VLM: an explicit "one rack" means do NOT split, even
+            # if the geometric center-field test happened to see >=2 clusters
+            # (its peak heuristic is noisy on detector boxes). Only split when
+            # the VLM says multiple, or when the VLM gave no usable answer
+            # and the geometric test has to make the call.
+            should_split = (choice == "multiple racks") or (
+                choice != "one rack" and n_clusters >= 2)
+            if should_split:
                 width_unit = float(self.opts.get("width_unit", 0.6))
                 n = max(2, int(round(box.size[0] / width_unit)))
                 return Verdict(action="split", params={"n": n, "width_unit": width_unit})

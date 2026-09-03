@@ -341,7 +341,8 @@ def merge_fragments(scene: Scene, yaw: float = 0.0,
                     overlap_thr: float = 0.35,
                     max_depth: float = 1.6,
                     max_width: float = 0.9,
-                    max_merge_size: float = 1.2) -> tuple[list[OrientedBox], int]:
+                    max_merge_size: float = 1.2,
+                    trusted: bool = False) -> tuple[list[OrientedBox], int]:
     """Merge fragment boxes that observe the SAME device (Stage B0).
 
     Input boxes coming from per-view mask back-projection are fragments:
@@ -363,6 +364,11 @@ def merge_fragments(scene: Scene, yaw: float = 0.0,
     -- those stay separate and are handled by gap completion /
     merged-row split. Known limitation: two adjacent sub-0.45m devices
     sitting flush would satisfy (c) and wrongly merge.
+
+    `trusted=True` disables rule (c): for detector boxes that ALREADY make
+    per-device cuts, left/right complementary halves usually mean two DIFFERENT
+    adjacent devices, not one split device -- merging them would undo the
+    detector's own separation. (a)+(b) still merge true same-device fragments.
 
     Returns (boxes, n_merges). n_merges counts absorbed boxes.
     """
@@ -436,7 +442,11 @@ def merge_fragments(scene: Scene, yaw: float = 0.0,
                     if c_ov > 0 else 0.0
                 along_union = max(a1, b1) - min(a0, b0)
                 lr_complementary = (cross_frac >= 0.8 and along_union <= max_width)
-                if same_spot or fb_complementary or lr_complementary:
+                # trusted: detector boxes already split per device, so
+                # left/right complements usually mean adjacent devices, not a
+                # split one -- only allow same-spot / front-back merges
+                use_lr = lr_complementary and not trusted
+                if same_spot or fb_complementary or use_lr:
                     boxes[i] = _merge_pair(boxes[i], boxes[j])
                     boxes.pop(j)
                     n_absorbed += 1

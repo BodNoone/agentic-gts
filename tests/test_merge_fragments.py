@@ -164,6 +164,47 @@ def _mk(cx: float, cy: float, L: float, W: float, H: float):
     return OrientedBox(center=(cx, cy, H / 2), size=(L, W, H), yaw=0.0)
 
 
+def test_trust_input_no_synthetic_boxes():
+    """Trusted detector input: rules must NOT add boxes, must merge fine
+    fragments, and must leave a wide (merged-rack) box untouched for the
+    agent to split -- no geometry priors sprinkled on trusted input."""
+    from agentic_gts.rules.rules import apply_rules
+    from agentic_gts.core.models import DeviceType as DT
+
+    rng = np.random.default_rng(9)
+    pts = []
+    # a row of contiguous racks
+    for k in range(6):
+        cx = k * 0.7
+        for _ in range(1500):
+            pts.append([cx + rng.uniform(-0.3, 0.3), rng.uniform(-0.55, 0.55),
+                        rng.uniform(0.0, 2.0)])
+    scene = Scene(points=np.array(pts))
+
+    # one rack split into 3 fine fragments + one 2-rack merged box + one clean
+    scene.boxes = [_mk(0.0, 0.0, 0.6, 1.1, 2.0),
+                   _mk(0.35, 0.05, 0.35, 1.0, 2.0),
+                   _mk(0.15, -0.05, 0.3, 1.0, 2.0),
+                   _mk(0.7, 0.0, 1.35, 1.1, 2.0),   # two racks fused
+                   _mk(1.4, 0.0, 0.6, 1.1, 2.0)]    # clean rack
+    n_in = len(scene.boxes)
+    boxes, _ = apply_rules(scene, opts={"yaw": 0.0, "trust_input_boxes": True})
+
+    # 1) no rule-synthesized boxes: the count should stay tiny (5 -> 3 after
+    #    the two extra fragment boxes were absorbed into the first rack)
+    assert len(boxes) < n_in, f"rules added boxes ({n_in}->{len(boxes)})"
+    # 2) no box wider than a single rack unit survived as-is (the merged one
+    #    must be preserved FOR THE AGENT, not erased) -- so exactly one wide
+    #    box remains
+    wide = [b for b in boxes if b.size[0] > 1.2]
+    assert len(wide) == 1, f"expected 1 merged-rack box preserved, got {len(wide)}"
+    # 3) the fine fragments were merged: no leftover 0.3-0.35m slivers
+    tiny = [b for b in boxes if b.size[0] < 0.45]
+    assert len(tiny) == 0, f"fine fragments not merged: {[b.size[0] for b in tiny]}"
+    print(f"PASS trust-input: {n_in}->{len(boxes)} boxes, "
+          f"{len(wide)} wide kept for agent, no rule-synthesized boxes")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed = 0
