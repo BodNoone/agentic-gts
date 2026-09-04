@@ -11,7 +11,7 @@
     ↓
 阶段A  粗分割（superpoint 过分割 + 行结构合并，高召回）    [可选：也可直接输入已有检测 box]
     ↓
-阶段B  确定性规则（墙面过滤 / 尺寸 / 支撑度 / 行补全 / 联排切分）
+阶段B  确定性处理（B0 碎片合并 + 轻量纠偏；不做删/加/切分，那些留给 agent）
     ↓
 阶段C  Agent 修复循环（取证 → VLM 诊断 → 离散动作 → 几何工具执行 → 验证/回滚）
     ↓
@@ -148,7 +148,7 @@ agentic_gts/
 ├── core/models.py        OrientedBox / Scene / Issue 数据模型
 ├── synth/generator.py    合成机房生成器（含四类噪声注入）
 ├── segment/coarse.py     阶段A：superpoint 粗分割
-├── rules/rules.py        阶段B：确定性规则
+├── rules/rules.py        阶段B：B0 碎片合并 + 轻量纠偏（墙/朝向），不做删加切
 ├── tools/geometry.py     几何工具集（fit_box / split / 中心场 / 行结构 / 支撑度）
 ├── agent/judge.py        VLM 裁判（Qwen3-VL 接口 + mock 降级）
 ├── agent/loop.py         阶段C：agent 修复循环（诊断→动作→验证→回滚）
@@ -177,7 +177,7 @@ python tests/test_pipeline.py
 
 ## 已知限制
 
-- 粗分割（阶段A）在本版本中主要产出行级候选，依赖阶段B切分为单柜；如已有检测 box 建议直接走 `--boxes` 输入路径。
+- 粗分割（阶段A）在本版本中主要产出行级候选，单柜化（联排切分）交由阶段C agent 处理；如已有检测 box 建议直接走 `--boxes` 输入路径。
 - 布局假设设备按行摆放（机房通用），非行结构场景（散放设备）需调整 `row_structure` 容差。
 - 动态场景 / 多层机房未覆盖。
 - VLM 裁判当前只在 merged / false-positive 两类 issue 上介入；证据图为俯视密度图，可扩展接入 3DGS 渲染视图。

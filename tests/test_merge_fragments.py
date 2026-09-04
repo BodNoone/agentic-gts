@@ -164,6 +164,32 @@ def _mk(cx: float, cy: float, L: float, W: float, H: float):
     return OrientedBox(center=(cx, cy, H / 2), size=(L, W, H), yaw=0.0)
 
 
+def test_geometry_path_no_deletion_or_addition():
+    """Untrusted (no-box) cleanup must correct obvious hiccups without
+    deleting low-support candidates, adding row-fill boxes, or hard-splitting
+    merged rows -- those are the agent's judgement calls."""
+    from agentic_gts.rules.rules import apply_rules
+
+    cloud = _rack_cloud(1.0, 1.0, L=1.2, W=1.1, H=2.0)
+    scene = Scene(points=cloud)
+    # a real rack + a low-support (empty) box + a merged-2-rack box
+    scene.boxes = [
+        _mk(1.0, 1.0, 0.6, 1.1, 2.0),   # real rack
+        _mk(1.0, 3.2, 0.6, 1.1, 2.0),   # low-support (no points there)
+        _mk(2.6, 1.0, 1.3, 1.1, 2.0),   # two racks fused
+    ]
+    before = len(scene.boxes)
+    boxes, _ = apply_rules(scene, opts={"yaw": 0.0})   # NOTE: no trust_input_boxes
+    # 1) no box was deleted (support/aspect filter is OFF)
+    assert len(boxes) == before, f"cleanup deleted boxes ({before}->{len(boxes)})"
+    # 2) no synthetic boxes were added (row-fill is OFF)
+    # 3) merged-rack box was not hard-split (that is the agent's call)
+    wide = [b for b in boxes if b.size[0] > 1.2]
+    assert len(wide) == 1, f"merged box hard-split by rules: {[b.size[0] for b in boxes]}"
+    print(f"PASS geometry-path: {before}->{len(boxes)} boxes, no delete/add/split")
+
+
+# --- keep this test last: it mutates the module-level helper usage ---
 def test_trust_input_no_synthetic_boxes():
     """Trusted detector input: rules must NOT add boxes, must merge fine
     fragments, and must leave a wide (merged-rack) box untouched for the
