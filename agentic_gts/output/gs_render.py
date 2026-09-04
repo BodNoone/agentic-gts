@@ -344,8 +344,11 @@ def overlay_boxes(img: np.ndarray, boxes, cam: Cam) -> np.ndarray:
     dr = ImageDraw.Draw(pil)
     for i, b in enumerate(boxes):
         cs = _box_corners_3d(b)
-        # project the bottom ring (corners 0,2,4,6 in the local ordering: z=-h)
-        uv = cam.project_cv([cs[0], cs[2], cs[4], cs[6]])
+        # Project the BOTTOM ring (z=-h) in polygon order so the rectangle is
+        # a proper closed quad, not two crossed triangles. Corner ordering
+        # for (x,y,z) in ((-l,l),(-w,w),(-h,h)): bottom ring = 0,2,6,4
+        # (0=(-l,-w) 2=(-l,+w) 6=(+l,+w) 4=(+l,-w)) -> that is the perimeter.
+        uv = cam.project_cv([cs[0], cs[2], cs[6], cs[4]])
         color = (255, 60, 50) if getattr(b.confidence, "value", "") != "low" \
             else (255, 190, 40)
         # thin footprint rectangle

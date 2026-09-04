@@ -165,17 +165,20 @@ def _render_cut_z(points: np.ndarray, boxes, margin: float = 0.3,
     return _auto_ceiling_z(points[:, 2])
 
 
-def _render_cut_z_low(boxes, margin: float = 0.08) -> float:
-    """Floor cut for top-down renders: remove ground-level gaussians.
+def _render_cut_z_low(boxes, lift: float = 0.35) -> float:
+    """Floor cut for the top-down view: remove ground-level gaussians.
 
-    The floor texture / reflections in a 3DGS render occlude the rack
-    footprints and mislead the VLM. Racks sit ON the floor, so their bottom
-    face defines the floor level; gaussians below (box bottom - margin) are
-    the floor and are dropped. A small positive margin keeps the rack's own
-    bottom edge.
+    3DGS floor splats are wide and have thickness -- their centres sit near
+    z=0 but the gaussian body extends well above, so cutting at 'rack bottom
+    - small' only trims a sliver. The floor texture then still occludes the
+    rack footprints. To remove it, lift the lower bound ABOVE the rack bottom
+    by `lift` (default 0.35m): ground splats are dropped while the racks keep
+    everything above the bottom quarter. This is a discovery view, so losing
+    the rack's lowest sliver is acceptable -- the top/side that identifies a
+    rack remains.
     """
     if boxes:
-        return min(b.center[2] - b.size[2] / 2.0 for b in boxes) - margin
+        return min(b.center[2] - b.size[2] / 2.0 for b in boxes) + lift
     return float("-inf")
 
 
