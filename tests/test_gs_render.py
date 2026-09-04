@@ -136,14 +136,17 @@ def test_overlay_footprint_not_3d_wireframe():
     out = overlay_boxes(img, boxes, cam)
     assert out.shape == (H, W, 3)
     assert out.min() >= 0.0 and out.max() <= 1.0
-    # bottom-ring corners project in-frame; the chip sits near one of them
+    # The overlay now projects the TOP ring (z=+h) so the box footprint
+    # matches the visible rack under perspective; the chip sits near the top
+    # ring's first corner. Verify that corner is in-frame and pixels near it
+    # changed.
     cs = _box_corners_3d(boxes[0])
-    uv0 = cam.project_cv([cs[0]])[0]
+    uv0 = cam.project_cv([cs[1]])[0]
     assert 0 <= uv0[0] < W and 0 <= uv0[1] < H
     # the overlay changed pixels near the box (something was drawn)
     y0, x0 = int(uv0[1]), int(uv0[0])
     assert not np.allclose(out[y0 - 5:y0 + 5, x0 - 5:x0 + 5], img[y0 - 5:y0 + 5, x0 - 5:x0 + 5])
-    print("PASS overlay draws footprint + chip (no 3D wireframe)")
+    print("PASS overlay draws footprint + chip (top ring, no 3D wireframe)")
 
 
 def test_godview_nadir_camera():

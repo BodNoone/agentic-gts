@@ -344,11 +344,15 @@ def overlay_boxes(img: np.ndarray, boxes, cam: Cam) -> np.ndarray:
     dr = ImageDraw.Draw(pil)
     for i, b in enumerate(boxes):
         cs = _box_corners_3d(b)
-        # Project the BOTTOM ring (z=-h) in polygon order so the rectangle is
-        # a proper closed quad, not two crossed triangles. Corner ordering
-        # for (x,y,z) in ((-l,l),(-w,w),(-h,h)): bottom ring = 0,2,6,4
-        # (0=(-l,-w) 2=(-l,+w) 6=(+l,+w) 4=(+l,-w)) -> that is the perimeter.
-        uv = cam.project_cv([cs[0], cs[2], cs[6], cs[4]])
+        # Project the TOP ring (z=+h) in polygon order. The god view is a
+        # discovery view and the rack's visible top is what the VLM sees as
+        # "where the device is"; projecting the bottom ring would be pulled
+        # outward under perspective for off-centre racks (a tall rack at the
+        # frame edge leans its base away), so the box would look misaligned
+        # with the rendered rack. The top ring matches the visible footprint.
+        # Corner ordering for (x,y,z) in ((-l,l),(-w,w),(-h,h)): top ring =
+        # 1,3,7,5. (1=(-l,-w) 3=(-l,+w) 7=(+l,+w) 5=(+l,-w)) -> perimeter.
+        uv = cam.project_cv([cs[1], cs[3], cs[7], cs[5]])
         color = (255, 60, 50) if getattr(b.confidence, "value", "") != "low" \
             else (255, 190, 40)
         # thin footprint rectangle
