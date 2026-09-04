@@ -51,15 +51,18 @@ def fuse_fragments(scene: Scene, yaw: float = 0.0, trusted: bool = False,
                    width_unit: float = 0.6) -> tuple[list[OrientedBox], int]:
     """B0: fuse per-view back-projection fragments of the SAME device.
 
-    Pure geometry; never filters, adds, or splits. A box WIDER than a single
-    rack unit (multi-device / merged racks) is held out so fragment merging
-    does not absorb it -- that is the agent's to split. `trusted` disables the
-    left/right complementary merge (usually adjacent devices, not a split one).
+    Pure geometry; never filters, adds, or splits. A box clearly WIDER than a
+    single rack unit (i.e. a genuine multi-device / merged-rack box) is held
+    out so fragment merging does not absorb it -- that is the agent's to split.
+    The bar is deliberately loose (2.0 x unit) so a single device's front/back
+    or side fragments, which can be close to one rack width, still participate
+    in the merge. `trusted` disables the left/right complementary merge
+    (usually adjacent devices, not a split one).
 
     Returns (boxes, n_absorbed).
     """
-    wide = [b for b in scene.boxes if b.size[0] > width_unit * 1.2]
-    frag = [b for b in scene.boxes if b.size[0] <= width_unit * 1.2]
+    wide = [b for b in scene.boxes if b.size[0] > width_unit * 2.0]
+    frag = [b for b in scene.boxes if b.size[0] <= width_unit * 2.0]
     tmp = Scene(points=scene.points, boxes=frag)
     merged, n_absorbed = geo.merge_fragments(tmp, yaw=yaw, trusted=trusted)
     return merged + wide, n_absorbed

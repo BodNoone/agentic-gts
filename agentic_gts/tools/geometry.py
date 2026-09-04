@@ -127,45 +127,86 @@ def face_support_fraction(scene: Scene, box: OrientedBox, cell: float = 0.1,
 
 def center_field_clusters(scene: Scene, box: OrientedBox,
                           dbscan_eps: float = 0.05,
-                          min_pts: int = 10) -> tuple[int, float, np.ndarray]:
-    """FoundObj-inspired completeness check for (possibly merged) rack boxes.
+                          min_pts: int = 10,
+                          empty_frac: float = 0.25) -> tuple[int, float, np.ndarray]:
+    """How many racks does a (possibly merged) box contain, from the point
+    density along the row axis (local x).
 
-    Real racks expose their *side faces* as high-density slabs along the row
-    axis (local x). One rack -> 2 side-face peaks (its two ends). A merged
-    box containing k racks -> k+1 peaks (shared boundaries also produce a
-    density slab from the two adjacent side faces). We count interior
-    density peaks of the x-histogram to estimate how many racks are inside.
+    A single rack fills the box's x-extent with a contiguous high-density
+    run (its front/back/side surfaces) -- 1 cluster. A box that fused two
+    racks with a gap between them shows two dense runs separated by a
+    low-density gap -> 2 clusters. Two flush racks with no point gap still
+    produce a contiguous run, which the side-face peaks below can catch.
 
-    Returns (estimated_rack_count, dominant_fraction, labels_placeholder).
+    We first segment the x-histogram into dense runs separated by near-empty
+    gaps (the straightforward 'two racks with an aisle between' case). If
+    that gives one run (flush racks), fall back to counting side-face density
+    peaks. Returns (estimated_rack_count, dominant_fraction, labels_placeholder).
     """
-    region = _region_of_box(box, expand=0.1)
+    region = _region_of_box(box, expand=0.03)
     pts = scene.points_in_region(region)
     if len(pts) < min_pts:
         return 0, 0.0, np.zeros(0, dtype=int)
     local = box.world_to_local(pts)
     half = np.asarray(box.size) / 2.0
-    inside = local[np.all(np.abs(local) <= half + 0.05, axis=1)]
+    # keep points strictly inside the box (a small margin, no relax): an
+    # expanded region would sweep in neighbouring racks and create a fake
+    # gap in the x histogram, misreading a single rack as two.
+    inside = local[np.all(np.abs(local) <= half, axis=1)]
     if len(inside) < min_pts:
         return 0, 0.0, np.zeros(0, dtype=int)
     x = inside[:, 0]
     cell = 0.02
     nb = max(int(box.size[0] / cell), 4)
     hist, edges = np.histogram(x, bins=nb, range=(-half[0], half[0]))
-    if hist.max() < 5:
+    peak = float(hist.max())
+    if peak < 5:
         return 1, 1.0, np.zeros(0, dtype=int)
-    # peaks = bins clearly denser than the running background (front/back faces
-    # give a uniform base level; side faces spike above it)
-    base = np.median(hist)
+
+    # ---- dense-run segmentation: separate by a REAL empty gap ----
+    # Two racks fused into one box usually keep an aisle gap between them:
+    # a contiguous run of essentially EMPTY bins (near-zero points). A single
+    # rack is contiguous in x even if its surface density fluctuates, so we
+    # require the gap to be truly empty (each bin < ~4% of the peak) and at
+    # least a couple of bins wide to count as a separator.
+    peak_f = float(hist.max())
+    # A bin is EMPTY only if it has essentially no points (below an absolute
+    # small count). A rack's side surface is thin but contiguous -- its sparse
+    # bins (~20-45 pts) must stay occupied. A genuine aisle gap between two
+    # racks is near zero (<~8 pts) across a couple of bins.
+    nonempty = hist > 8.0
+    # count contiguous NON-EMPTY runs (a run of >0 nonempty bins)
+    runs = 0
+    in_run = False
+    for v in nonempty:
+        if v and not in_run:
+            runs += 1
+            in_run = True
+        elif not v:
+            in_run = False
+    # longest empty gap (>=2 bins, i.e. >=4cm) confirms a separator
+    max_gap = 0
+    gap = 0
+    for v in nonempty:
+        if not v:
+            gap += 1
+            max_gap = max(max_gap, gap)
+        else:
+            gap = 0
+    if runs >= 2 and max_gap >= 2:
+        return min(runs, max(2, int(round(box.size[0] / 0.6)))), \
+            1.0 / runs, np.zeros(0, dtype=int)
+
+    # ---- flush racks: fall back to side-face density peaks ----
+    base = float(np.median(hist))
     thr = max(base * 2.5, 8)
     peak_mask = hist >= thr
-    # collapse contiguous peak bins into single peaks
     n_peaks = 0
     prev = False
     for p in peak_mask:
         if p and not prev:
             n_peaks += 1
         prev = p
-    # k peaks (including both outer ends) -> k-1 racks
     est_racks = max(n_peaks - 1, 1)
     return est_racks, 1.0 / est_racks, np.zeros(0, dtype=int)
 
@@ -176,13 +217,17 @@ def split_box(scene: Scene, box: OrientedBox, n: int, width_unit: float | None =
         return [box]
     L, W, H = box.size
     row_axis = box.rotation[:, 0]  # local x direction in world
-    # choose split width
+    # choose split width: use the caller's n (the count the geometry actually
+    # found) unless it is invalid; width_unit is only a fallback when n<2.
     total = L
-    widths = np.full(n, total / n)
-    if width_unit and width_unit > 0:
-        k = max(1, int(round(total / width_unit)))
-        widths = np.full(k, total / k)
-        n = k
+    if n is not None and n >= 2:
+        k = int(n)
+    elif width_unit and width_unit > 0:
+        k = max(2, int(round(total / width_unit)))
+    else:
+        k = 2
+    widths = np.full(k, total / k)
+    n = k
     center = np.asarray(box.center)
     result = []
     acc = 0.0
@@ -339,7 +384,7 @@ def is_aligned(box: OrientedBox, row_axis: np.ndarray, tol_deg: float = 12.0) ->
 # --------------------------------------------------------------- B0: fragments
 def merge_fragments(scene: Scene, yaw: float = 0.0,
                     overlap_thr: float = 0.35,
-                    max_depth: float = 1.6,
+                    max_depth: float = 2.2,
                     max_width: float = 0.9,
                     max_merge_size: float = 1.2,
                     trusted: bool = False) -> tuple[list[OrientedBox], int]:
@@ -433,7 +478,11 @@ def merge_fragments(scene: Scene, yaw: float = 0.0,
                 along_frac = a_ov / max(min(a1 - a0, b1 - b0), 1e-6) \
                     if a_ov > 0 else 0.0
                 cross_union = max(c1, d1) - min(c0, d0)
-                fb_complementary = (along_frac >= 0.8 and c_ov <= 0.02 * cross_union
+                # front/back complementary halves: largely full along overlap,
+                # cross extents disjoint-ish (allow up to 35% overlap so
+                # real back-projection faces with slight overlap still merge)
+                # and the union within one plausible rack depth (<= 2.2m).
+                fb_complementary = (along_frac >= 0.8 and c_ov <= 0.35 * cross_union
                                     and cross_union <= max_depth)
                 # left/right complementary halves: full cross overlap, along
                 # union within one rack width (small along overlap allowed --

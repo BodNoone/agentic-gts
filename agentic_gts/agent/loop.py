@@ -231,23 +231,35 @@ class LayoutAgent:
         box = scene.get_box(issue.box_ids[0]) if issue.box_ids else None
         if issue.issue_type == IssueType.MERGED_ROW and box is not None:
             n_clusters, dom, _ = geo.center_field_clusters(scene, box)
-            verdict = self.judge.adjudicate_box(
-                scene, box,
-                question=("Does the red box contain one rack or multiple racks? "
-                          "If multiple, they should be split."),
-                options=["one rack", "multiple racks"],
-            )
-            choice = (verdict.params or {}).get("choice", "")
-            # Trust the VLM: an explicit "one rack" means do NOT split, even
-            # if the geometric center-field test happened to see >=2 clusters
-            # (its peak heuristic is noisy on detector boxes). Only split when
-            # the VLM says multiple, or when the VLM gave no usable answer
-            # and the geometric test has to make the call.
-            should_split = (choice == "multiple racks") or (
-                choice != "one rack" and n_clusters >= 2)
-            if should_split:
+            # Geometry is the hard signal: a box whose center-field splits
+            # into >=2 coherent slabs IS multiple racks -- split it. The VLM
+            # is a second opinion only: it can confirm the count / spot a
+            # genuinely single tall unit, but it does not veto a clear
+            # geometric multi-cluster. Trusted boxes are roughly right; the
+            # merging of adjacent racks is exactly the refinement we want.
+            split = n_clusters >= 2
+            if split:
+                # use the VLM to sanity-check the count where available, but
+                # never to overrule the geometry
+                try:
+                    verdict = self.judge.adjudicate_box(
+                        scene, box,
+                        question=("Does the red box contain one rack or multiple racks? "
+                                  "If multiple, they should be split."),
+                        options=["one rack", "multiple racks"],
+                    )
+                    choice = (verdict.params or {}).get("choice", "")
+                    # if VLM saw multiple, trust it over the peak count too
+                    if choice == "multiple racks":
+                        split = True
+                except Exception:
+                    pass
+            if split:
                 width_unit = float(self.opts.get("width_unit", 0.6))
-                n = max(2, int(round(box.size[0] / width_unit)))
+                # split into the number of racks the geometry actually found
+                # (n_clusters), not a width_unit guess -- a 2.6m box with two
+                # clusters should become TWO racks, not round(2.6/0.6)=4.
+                n = max(2, min(int(n_clusters), int(round(box.size[0] / width_unit))))
                 return Verdict(action="split", params={"n": n, "width_unit": width_unit})
             return Verdict(action="keep")
         if issue.issue_type == IssueType.FALSE_POSITIVE and box is not None:
@@ -331,12 +343,18 @@ class LayoutAgent:
                 continue  # deleted is fine
             if geo.support_fraction(scene, b) < 0.1:
                 return False
-        # merged-row: after split every piece should be ~1 unit wide
+        # merged-row: after split, no single piece should remain as wide as
+        # (or wider than) the original fused box -- i.e. the split actually
+        # took. A piece is fine if it is clearly narrower than the parent.
         if issue.issue_type == IssueType.MERGED_ROW:
+            parent = scene.get_box(issue.box_ids[0])
+            parent_w = parent.size[0] if parent is not None else None
             pieces = [b for b in scene.boxes
                       if b.meta.get("split_from") in issue.box_ids or b.box_id in issue.box_ids]
             for p in pieces:
-                if p.size[0] > width_unit * 1.8:
+                if parent_w is not None and p.size[0] >= parent_w * 0.95:
+                    return False
+                if p.size[0] > width_unit * 3.0:  # sanity: absurdly wide piece
                     return False
         # overlap resolved?
         if issue.issue_type == IssueType.OVERLAP:
