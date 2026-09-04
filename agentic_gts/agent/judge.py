@@ -52,7 +52,9 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
             from agentic_gts.tools.gs_io import read_gaussian_ply
             from agentic_gts.output.gs_render import make_local_cam, render_gs_view
             gs = read_gaussian_ply(gs_ply)
-            cut = _render_cut_z(stage_points, boxes)
+            # Match the god-view cut so the same overhead structure (lamps,
+            # trays) does not appear in the local oblique crop either.
+            cut = _render_cut_z(stage_points, boxes, margin=-0.45)
             cut_low = _render_cut_z_low(boxes)
             cam = make_local_cam(boxes[0], extent=extent * 2)
             img = render_gs_view(gs, boxes, cam, cut_z=cut, cut_z_low=cut_low)
@@ -200,10 +202,13 @@ def render_godview_png(points: np.ndarray, boxes, max_points: int = 250_000,
             gs = read_gaussian_ply(gs_ply)
             # Cut slightly INTO the rack tops (negative margin): cable trays
             # often sit flush against the rack top and survive a cut at
-            # 'top + small'. Dipping ~0.15m below the highest rack top removes
-            # them; losing a sliver of the rack's top face is fine for a
-            # global layout view.
-            cut = _render_cut_z(points, boxes, margin=-0.15)
+            # Cut INTO the rack tops (negative margin): overhead structure
+            # (cable trays, ducts, lamps) sits above the rack top and must
+            # not occlude the top-down discovery view. Dip ~0.45m below the
+            # highest rack top so lamps and tray residue are removed too.
+            # Losing the rack's top quarter is acceptable here -- this is a
+            # find-gaps view, the top/side identity of a rack is unaffected.
+            cut = _render_cut_z(points, boxes, margin=-0.45)
             cut_low = _render_cut_z_low(boxes)
             # True top-down camera. Height is auto-derived from the room
             # footprint (a god-view overlooks the whole layout), so it sits
