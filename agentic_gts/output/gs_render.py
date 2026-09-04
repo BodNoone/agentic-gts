@@ -121,21 +121,27 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
         up = np.array([0.0, 1.0, 0.0])  # screen up aligned with world +y
         # Analytic first guess for the height, then nudge up until the whole
         # footprint (including its rack-top corners) projects inside the frame.
-        fov_half = math.radians(60.0 / 2.0)
+        fov_half = math.radians(60.0 / 2.0)     # fovy is the VERTICAL half-angle
         span_x = float(hi[0] - lo[0])
         span_y = float(hi[1] - lo[1])
-        # vertical half-angle at the same 60 deg fovy: pixels are square
-        fy_half = math.atan(math.tan(fov_half) * (H / W))
-        need_h = max(span_x / 2.0 / math.tan(fov_half),
-                     span_y / 2.0 / math.tan(fy_half))
+        # horizontal half-angle at the same fovy: pixels are square, so
+        # tan(fx) = tan(fy) * W/H  (wider frame -> wider horizontal FOV)
+        fx_half = math.atan(math.tan(fov_half) * (W / H))
+        # on-screen x <- world x needs fx_half; on-screen y <- world y needs fov_half
+        need_h = max(span_x / 2.0 / math.tan(fx_half),
+                     span_y / 2.0 / math.tan(fov_half))
+        # Base height frames the footprint *exactly* at hf=1.0, then keep a
+        # little extra so the rack-TOP corners (projected at z_ref, which
+        # spread outward under perspective) stay inside the frame too. The
+        # rack footprint sits inside the padded framing box, so exact-fit on
+        # the padded box is guaranteed in-frame; the z_ref term is what
+        # clears the outward-spreading rack tops.
         base_z = max(float(cam_z) if (cam_z is not None and np.isfinite(cam_z)) else 0.0,
-                     need_h * 1.08 + z_ref)
+                     need_h + z_ref * 1.25)
         # 4 footprint corners at rack-top height (worst case for overhang)
         corners = np.array([[x, y, z_ref] for x in (lo[0] , hi[0])
                             for y in (lo[1], hi[1])])
-        # Frame tightly (target ~2% border) so the racks fill the frame;
-        # nudge up only as far as needed.
-        for hf in (1.0, 1.03, 1.06, 1.1, 1.15, 1.22, 1.3, 1.4, 1.55, 1.75, 2.0):
+        for hf in (1.0, 1.02, 1.05, 1.08, 1.12, 1.18, 1.25, 1.35, 1.5):
             eye_z = base_z * hf
             c = Cam(eye=np.array([center[0], center[1], eye_z]),
                     target=np.array([center[0], center[1], z_floor]),
@@ -144,10 +150,10 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
             if not np.all(pc[:, 2] > 0.1):
                 continue
             uv = c.project_cv(corners)
-            if (uv[:, 0].min() > 0.01 * W and uv[:, 0].max() < 0.99 * W and
-                    uv[:, 1].min() > 0.01 * H and uv[:, 1].max() < 0.99 * H):
+            if (uv[:, 0].min() > 0.005 * W and uv[:, 0].max() < 0.995 * W and
+                    uv[:, 1].min() > 0.005 * H and uv[:, 1].max() < 0.995 * H):
                 return c
-        return Cam(eye=np.array([center[0], center[1], base_z * 2.0]),
+        return Cam(eye=np.array([center[0], center[1], base_z * 1.0]),
                    target=np.array([center[0], center[1], z_floor]),
                    up=up, fovy_deg=60.0, W=W, H=H)
 
