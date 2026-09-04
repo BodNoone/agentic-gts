@@ -431,8 +431,43 @@ class VLMJudge:
         print(f"[vlm][local] loading {self.model} (transformers "
               f"{transformers.__version__}) ... first call only")
         processor = AutoProcessor.from_pretrained(self.model)
-        model = ModelCls.from_pretrained(
-            self.model, torch_dtype=torch.bfloat16, device_map="auto")
+        # Pick the best available attention backend. flash_attention_2 is the
+        # fastest on CUDA but requires the flash-attn package; if it is not
+        # importable, fall back to sdpa (the default efficient path in
+        # transformers >= 2.0, still much better than eager). Never force a
+        # backend that is not installed.
+        attn = None
+        if torch.cuda.is_available():
+            try:
+                import flash_attn  # noqa: F401
+                attn = "flash_attention_2"
+                print("[vlm][local] using flash_attention_2")
+            except ImportError:
+                pass
+        if attn is None:
+            # is_torch_sdpa_available can live at the package root or under
+            # transformers.utils depending on version; probe both.
+            _probe = None
+            try:
+                from transformers import is_torch_sdpa_available as _probe
+            except ImportError:
+                try:
+                    from transformers.utils import is_torch_sdpa_available as _probe
+                except ImportError:
+                    _probe = None
+            if _probe is not None:
+                try:
+                    if _probe():
+                        attn = "sdpa"
+                        print("[vlm][local] using sdpa attention")
+                except Exception:
+                    pass
+        if not attn:
+            print("[vlm][local] no fast attention backend -> eager attention")
+        kwargs = {"torch_dtype": torch.bfloat16, "device_map": "auto"}
+        if attn:
+            kwargs["attn_implementation"] = attn
+        model = ModelCls.from_pretrained(self.model, **kwargs)
         model.eval()
         self._local_model = (processor, model)
 
