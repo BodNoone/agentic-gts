@@ -176,13 +176,26 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
     return cam
 
 
-def make_local_cam(box, extent: float = 1.0, W: int = 448, H: int = 448) -> Cam:
-    """Nadir (straight-down) camera over one box, up-aligned with the box yaw."""
+def make_local_cam(box, extent: float = 1.2, W: int = 448, H: int = 448,
+                   elev_deg: float = 38.0) -> Cam:
+    """Oblique camera for one box so the VLM sees the rack's side + top.
+
+    A pure top-down view only shows the rack top and loses the
+    height/door/side detail that distinguishes a rack from clutter. Here the
+    camera sits up and to one side, looking down and IN toward the box. The
+    horizontal direction is aligned with the box's yaw (its long axis), so we
+    look along the row -- the info-rich face. `up` is world-vertical so the
+    rack stays upright in the image.
+    """
     c = np.asarray(box.center, dtype=float)
     top = c[2] + box.size[2] / 2.0
-    eye = np.array([c[0], c[1], top + 2.0 * extent])
-    up = np.array([math.cos(box.yaw), math.sin(box.yaw), 0.0])
-    return Cam(eye=eye, target=np.array([c[0], c[1], 0.0]), up=up,
+    # aim at the box's upper-mid so the whole rack is in view
+    aim = np.array([c[0], c[1], c[2] + box.size[2] * 0.35])
+    # horizontal offset along the box's long axis (its yaw direction)
+    hdir = np.array([math.cos(box.yaw), math.sin(box.yaw), 0.0])
+    horiz = np.asarray(box.size[0]) * 1.0 + extent
+    eye = aim + hdir * horiz + np.array([0.0, 0.0, horiz * math.tan(math.radians(elev_deg)) * 1.6])
+    return Cam(eye=eye, target=aim, up=np.array([0.0, 0.0, 1.0]),
                fovy_deg=60.0, W=W, H=H)
 
 
@@ -302,23 +315,33 @@ def _box_corners_3d(box) -> np.ndarray:
 
 
 def overlay_boxes(img: np.ndarray, boxes, cam: Cam) -> np.ndarray:
-    """Draw numbered box wireframes onto a rendered image (PIL, in-place copy)."""
+    """Overlay numbered boxes on a rendered image.
+
+    God-view is a top-down *discovery* view: the VLM only needs to know WHERE
+    devices are (2D), not the 3D orientation/height. We therefore draw only
+    the box's footprint rectangle (thin, semi-transparent, confidence-coloured)
+    plus a small high-contrast numbered chip, so the gaussian render underneath
+    stays readable. The chip is placed on the rectangle's edge (not its centre)
+    so it never hides the rack body.
+    """
     from PIL import Image, ImageDraw
-    pil = Image.fromarray((img * 255).astype(np.uint8))
+    pil = Image.fromarray((np.clip(img, 0, 1) * 255).astype(np.uint8))
     dr = ImageDraw.Draw(pil)
     for i, b in enumerate(boxes):
-        corners = _box_corners_3d(b)
-        uv = cam.project_cv(corners)
+        cs = _box_corners_3d(b)
+        # project the bottom ring (corners 0,2,4,6 in the local ordering: z=-h)
+        uv = cam.project_cv([cs[0], cs[2], cs[4], cs[6]])
         color = (255, 60, 50) if getattr(b.confidence, "value", "") != "low" \
             else (255, 190, 40)
-        # local corner order: x(-,+), y(-,+), z(-,+) -> bottom ring 0,2,6,4 / top 1,3,7,5
-        edges = [(0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3), (2, 6),
-                 (3, 7), (4, 5), (4, 6), (5, 7), (6, 7)]
-        for a, b_ in edges:
-            dr.line([tuple(uv[a]), tuple(uv[b_])], fill=color,
-                    width=3 if a in (0, 2, 4, 6) else 2)
-        c_uv = cam.project_cv(np.asarray(b.center, dtype=float)[None])[0]
-        dr.text((c_uv[0] - 4, c_uv[1] - 6), str(i), fill=color)
+        # thin footprint rectangle
+        dr.line([tuple(uv[0]), tuple(uv[1]), tuple(uv[2]), tuple(uv[3]),
+                 tuple(uv[0])], fill=color, width=2)
+        # numbered chip on the rectangle's top-left edge, off the rack body
+        cx, cy = uv[0]
+        chip = str(i)
+        wpx = dr.textlength(chip, font=None)
+        dr.rectangle([cx - 3, cy - 9, cx + wpx + 5, cy + 5], fill=(0, 0, 0))
+        dr.text((cx + 2, cy - 8), chip, fill=(255, 255, 255))
     return np.asarray(pil).astype(np.float32) / 255.0
 
 

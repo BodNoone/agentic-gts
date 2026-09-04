@@ -99,19 +99,51 @@ def test_render_falls_back_without_cuda():
 
 
 def test_camera_projection_sanity():
+    import math as _m
     from agentic_gts.output.gs_render import make_local_cam
     box = OrientedBox(center=(5.0, -3.0, 1.0), size=(1.2, 0.7, 2.0),
                       yaw=math.radians(30.0))
     cam = make_local_cam(box, extent=1.0)
+    # oblique view: the box centre lands inside the frame (lower-half), not
+    # necessarily dead-centre -- a nadir centre assertion no longer applies
     uv = cam.project_cv(np.asarray(box.center, dtype=float)[None])[0]
-    # nadir camera centered on the box: center must land mid-image
-    assert abs(uv[0] - cam.W / 2) < 2.0 and abs(uv[1] - cam.H / 2) < 2.0
+    assert 0 < uv[0] < cam.W and 0 < uv[1] < cam.H, f"centre off-frame: {uv}"
+    # the view is OBLIQUE (not top-down): the look direction has a horizontal
+    # component, so the rack's side face is visible (the point of this view)
+    look = cam.target - cam.eye
+    look = look / np.linalg.norm(look)
+    assert _m.degrees(_m.acos(abs(look[2]))) < 80, "not oblique (too top-down)"
+    assert np.linalg.norm(look[:2]) > 0.2, "no horizontal look component"
     # all corners in front of the camera
     from agentic_gts.output.gs_render import _box_corners_3d
     cs = _box_corners_3d(box)
     pc = np.hstack([cs, np.ones((len(cs), 1))]) @ cam.view_cv().T
     assert np.all(pc[:, 2] > 0)
-    print("PASS camera projection sanity")
+    print("PASS camera projection sanity (oblique local view)")
+
+
+def test_overlay_footprint_not_3d_wireframe():
+    """godview overlay must draw only the footprint rectangle + a numbered
+    chip -- NOT a 3D wireframe -- so the gaussian render stays readable."""
+    from agentic_gts.output.gs_render import (_box_corners_3d, make_godview_cam,
+                                              overlay_boxes)
+    W, H = 640, 480
+    pts = np.array([[0, 0, 0], [8, 0, 0], [8, 6, 0], [0, 6, 0],
+                    [0, 0, 2.3], [8, 0, 2.3], [8, 6, 2.3], [0, 6, 2.3]])
+    boxes = [OrientedBox(center=(2.0, 3.0, 1.15), size=(0.6, 1.1, 2.3), yaw=0.0)]
+    cam = make_godview_cam(pts, boxes, nadir=True, W=W, H=H)
+    img = np.full((H, W, 3), 0.3, dtype=np.float32)
+    out = overlay_boxes(img, boxes, cam)
+    assert out.shape == (H, W, 3)
+    assert out.min() >= 0.0 and out.max() <= 1.0
+    # bottom-ring corners project in-frame; the chip sits near one of them
+    cs = _box_corners_3d(boxes[0])
+    uv0 = cam.project_cv([cs[0]])[0]
+    assert 0 <= uv0[0] < W and 0 <= uv0[1] < H
+    # the overlay changed pixels near the box (something was drawn)
+    y0, x0 = int(uv0[1]), int(uv0[0])
+    assert not np.allclose(out[y0 - 5:y0 + 5, x0 - 5:x0 + 5], img[y0 - 5:y0 + 5, x0 - 5:x0 + 5])
+    print("PASS overlay draws footprint + chip (no 3D wireframe)")
 
 
 def test_godview_nadir_camera():
@@ -186,6 +218,7 @@ if __name__ == "__main__":
     test_gs_parse_ascii()
     test_render_falls_back_without_cuda()
     test_camera_projection_sanity()
+    test_overlay_footprint_not_3d_wireframe()
     test_godview_nadir_camera()
     test_godview_frames_box_footprint()
     test_prep_cuts_ceiling()
