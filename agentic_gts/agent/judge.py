@@ -294,6 +294,28 @@ class VLMJudge:
         self.api_key = api_key or os.environ.get("VLM_API_KEY", "EMPTY")
         self.timeout = timeout
         self._local_model = None   # lazy: (processor, model), loaded once
+        self.record_path = None    # if set, append JSONL records of adjudications
+
+    def set_record(self, record_path: str) -> None:
+        """Enable structured recording of every adjudication to a JSONL file."""
+        self.record_path = record_path
+
+    def _record(self, kind: str, prompt: str, answer: str,
+                choice: str, confidence: float, detail: str,
+                png_path: str | None = None) -> None:
+        """Append one adjudication record (image path + prompt + answer)."""
+        if not self.record_path:
+            return
+        import os as _os
+        rec = {"kind": kind, "prompt": prompt, "answer": answer,
+               "choice": choice, "confidence": confidence,
+               "detail": detail, "image": png_path}
+        try:
+            _os.makedirs(_os.path.dirname(self.record_path), exist_ok=True)
+            with open(self.record_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"[vlm][record] failed to write ({type(e).__name__}: {e})")
 
     # ---- backend-agnostic interface ----
     def adjudicate_box(self, scene, box, question: str,
@@ -302,8 +324,92 @@ class VLMJudge:
         if self.backend == "mock":
             return self._mock_adjudicate(box, question)
         if self.backend == "local":
-            return self._local_adjudicate(scene, box, question, options)
-        return self._qwen_adjudicate(scene, box, question, options)
+            v = self._local_adjudicate(scene, box, question, options)
+        else:
+            v = self._qwen_adjudicate(scene, box, question, options)
+        self._record("box", question, v.raw or v.detail,
+                     (v.params or {}).get("choice", ""), v.confidence, v.detail)
+        return v
+
+    def adjudicate_pair(self, scene, a, b, question: str,
+                        options: list[str]) -> Verdict:
+        """Ask the VLM whether two boxes are faces of the SAME rack.
+
+        Renders a local crop showing BOTH boxes, then routes to the same
+        backend as adjudicate_box. Mock / failure degrades to 'keep' (do not
+        merge without evidence).
+        """
+        if not (a and b):
+            return Verdict(action="keep", confidence=0.5, detail="no boxes")
+        boxes = [a, b]
+        v = None
+        try:
+            img_arr = render_topdown_image(scene.points, boxes,
+                                           gs_ply=scene.meta.get("gs_ply"))
+            if self.backend == "local":
+                v = self._local_pair_call(img_arr, question, options)
+            elif self.backend == "qwen":
+                v = self._qwen_pair_call(img_arr, question, options)
+            else:
+                v = Verdict(action="keep", confidence=0.5,
+                            detail="mock: keep (no VLM)")
+        except Exception as e:
+            print(f"[vlm][pair] failed ({type(e).__name__}: {e}) -> keep")
+            v = Verdict(action="keep", confidence=0.5, detail=f"{type(e).__name__}")
+        self._record("pair", question, v.raw or v.detail,
+                     (v.params or {}).get("choice", ""), v.confidence, v.detail)
+        return v
+
+    def _local_pair_call(self, img_arr, question, options) -> Verdict:
+        from PIL import Image
+        import io as _io
+        self._ensure_local_model()
+        processor, model = self._local_model
+        buf = _io.BytesIO()
+        import matplotlib.pyplot as plt
+        plt.imsave(buf, img_arr, format="png")
+        image = Image.open(buf).convert("RGB")
+        prompt = (f"Decide the best answer from the bird's-eye image "
+                  f"(two red wireframes = two candidate boxes).\n\n"
+                  f"QUESTION: {question}\n"
+                  f"OPTIONS:\n" + "\n".join(f"- {o}" for o in options) +
+                  f"\n\nReply with the exact option text only.")
+        messages = [{"role": "user", "content": [
+            {"type": "image", "image": image}, {"type": "text", "text": prompt}]}]
+        text = processor.apply_chat_template(messages, tokenize=False,
+                                             add_generation_prompt=True)
+        inputs = processor(text=[text], images=[image],
+                           return_tensors="pt").to(model.device)
+        import torch
+        with torch.inference_mode():
+            out = model.generate(**inputs, max_new_tokens=64, do_sample=False)
+        trimmed = [o[len(i):] for i, o in zip(inputs.input_ids, out)]
+        answer = processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
+        matched = self._match_option(answer, options)
+        return Verdict(action="answer", params={"choice": matched},
+                       confidence=0.8, detail=answer, raw=answer)
+
+    def _qwen_pair_call(self, img_arr, question, options) -> Verdict:
+        b64 = self._array_to_png_b64(img_arr)
+        prompt = (f"Decide the best answer from the bird's-eye image "
+                  f"(two red wireframes = two candidate boxes).\n\n"
+                  f"QUESTION: {question}\n"
+                  f"OPTIONS:\n" + "\n".join(f"- {o}" for o in options) +
+                  f"\n\nReply with the exact option text only.")
+        r = requests.post(
+            self.api_base + "/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={"model": self.model, "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]}],
+                "max_tokens": 64, "temperature": 0.0},
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        text = r.json()["choices"][0]["message"]["content"].strip()
+        matched = self._match_option(text, options)
+        return Verdict(action="answer", params={"choice": matched},
+                       confidence=0.8, detail=text, raw=text)
 
     # ---- god-view global audit ----
     _GODVIEW_PROMPT = (

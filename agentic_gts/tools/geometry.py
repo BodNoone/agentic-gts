@@ -243,6 +243,52 @@ def split_box(scene: Scene, box: OrientedBox, n: int, width_unit: float | None =
     return result
 
 
+def merge_box_pair(scene: Scene, a: OrientedBox, b: OrientedBox,
+                   snap_to_points: bool = True) -> OrientedBox | None:
+    """Merge two boxes into one bounding rack box (faces of the same device).
+
+    Joins the two along the shared row axis: union of their row extents,
+    depth/height = the larger of the two, yaw follows the dominant one. If
+    both snap to points, refit the union so the edges land on surfaces.
+    Returns None if the pair cannot be merged (e.g. no point support).
+    """
+    # row axis from the larger / lower-index box; align the other to it
+    yaw = a.yaw
+    axis = np.array([math.cos(yaw), math.sin(yaw)])
+    cross = np.array([-math.sin(yaw), math.cos(yaw)])
+
+    def _ext(b: OrientedBox):
+        cs = np.asarray(b.corners_2d())
+        pa = cs @ axis
+        pc = cs @ cross
+        return (float(pa.min()), float(pa.max()),
+                float(pc.min()), float(pc.max()))
+    ea, eb = _ext(a), _ext(b)
+    a0 = min(ea[0], eb[0]); a1 = max(ea[1], eb[1])
+    c0 = min(ea[2], eb[2]); c1 = max(ea[3], eb[3])
+    L = a1 - a0
+    W = c1 - c0
+    H = max(a.size[2], b.size[2])
+    cx, cy = a0 + L / 2, c0 + W / 2
+    world_xy = axis * cx + cross * cy
+    merged = OrientedBox(
+        center=(float(world_xy[0]), float(world_xy[1]), H / 2),
+        size=(max(L, 0.2), max(W, 0.3), max(H, 0.4)),
+        yaw=yaw, device_type=DeviceType.RACK,
+        source=BoxSource.RULE_FIX, confidence=Confidence.MID,
+        meta={"merged_from": [a.box_id, b.box_id]},
+    )
+    if snap_to_points:
+        refit = fit_box_to_points(scene, merged.center[:2], merged.size, yaw)
+        if refit is not None and max(refit.size[:2]) >= max(merged.size[:2]) * 0.6:
+            refit.meta = merged.meta
+            return refit
+    # fall back to plain union if refinement produced something degenerate
+    if support_fraction(scene, merged) < 0.1:
+        return None
+    return merged
+
+
 def row_structure(scene: Scene, yaw: float = 0.0,
                   cluster_tol: float = 0.25) -> list[dict]:
     """Detect rows by clustering box centers' cross-axis coordinate.

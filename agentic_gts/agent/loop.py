@@ -95,7 +95,62 @@ class LayoutAgent:
                     issues.append(Issue(IssueType.OVERLAP, [a.box_id, b.box_id],
                                         self._region(a), detail=f"iou={iou:.2f}",
                                         severity=0.6))
+        # candidate boxes that may be faces of the SAME rack (no intersection,
+        # aligned along the row, close together) -- the geometry cannot decide
+        # (rules can't be enumerated), so hand to the VLM to reason about.
+        for aid, bid in self._find_merge_candidates(scene):
+            a, b = scene.get_box(aid), scene.get_box(bid)
+            if a is None or b is None:
+                continue
+            x0 = min(a.center[0], b.center[0])
+            y0 = min(a.center[1], b.center[1])
+            x1 = max(a.center[0], b.center[0])
+            y1 = max(a.center[1], b.center[1])
+            issues.append(Issue(IssueType.MERGED_NEIGHBORS, [aid, bid],
+                                (x0 - 0.5, y0 - 0.5, x1 + 0.5, y1 + 0.5),
+                                detail="adjacent, may be same rack faces",
+                                severity=0.65))
         return issues
+
+    def _find_merge_candidates(self, scene: Scene,
+                               gap_ratio: float = 2.0) -> list[tuple[str, str]]:
+        """Pairs of boxes likely to be faces of ONE rack.
+
+        A single rack's front / back / side surfaces come out as separate
+        detector boxes with NO intersection: they overlap along the ROW axis
+        (same along-position) but separate along the CROSS axis (front vs back
+        face, or two side fragments). This is not enumerable by rules -- the
+        VLM decides. We only scan for plausible candidates: same row, near
+        along-position, cross-positions close (within a rack footprint).
+        """
+        yaw = float(scene.meta.get("yaw", 0.0))
+        axis = np.array([math.cos(yaw), math.sin(yaw)])
+        cross = np.array([-math.sin(yaw), math.cos(yaw)])
+        res = []
+        for i, a in enumerate(scene.boxes):
+            for b in scene.boxes[i + 1:]:
+                ca, cb = np.asarray(a.center[:2]), np.asarray(b.center[:2])
+                if np.linalg.norm(ca - cb) > 3.5:
+                    continue
+                along_a, along_b = ca @ axis, cb @ axis
+                cross_a, cross_b = ca @ cross, cb @ cross
+                # same row: cross positions must be close (< 1.2 rack depth)
+                if abs(cross_a - cross_b) > 1.2:
+                    continue
+                # near same along position (a rack is ~one unit long): centers
+                # within ~1.5 rack widths along the row
+                if abs(along_a - along_b) > 1.5:
+                    continue
+                # either the cross gap is small (front/back of ONE rack) or
+                # the along gap is small (left/right fragments of ONE rack)
+                cross_gap = abs(cross_a - cross_b)
+                along_gap = abs(along_a - along_b)
+                small_along = min(a.size[0], b.size[0]) * gap_ratio
+                small_cross = min(a.size[1], b.size[1]) * gap_ratio
+                near = (cross_gap <= small_cross and along_gap <= small_along)
+                if near:
+                    res.append((a.box_id, b.box_id))
+        return res
 
     # ---------------- god-view global audit ----------------
     def godview_pass(self, scene: Scene) -> list[Issue]:
@@ -349,6 +404,26 @@ class LayoutAgent:
                 n = max(2, min(int(n_clusters), int(round(box.size[0] / width_unit))))
                 return Verdict(action="split", params={"n": n, "width_unit": width_unit})
             return Verdict(action="keep")
+        if issue.issue_type == IssueType.MERGED_NEIGHBORS and len(issue.box_ids) >= 2:
+            # Two boxes that do NOT intersect but sit close / aligned: they may
+            # be different faces of ONE rack (front/back/side) -- the kind of
+            # merge that cannot be enumerated with rules and needs reasoning.
+            # Ask the VLM over a crop that shows BOTH boxes.
+            a = scene.get_box(issue.box_ids[0])
+            b = scene.get_box(issue.box_ids[1])
+            if a is None or b is None:
+                return Verdict(action="keep")
+            verdict = self.judge.adjudicate_pair(
+                scene, a, b,
+                question=("Do the two red boxes belong to the SAME rack (different "
+                          "faces / a split rack) or are they TWO SEPARATE racks? "
+                          "Merge them only if they are the same device."),
+                options=["same rack, merge", "two separate racks"],
+            )
+            choice = (verdict.params or {}).get("choice", "")
+            if choice == "same rack, merge" or verdict.action == "merge":
+                return Verdict(action="merge", params={"box_ids": [a.box_id, b.box_id]})
+            return Verdict(action="keep")
         if issue.issue_type == IssueType.FALSE_POSITIVE and box is not None:
             # persist the exact per-box evidence image the VLM sees: when
             # the global pass nominates a box, this local crop is what the
@@ -388,6 +463,21 @@ class LayoutAgent:
             for s in subs:
                 s.source = BoxSource.AGENT_FIX
                 scene.boxes.append(s)
+            return True
+        if verdict.action == "merge":
+            ids = (verdict.params or {}).get("box_ids") or issue.box_ids
+            boxes = [scene.get_box(i) for i in ids]
+            boxes = [b for b in boxes if b is not None]
+            if len(boxes) < 2:
+                return False
+            merged = geo.merge_box_pair(scene, boxes[0], boxes[1])
+            if merged is None:
+                return False
+            for b in boxes:
+                scene.remove_box(b.box_id)
+            merged.source = BoxSource.AGENT_FIX
+            merged.confidence = Confidence.HIGH
+            scene.boxes.append(merged)
             return True
         if verdict.action == "shrink":
             box = scene.get_box(issue.box_ids[0])

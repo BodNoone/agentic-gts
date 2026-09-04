@@ -131,6 +131,7 @@ class IssueType(str, Enum):
     MISSING = "missing"              # gap in row with point density but no box
     FALSE_POSITIVE = "false_positive"
     MERGED_ROW = "merged_row"        # multiple racks in one box
+    MERGED_NEIGHBORS = "merged_neighbors"  # two boxes may be faces of ONE rack
     OVERLAP = "overlap"              # two boxes overlapping
     MISALIGNED = "misaligned"        # not aligned with row direction
     LOW_SUPPORT = "low_support"

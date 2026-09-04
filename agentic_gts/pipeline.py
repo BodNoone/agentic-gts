@@ -302,6 +302,12 @@ def run_pipeline(scene: Scene,
     # --- stage C: agent loop ---
     judge = VLMJudge(backend=vlm_backend, api_base=vlm_api_base,
                      model=vlm_model)
+    # record every adjudication (prompt + answer + choice + confidence) to a
+    # JSONL so the user can audit why the agent decided each issue
+    try:
+        judge.set_record(os.path.join(out_dir, "vlm_records.jsonl"))
+    except Exception as e:
+        print(f"[warn] record path set failed ({type(e).__name__}: {e})")
     agent = LayoutAgent(judge=judge, opts=opts, out_dir=out_dir)
     report = agent.run(scene)
     n_res = len(report.resolved)
