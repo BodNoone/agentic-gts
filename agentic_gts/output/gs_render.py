@@ -206,17 +206,25 @@ def make_local_cam(box, extent: float = 1.2, W: int = 448, H: int = 448,
 
 
 # ---------------------------------------------------------------- rasterizers
-def _prep(gs: GaussianData, cut_z: float):
-    """Common tensor-ready numpy arrays (ceiling cut applied)."""
-    m = np.isfinite(cut_z)
-    mask = gs.means[:, 2] < cut_z if m else np.ones(len(gs), dtype=bool)
-    means = gs.means[mask].astype(np.float64)
-    scales = np.exp(gs.log_scales[mask].astype(np.float64))
-    quats = gs.quats[mask].astype(np.float64)
+def _prep(gs: GaussianData, cut_z: float, cut_z_low: float = float("-inf")):
+    """Common tensor-ready numpy arrays (ceiling + floor cuts applied).
+
+    cut_z: keep gaussians BELOW this (removes ceiling / overhead trays).
+    cut_z_low: keep gaussians ABOVE this (removes the floor and below, whose
+    texture / reflections occlude the rack footprint in a top-down view).
+    """
+    m = np.ones(len(gs), dtype=bool)
+    if np.isfinite(cut_z):
+        m &= gs.means[:, 2] < cut_z
+    if np.isfinite(cut_z_low):
+        m &= gs.means[:, 2] > cut_z_low
+    means = gs.means[m].astype(np.float64)
+    scales = np.exp(gs.log_scales[m].astype(np.float64))
+    quats = gs.quats[m].astype(np.float64)
     qn = np.linalg.norm(quats, axis=1, keepdims=True)
     quats = quats / np.clip(qn, 1e-9, None)
-    opac = 1.0 / (1.0 + np.exp(-gs.raw_opacity[mask].astype(np.float64)))  # sigmoid
-    rgb = np.clip(0.5 + SH_C0 * gs.f_dc[mask].astype(np.float64), 0.0, 1.0)
+    opac = 1.0 / (1.0 + np.exp(-gs.raw_opacity[m].astype(np.float64)))  # sigmoid
+    rgb = np.clip(0.5 + SH_C0 * gs.f_dc[m].astype(np.float64), 0.0, 1.0)
     return means, quats, scales, opac, rgb
 
 
@@ -285,9 +293,10 @@ def _try_official(means, quats, scales, opac, rgb, cam: Cam):
     return np.clip(img.detach().cpu().numpy().T, 0.0, 1.0)
 
 
-def rasterize_gs(gs: GaussianData, cam: Cam, cut_z: float = float("inf")):
+def rasterize_gs(gs: GaussianData, cam: Cam, cut_z: float = float("inf"),
+                 cut_z_low: float = float("-inf")):
     """(H,W,3) float image or None if no CUDA rasterizer is available."""
-    means, quats, scales, opac, rgb = _prep(gs, cut_z)
+    means, quats, scales, opac, rgb = _prep(gs, cut_z, cut_z_low)
     if len(means) == 0:
         return None
     try:
@@ -352,9 +361,10 @@ def overlay_boxes(img: np.ndarray, boxes, cam: Cam) -> np.ndarray:
 
 
 def render_gs_view(gs: GaussianData, boxes, cam: Cam,
-                   cut_z: float = float("inf")):
+                   cut_z: float = float("inf"),
+                   cut_z_low: float = float("-inf")):
     """Full render: gaussians + numbered box overlay. None if no backend."""
-    img = rasterize_gs(gs, cam, cut_z=cut_z)
+    img = rasterize_gs(gs, cam, cut_z=cut_z, cut_z_low=cut_z_low)
     if img is None:
         return None
     if boxes:

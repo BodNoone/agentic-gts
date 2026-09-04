@@ -53,8 +53,9 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
             from agentic_gts.output.gs_render import make_local_cam, render_gs_view
             gs = read_gaussian_ply(gs_ply)
             cut = _render_cut_z(stage_points, boxes)
+            cut_low = _render_cut_z_low(boxes)
             cam = make_local_cam(boxes[0], extent=extent * 2)
-            img = render_gs_view(gs, boxes, cam, cut_z=cut)
+            img = render_gs_view(gs, boxes, cam, cut_z=cut, cut_z_low=cut_low)
             if img is not None:
                 return img
         except Exception as e:
@@ -164,6 +165,20 @@ def _render_cut_z(points: np.ndarray, boxes, margin: float = 0.3,
     return _auto_ceiling_z(points[:, 2])
 
 
+def _render_cut_z_low(boxes, margin: float = 0.08) -> float:
+    """Floor cut for top-down renders: remove ground-level gaussians.
+
+    The floor texture / reflections in a 3DGS render occlude the rack
+    footprints and mislead the VLM. Racks sit ON the floor, so their bottom
+    face defines the floor level; gaussians below (box bottom - margin) are
+    the floor and are dropped. A small positive margin keeps the rack's own
+    bottom edge.
+    """
+    if boxes:
+        return min(b.center[2] - b.size[2] / 2.0 for b in boxes) - margin
+    return float("-inf")
+
+
 def render_godview_png(points: np.ndarray, boxes, max_points: int = 250_000,
                        dpi: int = 130, gs_ply: str | None = None) -> bytes:
     """Full-scene bird's-eye render for the god-view pass.
@@ -186,15 +201,20 @@ def render_godview_png(points: np.ndarray, boxes, max_points: int = 250_000,
             # them; losing a sliver of the rack's top face is fine for a
             # global layout view.
             cut = _render_cut_z(points, boxes, margin=-0.15)
+            cut_low = _render_cut_z_low(boxes)
             # True top-down camera. Height is auto-derived from the room
             # footprint (a god-view overlooks the whole layout), so it sits
             # well above every rack. Overhead structure is removed by the
             # ceiling Z-cut, so a high eye cannot re-introduce the ceiling.
+            # Ground texture / reflections sit below cut_low and must not
+            # figure into the render (they occlude the rack footprints).
             pts_for_cam = points[points[:, 2] < cut] if np.isfinite(cut) else points
+            if np.isfinite(cut_low):
+                pts_for_cam = pts_for_cam[pts_for_cam[:, 2] > cut_low]
             if len(pts_for_cam) < 100:
                 pts_for_cam = points
             cam = make_godview_cam(pts_for_cam, boxes, nadir=True)
-            img = render_gs_view(gs, boxes, cam, cut_z=cut)
+            img = render_gs_view(gs, boxes, cam, cut_z=cut, cut_z_low=cut_low)
             if img is not None:
                 print(f"[gs][godview] true 3DGS render "
                       f"({len(gs)} gaussians, top-down view)")

@@ -213,6 +213,20 @@ def test_prep_cuts_ceiling():
     print("PASS prep cuts ceiling gaussians at cut_z")
 
 
+def test_prep_cuts_floor():
+    """Gaussians below cut_z_low (the floor / ground texture) must be
+    excluded too, so ground reflections don't occlude the rack footprints."""
+    from agentic_gts.output.gs_render import _prep
+    gs = _tiny_gs(50)
+    gs.means[:, 2][:25] = -0.1       # 25 floor-level gaussians
+    gs.means[:, 2][25:] = 1.0        # 25 at rack height
+    cut_z, cut_z_low = 2.6, 0.2      # racks ~1.0m, floor ~-0.1m
+    means, _, _, _, _ = _prep(gs, cut_z, cut_z_low)
+    assert len(means) == 25, f"expected 25 kept (racks), got {len(means)}"
+    assert np.all(means[:, 2] > cut_z_low)
+    print("PASS prep cuts floor gaussians at cut_z_low")
+
+
 if __name__ == "__main__":
     test_gs_roundtrip_binary()
     test_gs_parse_ascii()
@@ -222,4 +236,5 @@ if __name__ == "__main__":
     test_godview_nadir_camera()
     test_godview_frames_box_footprint()
     test_prep_cuts_ceiling()
+    test_prep_cuts_floor()
     print("ALL GS TESTS PASSED")
