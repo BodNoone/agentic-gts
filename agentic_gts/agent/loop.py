@@ -30,6 +30,15 @@ from agentic_gts.agent.judge import Verdict, VLMJudge
 from agentic_gts.tools import geometry as geo
 
 
+def _points_in_radius(points: np.ndarray, c: tuple[float, float],
+                      r: float) -> np.ndarray:
+    """2D circular crop of points around (c[0], c[1]) within radius r."""
+    if len(points) == 0:
+        return points
+    d = np.hypot(points[:, 0] - c[0], points[:, 1] - c[1])
+    return points[d <= r]
+
+
 @dataclass
 class AgentReport:
     resolved: list[dict] = field(default_factory=list)
@@ -178,26 +187,104 @@ class LayoutAgent:
         scene.boxes = refined
 
     def _handle_issue(self, scene: Scene, issue: Issue, report: AgentReport) -> bool:
+        # One readable per-issue diagnostic line so the user can see WHY the
+        # agent decided what it did (geometry evidence + VLM/mock verdict).
+        self._log_issue(scene, issue)
+        before = copy.deepcopy(scene.boxes)
         for attempt in range(self.max_retries + 1):
             snapshot = copy.deepcopy(scene.boxes)
             action = self._decide(scene, issue)
             applied = self._execute(scene, issue, action)
             if not applied:
+                print(f"[diag][C]   attempt {attempt}: action '{action.action}' not applied"
+                      f" (rollback)")
                 scene.boxes = snapshot
                 continue
             if self._verify(scene, issue):
+                print(f"[diag][C]   attempt {attempt}: '{action.action}' ok -> "
+                      f"{len(scene.boxes)} boxes after")
                 report.actions_taken.append({
                     "issue_id": issue.issue_id, "action": action.action,
                     "params": action.params, "attempt": attempt,
                 })
+                self._render_fix(scene, issue, before, out_tag="after")
                 return True
+            print(f"[diag][C]   attempt {attempt}: '{action.action}' FAILED verify "
+                  f"(rollback)")
             scene.boxes = snapshot  # rollback
         # leave as-is; mark involved boxes low confidence
         for bid in issue.box_ids:
             b = scene.get_box(bid)
             if b:
                 b.confidence = Confidence.LOW
+        self._render_fix(scene, issue, before, out_tag="unresolved")
         return False
+
+    def _log_issue(self, scene: Scene, issue: Issue) -> None:
+        """Print the evidence behind an issue decision so it is auditable."""
+        b = scene.get_box(issue.box_ids[0]) if issue.box_ids else None
+        if b is None:
+            print(f"[diag][C] issue {issue.issue_type.value} "
+                  f"(no box for {issue.box_ids[:3]}) @ detail={issue.detail[:60]}")
+            return
+        sup = geo.support_fraction(scene, b)
+        sup = max(sup, geo.face_support_fraction(scene, b)) if sup < 0.12 else sup
+        if issue.issue_type == IssueType.MERGED_ROW:
+            nc, dom, _ = geo.center_field_clusters(scene, b)
+            print(f"[diag][C] issue MERGED_ROW  box={b.box_id[:6]} "
+                  f"@({b.center[0]:.1f},{b.center[1]:.1f}) "
+                  f"size=({b.size[0]:.2f}x{b.size[1]:.2f}x{b.size[2]:.2f}) "
+                  f"n_clusters={nc} support={sup:.2f}")
+        elif issue.issue_type == IssueType.FALSE_POSITIVE:
+            print(f"[diag][C] issue FALSE_POS  box={b.box_id[:6]} "
+                  f"@({b.center[0]:.1f},{b.center[1]:.1f}) "
+                  f"size=({b.size[0]:.2f}x{b.size[1]:.2f}) support={sup:.2f}")
+        else:
+            print(f"[diag][C] issue {issue.issue_type.value} box={b.box_id[:6]} "
+                  f"@({b.center[0]:.1f},{b.center[1]:.1f}) "
+                  f"size=({b.size[0]:.2f}x{b.size[1]:.2f}) detail={issue.detail[:60]}")
+
+    def _render_fix(self, scene: Scene, issue: Issue, before_boxes,
+                    out_tag: str = "after") -> None:
+        """Render a before/after crop around the issue's boxes so the fix is
+        visible, not just logged. Uses the issue region (not get_box, which
+        returns None after a split/delete removed the original box).
+        Best-effort; never breaks the loop."""
+        if not self.out_dir:
+            return
+        try:
+            import os as _os
+            from agentic_gts.output.visualize import overlay_topdown
+            _os.makedirs(self.out_dir, exist_ok=True)
+            # bounding region: prefer the issue region, else a surviving box
+            cx = cy = ext = None
+            if issue.region:
+                x0, y0, x1, y1 = issue.region
+                cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+                ext = max(x1 - x0, y1 - y0) / 2.0 + 0.5
+            else:
+                surv = [b for b in scene.boxes if b.box_id in issue.box_ids]
+                if not surv and before_boxes:
+                    surv = [b for b in before_boxes if b.box_id in issue.box_ids]
+                if surv:
+                    b = surv[0]
+                    cx, cy = b.center[0], b.center[1]
+                    ext = max(b.size[0], b.size[1]) * 1.5 + 0.5
+            if cx is None:
+                return
+            r_pts = _points_in_radius(scene.points, (cx, cy), ext)
+            tmp_before = Scene(points=r_pts, boxes=before_boxes)
+            tmp_after = Scene(points=r_pts, boxes=scene.boxes)
+            with open(_os.path.join(self.out_dir,
+                      f"fix_{issue.issue_type.value}_{out_tag}_before.png"), "wb") as f:
+                f.write(overlay_topdown(tmp_before, title=f"{issue.issue_type.value} before"))
+            with open(_os.path.join(self.out_dir,
+                      f"fix_{issue.issue_type.value}_{out_tag}_after.png"), "wb") as f:
+                f.write(overlay_topdown(tmp_after, title=f"{issue.issue_type.value} after"))
+            print(f"[diag][C]   fix render -> {self.out_dir}/fix_{issue.issue_type.value}_"
+                  f"{out_tag}_[before|after].png")
+        except Exception as e:
+            print(f"[diag][C]   fix render failed ({type(e).__name__}: {e})")
 
     # ---------------- decision ----------------
     def _save_local_evidence(self, scene: Scene, box: OrientedBox,
