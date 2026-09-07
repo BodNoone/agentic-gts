@@ -196,36 +196,120 @@ def _wireframe_points(box: OrientedBox, step: float = 0.02) -> np.ndarray:
     return box.local_to_world(np.vstack(segs))
 
 
+def _face_points(box: OrientedBox, step: float = 0.05) -> np.ndarray:
+    """Sample the 6 box faces on a sparse grid (for PLY export): a
+    point-cloud viewer then shows a solid-looking box, not 12 thin edges
+    drowning in a million-point cloud."""
+    l, w, h = np.asarray(box.size) / 2.0
+    us = np.arange(-l, l + step / 2, step)
+    vs = np.arange(-w, w + step / 2, step)
+    gu, gv = np.meshgrid(us, vs, indexing="ij")
+    face_uv = np.stack([gu.ravel(), gv.ravel()], axis=1)
+    faces = [
+        np.column_stack([face_uv[:, 0], face_uv[:, 1], np.full(len(face_uv), h)]),
+        np.column_stack([face_uv[:, 0], face_uv[:, 1], np.full(len(face_uv), -h)]),
+        np.column_stack([face_uv[:, 0], np.full(len(face_uv), l), face_uv[:, 1]]),
+        np.column_stack([face_uv[:, 0], np.full(len(face_uv), -l), face_uv[:, 1]]),
+        np.column_stack([np.full(len(face_uv), w), face_uv[:, 0], face_uv[:, 1]]),
+        np.column_stack([np.full(len(face_uv), -w), face_uv[:, 0], face_uv[:, 1]]),
+    ]
+    return box.local_to_world(np.vstack(faces))
+
+
+def _gs_cloud_colors(gs) -> np.ndarray:
+    """Real per-gaussian RGB from the SH DC term (first-order
+    approximation used by every 3DGS viewer): 0.5 + C0 * f_dc."""
+    c0 = 0.28209479177387814
+    rgb = 0.5 + c0 * np.asarray(gs.f_dc)[:, :3]
+    return np.clip(rgb, 0.0, 1.0)
+
+
 def export_ply(scene: Scene, path: str,
                gt_boxes: list[OrientedBox] | None = None,
-               max_points: int = 1_000_000) -> None:
-    """Write a merged PLY: cloud (gray, height-tinted) + box wireframes.
+               max_points: int = 1_000_000,
+               gs_ply: str | None = None) -> None:
+    """Write a merged PLY: cloud + box wireframes/faces.
 
-    Openable in CloudCompare / MeshLab / any PLY viewer for 3D inspection
-    without needing this codebase.
+    Cloud coloring: if `gs_ply` (the source 3DGS model) is given and
+    readable, each point keeps its TRUE gaussian color (SH DC term) --
+    the cloud looks like the splat render. Falls back to height tint.
+    Boxes are drawn as dense edges + sampled faces so they stay visible
+    inside a million-point cloud.
     """
     import open3d as o3d
-    pts = scene.points
-    if len(pts) > max_points:
-        sel = np.random.default_rng(0).choice(len(pts), max_points, replace=False)
-        pts = pts[sel]
-    z = pts[:, 2]
-    t = (z - z.min()) / max(float(np.ptp(z)), 1e-6)
-    cloud_colors = np.stack([0.6 - 0.2 * t, 0.6 - 0.05 * t, 0.6 + 0.3 * t], axis=1)
+    pts, colors = None, None
+    if gs_ply:
+        try:
+            from agentic_gts.tools.gs_io import read_gaussian_ply
+            gs = read_gaussian_ply(gs_ply)
+            if len(gs.means) > max_points:
+                sel = np.random.default_rng(0).choice(
+                    len(gs.means), max_points, replace=False)
+                gs_pts, gs_col = gs.means[sel], _gs_cloud_colors(gs)[sel]
+            else:
+                gs_pts, gs_col = gs.means, _gs_cloud_colors(gs)
+            pts, colors = gs_pts, gs_col
+            print(f"[viz] cloud colored from 3DGS SH DC ({len(pts)} gaussians)")
+        except Exception as e:
+            print(f"[viz] GS coloring failed ({type(e).__name__}: {e}) "
+                  f"-> height tint")
+    if pts is None:
+        pts = scene.points
+        if len(pts) > max_points:
+            sel = np.random.default_rng(0).choice(len(pts), max_points,
+                                                  replace=False)
+            pts = pts[sel]
+        z = pts[:, 2]
+        t = (z - z.min()) / max(float(np.ptp(z)), 1e-6)
+        colors = np.clip(
+            np.stack([0.6 - 0.2 * t, 0.6 - 0.05 * t, 0.6 + 0.3 * t], axis=1),
+            0, 1)
 
     all_pts = [pts]
-    all_col = [np.clip(cloud_colors, 0, 1)]
+    all_col = [colors]
     for b in scene.boxes:
-        wp = _wireframe_points(b)
         color = np.asarray(_CONF_COLOR.get(b.confidence.value, (0.3, 0.3, 0.3)))
+        wp = _wireframe_points(b)
+        fp = _face_points(b)
         all_pts.append(wp)
-        all_col.append(np.tile(color, (len(wp), 1)))
+        all_col.append(np.tile(np.minimum(color + 0.25, 1.0), (len(wp), 1)))
+        all_pts.append(fp)
+        all_col.append(np.tile(color * 0.6, (len(fp), 1)))
     if gt_boxes:
         for g in gt_boxes:
             wp = _wireframe_points(g)
             all_pts.append(wp)
             all_col.append(np.tile((0.25, 0.41, 0.88), (len(wp), 1)))
 
+    merged = o3d.geometry.PointCloud(
+        o3d.utility.Vector3dVector(np.vstack(all_pts)))
+    merged.colors = o3d.utility.Vector3dVector(np.vstack(all_col))
+    o3d.io.write_point_cloud(path, merged)
+
+
+def export_boxes_ply(scene: Scene, path: str,
+                     gt_boxes: list[OrientedBox] | None = None) -> None:
+    """Write a boxes-ONLY PLY (no point cloud): dense colored edges +
+    sampled faces per box. Use when the raw cloud would visually bury
+    the layout, or as the lightweight final visualization artifact."""
+    import open3d as o3d
+    all_pts, all_col = [], []
+    for b in scene.boxes:
+        color = np.asarray(_CONF_COLOR.get(b.confidence.value, (0.3, 0.3, 0.3)))
+        wp = _wireframe_points(b, step=0.01)
+        fp = _face_points(b, step=0.03)
+        all_pts.append(wp)
+        all_col.append(np.tile(np.minimum(color + 0.25, 1.0), (len(wp), 1)))
+        all_pts.append(fp)
+        all_col.append(np.tile(color * 0.6, (len(fp), 1)))
+    if gt_boxes:
+        for g in gt_boxes:
+            wp = _wireframe_points(g, step=0.01)
+            all_pts.append(wp)
+            all_col.append(np.tile((0.25, 0.41, 0.88), (len(wp), 1)))
+    if not all_pts:
+        print(f"[viz] no boxes to export -> {path} skipped")
+        return
     merged = o3d.geometry.PointCloud(
         o3d.utility.Vector3dVector(np.vstack(all_pts)))
     merged.colors = o3d.utility.Vector3dVector(np.vstack(all_col))
