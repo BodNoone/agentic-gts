@@ -62,15 +62,22 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
             # door seam hidden from one azimuth. Front shows door/panel
             # detail, side shows the row context and depth, oblique (55
             # deg tilt) shows the top and the full outline. All views keep
-            # the same rules: no z cuts (see below), wire3d overlay,
+            # the same rules: a mild top cut (see below), wire3d overlay,
             # gaussians isolated to the boxes' neighbourhood so unrelated
             # structure cannot occlude what is being adjudicated.
+            # Mild ceiling cut: remove everything above the boxes' top so
+            # cable trays / ceiling clutter near the rack do not pile up at
+            # the top of the image. The cut dips ~8cm INTO the rack top
+            # (user-approved 5-10cm sacrifice) -- flush overhead structure
+            # (trays, ducts) otherwise survives a cut at exactly the top.
+            top = max(b.center[2] + b.size[2] / 2.0 for b in boxes)
+            cut_z = top - 0.08
             views = []
             for elev, azim in ((18.0, 0.0), (18.0, 90.0), (55.0, 35.0)):
                 cam = make_local_cam(boxes, extent=extent * 2,
                                      elev_deg=elev, azim_deg=azim)
-                v = render_gs_view(gs, boxes, cam, overlay="wire3d",
-                                   isolate_boxes=True)
+                v = render_gs_view(gs, boxes, cam, cut_z=cut_z,
+                                   overlay="wire3d", isolate_boxes=True)
                 if v is not None:
                     views.append(v)
             if views:
