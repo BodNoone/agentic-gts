@@ -104,9 +104,9 @@ def test_camera_projection_sanity():
     box = OrientedBox(center=(5.0, -3.0, 1.0), size=(1.2, 0.7, 2.0),
                       yaw=math.radians(30.0))
     cam = make_local_cam(box, extent=1.0)
-    # oblique view: the box centre lands inside the frame (lower-half), not
-    # necessarily dead-centre -- a nadir centre assertion no longer applies
-    uv = cam.project_cv(np.asarray(box.center, dtype=float)[None])[0]
+    # oblique view: the box centre lands inside the frame, not
+    # necessarily dead-centre
+    uv = cam.project(np.asarray(box.center, dtype=float)[None])[0]
     assert 0 < uv[0] < cam.W and 0 < uv[1] < cam.H, f"centre off-frame: {uv}"
     # the view is OBLIQUE (not top-down): the look direction has a horizontal
     # component, so the rack's side face is visible (the point of this view)
@@ -114,11 +114,11 @@ def test_camera_projection_sanity():
     look = look / np.linalg.norm(look)
     assert _m.degrees(_m.acos(abs(look[2]))) < 80, "not oblique (too top-down)"
     assert np.linalg.norm(look[:2]) > 0.2, "no horizontal look component"
-    # all corners in front of the camera
+    # all corners in front of the camera (OpenGL: in front => z_cam < 0)
     from agentic_gts.output.gs_render import _box_corners_3d
     cs = _box_corners_3d(box)
-    pc = np.hstack([cs, np.ones((len(cs), 1))]) @ cam.view_cv().T
-    assert np.all(pc[:, 2] > 0)
+    pc = np.hstack([cs, np.ones((len(cs), 1))]) @ cam.view_w2c().T
+    assert np.all(pc[:, 2] < 0)
     print("PASS camera projection sanity (oblique local view)")
 
 
@@ -141,7 +141,7 @@ def test_overlay_footprint_not_3d_wireframe():
     # ring's first corner. Verify that corner is in-frame and pixels near it
     # changed.
     cs = _box_corners_3d(boxes[0])
-    uv0 = cam.project_cv([cs[1]])[0]
+    uv0 = cam.project([cs[1]])[0]
     assert 0 <= uv0[0] < W and 0 <= uv0[1] < H
     # the overlay changed pixels near the box (something was drawn)
     y0, x0 = int(uv0[1]), int(uv0[0])
@@ -163,13 +163,13 @@ def test_godview_nadir_camera():
     assert cam.eye[2] > 3.0, f"camera too low: eye_z={cam.eye[2]:.2f}"
     assert cam.up[2] == 0            # screen up is horizontal (not +z)
     corners = np.array([[0, 0, 2.4], [8, 0, 2.4], [8, 6, 2.4], [0, 6, 2.4]])
-    uv = cam.project_cv(corners)
+    uv = cam.project(corners)
     in_frame = (uv[:, 0].min() > 0.03 * W and uv[:, 0].max() < 0.97 * W and
                 uv[:, 1].min() > 0.03 * H and uv[:, 1].max() < 0.97 * H)
     assert in_frame, f"footprint not framed: uv={uv}"
     # world +x stays on a horizontal screen line, +y on a vertical line
-    uvx = cam.project_cv(np.array([[2, 3, 2.4], [6, 3, 2.4]]))
-    uvy = cam.project_cv(np.array([[4, 1, 2.4], [4, 5, 2.4]]))
+    uvx = cam.project(np.array([[2, 3, 2.4], [6, 3, 2.4]]))
+    uvy = cam.project(np.array([[4, 1, 2.4], [4, 5, 2.4]]))
     assert abs(uvx[0, 1] - uvx[1, 1]) < 1.0      # horizontal
     assert abs(uvy[0, 0] - uvy[1, 0]) < 1.0      # vertical
     print("PASS godview nadir camera (frame + orientation + height)")
@@ -190,7 +190,7 @@ def test_godview_frames_box_footprint():
              for r in range(5) for c in range(12)]
     cam = make_godview_cam(pts, boxes, nadir=True, W=W, H=H)
     gp = np.array([[16, 12, 2.3], [24, 12, 2.3], [24, 18, 2.3], [16, 18, 2.3]])
-    uv = cam.project_cv(gp)
+    uv = cam.project(gp)
     # the rack patch must fill most of the frame, not a tiny central patch
     w_frac = (uv[:, 0].max() - uv[:, 0].min()) / W
     h_frac = (uv[:, 1].max() - uv[:, 1].min()) / H

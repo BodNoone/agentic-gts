@@ -31,8 +31,10 @@ class Cam:
     W: int
     H: int
 
-    # ---- official-3DGS-convention view matrix: cam axes x=right, y=up, z=BACKWARD
-    def view_official(self) -> np.ndarray:
+    # ---- official-3DGS / OpenGL-convention view matrix:
+    # cam axes x=right, y=up, z=BACKWARD (camera looks along -z).
+    # This is what gsplat and diff-gaussian-rasterization expect.
+    def view_w2c(self) -> np.ndarray:
         zax = self.eye - self.target
         zax = zax / (np.linalg.norm(zax) + 1e-12)
         xax = np.cross(self.up, zax)
@@ -43,10 +45,9 @@ class Cam:
         V[:3, 3] = V[:3, :3] @ (-self.eye)
         return V
 
-    # ---- standard CV view matrix: x=right, y=down, z=FORWARD (gsplat's layout)
-    def view_cv(self) -> np.ndarray:
-        D = np.diag([1.0, -1.0, -1.0, 1.0])
-        return D @ self.view_official()
+    # legacy alias
+    def view_official(self) -> np.ndarray:
+        return self.view_w2c()
 
     def K(self) -> np.ndarray:
         fy = (self.H / 2.0) / math.tan(math.radians(self.fovy_deg) / 2.0)
@@ -55,15 +56,24 @@ class Cam:
                          [0.0, fy, self.H / 2.0],
                          [0.0, 0.0, 1.0]])
 
-    # ---- pixel projection, standard CV convention (matches gsplat output)
-    def project_cv(self, pts: np.ndarray) -> np.ndarray:
-        """Nx3 world points -> Nx2 pixel coords (z-forward CV convention)."""
+    def project(self, pts: np.ndarray) -> np.ndarray:
+        """Project Nx3 world points to Nx2 pixel coords.
+
+        Matches gsplat / official 3DGS rasterizer output: (0,0) is top-left,
+        v increases downward. The w2c matrix is OpenGL convention
+        (x=right, y=up, z=backward, looks along -z); the K is OpenCV
+        (fx,fy,cx,cy with v-down). Depth in front of the camera is -z_cam.
+        """
         h = np.hstack([pts, np.ones((len(pts), 1))])
-        pc = h @ self.view_cv().T
-        z = np.clip(pc[:, 2], 1e-6, None)
+        pc = h @ self.view_w2c().T        # (x_c, y_c, z_c) in cam frame
+        d = -pc[:, 2]                      # depth: positive in front of cam
+        d = np.clip(d, 1e-6, None)
         K = self.K()
-        return np.stack([K[0, 0] * pc[:, 0] / z + K[0, 2],
-                         K[1, 1] * pc[:, 1] / z + K[1, 2]], axis=1)
+        # u = fx * x_c / d + cx
+        # v = cy - fy * y_c / d   (cam y up -> image v down)
+        u = K[0, 0] * pc[:, 0] / d + K[0, 2]
+        v = K[1, 2] - K[1, 1] * pc[:, 1] / d
+        return np.stack([u, v], axis=1)
 
 
 def _bbox(pts: np.ndarray):
@@ -146,10 +156,11 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
             c = Cam(eye=np.array([center[0], center[1], eye_z]),
                     target=np.array([center[0], center[1], z_floor]),
                     up=up, fovy_deg=60.0, W=W, H=H)
-            pc = np.hstack([corners, np.ones((len(corners), 1))]) @ c.view_cv().T
-            if not np.all(pc[:, 2] > 0.1):
+            pc = np.hstack([corners, np.ones((len(corners), 1))]) @ c.view_w2c().T
+            # OpenGL cam: in front means z_cam < 0 (camera looks along -z)
+            if not np.all(pc[:, 2] < -0.1):
                 continue
-            uv = c.project_cv(corners)
+            uv = c.project(corners)
             if (uv[:, 0].min() > 0.005 * W and uv[:, 0].max() < 0.995 * W and
                     uv[:, 1].min() > 0.005 * H and uv[:, 1].max() < 0.995 * H):
                 return c
@@ -171,10 +182,10 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
         c = Cam(eye=eye, target=np.array([center[0], center[1], z_floor]),
                 up=up, fovy_deg=60.0, W=W, H=H)
         cam = cam or c
-        pc = np.hstack([corners, np.ones((len(corners), 1))]) @ c.view_cv().T
-        if not np.all(pc[:, 2] > 0.1):       # some corner behind the camera
+        pc = np.hstack([corners, np.ones((len(corners), 1))]) @ c.view_w2c().T
+        if not np.all(pc[:, 2] < -0.1):       # some corner behind the camera
             continue
-        uv = c.project_cv(corners)
+        uv = c.project(corners)
         if (uv[:, 0].min() > 0.03 * W and uv[:, 0].max() < 0.97 * W and
                 uv[:, 1].min() > 0.03 * H and uv[:, 1].max() < 0.97 * H):
             cam = c
@@ -301,7 +312,7 @@ def rasterize_gs(gs: GaussianData, cam: Cam, cut_z: float = float("inf"),
         return None
     try:
         return _try_gsplat(means, quats, scales, opac, rgb,
-                           cam.view_cv(), cam.K(), cam.W, cam.H)
+                           cam.view_w2c(), cam.K(), cam.W, cam.H)
     except ImportError:
         pass
     except Exception as e:
@@ -352,7 +363,7 @@ def overlay_boxes(img: np.ndarray, boxes, cam: Cam) -> np.ndarray:
         # with the rendered rack. The top ring matches the visible footprint.
         # Corner ordering for (x,y,z) in ((-l,l),(-w,w),(-h,h)): top ring =
         # 1,3,7,5. (1=(-l,-w) 3=(-l,+w) 7=(+l,+w) 5=(+l,-w)) -> perimeter.
-        uv = cam.project_cv([cs[1], cs[3], cs[7], cs[5]])
+        uv = cam.project([cs[1], cs[3], cs[7], cs[5]])
         color = (255, 60, 50) if getattr(b.confidence, "value", "") != "low" \
             else (255, 190, 40)
         # thin footprint rectangle
