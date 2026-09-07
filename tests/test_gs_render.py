@@ -316,6 +316,29 @@ def test_near_boxes_mask_isolates():
     print("PASS near-boxes mask keeps box gaussians, drops the rest")
 
 
+def test_near_boxes_mask_keeps_floor():
+    """While isolating, the floor band AROUND the box must survive (the
+    floor never occludes a rack and anchors ground contact for the VLM),
+    but far-away floor is still dropped by the radius cap -- and
+    keep_floor=False restores the old hide-everything behaviour."""
+    from agentic_gts.output.gs_render import _near_boxes_mask
+    gs = _tiny_gs(60)
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(1.2, 0.7, 2.0),
+                      yaw=math.radians(30.0))
+    gs.means[:10] = np.array([0.0, 0.0, 1.0])        # inside the box
+    gs.means[10:30] = np.array([1.2, 1.0, 0.02])     # floor beside the box
+    gs.means[30:50] = np.array([12.0, 12.0, 0.02])   # far-away floor
+    gs.means[50:] = np.array([3.0, 3.0, 1.0])        # far-away occluder
+    m = _near_boxes_mask(gs, [box], margin=0.25)
+    assert m[:10].all(), "box-interior gaussians kept"
+    assert m[10:30].all(), "floor beside the box must stay visible"
+    assert not m[30:50].any(), "far-away floor masked (radius cap)"
+    assert not m[50:].any(), "far-away occluder masked"
+    m2 = _near_boxes_mask(gs, [box], margin=0.25, keep_floor=False)
+    assert not m2[10:30].any(), "keep_floor=False drops the floor again"
+    print("PASS near-boxes mask keeps local floor, drops far floor")
+
+
 def test_tile_views_composite():
     """Three single-view renders must tile into ONE composite (3x width,
     same height + label strip) so the VLM call stays a single image."""
@@ -356,6 +379,7 @@ if __name__ == "__main__":
     test_local_cam_front_face()
     test_local_cam_frames_pair()
     test_near_boxes_mask_isolates()
+    test_near_boxes_mask_keeps_floor()
     test_local_cam_azim_rotates_view()
     test_tile_views_composite()
     test_overlay_footprint_not_3d_wireframe()

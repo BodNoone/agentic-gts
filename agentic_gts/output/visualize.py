@@ -289,19 +289,18 @@ def export_ply(scene: Scene, path: str,
 
 def export_boxes_ply(scene: Scene, path: str,
                      gt_boxes: list[OrientedBox] | None = None) -> None:
-    """Write a boxes-ONLY PLY (no point cloud): dense colored edges +
-    sampled faces per box. Use when the raw cloud would visually bury
-    the layout, or as the lightweight final visualization artifact."""
+    """Write a boxes-ONLY PLY (no point cloud): dense colored wireframe
+    points per box -- no face sampling, so thin fragment boxes render as
+    clean thin wireframes instead of dotted sheets. Use when the raw
+    cloud would visually bury the layout, or as the lightweight final
+    visualization artifact."""
     import open3d as o3d
     all_pts, all_col = [], []
     for b in scene.boxes:
         color = np.asarray(_CONF_COLOR.get(b.confidence.value, (0.3, 0.3, 0.3)))
         wp = _wireframe_points(b, step=0.01)
-        fp = _face_points(b, step=0.03)
         all_pts.append(wp)
         all_col.append(np.tile(np.minimum(color + 0.25, 1.0), (len(wp), 1)))
-        all_pts.append(fp)
-        all_col.append(np.tile(color * 0.6, (len(fp), 1)))
     if gt_boxes:
         for g in gt_boxes:
             wp = _wireframe_points(g, step=0.01)

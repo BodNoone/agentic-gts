@@ -285,8 +285,8 @@ def test_ply_artifacts():
         p1 = os.path.join(out, "boxes_only.ply")
         export_boxes_ply(scene, p1)
         n1 = _ply_point_count(p1)
-        # 3 boxes: 12 edges * ~110 pts + 6 faces * ~240 pts each, no cloud
-        assert 3 * 2000 < n1 < 3 * 8000, f"boxes_only point count {n1} off"
+        # 3 boxes: wireframe only (12 edges, ~1480 pts each), no faces/cloud
+        assert 3 * 1000 < n1 < 3 * 4000, f"boxes_only point count {n1} off"
         # mixed: cloud points must dominate
         p2 = os.path.join(out, "cloud_with_boxes.ply")
         export_ply(scene, p2, gs_ply=None)

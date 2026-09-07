@@ -64,7 +64,9 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
             # deg tilt) shows the top and the full outline. All views keep
             # the same rules: no z cuts (see below), wire3d overlay,
             # gaussians isolated to the boxes' neighbourhood so unrelated
-            # structure cannot occlude what is being adjudicated.
+            # structure cannot occlude what is being adjudicated -- except
+            # the floor band around the boxes, which never occludes and
+            # anchors the rack (ground contact = free evidence).
             views = []
             for elev, azim in ((18.0, 0.0), (18.0, 90.0), (55.0, 35.0)):
                 cam = make_local_cam(boxes, extent=extent * 2,
@@ -127,7 +129,9 @@ _LOCAL_VIEW_DESC = (
     "front face: doors, panels, LEDs), 'side' (view along the row: depth and "
     "neighbouring racks), and 'oblique' (elevated view: top face and full "
     "outline). Red wireframes mark the candidate box(es); each wireframe is "
-    "the full 3D box, not just its top."
+    "the full 3D box, not just its top. The floor around the candidate is "
+    "kept visible: check whether the box's bottom actually touches the "
+    "ground -- a wireframe floating above the floor suggests a bad box."
 )
 
 
