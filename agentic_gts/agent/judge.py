@@ -44,8 +44,10 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
     """Render the local evidence image the VLM adjudicates on.
 
     If the scene comes from a 3DGS model (gs_ply set and a CUDA rasterizer
-    is available), this is a TRUE Gaussian-splat render from a nadir camera
-    over the box; otherwise it falls back to the 2D scatter density view.
+    is available), this is a TRUE Gaussian-splat render from a front-face
+    camera (slight downward tilt) with the full 3D wireframe overlaid --
+    the fine-detail counterpart to the god-view's coarse positioning.
+    Otherwise it falls back to the 2D scatter density view.
     """
     # ---- 3DGS true render (preferred when available) ----
     if gs_ply and boxes:
@@ -54,11 +56,15 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
             from agentic_gts.output.gs_render import make_local_cam, render_gs_view
             gs = read_gaussian_ply(gs_ply)
             # Match the god-view cut so the same overhead structure (lamps,
-            # trays) does not appear in the local oblique crop either.
+            # trays) does not appear in the local crop either. The floor cut
+            # is dropped here: this is now a FRONT-FACE detail view, the
+            # floor no longer occludes the rack (it lies below the sight
+            # line), and cutting it would detach the wireframe's bottom ring
+            # from the visible rack body.
             cut = _render_cut_z(stage_points, boxes, margin=-0.45)
-            cut_low = _render_cut_z_low(boxes)
             cam = make_local_cam(boxes[0], extent=extent * 2)
-            img = render_gs_view(gs, boxes, cam, cut_z=cut, cut_z_low=cut_low)
+            img = render_gs_view(gs, boxes, cam, cut_z=cut,
+                                 overlay="wire3d")
             if img is not None:
                 return img
         except Exception as e:

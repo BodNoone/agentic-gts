@@ -183,25 +183,29 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
 
 
 def make_local_cam(box, extent: float = 1.2, W: int = 448, H: int = 448,
-                   elev_deg: float = 38.0) -> Cam:
-    """Oblique camera for one box so the VLM sees the rack's side + top.
+                   elev_deg: float = 18.0) -> Cam:
+    """Front-face camera for one box: the fine-detail counterpart to the
+    god-view's coarse positioning.
 
-    A pure top-down view only shows the rack top and loses the
-    height/door/side detail that distinguishes a rack from clutter. Here the
-    camera sits up and to one side, looking down and IN toward the box. The
-    horizontal direction is aligned with the box's yaw (its long axis), so we
-    look along the row -- the info-rich face. `up` is world-vertical so the
-    rack stays upright in the image.
+    The camera looks at the box from its FRONT (perpendicular to the row
+    direction), tilted down only slightly (`elev_deg`): the VLM sees the
+    rack's front face (doors/panels/LED detail) plus a sliver of the top.
+    A steep tilt would collapse the height back into a near-top-down view
+    -- the thing the god-view already provides. `up` stays world-vertical
+    so the rack renders upright.
     """
     c = np.asarray(box.center, dtype=float)
-    top = c[2] + box.size[2] / 2.0
-    # aim at the box's upper-mid so the whole rack is in view
-    aim = np.array([c[0], c[1], c[2] + box.size[2] * 0.35])
-    # horizontal offset along the box's long axis (its yaw direction)
-    hdir = np.array([math.cos(box.yaw), math.sin(box.yaw), 0.0])
-    horiz = np.asarray(box.size[0]) * 1.0 + extent
-    eye = aim + hdir * horiz + np.array([0.0, 0.0, horiz * math.tan(math.radians(elev_deg)) * 1.6])
-    return Cam(eye=eye, target=aim, up=np.array([0.0, 0.0, 1.0]),
+    yaw = float(box.yaw)
+    # front direction = cross axis (the rack's door face), NOT the row axis
+    front = np.array([-math.sin(yaw), math.cos(yaw), 0.0])
+    size = np.asarray(box.size, dtype=float)
+    # distance so the full rack height (and its width + margin) stay framed
+    fy = math.tan(math.radians(60.0 / 2.0))
+    fx = fy * (W / H)
+    dist = max((size[2] / 2.0) / fy, (size[0] / 2.0 + extent) / fx)
+    eye = c + front * dist + np.array(
+        [0.0, 0.0, dist * math.tan(math.radians(elev_deg))])
+    return Cam(eye=eye, target=c, up=np.array([0.0, 0.0, 1.0]),
                fovy_deg=60.0, W=W, H=H)
 
 
@@ -329,21 +333,47 @@ def _box_corners_3d(box) -> np.ndarray:
     return local @ rot.T + np.asarray(box.center, dtype=float)
 
 
-def overlay_boxes(img: np.ndarray, boxes, cam: Cam) -> np.ndarray:
+def overlay_boxes(img: np.ndarray, boxes, cam: Cam,
+                  mode: str = "footprint") -> np.ndarray:
     """Overlay numbered boxes on a rendered image.
 
-    God-view is a top-down *discovery* view: the VLM only needs to know WHERE
-    devices are (2D), not the 3D orientation/height. We therefore draw only
-    the box's footprint rectangle (thin, semi-transparent, confidence-coloured)
-    plus a small high-contrast numbered chip, so the gaussian render underneath
-    stays readable. The chip is placed on the rectangle's edge (not its centre)
-    so it never hides the rack body.
+    mode="footprint" (god-view): a top-down *discovery* view -- the VLM only
+    needs to know WHERE devices are (2D), so we draw only the box's top-face
+    rectangle (thin, confidence-coloured) plus a numbered chip; the gaussian
+    render underneath stays readable.
+
+    mode="wire3d" (local evidence): the camera looks at the box from its
+    front at a slight tilt, so we draw the FULL 12-edge 3D wireframe. A
+    lone top rectangle would float mid-air over an oblique render; the full
+    wireframe hugs the rack's visible faces and shows the VLM exactly which
+    volume the candidate box claims.
     """
     from PIL import Image, ImageDraw
     pil = Image.fromarray((np.clip(img, 0, 1) * 255).astype(np.uint8))
     dr = ImageDraw.Draw(pil)
     for i, b in enumerate(boxes):
         cs = _box_corners_3d(b)
+        color = (255, 60, 50) if getattr(b.confidence, "value", "") != "low" \
+            else (255, 190, 40)
+        if mode == "wire3d":
+            # corner ordering (x,y,z) in ((-l,l),(-w,w),(-h,h)):
+            # idx = 4*xi + 2*yi + zi, so 0..7. Full 12-edge wireframe.
+            uv = cam.project_cv(cs)
+            top_ring = [uv[1], uv[3], uv[7], uv[5]]
+            bot_ring = [uv[0], uv[2], uv[6], uv[4]]
+            for ring in (top_ring, bot_ring):
+                dr.line([tuple(p) for p in ring] + [tuple(ring[0])],
+                        fill=color, width=2)
+            for a, bidx in ((0, 1), (2, 3), (6, 7), (4, 5)):
+                dr.line([tuple(uv[a]), tuple(uv[bidx])], fill=color, width=2)
+            # numbered chip at the bottom ring's near corner
+            cx, cy = uv[0]
+            chip = str(i)
+            wpx = dr.textlength(chip, font=None)
+            dr.rectangle([cx - 3, cy - 9, cx + wpx + 5, cy + 5], fill=(0, 0, 0))
+            dr.text((cx + 2, cy - 8), chip, fill=(255, 255, 255))
+            continue
+        # ---- footprint mode (god-view) ----
         # Project the TOP ring (z=+h) in polygon order. The god view is a
         # discovery view and the rack's visible top is what the VLM sees as
         # "where the device is"; projecting the bottom ring would be pulled
@@ -353,8 +383,6 @@ def overlay_boxes(img: np.ndarray, boxes, cam: Cam) -> np.ndarray:
         # Corner ordering for (x,y,z) in ((-l,l),(-w,w),(-h,h)): top ring =
         # 1,3,7,5. (1=(-l,-w) 3=(-l,+w) 7=(+l,+w) 5=(+l,-w)) -> perimeter.
         uv = cam.project_cv([cs[1], cs[3], cs[7], cs[5]])
-        color = (255, 60, 50) if getattr(b.confidence, "value", "") != "low" \
-            else (255, 190, 40)
         # thin footprint rectangle
         dr.line([tuple(uv[0]), tuple(uv[1]), tuple(uv[2]), tuple(uv[3]),
                  tuple(uv[0])], fill=color, width=2)
@@ -369,13 +397,14 @@ def overlay_boxes(img: np.ndarray, boxes, cam: Cam) -> np.ndarray:
 
 def render_gs_view(gs: GaussianData, boxes, cam: Cam,
                    cut_z: float = float("inf"),
-                   cut_z_low: float = float("-inf")):
+                   cut_z_low: float = float("-inf"),
+                   overlay: str = "footprint"):
     """Full render: gaussians + numbered box overlay. None if no backend."""
     img = rasterize_gs(gs, cam, cut_z=cut_z, cut_z_low=cut_z_low)
     if img is None:
         return None
     if boxes:
-        img = overlay_boxes(img, boxes, cam)
+        img = overlay_boxes(img, boxes, cam, mode=overlay)
     return img
 
 

@@ -230,12 +230,67 @@ def test_prep_cuts_floor():
     print("PASS prep cuts floor gaussians at cut_z_low")
 
 
+def test_local_cam_front_face():
+    """The local camera must look at the box's FRONT (cross axis) with only
+    a slight tilt -- not a steep oblique / near-top-down view."""
+    import math as _m
+    from agentic_gts.output.gs_render import make_local_cam
+    yaw = _m.radians(30.0)
+    box = OrientedBox(center=(5.0, -3.0, 1.0), size=(1.2, 0.7, 2.0), yaw=yaw)
+    cam = make_local_cam(box, extent=1.0)
+    # sight direction is (mostly) along the box's cross axis = the front
+    front = np.array([-_m.sin(yaw), _m.cos(yaw)])
+    look = cam.target - cam.eye
+    look = look / np.linalg.norm(look)
+    align = -look[:2] @ front / (np.linalg.norm(look[:2]) + 1e-9)
+    assert align > 0.9, f"not looking at the front face (align={align:.2f})"
+    # SLIGHT tilt only: the look direction stays near-horizontal
+    tilt = _m.degrees(_m.asin(np.clip(-look[2], -1, 1)))
+    assert 0 < tilt < 35, f"tilt should be slight, got {tilt:.1f} deg"
+    # whole box stays in frame
+    from agentic_gts.output.gs_render import _box_corners_3d
+    cs = _box_corners_3d(box)
+    uv = cam.project_cv(cs)
+    assert (uv[:, 0].min() > 0 and uv[:, 0].max() < cam.W and
+            uv[:, 1].min() > 0 and uv[:, 1].max() < cam.H), f"box off-frame: {uv}"
+    print(f"PASS local cam front-face view (tilt {tilt:.1f} deg, box framed)")
+
+
+def test_overlay_wire3d_for_local_view():
+    """Local evidence overlay must draw the FULL 12-edge wireframe (the
+    camera is oblique; a lone top rectangle would float mid-air)."""
+    from agentic_gts.output.gs_render import _box_corners_3d, make_local_cam, overlay_boxes
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(0.6, 1.1, 2.0), yaw=0.0)
+    cam = make_local_cam(box, extent=1.0, W=448, H=448)
+    img = np.full((cam.H, cam.W, 3), 0.3, dtype=np.float32)
+    out = overlay_boxes(img, [box], cam, mode="wire3d")
+    # every edge midpoint of the wireframe must show drawn pixels: sample a
+    # few projected edge midpoints and confirm they differ from the flat input
+    cs = _box_corners_3d(box)
+    uv = cam.project_cv(cs)
+    edges = [(0, 1), (2, 3), (6, 7), (4, 5),        # vertical edges
+             (1, 3), (3, 7), (7, 5), (5, 1),        # top ring
+             (0, 2), (2, 6), (6, 4), (4, 0)]        # bottom ring
+    n_drawn = 0
+    for a, b in edges:
+        m = (uv[a] + uv[b]) / 2.0
+        x, y = int(m[0]), int(m[1])
+        if 0 <= y < cam.H and 0 <= x < cam.W:
+            if not np.allclose(out[y - 1:y + 2, x - 1:x + 2],
+                              img[y - 1:y + 2, x - 1:x + 2]):
+                n_drawn += 1
+    assert n_drawn >= 10, f"only {n_drawn}/12 edges visible"
+    print(f"PASS wire3d overlay draws full box ({n_drawn}/12 edges visible)")
+
+
 if __name__ == "__main__":
     test_gs_roundtrip_binary()
     test_gs_parse_ascii()
     test_render_falls_back_without_cuda()
     test_camera_projection_sanity()
+    test_local_cam_front_face()
     test_overlay_footprint_not_3d_wireframe()
+    test_overlay_wire3d_for_local_view()
     test_godview_nadir_camera()
     test_godview_frames_box_footprint()
     test_prep_cuts_ceiling()
