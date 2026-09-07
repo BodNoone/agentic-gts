@@ -44,32 +44,37 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
     """Render the local evidence image the VLM adjudicates on.
 
     If the scene comes from a 3DGS model (gs_ply set and a CUDA rasterizer
-    is available), this is a TRUE Gaussian-splat render from a front-face
-    camera (slight downward tilt) with the full 3D wireframe overlaid --
-    the fine-detail counterpart to the god-view's coarse positioning.
-    Otherwise it falls back to the 2D scatter density view.
+    is available), this is a TRUE Gaussian-splat composite of THREE views
+    (front / side / oblique-top), each with the full 3D wireframe overlaid
+    and unrelated gaussians hidden -- the fine-detail counterpart to the
+    god-view's coarse positioning. Otherwise it falls back to the 2D
+    scatter density view.
     """
     # ---- 3DGS true render (preferred when available) ----
     if gs_ply and boxes:
         try:
             from agentic_gts.tools.gs_io import read_gaussian_ply
-            from agentic_gts.output.gs_render import make_local_cam, render_gs_view
+            from agentic_gts.output.gs_render import (make_local_cam,
+                                                      render_gs_view)
             gs = read_gaussian_ply(gs_ply)
-            # NO ceiling cut here (unlike the god-view): the front-face
-            # camera looks nearly horizontally, so overhead structure sits
-            # above the sight line and cannot bury the rack. Cutting at
-            # box-top - 0.45m would instead TRUNCATE the rack's own top
-            # section, hiding exactly the detail this view exists for. The
-            # floor cut is dropped for the same reason (cutting it would
-            # detach the wireframe's bottom ring from the visible body).
-            # The camera frames the UNION of all boxes (a merge-pair passes
-            # two) and the render ISOLATES the near-box gaussians so
-            # unrelated structure cannot occlude the adjudicated box.
-            cam = make_local_cam(boxes, extent=extent * 2)
-            img = render_gs_view(gs, boxes, cam, overlay="wire3d",
-                                 isolate_boxes=True)
-            if img is not None:
-                return img
+            # THREE views per adjudication (tiled into one image): a single
+            # front view can be ambiguous -- reflections, blank panels, a
+            # door seam hidden from one azimuth. Front shows door/panel
+            # detail, side shows the row context and depth, oblique (55
+            # deg tilt) shows the top and the full outline. All views keep
+            # the same rules: no z cuts (see below), wire3d overlay,
+            # gaussians isolated to the boxes' neighbourhood so unrelated
+            # structure cannot occlude what is being adjudicated.
+            views = []
+            for elev, azim in ((18.0, 0.0), (18.0, 90.0), (55.0, 35.0)):
+                cam = make_local_cam(boxes, extent=extent * 2,
+                                     elev_deg=elev, azim_deg=azim)
+                v = render_gs_view(gs, boxes, cam, overlay="wire3d",
+                                   isolate_boxes=True)
+                if v is not None:
+                    views.append(v)
+            if views:
+                return _tile_views(views)
         except Exception as e:
             print(f"[gs][local] true render failed ({type(e).__name__}: {e}) "
                   f"-> scatter fallback")
@@ -111,6 +116,39 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
     plt.close(fig)
     buf.seek(0)
     return np.array(plt.imread(buf))  # HxWx4
+
+
+def _tile_views(views: list, labels=("front", "side", "oblique")) -> np.ndarray:
+    """Tile multiple single-view renders into ONE composite image.
+
+    One image per VLM call keeps the (OpenAI-compatible / transformers)
+    API payload unchanged -- a single image input -- while showing the box
+    from several viewpoints. Views are laid out horizontally with a small
+    label strip above each so the VLM (and auditors reading the saved
+    evidence) can tell them apart.
+    """
+    from PIL import Image, ImageDraw
+    tiles = []
+    for i, v in enumerate(views):
+        arr = (np.clip(v, 0, 1) * 255).astype(np.uint8)
+        if arr.shape[2] == 4:
+            arr = arr[:, :, :3]
+        im = Image.fromarray(arr)
+        strip = Image.new("RGB", (im.width, 18), (0, 0, 0))
+        d = ImageDraw.Draw(strip)
+        d.text((6, 3), labels[i % len(labels)], fill=(255, 255, 255))
+        tile = Image.new("RGB", (im.width, im.height + 18), (0, 0, 0))
+        tile.paste(strip, (0, 0))
+        tile.paste(im, (0, 18))
+        tiles.append(tile)
+    W = sum(t.width for t in tiles) + 4 * (len(tiles) - 1)
+    H = max(t.height for t in tiles)
+    out = Image.new("RGB", (W, H), (0, 0, 0))
+    x = 0
+    for t in tiles:
+        out.paste(t, (x, 0))
+        x += t.width + 4
+    return np.asarray(out).astype(np.float32) / 255.0
 
 
 def _auto_ceiling_z(z: np.ndarray, gap: float = 0.3, frac: float = 0.05) -> float:

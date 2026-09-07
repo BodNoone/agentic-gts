@@ -183,28 +183,32 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
 
 
 def make_local_cam(boxes, extent: float = 1.2, W: int = 448, H: int = 448,
-                   elev_deg: float = 18.0) -> Cam:
-    """Front-face camera for one box (or a pair): the fine-detail
-    counterpart to the god-view's coarse positioning.
+                   elev_deg: float = 18.0, azim_deg: float = 0.0) -> Cam:
+    """Camera for one box (or a pair): the fine-detail counterpart to the
+    god-view's coarse positioning.
 
     Accepts a single OrientedBox or a LIST of boxes (e.g. the two faces of
     a merge-pair adjudication) and frames the UNION of all their 3D corners
     -- with a verify-and-back-off loop so nothing clips out of view.
 
     The camera looks at the box from its FRONT (perpendicular to the row
-    direction), tilted down only slightly (`elev_deg`): the VLM sees the
-    rack's front face (doors/panels/LED detail) plus a sliver of the top.
-    A steep tilt would collapse the height back into a near-top-down view
-    -- the thing the god-view already provides. `up` stays world-vertical
-    so the rack renders upright.
+    direction), rotated around the box by `azim_deg` (0 = front face, 90 =
+    side face), tilted down by `elev_deg`. A slight tilt shows the face
+    detail (doors/panels/LED); a steeper one (e.g. 55) shows the top and
+    the box's full outline. `up` stays world-vertical so the rack renders
+    upright.
     """
     if hasattr(boxes, "center"):    # tolerate a single OrientedBox
         boxes = [boxes]
     ref = boxes[0]
     c = np.asarray(ref.center, dtype=float)
     yaw = float(ref.yaw)
-    # front direction = cross axis (the rack's door face), NOT the row axis
-    front = np.array([-math.sin(yaw), math.cos(yaw), 0.0])
+    # horizontal viewing direction: box front (cross axis) rotated by azim
+    az = math.radians(azim_deg)
+    base = np.array([-math.sin(yaw), math.cos(yaw)])          # front (cross)
+    rot = np.array([[math.cos(az), -math.sin(az)],
+                    [math.sin(az), math.cos(az)]])
+    horiz = rot @ base
     # all 3D corners of all boxes: the union that must stay in frame
     corners = np.vstack([_box_corners_3d(b) for b in boxes])
     fy = math.tan(math.radians(60.0 / 2.0))
@@ -215,8 +219,8 @@ def make_local_cam(boxes, extent: float = 1.2, W: int = 448, H: int = 448,
     dist0 = max(spans[2] / 2.0 / fy, (spans[0] + extent) / 2.0 / fx)
     for f in (1.0, 1.1, 1.25, 1.4, 1.6, 1.9, 2.2, 2.6, 3.0, 3.5):
         dist = dist0 * f
-        eye = c + front * dist + np.array(
-            [0.0, 0.0, dist * math.tan(math.radians(elev_deg))])
+        eye = c + np.array([horiz[0] * dist, horiz[1] * dist,
+                            dist * math.tan(math.radians(elev_deg))])
         cam = Cam(eye=eye, target=c, up=np.array([0.0, 0.0, 1.0]),
                   fovy_deg=60.0, W=W, H=H)
         pc = np.hstack([corners, np.ones((len(corners), 1))]) @ cam.view_cv().T

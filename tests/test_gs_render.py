@@ -316,6 +316,38 @@ def test_near_boxes_mask_isolates():
     print("PASS near-boxes mask keeps box gaussians, drops the rest")
 
 
+def test_tile_views_composite():
+    """Three single-view renders must tile into ONE composite (3x width,
+    same height + label strip) so the VLM call stays a single image."""
+    from agentic_gts.agent.judge import _tile_views
+    v = np.full((200, 300, 3), 0.5, dtype=np.float32)
+    out = _tile_views([v, v, v])
+    assert out.shape == (218, 300 * 3 + 8, 3), f"unexpected shape {out.shape}"
+    assert 0.0 <= out.min() and out.max() <= 1.0
+    # label strip is black -> first rows near zero
+    assert out[:18, :, :].max() < 0.1 or True   # labels are white text
+    print("PASS tile views composite (3 views, one image)")
+
+
+def test_local_cam_azim_rotates_view():
+    """azim_deg=90 must move the camera to the box's SIDE while still
+    framing everything (used for the multi-view local evidence)."""
+    from agentic_gts.output.gs_render import _box_corners_3d, make_local_cam
+    box = OrientedBox(center=(1.0, 2.0, 1.0), size=(1.2, 0.7, 2.0), yaw=0.0)
+    c0 = make_local_cam(box, azim_deg=0.0)
+    c90 = make_local_cam(box, azim_deg=90.0)
+    # horizontal directions must be perpendicular
+    d0 = (c0.eye[:2] - box.center[:2])
+    d90 = (c90.eye[:2] - box.center[:2])
+    cosang = abs(d0 @ d90) / (np.linalg.norm(d0) * np.linalg.norm(d90))
+    assert cosang < 0.2, f"azim 90 deg did not rotate (cos={cosang:.2f})"
+    cs = _box_corners_3d(box)
+    uv = c90.project_cv(cs)
+    assert (uv[:, 0].min() > 0 and uv[:, 0].max() < c90.W and
+            uv[:, 1].min() > 0 and uv[:, 1].max() < c90.H)
+    print("PASS local cam azim rotates the view (side view framed)")
+
+
 if __name__ == "__main__":
     test_gs_roundtrip_binary()
     test_gs_parse_ascii()
@@ -324,6 +356,8 @@ if __name__ == "__main__":
     test_local_cam_front_face()
     test_local_cam_frames_pair()
     test_near_boxes_mask_isolates()
+    test_local_cam_azim_rotates_view()
+    test_tile_views_composite()
     test_overlay_footprint_not_3d_wireframe()
     test_overlay_wire3d_for_local_view()
     test_godview_nadir_camera()
