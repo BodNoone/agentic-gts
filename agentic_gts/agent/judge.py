@@ -55,16 +55,15 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
             from agentic_gts.tools.gs_io import read_gaussian_ply
             from agentic_gts.output.gs_render import make_local_cam, render_gs_view
             gs = read_gaussian_ply(gs_ply)
-            # Match the god-view cut so the same overhead structure (lamps,
-            # trays) does not appear in the local crop either. The floor cut
-            # is dropped here: this is now a FRONT-FACE detail view, the
-            # floor no longer occludes the rack (it lies below the sight
-            # line), and cutting it would detach the wireframe's bottom ring
-            # from the visible rack body.
-            cut = _render_cut_z(stage_points, boxes, margin=-0.45)
+            # NO ceiling cut here (unlike the god-view): the front-face
+            # camera looks nearly horizontally, so overhead structure sits
+            # above the sight line and cannot bury the rack. Cutting at
+            # box-top - 0.45m would instead TRUNCATE the rack's own top
+            # section, hiding exactly the detail this view exists for. The
+            # floor cut is dropped for the same reason (cutting it would
+            # detach the wireframe's bottom ring from the visible body).
             cam = make_local_cam(boxes[0], extent=extent * 2)
-            img = render_gs_view(gs, boxes, cam, cut_z=cut,
-                                 overlay="wire3d")
+            img = render_gs_view(gs, boxes, cam, overlay="wire3d")
             if img is not None:
                 return img
         except Exception as e:
