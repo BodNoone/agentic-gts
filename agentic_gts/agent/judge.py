@@ -34,6 +34,7 @@ class Verdict:
     confidence: float = 0.5
     detail: str = ""
     raw: str = ""
+    png_path: str = None  # where the evidence image was persisted (if enabled)
 
 
 # ---------- image rendering helpers ----------
@@ -295,10 +296,33 @@ class VLMJudge:
         self.timeout = timeout
         self._local_model = None   # lazy: (processor, model), loaded once
         self.record_path = None    # if set, append JSONL records of adjudications
+        self.evidence_dir = None   # if set, persist adjudication images here
 
     def set_record(self, record_path: str) -> None:
-        """Enable structured recording of every adjudication to a JSONL file."""
+        """Enable structured recording of every adjudication to a JSONL file.
+        Also enables persisting every evidence image the VLM actually saw
+        (saved next to the record file) so decisions can be audited."""
         self.record_path = record_path
+        import os as _os
+        d = _os.path.dirname(record_path)
+        self.evidence_dir = d if d else "."
+
+    def _save_evidence_png(self, img_arr: np.ndarray, name: str) -> str | None:
+        """Persist the exact image the VLM adjudicates on (best-effort)."""
+        if not self.evidence_dir:
+            return None
+        try:
+            import os as _os
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            _os.makedirs(self.evidence_dir, exist_ok=True)
+            path = _os.path.join(self.evidence_dir, name)
+            plt.imsave(path, img_arr)
+            return path
+        except Exception as e:
+            print(f"[vlm][evidence] save failed ({type(e).__name__}: {e})")
+            return None
 
     def _record(self, kind: str, prompt: str, answer: str,
                 choice: str, confidence: float, detail: str,
@@ -328,7 +352,8 @@ class VLMJudge:
         else:
             v = self._qwen_adjudicate(scene, box, question, options)
         self._record("box", question, v.raw or v.detail,
-                     (v.params or {}).get("choice", ""), v.confidence, v.detail)
+                     (v.params or {}).get("choice", ""), v.confidence, v.detail,
+                     png_path=v.png_path)
         return v
 
     def adjudicate_pair(self, scene, a, b, question: str,
@@ -343,9 +368,15 @@ class VLMJudge:
             return Verdict(action="keep", confidence=0.5, detail="no boxes")
         boxes = [a, b]
         v = None
+        png_path = None
         try:
             img_arr = render_topdown_image(scene.points, boxes,
                                            gs_ply=scene.meta.get("gs_ply"))
+            # persist the exact image the VLM reasons over: for a merge
+            # decision this crop (both boxes + surrounding structure) is the
+            # single most useful artifact when auditing a wrong merge/keep
+            png_path = self._save_evidence_png(
+                img_arr, f"pair_evidence_{a.box_id[:8]}_{b.box_id[:8]}.png")
             if self.backend == "local":
                 v = self._local_pair_call(img_arr, question, options)
             elif self.backend == "qwen":
@@ -356,8 +387,10 @@ class VLMJudge:
         except Exception as e:
             print(f"[vlm][pair] failed ({type(e).__name__}: {e}) -> keep")
             v = Verdict(action="keep", confidence=0.5, detail=f"{type(e).__name__}")
+        v.png_path = png_path
         self._record("pair", question, v.raw or v.detail,
-                     (v.params or {}).get("choice", ""), v.confidence, v.detail)
+                     (v.params or {}).get("choice", ""), v.confidence, v.detail,
+                     png_path=png_path)
         return v
 
     def _local_pair_call(self, img_arr, question, options) -> Verdict:
@@ -598,6 +631,8 @@ class VLMJudge:
 
             img_arr = render_topdown_image(scene.points, [box],
                                            gs_ply=scene.meta.get("gs_ply"))
+            png_path = self._save_evidence_png(
+                img_arr, f"evidence_{box.box_id[:8]}.png")
             buf = io.BytesIO()
             plt.imsave(buf, img_arr, format="png")
             image = Image.open(buf).convert("RGB")
@@ -631,7 +666,8 @@ class VLMJudge:
                 trimmed, skip_special_tokens=True)[0].strip()
             matched = self._match_option(answer, options)
             return Verdict(action="answer", params={"choice": matched},
-                           confidence=0.8, detail=answer, raw=answer)
+                           confidence=0.8, detail=answer, raw=answer,
+                           png_path=png_path)
         except Exception as e:
             print(f"[vlm][local] inference failed ({type(e).__name__}: {e}) "
                   f"-> falling back to mock")
@@ -642,6 +678,8 @@ class VLMJudge:
                          options: list[str]) -> Verdict:
         img_arr = render_topdown_image(scene.points, [box],
                                        gs_ply=scene.meta.get("gs_ply"))
+        png_path = self._save_evidence_png(
+            img_arr, f"evidence_{box.box_id[:8]}.png")
         b64 = self._array_to_png_b64(img_arr)
         prompt = (
             f"You are an auditor in a data-center layout tool. Decide the best "
@@ -675,7 +713,8 @@ class VLMJudge:
             text = r.json()["choices"][0]["message"]["content"].strip()
             matched = self._match_option(text, options)
             return Verdict(action="answer", params={"choice": matched},
-                           confidence=0.8, detail=text, raw=text)
+                           confidence=0.8, detail=text, raw=text,
+                           png_path=png_path)
         except Exception as e:  # fallback to mock on any failure
             return self._mock_adjudicate(box, question)
 
