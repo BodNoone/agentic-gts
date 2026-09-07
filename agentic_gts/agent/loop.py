@@ -153,6 +153,22 @@ class LayoutAgent:
         return res
 
     # ---------------- god-view global audit ----------------
+    def _save_godview_png(self, scene: Scene, name: str = "godview.png") -> None:
+        """Persist the exact top-down image the VLM audits on (best-effort)."""
+        if not self.out_dir:
+            return
+        try:
+            from agentic_gts.agent.judge import render_godview_png
+            import os as _os
+            _os.makedirs(self.out_dir, exist_ok=True)
+            path = _os.path.join(self.out_dir, name)
+            with open(path, "wb") as f:
+                f.write(render_godview_png(scene.points, scene.boxes,
+                                           gs_ply=scene.meta.get("gs_ply")))
+            print(f"[diag][C] godview render -> {path}")
+        except Exception as e:
+            print(f"[diag][C] godview render save failed ({type(e).__name__})")
+
     def godview_pass(self, scene: Scene) -> list[Issue]:
         """One global VLM call over the whole scene (top-down, all boxes).
 
@@ -165,18 +181,7 @@ class LayoutAgent:
         # persist the exact image the VLM sees: it is the single most
         # useful artifact when auditing why the agent flagged (or missed)
         # a box -- no guessing from logs
-        if self.out_dir:
-            try:
-                from agentic_gts.agent.judge import render_godview_png
-                import os as _os
-                _os.makedirs(self.out_dir, exist_ok=True)
-                path = _os.path.join(self.out_dir, "godview.png")
-                with open(path, "wb") as f:
-                    f.write(render_godview_png(scene.points, scene.boxes,
-                                               gs_ply=scene.meta.get("gs_ply")))
-                print(f"[diag][C] godview render -> {path}")
-            except Exception as e:
-                print(f"[diag][C] godview render save failed ({type(e).__name__})")
+        self._save_godview_png(scene, "godview.png")
         try:
             flagged = self.judge.adjudicate_godview(scene, scene.boxes)
         except Exception as e:
@@ -197,17 +202,39 @@ class LayoutAgent:
     # ---------------- repair loop ----------------
     def run(self, scene: Scene) -> AgentReport:
         report = AgentReport()
+        # fixes cascade: a split creates fragments that may need merging, a
+        # merge may overlap a neighbour. One detection pass cannot see the
+        # problems the fixes THEMSELVES introduce -- so re-detect after each
+        # round (rules only; the god-view runs once up front) until a
+        # fixpoint or the round cap. `handled` prevents retrying an issue
+        # that failed verification (its key is stable while geometry is).
+        handled: set = set()
+        max_rounds = int(self.opts.get("agent_rounds", 3))
         issues = self.godview_pass(scene) + self.detect_issues(scene)
-        from collections import Counter
-        cnt = Counter(i.issue_type.value for i in issues)
-        print(f"[diag][C] issues detected: {dict(cnt) if cnt else 'none'}")
-        for issue in issues:
-            ok = self._handle_issue(scene, issue, report)
-            entry = {"issue": issue.to_dict(), "ok": ok}
-            (report.resolved if ok else report.unresolved).append(entry)
+        for rnd in range(max_rounds):
+            from collections import Counter
+            cnt = Counter(i.issue_type.value for i in issues)
+            print(f"[diag][C] round {rnd}: issues detected: "
+                  f"{dict(cnt) if cnt else 'none'}")
+            fresh = 0
+            for issue in issues:
+                key = (issue.issue_type.value, tuple(issue.box_ids),
+                       issue.detail)
+                if key in handled:
+                    continue
+                handled.add(key)
+                fresh += 1
+                ok = self._handle_issue(scene, issue, report)
+                entry = {"issue": issue.to_dict(), "ok": ok}
+                (report.resolved if ok else report.unresolved).append(entry)
+            if fresh == 0:
+                break
+            issues = self.detect_issues(scene)
         # final edge refinement: snap every box to its point support
         self._refine_edges(scene)
-        # confidence tagging
+        # confidence tagging (BEFORE the final QA: the QA's LOW marks must
+        # survive as the last word, not be overwritten back to HIGH by a
+        # good support fraction)
         for b in scene.boxes:
             sup = geo.support_fraction(scene, b)
             if sup > 0.3 and b.source != BoxSource.ROW_COMPLETION:
@@ -216,7 +243,41 @@ class LayoutAgent:
                 b.confidence = Confidence.MID
             else:
                 b.confidence = Confidence.LOW
+        # final global QA over the REPAIRED state: the repair loop can
+        # itself introduce global anomalies, and the first god-view pass
+        # ran before any fix so it never saw them
+        self._final_godview_qa(scene, report)
         return report
+
+    def _final_godview_qa(self, scene: Scene, report: AgentReport) -> None:
+        """One last god-view audit over the repaired state.
+
+        Late flags are NOT executed (repairs had their chance) -- a
+        deletion here could not be re-examined. Instead the box is marked
+        LOW confidence and surfaces as an unresolved entry for human
+        review. Mock/failure -> silently skipped.
+        """
+        self._save_godview_png(scene, "godview_final.png")
+        try:
+            flagged = self.judge.adjudicate_godview(scene, scene.boxes)
+        except Exception as e:
+            print(f"[diag][C] final godview QA error ({type(e).__name__}) -> skipped")
+            return
+        if not flagged:
+            print("[diag][C] final godview QA: clean")
+            return
+        for f in flagged:
+            if not (0 <= f["index"] < len(scene.boxes)):
+                continue
+            b = scene.boxes[f["index"]]
+            b.confidence = Confidence.LOW
+            print(f"[diag][C] final godview flagged #{f['index']} "
+                  f"@({b.center[0]:.1f},{b.center[1]:.1f}): {f['reason']} "
+                  f"-> LOW confidence, human review")
+            issue = Issue(IssueType.FALSE_POSITIVE, [b.box_id],
+                          self._region(b),
+                          detail=f"final godview: {f['reason']}", severity=0.7)
+            report.unresolved.append({"issue": issue.to_dict(), "ok": False})
 
     def _refine_edges(self, scene: Scene) -> None:
         """Snap box edges to point support for the final layout accuracy.
@@ -425,11 +486,9 @@ class LayoutAgent:
                 return Verdict(action="merge", params={"box_ids": [a.box_id, b.box_id]})
             return Verdict(action="keep")
         if issue.issue_type == IssueType.FALSE_POSITIVE and box is not None:
-            # persist the exact per-box evidence image the VLM sees: when
-            # the global pass nominates a box, this local crop is what the
-            # confirm/refuse decision was made on -- the key artifact for
-            # auditing (and tuning) that decision
-            self._save_local_evidence(scene, box, issue)
+            # The evidence image (three-view composite) is rendered AND
+            # persisted inside the judge (evidence_{id}.png) -- no
+            # second render here.
             verdict = self.judge.adjudicate_box(
                 scene, box,
                 question="Is there truly a device at the red box, or is it empty space?",
@@ -437,7 +496,13 @@ class LayoutAgent:
             )
             choice = (verdict.params or {}).get("choice", "")
             sup = geo.support_fraction(scene, box)
-            if choice == "empty space" or sup < 0.08:
+            # Deletion is irreversible and the dangerous direction: require
+            # BOTH the VLM's positive identification and a confident reply.
+            # A low-confidence "empty space" degrades to a shrink attempt /
+            # unresolved + LOW confidence (human review), never a delete.
+            vlm_says_empty = (choice == "empty space"
+                              and verdict.confidence >= 0.6)
+            if vlm_says_empty or sup < 0.08:
                 return Verdict(action="delete")
             return Verdict(action="shrink")
         if issue.issue_type == IssueType.OVERLAP and len(issue.box_ids) >= 2:

@@ -118,6 +118,19 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
     return np.array(plt.imread(buf))  # HxWx4
 
 
+# Description of the local evidence image shared by all per-box prompts.
+# MUST match what render_topdown_image actually produces (see _tile_views):
+# a three-view composite, NOT a bird's-eye view.
+_LOCAL_VIEW_DESC = (
+    "The image is a composite of THREE views of the same candidate region, "
+    "tiled side by side, each labeled above the panel: 'front' (the rack's "
+    "front face: doors, panels, LEDs), 'side' (view along the row: depth and "
+    "neighbouring racks), and 'oblique' (elevated view: top face and full "
+    "outline). Red wireframes mark the candidate box(es); each wireframe is "
+    "the full 3D box, not just its top."
+)
+
+
 def _tile_views(views: list, labels=("front", "side", "oblique")) -> np.ndarray:
     """Tile multiple single-view renders into ONE composite image.
 
@@ -344,6 +357,29 @@ class VLMJudge:
         self._local_model = None   # lazy: (processor, model), loaded once
         self.record_path = None    # if set, append JSONL records of adjudications
         self.evidence_dir = None   # if set, persist adjudication images here
+        self._render_cache = {}    # render cache: box-geometry key -> image
+
+    @staticmethod
+    def _render_cache_key(boxes) -> tuple:
+        """Cache key from the boxes' geometry (not identity): a retry after
+        a rollback restores identical geometry and must reuse the render."""
+        parts = []
+        for b in boxes:
+            c = np.round(np.asarray(b.center, dtype=float), 2)
+            s = np.round(np.asarray(b.size, dtype=float), 2)
+            parts.append((b.box_id, tuple(c), tuple(s), round(float(b.yaw), 3)))
+        return tuple(parts)
+
+    def _render_cached(self, scene, boxes):
+        """render_topdown_image with caching: the agent loop re-decides the
+        same issue up to max_retries times, and after a rollback the box
+        geometry is identical -- the three-view composite (3 rasterizations)
+        is then needlessly recomputed."""
+        key = self._render_cache_key(boxes)
+        if key not in self._render_cache:
+            self._render_cache[key] = render_topdown_image(
+                scene.points, boxes, gs_ply=scene.meta.get("gs_ply"))
+        return self._render_cache[key]
 
     def set_record(self, record_path: str) -> None:
         """Enable structured recording of every adjudication to a JSONL file.
@@ -471,8 +507,9 @@ class VLMJudge:
 
     def _qwen_pair_call(self, img_arr, question, options) -> Verdict:
         b64 = self._array_to_png_b64(img_arr)
-        prompt = (f"Decide the best answer from the bird's-eye image "
+        prompt = (f"Decide the best answer from the evidence image "
                   f"(two red wireframes = two candidate boxes).\n\n"
+                  f"{_LOCAL_VIEW_DESC}\n\n"
                   f"QUESTION: {question}\n"
                   f"OPTIONS:\n" + "\n".join(f"- {o}" for o in options) +
                   f"\n\nReply with the exact option text only.")
@@ -676,8 +713,7 @@ class VLMJudge:
             self._ensure_local_model()
             processor, model = self._local_model
 
-            img_arr = render_topdown_image(scene.points, [box],
-                                           gs_ply=scene.meta.get("gs_ply"))
+            img_arr = self._render_cached(scene, [box])
             png_path = self._save_evidence_png(
                 img_arr, f"evidence_{box.box_id[:8]}.png")
             buf = io.BytesIO()
@@ -723,16 +759,15 @@ class VLMJudge:
     # ---- Qwen (OpenAI-compatible chat completions with image) ----
     def _qwen_adjudicate(self, scene, box, question: str,
                          options: list[str]) -> Verdict:
-        img_arr = render_topdown_image(scene.points, [box],
-                                       gs_ply=scene.meta.get("gs_ply"))
+        img_arr = self._render_cached(scene, [box])
         png_path = self._save_evidence_png(
             img_arr, f"evidence_{box.box_id[:8]}.png")
         b64 = self._array_to_png_b64(img_arr)
         prompt = (
             f"You are an auditor in a data-center layout tool. Decide the best "
-            f"answer for this question by looking at the bird's-eye view "
-            f"image (red wireframe = the candidate box; photorealistic "
-            f"3DGS render or point-cloud scatter).\n\n"
+            f"answer for this question by looking at the evidence image "
+            f"(red wireframe = the candidate box).\n\n"
+            f"{_LOCAL_VIEW_DESC}\n\n"
             f"QUESTION: {question}\n"
             f"OPTIONS:\n" + "\n".join(f"- {o}" for o in options) +
             f"\n\nReply with the exact option text only."

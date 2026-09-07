@@ -134,16 +134,15 @@ def test_godview_flag_becomes_issue():
 
 
 def test_local_evidence_saved():
-    """The per-box local crop must be persisted during the repair loop."""
+    """The per-box evidence (three-view composite) must be persisted during
+    the repair loop -- by the JUDGE, before the VLM call, so it is saved
+    even when the backend call itself fails."""
     import glob
     import tempfile
     import shutil
     class FlaggingJudge(VLMJudge):
         def adjudicate_godview(self, scene, boxes):
             return [{"index": 0, "reason": "in aisle"}]
-        def adjudicate_box(self, scene, box, question, options):
-            return type("V", (), {"action": "keep", "params": {"choice": "real device"},
-                                  "confidence": 0.8, "detail": "stub", "raw": ""})()
 
     scene = _scene_with_racks()
     from agentic_gts.core.models import OrientedBox
@@ -151,7 +150,10 @@ def test_local_evidence_saved():
                    for _ in range(3)]
     out = tempfile.mkdtemp(prefix="godview_ev_")
     try:
-        agent = LayoutAgent(judge=FlaggingJudge(backend="qwen"), out_dir=out)
+        judge = FlaggingJudge(backend="qwen")
+        # enable the judge-side evidence dir (as pipeline.py does)
+        judge.set_record(os.path.join(out, "vlm_records.jsonl"))
+        agent = LayoutAgent(judge=judge, out_dir=out)
         agent.run(scene)
         ev = glob.glob(os.path.join(out, "evidence_*.png"))
         assert ev, f"no evidence png saved to {out}"
@@ -159,6 +161,73 @@ def test_local_evidence_saved():
         print(f"PASS local evidence saved: {os.path.basename(ev[0])}")
     finally:
         shutil.rmtree(out, ignore_errors=True)
+
+
+def test_final_godview_qa_flags_low_confidence():
+    """The post-repair god-view QA must NOT delete late-flagged boxes --
+    it marks them LOW confidence and reports them unresolved."""
+    import tempfile
+    import shutil
+    class LateFlaggingJudge(VLMJudge):
+        """First god-view: clean. Final QA (2nd call): flag box 0."""
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.calls = 0
+        def adjudicate_godview(self, scene, boxes):
+            self.calls += 1
+            if self.calls >= 2:
+                return [{"index": 0, "reason": "off every row"}]
+            return []
+
+    scene = _scene_with_racks()
+    from agentic_gts.core.models import OrientedBox, Confidence
+    # boxes placed ON the racks (no overlap issues: those would be fixed
+    # by resolve_overlap and change the count this test asserts on)
+    scene.boxes = [OrientedBox(center=(k * 0.62, 0, 1),
+                               size=(0.6, 1.1, 2.0), yaw=0.0)
+                   for k in range(3)]
+    out = tempfile.mkdtemp(prefix="godview_qa_")
+    try:
+        judge = LateFlaggingJudge(backend="qwen")
+        agent = LayoutAgent(judge=judge, out_dir=out)
+        report = agent.run(scene)
+        # box 0 still exists (no late deletion) ...
+        assert len(scene.boxes) == 3, "final QA must not delete boxes"
+        # ... but is flagged LOW and unresolved for human review
+        assert scene.boxes[0].confidence == Confidence.LOW
+        assert any("final godview" in str(e) for e in report.unresolved), \
+            "late flag must surface as unresolved"
+        assert os.path.exists(os.path.join(out, "godview_final.png")), \
+            "final godview render must be persisted"
+        print("PASS final godview QA: flags LOW, no deletion")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_low_confidence_empty_verdict_not_deleted():
+    """A low-confidence 'empty space' verdict must NOT delete the box --
+    deletion requires confidence >= 0.6 (irreversible action)."""
+    import tempfile
+    import shutil
+    class UnsureJudge(VLMJudge):
+        def adjudicate_godview(self, scene, boxes):
+            return [{"index": 0, "reason": "in aisle"}]
+        def adjudicate_box(self, scene, box, question, options):
+            return type("V", (), {"action": "answer",
+                                  "params": {"choice": "empty space"},
+                                  "confidence": 0.3, "detail": "unsure",
+                                  "raw": ""})()
+
+    scene = _scene_with_racks()
+    from agentic_gts.core.models import OrientedBox
+    scene.boxes = [OrientedBox(center=(k * 0.62, 0, 1),
+                               size=(0.6, 1.1, 2.0), yaw=0.0)
+                   for k in range(3)]
+    agent = LayoutAgent(judge=UnsureJudge(backend="qwen"))
+    agent.run(scene)
+    assert len(scene.boxes) == 3, \
+        "low-confidence empty-space verdict must not delete"
+    print("PASS low-confidence verdict does not delete")
 
 
 if __name__ == "__main__":
