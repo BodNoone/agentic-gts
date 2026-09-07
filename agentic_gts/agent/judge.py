@@ -283,7 +283,13 @@ def render_godview_png(points: np.ndarray, boxes, max_points: int = 250_000,
             if len(pts_for_cam) < 100:
                 pts_for_cam = points
             cam = make_godview_cam(pts_for_cam, boxes, nadir=True)
-            img = render_gs_view(gs, boxes, cam, cut_z=cut, cut_z_low=cut_low)
+            # wire3d (same as the local view): the VLM sees each
+            # candidate's FULL claimed volume -- both rings + vertical
+            # edges -- not just the floor footprint. Under perspective the
+            # bottom ring leans slightly outward for off-centre racks,
+            # which is the intended 3D depth cue.
+            img = render_gs_view(gs, boxes, cam, cut_z=cut, cut_z_low=cut_low,
+                                 overlay="wire3d")
             if img is not None:
                 print(f"[gs][godview] true 3DGS render "
                       f"({len(gs)} gaussians, top-down view)")
@@ -534,12 +540,16 @@ class VLMJudge:
         "view of the room: either a photorealistic 3D Gaussian-splatting "
         "render or a height-colored point-cloud scatter (colorbar = height in "
         "meters). Devices are tall rack structures (~2 m) that form parallel "
-        "rows separated by aisles. The numbered rectangles are candidate "
-        "device boxes.\n\n"
+        "rows separated by aisles. The numbered red wireframes are candidate "
+        "device boxes: each wireframe is the FULL 3D box (top and bottom "
+        "faces plus vertical edges), so you can see the height and total "
+        "volume each candidate claims, not just its floor footprint. Under "
+        "perspective an off-centre box's bottom face leans slightly outward. "
+        "(In the scatter fallback only the top-face rectangle is drawn.)\n\n"
         "Look at the GLOBAL spatial structure: identify boxes that are clearly "
-        "NOT real devices, e.g. a box floating in the middle of an aisle with "
-        "no structure under it, a box far away from every device row, or a box "
-        "on the room boundary where only a wall exists.\n\n"
+        "NOT real devices, e.g. a wireframe floating in the middle of an "
+        "aisle with no structure inside it, a box far away from every device "
+        "row, or a box on the room boundary where only a wall exists.\n\n"
         "Be conservative: only flag a box when the evidence is clear. Do not "
         "flag boxes that sit inside a device row.\n\n"
         "Reply with ONLY a JSON object, no other text:\n"

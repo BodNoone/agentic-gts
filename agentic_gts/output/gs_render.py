@@ -138,9 +138,13 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
         # clears the outward-spreading rack tops.
         base_z = max(float(cam_z) if (cam_z is not None and np.isfinite(cam_z)) else 0.0,
                      need_h + z_ref * 1.25)
-        # 4 footprint corners at rack-top height (worst case for overhang)
-        corners = np.array([[x, y, z_ref] for x in (lo[0] , hi[0])
-                            for y in (lo[1], hi[1])])
+        # 8 framing corners at BOTH floor and rack-top heights: the 3D
+        # wireframe's bottom ring sits at floor level, and under perspective
+        # the (closer, lower) floor corners lean OUTWARD vs the top ring --
+        # frame them too or the wireframe's lower edge clips the border.
+        corners = np.array([[x, y, z] for x in (lo[0], hi[0])
+                            for y in (lo[1], hi[1])
+                            for z in (z_floor, z_ref)])
         for hf in (1.0, 1.02, 1.05, 1.08, 1.12, 1.18, 1.25, 1.35, 1.5):
             eye_z = base_z * hf
             c = Cam(eye=np.array([center[0], center[1], eye_z]),

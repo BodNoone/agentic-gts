@@ -122,9 +122,12 @@ def test_camera_projection_sanity():
     print("PASS camera projection sanity (oblique local view)")
 
 
-def test_overlay_footprint_not_3d_wireframe():
-    """godview overlay must draw only the footprint rectangle + a numbered
-    chip -- NOT a 3D wireframe -- so the gaussian render stays readable."""
+def test_godview_overlay_wire3d():
+    """godview overlay must draw the FULL 3D wireframe (top ring + bottom
+    ring + vertical edges) + a numbered chip: the VLM audits the volume
+    each candidate claims, not just its floor footprint. Both rings' corner
+    projections must stay in-frame (the camera framing accounts for the
+    bottom ring's outward perspective lean)."""
     from agentic_gts.output.gs_render import (_box_corners_3d, make_godview_cam,
                                               overlay_boxes)
     W, H = 640, 480
@@ -133,20 +136,21 @@ def test_overlay_footprint_not_3d_wireframe():
     boxes = [OrientedBox(center=(2.0, 3.0, 1.15), size=(0.6, 1.1, 2.3), yaw=0.0)]
     cam = make_godview_cam(pts, boxes, nadir=True, W=W, H=H)
     img = np.full((H, W, 3), 0.3, dtype=np.float32)
-    out = overlay_boxes(img, boxes, cam)
+    out = overlay_boxes(img, boxes, cam, mode="wire3d")
     assert out.shape == (H, W, 3)
     assert out.min() >= 0.0 and out.max() <= 1.0
-    # The overlay now projects the TOP ring (z=+h) so the box footprint
-    # matches the visible rack under perspective; the chip sits near the top
-    # ring's first corner. Verify that corner is in-frame and pixels near it
-    # changed.
+    # top-ring corner (idx 1) AND bottom-ring corner (idx 0) must be
+    # in-frame and have drawn pixels around them
     cs = _box_corners_3d(boxes[0])
-    uv0 = cam.project_cv([cs[1]])[0]
-    assert 0 <= uv0[0] < W and 0 <= uv0[1] < H
-    # the overlay changed pixels near the box (something was drawn)
-    y0, x0 = int(uv0[1]), int(uv0[0])
-    assert not np.allclose(out[y0 - 5:y0 + 5, x0 - 5:x0 + 5], img[y0 - 5:y0 + 5, x0 - 5:x0 + 5])
-    print("PASS overlay draws footprint + chip (top ring, no 3D wireframe)")
+    for corner in (cs[1], cs[0]):
+        uv = cam.project_cv([corner])[0]
+        assert 0 <= uv[0] < W and 0 <= uv[1] < H, \
+            f"wireframe corner out of frame: {uv}"
+        y0, x0 = int(uv[1]), int(uv[0])
+        assert not np.allclose(out[y0 - 5:y0 + 5, x0 - 5:x0 + 5],
+                               img[y0 - 5:y0 + 5, x0 - 5:x0 + 5]), \
+            "no wireframe pixels near a ring corner"
+    print("PASS godview overlay draws full 3D wireframe (both rings in frame)")
 
 
 def test_godview_nadir_camera():
@@ -358,7 +362,7 @@ if __name__ == "__main__":
     test_near_boxes_mask_isolates()
     test_local_cam_azim_rotates_view()
     test_tile_views_composite()
-    test_overlay_footprint_not_3d_wireframe()
+    test_godview_overlay_wire3d()
     test_overlay_wire3d_for_local_view()
     test_godview_nadir_camera()
     test_godview_frames_box_footprint()
