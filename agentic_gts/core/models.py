@@ -240,6 +240,40 @@ def _object_entry_to_box(o: dict) -> dict:
     }
 
 
+def _box_to_object_entry(b: "OrientedBox") -> dict:
+    """Inverse of _object_entry_to_box: serialize an OrientedBox in the
+    detector-style 'objects' schema, so the final pipeline output is
+    round-trippable with the input box format (and consumable by the same
+    downstream tools).
+
+    The rotation matrix is written alongside rotations (degrees): loaders
+    that trust the matrix first (as we do) get the exact yaw; degree-based
+    readers get the rounded equivalent.
+    """
+    import math as _math
+    yaw = float(b.yaw)
+    c, s = _math.cos(yaw), _math.sin(yaw)
+    R = [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+    name = (b.meta or {}).get("object_name") or (b.device_type or "rack")
+    return {
+        "name": name,
+        "centroid": {"x": float(b.center[0]), "y": float(b.center[1]),
+                     "z": float(b.center[2])},
+        "dimensions": {"length": float(b.size[0]), "width": float(b.size[1]),
+                       "height": float(b.size[2])},
+        "rotations": {"x": 0.0, "y": 0.0, "z": _math.degrees(yaw)},
+        "rotation matrix": R,
+    }
+
+
+def save_boxes_as_objects(boxes: list, path: str) -> None:
+    """Save boxes in the same 'objects' JSON format the CLI accepts as
+    --boxes input (the detector output schema)."""
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"objects": [_box_to_object_entry(b) for b in boxes]},
+                  f, ensure_ascii=False, indent=2)
+
+
 # Standard rack dimensions (meters). Optional priors -- the pipeline
 # must work even when a machine room does not match these.
 STANDARD_RACK_WIDTHS = [0.6, 0.8]

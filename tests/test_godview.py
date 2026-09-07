@@ -230,6 +230,42 @@ def test_low_confidence_empty_verdict_not_deleted():
     print("PASS low-confidence verdict does not delete")
 
 
+def test_objects_format_roundtrip():
+    """boxes_objects.json must round-trip with the --boxes input schema:
+    save -> load -> same center/size/yaw (within float precision)."""
+    import json
+    import math
+    import tempfile
+    import shutil
+    from agentic_gts.core.models import (OrientedBox, Scene,
+                                         save_boxes_as_objects)
+
+    scene = _scene_with_racks()
+    # arbitrary yaw (not axis-aligned) + a device_type-derived name
+    boxes = [OrientedBox(center=(k * 0.62, 0.3 * k, 1.0),
+                         size=(0.6, 1.1, 2.0), yaw=math.radians(23.5),
+                         device_type="rack")
+             for k in range(4)]
+    out = tempfile.mkdtemp(prefix="obj_rt_")
+    try:
+        p = os.path.join(out, "boxes_objects.json")
+        save_boxes_as_objects(boxes, p)
+        data = json.load(open(p, encoding="utf-8"))
+        assert "objects" in data and len(data["objects"]) == 4
+        # load through the normal CLI path (Scene.load_boxes)
+        s2 = Scene(points=scene.points)
+        s2.load_boxes(p)
+        assert len(s2.boxes) == 4
+        for a, b in zip(boxes, s2.boxes):
+            assert np.allclose(a.center, b.center, atol=1e-6), "center drifted"
+            assert np.allclose(a.size, b.size, atol=1e-6), "size drifted"
+            dyaw = (a.yaw - b.yaw + np.pi) % (2 * np.pi) - np.pi
+            assert abs(dyaw) < 1e-6, f"yaw drifted {dyaw}"
+        print("PASS objects-format roundtrip (center/size/yaw exact)")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed = 0

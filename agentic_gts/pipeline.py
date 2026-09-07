@@ -319,6 +319,17 @@ def run_pipeline(scene: Scene,
 
     # --- outputs ---
     scene.save_boxes(os.path.join(out_dir, "boxes.json"))
+    # also persist the final layout in the detector-style 'objects' schema
+    # (same format the CLI accepts as --boxes input), so the result feeds
+    # the same downstream tools that produced the input
+    try:
+        from agentic_gts.core.models import save_boxes_as_objects
+        save_boxes_as_objects(scene.boxes,
+                               os.path.join(out_dir, "boxes_objects.json"))
+        print(f"[out] {len(scene.boxes)} boxes -> boxes_objects.json "
+              f"(input 'objects' format)")
+    except Exception as e:  # extra format must never break the run
+        print(f"[warn] objects-format save failed: {type(e).__name__}: {e}")
     with open(os.path.join(out_dir, "layout.svg"), "w", encoding="utf-8") as f:
         f.write(boxes_to_svg(scene.boxes, title="Data-center layout"))
     with open(os.path.join(out_dir, "layout.png"), "wb") as f:
