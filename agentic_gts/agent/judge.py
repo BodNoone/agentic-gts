@@ -62,8 +62,12 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
             # section, hiding exactly the detail this view exists for. The
             # floor cut is dropped for the same reason (cutting it would
             # detach the wireframe's bottom ring from the visible body).
-            cam = make_local_cam(boxes[0], extent=extent * 2)
-            img = render_gs_view(gs, boxes, cam, overlay="wire3d")
+            # The camera frames the UNION of all boxes (a merge-pair passes
+            # two) and the render ISOLATES the near-box gaussians so
+            # unrelated structure cannot occlude the adjudicated box.
+            cam = make_local_cam(boxes, extent=extent * 2)
+            img = render_gs_view(gs, boxes, cam, overlay="wire3d",
+                                 isolate_boxes=True)
             if img is not None:
                 return img
         except Exception as e:

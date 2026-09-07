@@ -283,12 +283,47 @@ def test_overlay_wire3d_for_local_view():
     print(f"PASS wire3d overlay draws full box ({n_drawn}/12 edges visible)")
 
 
+def test_local_cam_frames_pair():
+    """A merge-pair passes TWO boxes: the camera must frame the union so
+    neither box clips out of view."""
+    from agentic_gts.output.gs_render import _box_corners_3d, make_local_cam
+    # two thin front/back faces of one rack (no intersection)
+    a = OrientedBox(center=(0.0, -0.3, 1.0), size=(1.2, 0.2, 2.0), yaw=0.0)
+    b = OrientedBox(center=(0.0, 0.3, 1.0), size=(1.2, 0.2, 2.0), yaw=0.0)
+    cam = make_local_cam([a, b], extent=1.0)
+    cs = np.vstack([_box_corners_3d(a), _box_corners_3d(b)])
+    uv = cam.project_cv(cs)
+    assert (uv[:, 0].min() > 0 and uv[:, 0].max() < cam.W and
+            uv[:, 1].min() > 0 and uv[:, 1].max() < cam.H), \
+        f"pair clips out of view: {uv}"
+    print("PASS local cam frames both boxes of a pair")
+
+
+def test_near_boxes_mask_isolates():
+    """The local render keeps only gaussians inside the (inflated) box
+    OBBs: everything else -- e.g. an occluding rack 2m in front -- must be
+    masked out."""
+    from agentic_gts.output.gs_render import _near_boxes_mask
+    gs = _tiny_gs(60)
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(1.2, 0.7, 2.0),
+                      yaw=math.radians(30.0))
+    gs.means[:20] = np.array([0.0, 0.0, 1.0])            # inside the box
+    gs.means[20:40] = np.array([0.1, 0.1, 1.2])           # inside (rotated ok)
+    gs.means[40:] = np.array([3.0, 3.0, 1.0])             # far-away occluder
+    m = _near_boxes_mask(gs, [box], margin=0.25)
+    assert m[:40].all(), "box-interior gaussians must be kept"
+    assert not m[40:].any(), "far-away gaussians must be masked out"
+    print("PASS near-boxes mask keeps box gaussians, drops the rest")
+
+
 if __name__ == "__main__":
     test_gs_roundtrip_binary()
     test_gs_parse_ascii()
     test_render_falls_back_without_cuda()
     test_camera_projection_sanity()
     test_local_cam_front_face()
+    test_local_cam_frames_pair()
+    test_near_boxes_mask_isolates()
     test_overlay_footprint_not_3d_wireframe()
     test_overlay_wire3d_for_local_view()
     test_godview_nadir_camera()

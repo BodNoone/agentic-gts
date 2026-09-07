@@ -182,10 +182,14 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
     return cam
 
 
-def make_local_cam(box, extent: float = 1.2, W: int = 448, H: int = 448,
+def make_local_cam(boxes, extent: float = 1.2, W: int = 448, H: int = 448,
                    elev_deg: float = 18.0) -> Cam:
-    """Front-face camera for one box: the fine-detail counterpart to the
-    god-view's coarse positioning.
+    """Front-face camera for one box (or a pair): the fine-detail
+    counterpart to the god-view's coarse positioning.
+
+    Accepts a single OrientedBox or a LIST of boxes (e.g. the two faces of
+    a merge-pair adjudication) and frames the UNION of all their 3D corners
+    -- with a verify-and-back-off loop so nothing clips out of view.
 
     The camera looks at the box from its FRONT (perpendicular to the row
     direction), tilted down only slightly (`elev_deg`): the VLM sees the
@@ -194,22 +198,60 @@ def make_local_cam(box, extent: float = 1.2, W: int = 448, H: int = 448,
     -- the thing the god-view already provides. `up` stays world-vertical
     so the rack renders upright.
     """
-    c = np.asarray(box.center, dtype=float)
-    yaw = float(box.yaw)
+    if hasattr(boxes, "center"):    # tolerate a single OrientedBox
+        boxes = [boxes]
+    ref = boxes[0]
+    c = np.asarray(ref.center, dtype=float)
+    yaw = float(ref.yaw)
     # front direction = cross axis (the rack's door face), NOT the row axis
     front = np.array([-math.sin(yaw), math.cos(yaw), 0.0])
-    size = np.asarray(box.size, dtype=float)
-    # distance so the full rack height (and its width + margin) stay framed
+    # all 3D corners of all boxes: the union that must stay in frame
+    corners = np.vstack([_box_corners_3d(b) for b in boxes])
     fy = math.tan(math.radians(60.0 / 2.0))
     fx = fy * (W / H)
-    dist = max((size[2] / 2.0) / fy, (size[0] / 2.0 + extent) / fx)
-    eye = c + front * dist + np.array(
-        [0.0, 0.0, dist * math.tan(math.radians(elev_deg))])
-    return Cam(eye=eye, target=c, up=np.array([0.0, 0.0, 1.0]),
-               fovy_deg=60.0, W=W, H=H)
+    spans = corners.max(axis=0) - corners.min(axis=0)
+    # first-guess distance from the union's extent (plus margin), then
+    # verify by projection and back off until every corner is in frame
+    dist0 = max(spans[2] / 2.0 / fy, (spans[0] + extent) / 2.0 / fx)
+    for f in (1.0, 1.1, 1.25, 1.4, 1.6, 1.9, 2.2, 2.6, 3.0, 3.5):
+        dist = dist0 * f
+        eye = c + front * dist + np.array(
+            [0.0, 0.0, dist * math.tan(math.radians(elev_deg))])
+        cam = Cam(eye=eye, target=c, up=np.array([0.0, 0.0, 1.0]),
+                  fovy_deg=60.0, W=W, H=H)
+        pc = np.hstack([corners, np.ones((len(corners), 1))]) @ cam.view_cv().T
+        if not np.all(pc[:, 2] > 0.1):       # some corner behind the camera
+            continue
+        uv = cam.project_cv(corners)
+        if (uv[:, 0].min() > 0.02 * W and uv[:, 0].max() < 0.98 * W and
+                uv[:, 1].min() > 0.02 * H and uv[:, 1].max() < 0.98 * H):
+            return cam
+    return cam
 
 
 # ---------------------------------------------------------------- rasterizers
+def _near_boxes_mask(gs: GaussianData, boxes, margin: float = 0.25) -> np.ndarray:
+    """Boolean mask: gaussians whose xy lies inside any box's OBB (inflated
+    by `margin`). Used by the LOCAL render to hide unrelated structure --
+    other racks in front, walls -- so nothing occludes the box being
+    adjudicated. The margin is small: just enough to keep the box's own
+    noisy gaussians (which bleed slightly past its faces), while dropping
+    everything the adjudication does not need to see.
+    """
+    xy = gs.means[:, :2]
+    m = np.zeros(len(gs), dtype=bool)
+    for b in boxes:
+        yaw = float(b.yaw)
+        c, s = math.cos(yaw), math.sin(yaw)
+        d = xy - np.asarray(b.center, dtype=float)[:2]
+        along = d @ np.array([c, s])
+        cross = d @ np.array([-s, c])
+        size = np.asarray(b.size, dtype=float)
+        m |= (np.abs(along) < size[0] / 2.0 + margin) & \
+             (np.abs(cross) < size[1] / 2.0 + margin)
+    return m
+
+
 def _prep(gs: GaussianData, cut_z: float, cut_z_low: float = float("-inf")):
     """Common tensor-ready numpy arrays (ceiling + floor cuts applied).
 
@@ -230,6 +272,19 @@ def _prep(gs: GaussianData, cut_z: float, cut_z_low: float = float("-inf")):
     opac = 1.0 / (1.0 + np.exp(-gs.raw_opacity[m].astype(np.float64)))  # sigmoid
     rgb = np.clip(0.5 + SH_C0 * gs.f_dc[m].astype(np.float64), 0.0, 1.0)
     return means, quats, scales, opac, rgb
+
+
+def _subset_gs(gs: GaussianData, mask: np.ndarray) -> GaussianData:
+    """GaussianData restricted to the masked gaussians (views, no copy of
+    the big arrays beyond the boolean index)."""
+    import copy as _copy
+    sub = _copy.copy(gs)     # shallow: reuse untouched fields
+    sub.means = gs.means[mask]
+    sub.log_scales = gs.log_scales[mask]
+    sub.quats = gs.quats[mask]
+    sub.raw_opacity = gs.raw_opacity[mask]
+    sub.f_dc = gs.f_dc[mask]
+    return sub
 
 
 def _try_gsplat(means, quats, scales, opac, rgb, V_cv, K, W, H):
@@ -298,8 +353,16 @@ def _try_official(means, quats, scales, opac, rgb, cam: Cam):
 
 
 def rasterize_gs(gs: GaussianData, cam: Cam, cut_z: float = float("inf"),
-                 cut_z_low: float = float("-inf")):
-    """(H,W,3) float image or None if no CUDA rasterizer is available."""
+                 cut_z_low: float = float("-inf"),
+                 keep_mask: np.ndarray | None = None):
+    """(H,W,3) float image or None if no CUDA rasterizer is available.
+
+    keep_mask: optional boolean mask over gs (e.g. _near_boxes_mask) to
+    render only a subset -- used by the local view to hide unrelated
+    structure that would occlude the adjudicated box.
+    """
+    if keep_mask is not None:
+        gs = _subset_gs(gs, keep_mask)
     means, quats, scales, opac, rgb = _prep(gs, cut_z, cut_z_low)
     if len(means) == 0:
         return None
@@ -398,9 +461,19 @@ def overlay_boxes(img: np.ndarray, boxes, cam: Cam,
 def render_gs_view(gs: GaussianData, boxes, cam: Cam,
                    cut_z: float = float("inf"),
                    cut_z_low: float = float("-inf"),
-                   overlay: str = "footprint"):
-    """Full render: gaussians + numbered box overlay. None if no backend."""
-    img = rasterize_gs(gs, cam, cut_z=cut_z, cut_z_low=cut_z_low)
+                   overlay: str = "footprint",
+                   isolate_boxes: bool = False,
+                   isolate_margin: float = 0.25):
+    """Full render: gaussians + numbered box overlay. None if no backend.
+
+    isolate_boxes: keep ONLY the gaussians near `boxes` (their inflated
+    OBBs) -- for the local evidence view, so unrelated structure (other
+    racks in front, walls) cannot occlude the box being adjudicated.
+    """
+    keep = _near_boxes_mask(gs, boxes, margin=isolate_margin) \
+        if (isolate_boxes and boxes) else None
+    img = rasterize_gs(gs, cam, cut_z=cut_z, cut_z_low=cut_z_low,
+                       keep_mask=keep)
     if img is None:
         return None
     if boxes:
