@@ -162,11 +162,11 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
     cam = None
     z_floor = float(points[:, 2].min())
     # 8 corners of the framing footprint (floor + rack-top heights)
-    zc = z_ref if np.isfinite(z_ref) else float(points[:, 2].max())
+    zc = z_top if np.isfinite(z_top) else float(points[:, 2].max())
     corners = np.array([[x, y, z] for x in (lo[0], hi[0])
                         for y in (lo[1], hi[1]) for z in (z_floor, zc)])
     for dist in [(half_diag + 1.0) * f for f in (1.0, 1.2, 1.5, 1.8, 2.2, 2.8, 3.5, 4.5, 6.0, 8.0, 11.0)]:
-        eye = center + dist * np.array(
+        eye = np.array([center[0], center[1], z_floor]) + dist * np.array(
             [math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el)])
         c = Cam(eye=eye, target=np.array([center[0], center[1], z_floor]),
                 up=up, fovy_deg=60.0, W=W, H=H)
