@@ -234,26 +234,15 @@ def make_local_cam(boxes, extent: float = 1.2, W: int = 448, H: int = 448,
 
 
 # ---------------------------------------------------------------- rasterizers
-def _near_boxes_mask(gs: GaussianData, boxes, margin: float = 0.25,
-                     keep_floor: bool = True, floor_tol: float = 0.30,
-                     floor_pad: float = 2.0) -> np.ndarray:
+def _near_boxes_mask(gs: GaussianData, boxes, margin: float = 0.25) -> np.ndarray:
     """Boolean mask: gaussians whose xy lies inside any box's OBB (inflated
     by `margin`). Used by the LOCAL render to hide unrelated structure --
     other racks in front, walls -- so nothing occludes the box being
     adjudicated. The margin is small: just enough to keep the box's own
     noisy gaussians (which bleed slightly past its faces), while dropping
     everything the adjudication does not need to see.
-
-    keep_floor: the floor never OCCLUDES a rack (it lies below every sight
-    line to the box), and it anchors the box -- ground contact tells the
-    VLM whether the candidate stands on the floor or floats mid-air. So
-    gaussians in a low band (estimated floor + floor_tol) within
-    `floor_pad` metres horizontally around the boxes are kept too. The
-    radius cap avoids the surreal "infinite empty floor" background a
-    full-scene floor would render behind the rack.
     """
     xy = gs.means[:, :2]
-    z = gs.means[:, 2]
     m = np.zeros(len(gs), dtype=bool)
     for b in boxes:
         yaw = float(b.yaw)
@@ -264,16 +253,6 @@ def _near_boxes_mask(gs: GaussianData, boxes, margin: float = 0.25,
         size = np.asarray(b.size, dtype=float)
         m |= (np.abs(along) < size[0] / 2.0 + margin) & \
              (np.abs(cross) < size[1] / 2.0 + margin)
-    if keep_floor and boxes:
-        # global floor estimate: the lowest 1% of gaussians are floor
-        # (or sub-floor floaters -- harmless either way, the band is small)
-        floor_z = float(np.percentile(z, 1.0))
-        cs = np.vstack([b.corners_2d() for b in boxes])
-        c2 = cs.mean(axis=0)
-        r = float(np.linalg.norm(cs.max(axis=0) - cs.min(axis=0)) / 2.0) \
-            + floor_pad
-        m |= (z < floor_z + floor_tol) & \
-             (np.linalg.norm(xy - c2, axis=1) < r)
     return m
 
 
@@ -488,18 +467,14 @@ def render_gs_view(gs: GaussianData, boxes, cam: Cam,
                    cut_z_low: float = float("-inf"),
                    overlay: str = "footprint",
                    isolate_boxes: bool = False,
-                   isolate_margin: float = 0.25,
-                   keep_floor: bool = True):
+                   isolate_margin: float = 0.25):
     """Full render: gaussians + numbered box overlay. None if no backend.
 
     isolate_boxes: keep ONLY the gaussians near `boxes` (their inflated
     OBBs) -- for the local evidence view, so unrelated structure (other
     racks in front, walls) cannot occlude the box being adjudicated.
-    keep_floor: while isolating, still keep the floor band around the
-    boxes (it never occludes, and ground contact is evidence).
     """
-    keep = _near_boxes_mask(gs, boxes, margin=isolate_margin,
-                            keep_floor=keep_floor) \
+    keep = _near_boxes_mask(gs, boxes, margin=isolate_margin) \
         if (isolate_boxes and boxes) else None
     img = rasterize_gs(gs, cam, cut_z=cut_z, cut_z_low=cut_z_low,
                        keep_mask=keep)
