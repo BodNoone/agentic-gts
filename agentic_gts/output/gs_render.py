@@ -238,13 +238,14 @@ def make_local_cam(boxes, extent: float = 1.2, W: int = 448, H: int = 448,
 
 
 # ---------------------------------------------------------------- rasterizers
-def _near_boxes_mask(gs: GaussianData, boxes, margin: float = 0.25) -> np.ndarray:
+def _near_boxes_mask(gs: GaussianData, boxes, margin: float = 0.6) -> np.ndarray:
     """Boolean mask: gaussians whose xy lies inside any box's OBB (inflated
     by `margin`). Used by the LOCAL render to hide unrelated structure --
     other racks in front, walls -- so nothing occludes the box being
-    adjudicated. The margin is small: just enough to keep the box's own
-    noisy gaussians (which bleed slightly past its faces), while dropping
-    everything the adjudication does not need to see.
+    adjudicated. The margin keeps a ring of immediate context around the
+    box (its own noisy gaussians bleeding past the faces, plus the closest
+    neighbouring structure) while dropping everything the adjudication
+    does not need to see.
     """
     xy = gs.means[:, :2]
     m = np.zeros(len(gs), dtype=bool)
@@ -471,7 +472,7 @@ def render_gs_view(gs: GaussianData, boxes, cam: Cam,
                    cut_z_low: float = float("-inf"),
                    overlay: str = "footprint",
                    isolate_boxes: bool = False,
-                   isolate_margin: float = 0.25):
+                   isolate_margin: float = 0.6):
     """Full render: gaussians + numbered box overlay. None if no backend.
 
     isolate_boxes: keep ONLY the gaussians near `boxes` (their inflated
