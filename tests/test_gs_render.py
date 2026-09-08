@@ -492,6 +492,70 @@ def test_box_visibility_detects_occlusion():
           f"cut={vis_cut:.2f} nocut={vis_nocut:.2f})")
 
 
+def test_camera_pullout_of_sandwich():
+    """A rack flush inside a CONTINUOUS row: the SIDE view camera travels
+    along the row and lands INSIDE the row (a blurry wall of near splats).
+    camera_clearance must flag the embedded camera; _pullback_cam must
+    rescue it. Scaling along the sight ray alone can NEVER exit a
+    continuous row (the ray IS the row axis) -- the rescue must come from
+    the elevation lift, looking down the row from above the rack tops,
+    while keeping the azimuth (still a side view)."""
+    from agentic_gts.output.gs_render import (camera_clearance,
+                                              make_local_cam, _pullback_cam)
+    from agentic_gts.tools.gs_io import GaussianData
+
+    def _gs(means, radius):
+        means = np.asarray(means, dtype=float)
+        n = len(means)
+        return GaussianData(
+            means=means,
+            log_scales=np.full((n, 3), float(np.log(radius))),
+            quats=np.tile([[1.0, 0.0, 0.0, 0.0]], (n, 1)),
+            raw_opacity=np.full(n, 8.0),
+            f_dc=np.zeros((n, 3)),
+        )
+
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(0.6, 1.1, 2.0), yaw=0.0)
+    # a continuous row along x: gaps only where the adjudicated box sits
+    rng = np.random.default_rng(1)
+    row = []
+    for _ in range(3000):
+        x = rng.uniform(-6.0, 6.0)
+        if -0.65 < x < 0.65:        # the box's own slot in the row
+            continue
+        row.append([x, rng.uniform(-0.5, 0.5), rng.uniform(0.0, 2.0)])
+    gs = _gs(row, 0.04)
+
+    # side view (azim 90): eye along the row -> embedded in the row
+    cam_side = make_local_cam(box, azim_deg=90.0)
+    clr_in = camera_clearance(gs, [box], cam_side)
+    assert clr_in < 0.0, \
+        f"side camera inside the continuous row must be flagged, {clr_in}"
+    cam_out, clr_out = _pullback_cam(gs, [box], cam_side, None,
+                                     float("inf"))
+    assert clr_out >= 0.10, \
+        f"pullback must rescue the sandwiched camera, got {clr_out}"
+    # azimuth preserved: eye stays over the row axis (x), just higher
+    eye_in = np.asarray(cam_side.eye) - np.asarray(cam_side.target)
+    eye_out = np.asarray(cam_out.eye) - np.asarray(cam_out.target)
+    cross = abs(eye_in[0] * eye_out[1] - eye_in[1] * eye_out[0])
+    scale = np.linalg.norm(eye_in) * np.linalg.norm(eye_out)
+    assert cross / scale < 0.05, "rescue must keep the side-view azimuth"
+    assert eye_out[2] > eye_in[2] + 0.5, \
+        "continuous-row rescue must raise the camera above the rack tops"
+    # a camera already in the open is returned untouched
+    cam_free = make_local_cam(box, azim_deg=0.0, elev_deg=55.0)
+    cam_free.eye = np.asarray(cam_free.eye) + np.array([0.0, 4.0, 2.0])
+    cam_same, clr_same = _pullback_cam(gs, [box], cam_free, None,
+                                       float("inf"))
+    if clr_same >= 0.10:
+        assert np.allclose(cam_same.eye, cam_free.eye), \
+            "clear camera must not be moved"
+    print(f"PASS camera pullout of sandwich "
+          f"(embedded={clr_in:.2f} rescued={clr_out:.2f} "
+          f"lift={eye_out[2] - eye_in[2]:.2f}m)")
+
+
 def test_quality_out_and_gating():
     """render_topdown_image must fill quality_out on the scatter fallback
     (mode marker), and the judge must cap a verdict's confidence when the

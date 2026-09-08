@@ -672,13 +672,88 @@ def box_visibility(gs: GaussianData, boxes, cam: Cam,
     return float(visible.mean())
 
 
+def camera_clearance(gs: GaussianData, boxes, cam: Cam,
+                     keep_mask: np.ndarray | None = None,
+                     cut_z: float = float("inf")) -> float:
+    """Signed distance [m] from the camera eye to the nearest gaussian
+    structure it would render (the occluder set: keep_mask, below cut_z,
+    outside the adjudicated boxes). Negative = the eye is INSIDE a splat.
+
+    Catches the 'sandwiched device' failure the quality/visibility scores
+    only half-cover: a rack flush between two neighbours has its SIDE view
+    camera travel along the row and end up embedded in the neighbouring
+    rack -- the render is then a wall of huge near-camera splats (a blurry
+    mess) regardless of how well that direction was trained. This is a
+    property of the camera POSITION, so it must be tested before scoring:
+    a colliding camera is pulled back along its sight axis (see
+    _pullback_cam) instead of being silently scored and picked."""
+    m = keep_mask if keep_mask is not None else np.ones(len(gs), dtype=bool)
+    means = np.asarray(gs.means)[m]
+    radii = np.exp(np.asarray(gs.log_scales)[m]).max(axis=1)
+    if cut_z is not None and np.isfinite(cut_z):
+        below = means[:, 2] < cut_z
+        means, radii = means[below], radii[below]
+    inside = np.zeros(len(means), dtype=bool)
+    for b in boxes:
+        inside |= b.contains(means, margin=0.05)
+    means, radii = means[~inside], radii[~inside]
+    if len(means) == 0:
+        return float("inf")
+    d = np.linalg.norm(means - np.asarray(cam.eye, dtype=float), axis=1)
+    return float((d - radii).min())
+
+
+def _pullback_cam(gs: GaussianData, boxes, cam: Cam,
+                  keep_mask: np.ndarray | None, cut_z: float,
+                  min_clear: float = 0.10):
+    """Move a structure-embedded camera to a clear position. Returns
+    (cam, clearance).
+
+    Two escape moves, both preserving the camera's AZIMUTH (the slot's
+    role: a side view stays a side view):
+      1. scale the eye about the target along the sight ray -- escapes a
+         finite structure the camera just clipped into (near row end,
+         opposing rack across a narrow aisle);
+      2. additionally RAISE the eye -- a sandwiched mid-row rack's side
+         camera sits inside a CONTINUOUS row, and no amount of backing off
+         along the row axis exits it; looking down the row from above the
+         rack tops is the only clear sightline, and at 768px per tile the
+         smaller/steeper box stays readable.
+    If nothing clears, the least-embedded attempt is returned with its
+    (negative) clearance, which disqualifies the candidate downstream and
+    gates the verdict confidence."""
+    c = np.asarray(cam.target, dtype=float)
+    eye0 = np.asarray(cam.eye, dtype=float)
+
+    def _mk(f, lift):
+        eye = c + (eye0 - c) * f
+        eye = eye + np.array([0.0, 0.0, lift])
+        return Cam(eye=eye, target=cam.target, up=cam.up,
+                   fovy_deg=cam.fovy_deg, W=cam.W, H=cam.H)
+
+    best, best_clr = cam, camera_clearance(gs, boxes, cam, keep_mask, cut_z)
+    if best_clr >= min_clear:
+        return best, best_clr
+    attempts = [(f, 0.0) for f in (1.35, 1.8, 2.4, 3.2)] + \
+               [(f, lift) for f in (1.8, 2.4)
+                for lift in (0.8, 1.6)]
+    for f, lift in attempts:
+        cand = _mk(f, lift)
+        clr = camera_clearance(gs, boxes, cand, keep_mask, cut_z)
+        if clr > best_clr:
+            best, best_clr = cand, clr
+        if clr >= min_clear:
+            return cand, clr
+    return best, best_clr
+
+
 def render_slot_candidates(gs, boxes, cam_fn, candidates, cut_z,
                             overlay: str, iso_margin: float):
     """Render several (elev, azim) candidates for ONE view slot, score each
     on the RAW render (before the wireframe overlay -- drawn lines would
     pollute the sharpness/speckle metrics), and return the best.
 
-    Two independent scores per candidate:
+    Three independent signals per candidate:
       quality     -- image-based (sharpness/coverage/speckle): is this view
                      well-trained? A view extrapolated away from the
                      training cameras blurs and grows floaters.
@@ -686,12 +761,18 @@ def render_slot_candidates(gs, boxes, cam_fn, candidates, cut_z,
                      VISIBLE, or does a wall / flush neighbour fill the
                      frame? A sharp wall still scores high on quality, so
                      only the sightline test catches it.
+      clearance   -- geometry-based (camera_clearance): is the CAMERA
+                     itself outside the structure? A sandwiched device's
+                     side view embeds the camera in the neighbouring rack
+                     (a blurry wall of near splats); the camera is pulled
+                     back along its sight axis until it clears.
 
     Selection: among candidates where the box is visible (visibility >=
-    0.25) pick the highest image quality; if EVERY candidate is occluded,
-    keep the least-occluded one (its low visibility flows into the
-    confidence gating downstream -- the verdict is then distrusted
-    instead of silently judged on a wall).
+    0.25) AND the camera is outside the structure (clearance >= 0 after
+    the pullback) pick the highest image quality; if every candidate fails,
+    keep the least-occluded one (its low visibility / negative clearance
+    flows into the confidence gating downstream -- the verdict is then
+    distrusted instead of silently judged on a wall of near splats).
 
     cam_fn(elev_deg, azim_deg) -> Cam. The isolation mask is computed ONCE
     for all candidates (it depends only on the boxes, not the camera).
@@ -701,18 +782,22 @@ def render_slot_candidates(gs, boxes, cam_fn, candidates, cut_z,
     scored = []
     for elev, azim in candidates:
         cam = cam_fn(elev, azim)
+        cam, clr = _pullback_cam(gs, boxes, cam, keep, cut_z)
         vis = box_visibility(gs, boxes, cam, keep_mask=keep, cut_z=cut_z)
         img = rasterize_gs(gs, cam, cut_z=cut_z, keep_mask=keep)
         if img is None:
             continue
         q = view_quality(img)
         q["visibility"] = round(vis, 4)
+        q["clearance"] = round(clr, 3) if np.isfinite(clr) else None
         if boxes:
             img = overlay_boxes(img, boxes, cam, mode=overlay)
         scored.append((img, q, (elev, azim)))
     if not scored:
         return (None, None, None)
-    eligible = [s for s in scored if s[1]["visibility"] >= 0.25]
+    eligible = [s for s in scored
+                if s[1]["visibility"] >= 0.25
+                and (s[1]["clearance"] is None or s[1]["clearance"] >= 0.0)]
     if eligible:
         return max(eligible, key=lambda s: s[1]["score"])
     return max(scored, key=lambda s: s[1]["visibility"])

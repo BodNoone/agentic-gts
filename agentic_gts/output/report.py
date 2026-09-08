@@ -108,6 +108,8 @@ def _quality_chip(quality) -> str:
     slots = " ".join(
         f"{k} {v.get('score', 0):.2f}"
         + (f" vis {float(v['visibility']):.2f}" if "visibility" in v else "")
+        + (f" clr {float(v['clearance']):.2f}m"
+           if v.get("clearance") is not None else "")
         for k, v in quality.items() if isinstance(v, dict))
     return (f'<span title="{_html.escape(slots)}" '
             f'style="color:{color};font-size:12px">渲染质量 ≥ {worst:.2f}</span>')

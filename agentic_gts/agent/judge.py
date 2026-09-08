@@ -479,7 +479,9 @@ class VLMJudge:
         confident delete. A slot whose box is mostly hidden behind a wall
         or a flush neighbour (visibility < 0.3) counts as untrustworthy
         even when the image itself is sharp -- a sharp wall is still a
-        wall."""
+        wall. Likewise a camera still embedded in structure after the
+        pullback (clearance < 0) renders a blurry wall of near splats and
+        is untrustworthy however sharp the rest of the frame looks."""
         if not quality:
             return 1.0
         eff = []
@@ -489,6 +491,9 @@ class VLMJudge:
             s = float(v.get("score", 1.0))
             vis = v.get("visibility")
             if vis is not None and float(vis) < 0.3:
+                s = min(s, 0.3)
+            clr = v.get("clearance")
+            if clr is not None and float(clr) < 0.0:
                 s = min(s, 0.3)
             eff.append(s)
         return min(eff) if eff else 1.0
