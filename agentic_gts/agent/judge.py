@@ -475,13 +475,23 @@ class VLMJudge:
         """Worst per-slot view score (1.0 when unknown, e.g. scatter
         fallback where 'quality' is not a trained-view property). Callers
         cap the VLM verdict confidence when this is low: a blurry /
-        floater-ridden evidence image must not produce a confident
-        delete."""
+        floater-ridden / OCCLUDED evidence image must not produce a
+        confident delete. A slot whose box is mostly hidden behind a wall
+        or a flush neighbour (visibility < 0.3) counts as untrustworthy
+        even when the image itself is sharp -- a sharp wall is still a
+        wall."""
         if not quality:
             return 1.0
-        scores = [v.get("score") for v in quality.values()
-                  if isinstance(v, dict)]
-        return min(scores) if scores else 1.0
+        eff = []
+        for v in quality.values():
+            if not isinstance(v, dict):
+                continue
+            s = float(v.get("score", 1.0))
+            vis = v.get("visibility")
+            if vis is not None and float(vis) < 0.3:
+                s = min(s, 0.3)
+            eff.append(s)
+        return min(eff) if eff else 1.0
 
     def _gate_quality(self, v: Verdict, boxes, quality: dict | None = None) -> dict:
         """Cap a verdict's confidence when its evidence render scored low

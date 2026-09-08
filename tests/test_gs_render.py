@@ -434,6 +434,64 @@ def test_view_quality_scoring():
           f"empty={qe['score']:.2f} floater={qf['score']:.2f})")
 
 
+def test_box_visibility_detects_occlusion():
+    """The geometric sightline test must catch the wall / flush-neighbour
+    case the image-quality scorer cannot: a wall in front of the camera
+    renders sharp and scores well, but the box is invisible. The device's
+    own splats (inside the box) must not self-occlude; structure BEHIND
+    the box must not occlude either."""
+    from agentic_gts.output.gs_render import box_visibility, make_local_cam
+    from agentic_gts.tools.gs_io import GaussianData
+
+    def _gs(means, radius):
+        means = np.asarray(means, dtype=float)
+        n = len(means)
+        return GaussianData(
+            means=means,
+            log_scales=np.full((n, 3), float(np.log(radius))),
+            quats=np.tile([[1.0, 0.0, 0.0, 0.0]], (n, 1)),
+            raw_opacity=np.full(n, 8.0),
+            f_dc=np.zeros((n, 3)),
+        )
+
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(0.6, 1.1, 2.0), yaw=0.0)
+    cam = make_local_cam(box, azim_deg=0.0)     # looks from +y (front)
+    rng = np.random.default_rng(0)
+    # the device's own splats (inside the box) must NOT self-occlude
+    own = np.column_stack([rng.uniform(-0.25, 0.25, 300),
+                           rng.uniform(-0.45, 0.45, 300),
+                           rng.uniform(0.1, 1.9, 300)])
+    assert box_visibility(_gs(own, 0.03), [box], cam) > 0.9, \
+        "own splats must not self-occlude"
+    # a wall of big splats between camera (+y) and the box front face
+    xs, zs = np.meshgrid(np.linspace(-1.2, 1.2, 9),
+                         np.linspace(0.0, 2.2, 9))
+    wall = np.column_stack([xs.ravel(), np.full(xs.size, 0.8), zs.ravel()])
+    vis_wall = box_visibility(_gs(wall, 0.5), [box], cam)
+    assert vis_wall < 0.3, f"wall must block sightlines, got {vis_wall}"
+    # the same wall BEHIND the box must not occlude the front view
+    wall_back = np.column_stack([xs.ravel(), np.full(xs.size, -0.8),
+                                 zs.ravel()])
+    vis_back = box_visibility(_gs(wall_back, 0.5), [box], cam)
+    assert vis_back > 0.9, f"structure behind the box must not occlude, " \
+                           f"got {vis_back}"
+    # ceiling splats above the box must not flag the oblique view when the
+    # render's cut_z removes them
+    cxs, cys = np.meshgrid(np.linspace(-1.0, 1.0, 5),
+                           np.linspace(-1.0, 1.0, 5))
+    ceil = np.column_stack([cxs.ravel(), cys.ravel(),
+                            np.full(cxs.size, 2.4)])
+    cam_ob = make_local_cam(box, elev_deg=55.0, azim_deg=35.0)
+    vis_cut = box_visibility(_gs(ceil, 0.4), [box], cam_ob,
+                             cut_z=2.0 - 0.08)
+    vis_nocut = box_visibility(_gs(ceil, 0.4), [box], cam_ob)
+    assert vis_cut > vis_nocut, "cut_z must exclude removed ceiling splats"
+    assert vis_cut > 0.9, f"with cut, oblique view must be clear, got {vis_cut}"
+    print(f"PASS box visibility detects occlusion "
+          f"(wall={vis_wall:.2f} behind={vis_back:.2f} "
+          f"cut={vis_cut:.2f} nocut={vis_nocut:.2f})")
+
+
 def test_quality_out_and_gating():
     """render_topdown_image must fill quality_out on the scatter fallback
     (mode marker), and the judge must cap a verdict's confidence when the
@@ -466,6 +524,14 @@ def test_quality_out_and_gating():
     v2 = Verdict(action="delete", confidence=0.9)
     j._gate_quality(v2, [box], quality={"front": {"score": 0.8}})
     assert v2.confidence == 0.9, "good render must not cap confidence"
+    # a SHARP but occluded view (wall/flush neighbour fills the frame) must
+    # also gate: image quality cannot see this, visibility can
+    qocc = {"front": {"score": 0.9, "visibility": 0.1}}
+    assert j._quality_floor(qocc) <= 0.35, \
+        "occluded view must count as untrustworthy evidence"
+    v3 = Verdict(action="delete", confidence=0.9)
+    j._gate_quality(v3, [box], quality=qocc)
+    assert v3.confidence <= 0.5, "occluded evidence must cap confidence"
     print("PASS quality_out fill + verdict confidence gating")
 
 
@@ -486,5 +552,6 @@ if __name__ == "__main__":
     test_prep_cuts_ceiling()
     test_prep_cuts_floor()
     test_view_quality_scoring()
+    test_box_visibility_detects_occlusion()
     test_quality_out_and_gating()
     print("ALL GS TESTS PASSED")

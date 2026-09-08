@@ -106,8 +106,9 @@ def _quality_chip(quality) -> str:
     else:
         color = "#c62828"
     slots = " ".join(
-        f"{k} {v.get('score', 0):.2f}" for k, v in quality.items()
-        if isinstance(v, dict))
+        f"{k} {v.get('score', 0):.2f}"
+        + (f" vis {float(v['visibility']):.2f}" if "visibility" in v else "")
+        for k, v in quality.items() if isinstance(v, dict))
     return (f'<span title="{_html.escape(slots)}" '
             f'style="color:{color};font-size:12px">渲染质量 ≥ {worst:.2f}</span>')
 

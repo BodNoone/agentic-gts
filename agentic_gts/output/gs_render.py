@@ -600,26 +600,119 @@ def view_quality(img: np.ndarray) -> dict:
             "coverage": round(cov, 4), "speckle": round(speck_n, 4)}
 
 
+def box_visibility(gs: GaussianData, boxes, cam: Cam,
+                   keep_mask: np.ndarray | None = None,
+                   cut_z: float = float("inf"),
+                   max_gaussians: int = 60_000) -> float:
+    """Fraction of box-surface sample points with a CLEAR sightline from
+    the camera. [0,1], higher = the box is actually visible.
+
+    Catches the occluded-view case that image-quality scores CANNOT: a box
+    against a wall, or flush against a neighbouring rack, gets its front
+    view filled by the wall / neighbour -- which renders SHARP and scores
+    well while the adjudicated box is invisible. Occlusion is geometric
+    and must be tested geometrically: for each sample point on the boxes'
+    6 faces, cast the sightline from the camera and ask whether any other
+    gaussian (an ellipsoid of radius ~1.5x its max scale) intersects the
+    segment IN FRONT of the point.
+
+    Excluded from occluders: the boxes' OWN splats (inside any box with a
+    small margin -- the device surface itself must not self-occlude) and
+    gaussians above cut_z (the ceiling cut already removes them from the
+    actual render, so they must not count as blockers either).
+    """
+    m = keep_mask if keep_mask is not None else np.ones(len(gs), dtype=bool)
+    means = np.asarray(gs.means)[m]
+    radii = np.exp(np.asarray(gs.log_scales)[m]).max(axis=1) * 1.5
+    if cut_z is not None and np.isfinite(cut_z):
+        below = means[:, 2] < cut_z
+        means, radii = means[below], radii[below]
+    # exclude the device's own splats: inside any box (with margin)
+    inside = np.zeros(len(means), dtype=bool)
+    for b in boxes:
+        inside |= b.contains(means, margin=0.05)
+    means, radii = means[~inside], radii[~inside]
+    if len(means) > max_gaussians:      # cap for memory/speed, deterministic
+        sel = np.random.default_rng(0).choice(len(means), max_gaussians,
+                                              replace=False)
+        means, radii = means[sel], radii[sel]
+    # sample points: 3x3 grid on each of the 6 faces of every box
+    pts = []
+    for b in boxes:
+        l, w, h = (s / 2.0 for s in np.asarray(b.size, dtype=float))
+        faces = []
+        for u in np.linspace(-l, l, 3):
+            for v in np.linspace(-w, w, 3):
+                faces += [(u, v, h), (u, v, -h)]
+        for u in np.linspace(-l, l, 3):
+            for z in np.linspace(-h, h, 3):
+                faces += [(u, w, z), (u, -w, z)]
+        for v in np.linspace(-w, w, 3):
+            for z in np.linspace(-h, h, 3):
+                faces += [(l, v, z), (-l, v, z)]
+        pts.append(b.local_to_world(np.asarray(faces)))
+    P = np.vstack(pts)                          # (n,3)
+    if len(means) == 0:
+        return 1.0
+    C = np.asarray(cam.eye, dtype=float)
+    D = P - C
+    L = np.linalg.norm(D, axis=1)                # (n,)
+    U = D / np.clip(L[:, None], 1e-9, None)
+    visible = np.ones(len(P), dtype=bool)
+    step = 20_000
+    for s in range(0, len(means), step):
+        G = means[s:s + step]                    # (m,3)
+        R = radii[s:s + step]                    # (m,)
+        GC = G[:, None, :] - C                   # (m,n,3)
+        t = np.einsum("mnc,nc->mn", GC, U)       # proj along sightline
+        perp2 = np.einsum("mnc,mnc->mn", GC, GC) - t ** 2
+        occl = (t > 0.05) & (t < L[None, :] - 0.15) & \
+               (perp2 < R[:, None] ** 2)
+        visible &= ~occl.any(axis=0)
+    return float(visible.mean())
+
+
 def render_slot_candidates(gs, boxes, cam_fn, candidates, cut_z,
                             overlay: str, iso_margin: float):
     """Render several (elev, azim) candidates for ONE view slot, score each
     on the RAW render (before the wireframe overlay -- drawn lines would
     pollute the sharpness/speckle metrics), and return the best.
 
+    Two independent scores per candidate:
+      quality     -- image-based (sharpness/coverage/speckle): is this view
+                     well-trained? A view extrapolated away from the
+                     training cameras blurs and grows floaters.
+      visibility  -- geometry-based (box_visibility): is the box actually
+                     VISIBLE, or does a wall / flush neighbour fill the
+                     frame? A sharp wall still scores high on quality, so
+                     only the sightline test catches it.
+
+    Selection: among candidates where the box is visible (visibility >=
+    0.25) pick the highest image quality; if EVERY candidate is occluded,
+    keep the least-occluded one (its low visibility flows into the
+    confidence gating downstream -- the verdict is then distrusted
+    instead of silently judged on a wall).
+
     cam_fn(elev_deg, azim_deg) -> Cam. The isolation mask is computed ONCE
     for all candidates (it depends only on the boxes, not the camera).
     Returns (img, quality, (elev, azim)) or (None, None, None).
     """
     keep = _near_boxes_mask(gs, boxes, margin=iso_margin) if boxes else None
-    best = (None, None, None)
+    scored = []
     for elev, azim in candidates:
         cam = cam_fn(elev, azim)
+        vis = box_visibility(gs, boxes, cam, keep_mask=keep, cut_z=cut_z)
         img = rasterize_gs(gs, cam, cut_z=cut_z, keep_mask=keep)
         if img is None:
             continue
         q = view_quality(img)
+        q["visibility"] = round(vis, 4)
         if boxes:
             img = overlay_boxes(img, boxes, cam, mode=overlay)
-        if best[1] is None or q["score"] > best[1]["score"]:
-            best = (img, q, (elev, azim))
-    return best
+        scored.append((img, q, (elev, azim)))
+    if not scored:
+        return (None, None, None)
+    eligible = [s for s in scored if s[1]["visibility"] >= 0.25]
+    if eligible:
+        return max(eligible, key=lambda s: s[1]["score"])
+    return max(scored, key=lambda s: s[1]["visibility"])
