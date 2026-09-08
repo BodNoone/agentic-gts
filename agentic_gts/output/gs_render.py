@@ -186,7 +186,7 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
     return cam
 
 
-def make_local_cam(boxes, extent: float = 1.2, W: int = 448, H: int = 448,
+def make_local_cam(boxes, extent: float = 1.2, W: int = 768, H: int = 768,
                    elev_deg: float = 18.0, azim_deg: float = 0.0) -> Cam:
     """Camera for one box (or a pair): the fine-detail counterpart to the
     god-view's coarse positioning.
@@ -201,7 +201,12 @@ def make_local_cam(boxes, extent: float = 1.2, W: int = 448, H: int = 448,
     detail (doors/panels/LED); a steeper one (e.g. 55) shows the top and
     the box's full outline. `up` stays world-vertical so the rack renders
     upright.
+
+    W/H default 768: each tile of the three-view composite the VLM
+    adjudicates on carries ~5cm-scale misfits (wireframe overhang); at
+    448px a 1m-wide rack resolves to ~2px/cm which the VLM cannot read.
     """
+
     if hasattr(boxes, "center"):    # tolerate a single OrientedBox
         boxes = [boxes]
     ref = boxes[0]

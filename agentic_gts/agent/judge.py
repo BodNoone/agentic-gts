@@ -40,7 +40,7 @@ class Verdict:
 # ---------- image rendering helpers ----------
 
 def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
-                         size: int = 320, gs_ply: str | None = None,
+                         size: int = 768, gs_ply: str | None = None,
                          overlay: str = "wire3d") -> np.ndarray:
     """Render the local evidence image the VLM adjudicates on.
 
@@ -108,7 +108,7 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
         m &= stage_points[:, 2] < cut
     pts = stage_points[m][:, :2]
 
-    fig, ax = plt.subplots(figsize=(4, 4), dpi=size // 4)
+    fig, ax = plt.subplots(figsize=(4, 4), dpi=size // 4)  # 768px @ size=768
     if len(pts):
         ax.scatter(pts[:, 0], pts[:, 1], s=0.5, alpha=0.6, c="steelblue")
     ax.axis("equal")
@@ -170,25 +170,28 @@ def _tile_views(views: list, labels=("front", "side", "oblique")) -> np.ndarray:
     """
     from PIL import Image, ImageDraw
     tiles = []
+    label_h = max(18, views[0].shape[0] // 25)   # scale with tile resolution
     for i, v in enumerate(views):
         arr = (np.clip(v, 0, 1) * 255).astype(np.uint8)
         if arr.shape[2] == 4:
             arr = arr[:, :, :3]
         im = Image.fromarray(arr)
-        strip = Image.new("RGB", (im.width, 18), (0, 0, 0))
+        strip = Image.new("RGB", (im.width, label_h), (0, 0, 0))
         d = ImageDraw.Draw(strip)
-        d.text((6, 3), labels[i % len(labels)], fill=(255, 255, 255))
-        tile = Image.new("RGB", (im.width, im.height + 18), (0, 0, 0))
+        d.text((10, label_h // 6), labels[i % len(labels)],
+               fill=(255, 255, 255))
+        tile = Image.new("RGB", (im.width, im.height + label_h), (0, 0, 0))
         tile.paste(strip, (0, 0))
-        tile.paste(im, (0, 18))
+        tile.paste(im, (0, label_h))
         tiles.append(tile)
-    W = sum(t.width for t in tiles) + 4 * (len(tiles) - 1)
+    gap = max(4, label_h // 4)
+    W = sum(t.width for t in tiles) + gap * (len(tiles) - 1)
     H = max(t.height for t in tiles)
     out = Image.new("RGB", (W, H), (0, 0, 0))
     x = 0
     for t in tiles:
         out.paste(t, (x, 0))
-        x += t.width + 4
+        x += t.width + gap
     return np.asarray(out).astype(np.float32) / 255.0
 
 
