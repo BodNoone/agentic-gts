@@ -285,9 +285,10 @@ class LayoutAgent:
     def _vlm_refine(self, scene: Scene, report: AgentReport) -> None:
         """Fine-grained per-box refinement pass.
 
-        The VLM proposes RELATIVE, quantized corrections (dl/dw/dh in
+        The VLM proposes RELATIVE, quantized corrections (dl/dw in
         5cm steps, dyaw in 5deg steps, z-rotation only) from the
-        axes-annotated three-view composite. Those corrections only steer a
+        axes-annotated three-view composite. Height is TRUSTED from the
+        input boxes and never touched here. Those corrections only steer a
         SEED box: the exact geometry comes from fit_box_to_points, which
         re-derives center/size from the point support at the corrected
         yaw. A refinement that drifts away (IoU < 0.3 with the original)
@@ -307,8 +308,9 @@ class LayoutAgent:
             new_yaw = float(b.yaw) + math.radians(float(p.get("dyaw_deg", 0.0)))
             seed = (max(b.size[0] + float(p.get("dl", 0.0)), 0.15),
                     max(b.size[1] + float(p.get("dw", 0.0)), 0.15),
-                    max(b.size[2] + float(p.get("dh", 0.0)), 0.2))
-            refit = geo.fit_box_to_points(scene, b.center[:2], seed, new_yaw)
+                    b.size[2])
+            refit = geo.fit_box_to_points(scene, b.center[:2], seed, new_yaw,
+                                           keep_height=True)
             if refit is None or refit.iou_2d(b) < 0.3:
                 print(f"[diag][C] refine {b.box_id[:6]} rejected (drift) -> keep")
                 continue
@@ -318,7 +320,8 @@ class LayoutAgent:
             # VLM number, not a correction. This directly tests "did the
             # rotation help", independent of how sparse the cloud is.
             control = geo.fit_box_to_points(scene, b.center[:2], seed,
-                                             float(b.yaw))
+                                             float(b.yaw),
+                                             keep_height=True)
             sup_new = geo.support_fraction(scene, refit)
             sup_ctrl = (geo.support_fraction(scene, control)
                         if control is not None else 0.0)
@@ -338,20 +341,20 @@ class LayoutAgent:
                                          "action": "refine", "params": p})
             print(f"[diag][C] refine {b.box_id[:6]}: "
                   f"dyaw={p.get('dyaw_deg', 0):+.0f}deg "
-                  f"dl={p.get('dl', 0):+.2f} dw={p.get('dw', 0):+.2f} "
-                  f"dh={p.get('dh', 0):+.2f}")
+                  f"dl={p.get('dl', 0):+.2f} dw={p.get('dw', 0):+.2f}")
 
     def _refine_edges(self, scene: Scene) -> None:
         """Snap box edges to point support for the final layout accuracy.
 
         Expansion is tiny (2cm): adjacent racks are only mm apart, so any
         larger search window would absorb the neighbour's surface points.
+        Heights are trusted input -- never re-derived from points here.
         """
         refined: list[OrientedBox] = []
         for b in scene.boxes:
             refit = geo.fit_box_to_points(scene, b.center[:2],
-                                          (b.size[0] + 0.02, b.size[1] + 0.02, b.size[2] + 0.02),
-                                          b.yaw)
+                                          (b.size[0] + 0.02, b.size[1] + 0.02, b.size[2]),
+                                          b.yaw, keep_height=True)
             if refit is not None and refit.iou_2d(b) > 0.3:
                 refit.box_id = b.box_id
                 refit.device_type = b.device_type

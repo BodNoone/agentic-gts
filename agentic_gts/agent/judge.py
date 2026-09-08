@@ -643,10 +643,11 @@ class VLMJudge:
         "detection, and they usually do NOT fit the device well. The typical "
         "errors are: the wireframe overhangs past the device edge into the "
         "aisle or over the neighbouring device (too long/deep), the "
-        "wireframe covers only part of the device (too short), the box "
-        "misses the device's full height (too short), or the GREEN arrow is "
-        "not parallel to the device's long axis (wrong yaw). Only rotation "
-        "around the vertical (z) axis is allowed.\n\n"
+        "wireframe covers only part of the device (too short), or the GREEN "
+        "arrow is not parallel to the device's long axis (wrong yaw). Only "
+        "rotation around the vertical (z) axis is allowed. The box HEIGHT "
+        "is already trusted -- do NOT try to change it, only judge the "
+        "horizontal extent and the yaw.\n\n"
         "Work step by step:\n"
         "1. For each of the three views, write ONE short sentence stating "
         "whether the red wireframe matches the device outline; if not, say "
@@ -655,15 +656,11 @@ class VLMJudge:
         "2. Then output ONE JSON object with your corrections.\n\n"
         "Reply format -- a few short reasoning sentences, then the JSON "
         "object on the LAST line:\n"
-        '{"dl": <meters>, "dw": <meters>, "dh": <meters>, '
-        '"dyaw_deg": <degrees>}\n'
+        '{"dl": <meters>, "dw": <meters>, "dyaw_deg": <degrees>}\n'
         "- dl: length change along the GREEN arrow (meters, multiples of "
         "0.05, between -0.5 and 0.5): POSITIVE if the box is too short for "
         "the device, NEGATIVE if it overhangs.\n"
         "- dw: depth change along the BLUE arrow (same rules).\n"
-        "- dh: height change (meters, multiples of 0.05, between -0.3 and "
-        "0.3): positive = box too low, negative = box taller than the "
-        "device.\n"
         "- dyaw_deg: rotation around the vertical axis (degrees, multiples "
         "of 5, between -15 and 15), positive = counterclockwise seen from "
         "above. Use a NON-ZERO value when the GREEN arrow is not parallel "
@@ -738,7 +735,6 @@ class VLMJudge:
         p = {
             "dl": _q(data.get("dl", 0), 0.05, -0.5, 0.5),
             "dw": _q(data.get("dw", 0), 0.05, -0.5, 0.5),
-            "dh": _q(data.get("dh", 0), 0.05, -0.3, 0.3),
             "dyaw_deg": _q(data.get("dyaw_deg", 0), 5.0, -15.0, 15.0),
         }
         if not any(abs(v) > 1e-9 for v in p.values()):

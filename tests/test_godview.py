@@ -268,13 +268,15 @@ def test_objects_format_roundtrip():
 
 def test_parse_fit_reply_quantized_clamped():
     """The VLM's fit reply must be snapped to the 5cm/5deg grid and
-    clamped to the allowed ranges; all-zero / garbage -> None (keep)."""
+    clamped to the allowed ranges; all-zero / garbage -> None (keep).
+    Height is trusted input -> dh is not part of the action space; a
+    stray dh in the reply must be ignored, not break the parse."""
     from agentic_gts.agent.judge import VLMJudge
     p = VLMJudge._parse_fit_reply(
         '{"dl": 0.13, "dw": -9.0, "dh": 0.3, "dyaw_deg": 47}')
     assert abs(p["dl"] - 0.15) < 1e-9   # 0.13 snapped to the 5cm grid
     assert abs(p["dw"] - (-0.5)) < 1e-9  # clamped at the lower bound
-    assert abs(p["dh"] - 0.3) < 1e-9
+    assert "dh" not in p                 # height axis retired
     assert abs(p["dyaw_deg"] - 15.0) < 1e-9  # clamped at the upper bound
     assert VLMJudge._parse_fit_reply('{"dl": 0.0, "dw": 0.0, "dh": 0.0,'
                                      ' "dyaw_deg": 0.0}') is None
@@ -293,7 +295,7 @@ def test_parse_fit_reply_with_reasoning():
     reply = ("front view: wireframe right end hangs over the aisle.\n"
              "side view: depth ok {not json}.\n"
              'oblique: GREEN arrow skewed ~10deg off the rack axis.\n'
-             '{"dl": -0.1, "dw": 0.0, "dh": 0.0, "dyaw_deg": 10}')
+             '{"dl": -0.1, "dw": 0.0, "dyaw_deg": 10}')
     p = VLMJudge._parse_fit_reply(reply)
     assert p is not None and abs(p["dl"] + 0.1) < 1e-9 \
         and abs(p["dyaw_deg"] - 10.0) < 1e-9, f"reasoning reply lost: {p}"
@@ -337,7 +339,7 @@ def test_vlm_refine_corrects_yaw():
     class RotatingJudge(VLMJudge):
         def adjudicate_fit(self, scene, box):
             return Verdict(action="refine", confidence=0.8,
-                           params={"dl": 0.0, "dw": 0.0, "dh": 0.0,
+                           params={"dl": 0.0, "dw": 0.0,
                                    "dyaw_deg": 5.0})
 
     # racks physically rotated 10 deg; boxes placed at yaw=0 (wrong)
@@ -382,7 +384,7 @@ def test_vlm_refine_bounds_hallucinated_growth():
     class GrowJudge(VLMJudge):
         def adjudicate_fit(self, scene, box):
             return Verdict(action="refine", confidence=0.8,
-                           params={"dl": 0.5, "dw": 0.5, "dh": 0.3,
+                           params={"dl": 0.5, "dw": 0.5,
                                    "dyaw_deg": 0.0})
 
     # ONE isolated rack (a dense scene would let the grown seed swallow
@@ -401,6 +403,39 @@ def test_vlm_refine_bounds_hallucinated_growth():
         assert b.size[0] < 0.75, f"length hallucinated to {b.size[0]:.2f}"
         assert b.size[1] < 1.25, f"depth hallucinated to {b.size[1]:.2f}"
     print("PASS vlm refine bounds hallucinated growth (fit trims to support)")
+
+
+def test_vlm_refine_preserves_trusted_height():
+    """Input box heights are TRUSTED: even when the visible point support
+    spans less z than the box (surface fragments, ceiling-cut renders),
+    refine and the final edge snap must keep the original height instead
+    of re-deriving it from point percentiles."""
+    from agentic_gts.agent.judge import Verdict
+    from agentic_gts.core.models import OrientedBox
+
+    class NudgeJudge(VLMJudge):
+        def adjudicate_fit(self, scene, box):
+            return Verdict(action="refine", confidence=0.8,
+                           params={"dl": -0.05, "dw": 0.0,
+                                   "dyaw_deg": 0.0})
+
+    # points cover only the lower 1.2m of a 2.0m-high rack
+    rng = np.random.default_rng(5)
+    u = rng.uniform(-0.3, 0.3, 400)
+    v = rng.uniform(-0.55, 0.55, 400)
+    z = rng.uniform(0, 1.2, 400)
+    scene = Scene(points=np.stack([u, v, z], axis=1))
+    scene.boxes = [OrientedBox(center=(0, 0, 1), size=(0.6, 1.1, 2.0),
+                               yaw=0.0)]
+    agent = LayoutAgent(judge=NudgeJudge(backend="qwen"))
+    agent.run(scene)
+    assert len(scene.boxes) == 1
+    b = scene.boxes[0]
+    assert abs(b.size[2] - 2.0) < 1e-6, \
+        f"trusted height changed to {b.size[2]:.3f}"
+    assert abs(b.center[2] - 1.0) < 1e-6, \
+        f"trusted z-center changed to {b.center[2]:.3f}"
+    print("PASS vlm refine preserves trusted height (z never re-derived)")
 
 
 def test_agent_merges_fragments_geometrically():

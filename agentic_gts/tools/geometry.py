@@ -14,12 +14,18 @@ from agentic_gts.core.models import BoxSource, Confidence, DeviceType, OrientedB
 
 def fit_box_to_points(scene: Scene, seed_center: tuple[float, float],
                       seed_size: tuple[float, float, float], yaw: float,
-                      inlier_frac: float = 0.9) -> OrientedBox | None:
+                      inlier_frac: float = 0.9,
+                      keep_height: bool = False) -> OrientedBox | None:
     """Refit an oriented box to the local point support.
 
     Boundary estimation via 1D occupancy histograms per axis: find the
     contiguous occupied span containing the center. Robust to sparse noise
     while keeping edges tight to the true surface.
+
+    keep_height=True: the input box heights are TRUSTED (detector
+    output) -- keep the seed's z-extent untouched instead of re-deriving
+    it from point percentiles (surface fragments / ceiling cuts make
+    point-based z unreliable).
     """
     seed = OrientedBox(center=(seed_center[0], seed_center[1], seed_size[2] / 2),
                        size=seed_size, yaw=yaw)
@@ -40,7 +46,10 @@ def fit_box_to_points(scene: Scene, seed_center: tuple[float, float],
     qlo, qhi = np.percentile(inside, [0.5, 99.5], axis=0)
     xmin, xmax = float(qlo[0]), float(qhi[0])
     ymin, ymax = float(qlo[1]), float(qhi[1])
-    zmin, zmax = float(qlo[2]), float(qhi[2])
+    if keep_height:
+        zmin, zmax = -half[2], half[2]
+    else:
+        zmin, zmax = float(qlo[2]), float(qhi[2])
 
     new_size = (max(xmax - xmin, 0.15), max(ymax - ymin, 0.15), max(zmax - zmin, 0.2))
     local_center = np.array([(xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2])
