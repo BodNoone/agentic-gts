@@ -365,6 +365,33 @@ def test_vlm_refine_bounds_hallucinated_growth():
     print("PASS vlm refine bounds hallucinated growth (fit trims to support)")
 
 
+def test_agent_merges_fragments_geometrically():
+    """Front + back surface fragments of ONE rack must be fused by the
+    agent's geometric merge pass, with NO VLM merge adjudication (mock
+    judge): refine aligns the fragments, the deterministic rules pair
+    them. This is the replacement for the retired MERGED_NEIGHBORS pass."""
+    from agentic_gts.core.models import OrientedBox
+
+    rng = np.random.default_rng(3)
+    pts = []
+    for y_off in (0.55, -0.55):
+        u = rng.uniform(-0.3, 0.3, 300)
+        z = rng.uniform(0, 2.0, 300)
+        pts.append(np.stack([u, np.full(300, y_off), z], axis=1))
+    scene = Scene(points=np.vstack(pts))
+    scene.boxes = [
+        OrientedBox(center=(0, 0.55, 1), size=(0.6, 0.08, 2.0), yaw=0.0),
+        OrientedBox(center=(0, -0.55, 1), size=(0.6, 0.08, 2.0), yaw=0.0),
+    ]
+    agent = LayoutAgent(judge=VLMJudge(backend="mock"))
+    agent.run(scene)
+    assert len(scene.boxes) == 1, \
+        f"front/back fragments not fused: {len(scene.boxes)} boxes left"
+    b = scene.boxes[0]
+    assert b.size[1] > 0.9, f"merged depth {b.size[1]:.2f} -- fusion hollow"
+    print("PASS agent geometric merge fuses front/back fragments (no VLM)")
+
+
 def test_ply_artifacts():
     """Output PLYs: boxes_only.ply (no cloud) + cloud_with_boxes.ply
     (height-tinted when no GS, SH-DC colored when GS available)."""

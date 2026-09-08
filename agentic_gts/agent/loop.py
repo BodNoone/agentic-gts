@@ -95,62 +95,10 @@ class LayoutAgent:
                     issues.append(Issue(IssueType.OVERLAP, [a.box_id, b.box_id],
                                         self._region(a), detail=f"iou={iou:.2f}",
                                         severity=0.6))
-        # candidate boxes that may be faces of the SAME rack (no intersection,
-        # aligned along the row, close together) -- the geometry cannot decide
-        # (rules can't be enumerated), so hand to the VLM to reason about.
-        for aid, bid in self._find_merge_candidates(scene):
-            a, b = scene.get_box(aid), scene.get_box(bid)
-            if a is None or b is None:
-                continue
-            x0 = min(a.center[0], b.center[0])
-            y0 = min(a.center[1], b.center[1])
-            x1 = max(a.center[0], b.center[0])
-            y1 = max(a.center[1], b.center[1])
-            issues.append(Issue(IssueType.MERGED_NEIGHBORS, [aid, bid],
-                                (x0 - 0.5, y0 - 0.5, x1 + 0.5, y1 + 0.5),
-                                detail="adjacent, may be same rack faces",
-                                severity=0.65))
+        # NOTE: same-device fragment pairs (old MERGED_NEIGHBORS) are no
+        # longer detected here: the per-box VLM refine + deterministic
+        # geometric merge in run() handle them before this loop runs.
         return issues
-
-    def _find_merge_candidates(self, scene: Scene,
-                               gap_ratio: float = 2.0) -> list[tuple[str, str]]:
-        """Pairs of boxes likely to be faces of ONE rack.
-
-        A single rack's front / back / side surfaces come out as separate
-        detector boxes with NO intersection: they overlap along the ROW axis
-        (same along-position) but separate along the CROSS axis (front vs back
-        face, or two side fragments). This is not enumerable by rules -- the
-        VLM decides. We only scan for plausible candidates: same row, near
-        along-position, cross-positions close (within a rack footprint).
-        """
-        yaw = float(scene.meta.get("yaw", 0.0))
-        axis = np.array([math.cos(yaw), math.sin(yaw)])
-        cross = np.array([-math.sin(yaw), math.cos(yaw)])
-        res = []
-        for i, a in enumerate(scene.boxes):
-            for b in scene.boxes[i + 1:]:
-                ca, cb = np.asarray(a.center[:2]), np.asarray(b.center[:2])
-                if np.linalg.norm(ca - cb) > 3.5:
-                    continue
-                along_a, along_b = ca @ axis, cb @ axis
-                cross_a, cross_b = ca @ cross, cb @ cross
-                # same row: cross positions must be close (< 1.2 rack depth)
-                if abs(cross_a - cross_b) > 1.2:
-                    continue
-                # near same along position (a rack is ~one unit long): centers
-                # within ~1.5 rack widths along the row
-                if abs(along_a - along_b) > 1.5:
-                    continue
-                # either the cross gap is small (front/back of ONE rack) or
-                # the along gap is small (left/right fragments of ONE rack)
-                cross_gap = abs(cross_a - cross_b)
-                along_gap = abs(along_a - along_b)
-                small_along = min(a.size[0], b.size[0]) * gap_ratio
-                small_cross = min(a.size[1], b.size[1]) * gap_ratio
-                near = (cross_gap <= small_cross and along_gap <= small_along)
-                if near:
-                    res.append((a.box_id, b.box_id))
-        return res
 
     # ---------------- god-view global audit ----------------
     def _save_godview_png(self, scene: Scene, name: str = "godview.png") -> None:
@@ -202,6 +150,19 @@ class LayoutAgent:
     # ---------------- repair loop ----------------
     def run(self, scene: Scene) -> AgentReport:
         report = AgentReport()
+        # 1. fine-grained per-box pose refinement FIRST: the VLM proposes
+        # quantized size/yaw corrections (z-rotation only) from the
+        # axes-annotated local view; geometry tools re-fit the box to
+        # point support. Doing this BEFORE merging is the whole point:
+        # fragments of one rack become co-axial (same corrected yaw), so
+        # the geometric merge below can pair them reliably.
+        self._vlm_refine(scene, report)
+        # 2. geometric merge of the now co-axial fragments: with a common
+        # yaw, same-device fragments satisfy the deterministic front/back
+        # + side complement rules, and the VLM merge adjudication is no
+        # longer needed (the old MERGED_NEIGHBORS VLM pass is retired).
+        self._geometric_merge(scene, report)
+        # 3. repair loop: false positives, fused rows, overlaps.
         # fixes cascade: a split creates fragments that may need merging, a
         # merge may overlap a neighbour. One detection pass cannot see the
         # problems the fixes THEMSELVES introduce -- so re-detect after each
@@ -230,10 +191,6 @@ class LayoutAgent:
             if fresh == 0:
                 break
             issues = self.detect_issues(scene)
-        # fine-grained per-box pose refinement: the VLM proposes quantized
-        # size/yaw corrections (z-rotation only) from the axes-annotated
-        # local view; geometry tools then re-fit the box to point support
-        self._vlm_refine(scene, report)
         # final edge refinement: snap every box to its point support
         self._refine_edges(scene)
         # confidence tagging (BEFORE the final QA: the QA's LOW marks must
@@ -282,6 +239,33 @@ class LayoutAgent:
                           self._region(b),
                           detail=f"final godview: {f['reason']}", severity=0.7)
             report.unresolved.append({"issue": issue.to_dict(), "ok": False})
+
+    def _geometric_merge(self, scene: Scene, report: AgentReport) -> None:
+        """Deterministic fragment merge AFTER the per-box pose refinement.
+
+        The VLM merge adjudication (old MERGED_NEIGHBORS pass) is retired:
+        once refine has corrected each fragment's yaw/size to the device,
+        fragments of ONE rack are co-axial, and the B0 geometry rules
+        (front/back + side complement) pair them reliably -- no reasoning
+        needed. Reuses rules.fuse_fragments verbatim.
+        """
+        try:
+            from agentic_gts.rules.rules import fuse_fragments
+            yaw = float(scene.meta.get("yaw", 0.0))
+            trusted = bool(self.opts.get("trust_input_boxes"))
+            before = len(scene.boxes)
+            boxes, n_absorbed = fuse_fragments(scene, yaw=yaw,
+                                               trusted=trusted)
+            if n_absorbed > 0:
+                scene.boxes = boxes
+                report.actions_taken.append(
+                    {"issue_id": "geometric_merge", "action": "merge",
+                     "params": {"absorbed": n_absorbed}})
+                print(f"[diag][C] geometric merge absorbed {n_absorbed} "
+                      f"fragments ({before} -> {len(scene.boxes)} boxes)")
+        except Exception as e:
+            print(f"[diag][C] geometric merge failed ({type(e).__name__}: "
+                  f"{e}) -> skipped")
 
     def _vlm_refine(self, scene: Scene, report: AgentReport) -> None:
         """Fine-grained per-box refinement pass.
@@ -527,26 +511,6 @@ class LayoutAgent:
                 # clusters should become TWO racks, not round(2.6/0.6)=4.
                 n = max(2, min(int(n_clusters), int(round(box.size[0] / width_unit))))
                 return Verdict(action="split", params={"n": n, "width_unit": width_unit})
-            return Verdict(action="keep")
-        if issue.issue_type == IssueType.MERGED_NEIGHBORS and len(issue.box_ids) >= 2:
-            # Two boxes that do NOT intersect but sit close / aligned: they may
-            # be different faces of ONE rack (front/back/side) -- the kind of
-            # merge that cannot be enumerated with rules and needs reasoning.
-            # Ask the VLM over a crop that shows BOTH boxes.
-            a = scene.get_box(issue.box_ids[0])
-            b = scene.get_box(issue.box_ids[1])
-            if a is None or b is None:
-                return Verdict(action="keep")
-            verdict = self.judge.adjudicate_pair(
-                scene, a, b,
-                question=("Do the two red boxes belong to the SAME rack (different "
-                          "faces / a split rack) or are they TWO SEPARATE racks? "
-                          "Merge them only if they are the same device."),
-                options=["same rack, merge", "two separate racks"],
-            )
-            choice = (verdict.params or {}).get("choice", "")
-            if choice == "same rack, merge" or verdict.action == "merge":
-                return Verdict(action="merge", params={"box_ids": [a.box_id, b.box_id]})
             return Verdict(action="keep")
         if issue.issue_type == IssueType.FALSE_POSITIVE and box is not None:
             # The evidence image (three-view composite) is rendered AND
