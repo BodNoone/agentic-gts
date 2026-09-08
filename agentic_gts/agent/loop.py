@@ -85,6 +85,21 @@ class LayoutAgent:
                 issues.append(Issue(IssueType.MERGED_ROW, [b.box_id],
                                     self._region(b),
                                     detail=f"clusters={n_clusters}", severity=0.7))
+                continue
+            # width-grid misfit: the box spans a non-integer number of rack
+            # units (e.g. one whole device + half of the next). Sparse
+            # half-devices rarely form a density cluster, so the cluster
+            # check above misses them -- the GRID does not (a 0.9 m box is
+            # neither 1 nor 2 units of 0.6 m). Only nominates; the profile
+            # cliffs / VLM arbitration decide what to do.
+            L = float(b.size[0])
+            if L > width_unit * 1.2:
+                nearest = max(1, round(L / width_unit))
+                if abs(L - nearest * width_unit) > 0.25 * width_unit:
+                    issues.append(Issue(
+                        IssueType.WIDTH_MISFIT, [b.box_id], self._region(b),
+                        detail=f"width={L:.2f} not on {width_unit:.1f} grid",
+                        severity=0.6))
         # overlapping boxes
         for i, a in enumerate(scene.boxes):
             for b in scene.boxes[i + 1:]:
@@ -449,6 +464,58 @@ class LayoutAgent:
         except Exception as e:
             print(f"[diag][C]   fix render failed ({type(e).__name__}: {e})")
 
+    def _decide_width_misfit(self, scene: Scene, box: OrientedBox) -> Verdict:
+        """Width-grid misfit: decide split / truncate / keep.
+
+        Priority of evidence:
+        1. profile GAPS (interior empty runs) -- hard geometry: split at
+           the cliff positions, no VLM needed.
+        2. profile TAILS (fading ends) -- hard geometry: truncate the box
+           to the strong-density span (the observed half-device or noise
+           tail loses its claim on the box).
+        3. neither -- ambiguous (flush devices, a genuinely wide unit):
+           ask the VLM for the device count. "one device" (or a failed /
+           mock call) -> keep: a wide single device is legal and the grid
+           prior alone must never butcher it. "multiple" -> split at the
+           grid positions from the box edge (devices tile the row).
+        """
+        prof = geo.profile_cuts(scene, box)
+        if prof["gaps"]:
+            return Verdict(action="split",
+                           params={"n": len(prof["gaps"]) + 1,
+                                   "cuts": prof["gaps"]},
+                           detail=f"gaps at {[f'{c:.2f}' for c in prof['gaps']]}")
+        lo, hi = prof["tails"]
+        if lo is not None or hi is not None:
+            return Verdict(action="truncate",
+                           params={"lo": lo, "hi": hi},
+                           detail=f"tails lo={lo} hi={hi}")
+        try:
+            verdict = self.judge.adjudicate_box(
+                scene, box,
+                question=("Does the red wireframe cover exactly ONE device, "
+                          "or does it extend past a device boundary and "
+                          "cover more than one (possibly partial) device?"),
+                options=["one device", "multiple devices"],
+            )
+            choice = (verdict.params or {}).get("choice", "")
+        except Exception:
+            choice = ""
+        if choice == "multiple devices":
+            width_unit = float(self.opts.get("width_unit", 0.6))
+            L = float(box.size[0])
+            n = max(2, int(round(L / width_unit)))
+            # grid-aligned cuts from the box edge: devices tile the row, so
+            # boundaries fall on unit multiples when no cliff is visible
+            cuts = [-L / 2 + width_unit * k for k in range(1, n)]
+            cuts = [c for c in cuts if -L / 2 + 0.1 < c < L / 2 - 0.1]
+            if not cuts:
+                return Verdict(action="keep", detail="no valid grid cut")
+            return Verdict(action="split", params={"n": len(cuts) + 1,
+                                                    "cuts": cuts},
+                           detail=f"vlm: multiple, grid cuts")
+        return Verdict(action="keep", detail="no cliff, vlm/default: one device")
+
     # ---------------- decision ----------------
     def _save_local_evidence(self, scene: Scene, box: OrientedBox,
                              issue: Issue) -> None:
@@ -479,6 +546,8 @@ class LayoutAgent:
 
     def _decide(self, scene: Scene, issue: Issue) -> Verdict:
         box = scene.get_box(issue.box_ids[0]) if issue.box_ids else None
+        if issue.issue_type == IssueType.WIDTH_MISFIT and box is not None:
+            return self._decide_width_misfit(scene, box)
         if issue.issue_type == IssueType.MERGED_ROW and box is not None:
             n_clusters, dom, _ = geo.center_field_clusters(scene, box)
             # Geometry is the hard signal: a box whose center-field splits
@@ -506,6 +575,23 @@ class LayoutAgent:
                     pass
             if split:
                 width_unit = float(self.opts.get("width_unit", 0.6))
+                # the density profile is the authority on WHERE devices
+                # end. A sparse tail can masquerade as a second "cluster"
+                # to center_field_clusters (the 1.5-device box: one whole
+                # rack + a fading half-observed neighbour) -- equal-splitting
+                # that produces two wrong halves. Consult the profile:
+                # gaps -> split at the cliffs; tails -> truncate the fading
+                # end; only a clean profile falls back to equal division.
+                prof = geo.profile_cuts(scene, box)
+                if prof["gaps"]:
+                    return Verdict(action="split",
+                                   params={"n": len(prof["gaps"]) + 1,
+                                           "cuts": prof["gaps"]})
+                lo, hi = prof["tails"]
+                if lo is not None or hi is not None:
+                    return Verdict(action="truncate",
+                                   params={"lo": lo, "hi": hi},
+                                   detail="second cluster is a fading tail")
                 # split into the number of racks the geometry actually found
                 # (n_clusters), not a width_unit guess -- a 2.6m box with two
                 # clusters should become TWO racks, not round(2.6/0.6)=4.
@@ -548,13 +634,48 @@ class LayoutAgent:
                 return False
             params = verdict.params or {}
             subs = geo.split_box(scene, box, int(params.get("n", 2)),
-                                 params.get("width_unit"))
+                                 params.get("width_unit"),
+                                 params.get("cuts"))
             if len(subs) < 2:
                 return False
             scene.remove_box(box.box_id)
             for s in subs:
                 s.source = BoxSource.AGENT_FIX
                 scene.boxes.append(s)
+            return True
+        if verdict.action == "truncate":
+            # cut the box at the profile tail bounds, then refit: the seed
+            # keeps a small margin on the NON-cut side so the refit can
+            # re-capture the device's true edge there, while the cut side
+            # stays put (the tail points are outside the seed and cannot
+            # drag the percentile back out).
+            box = scene.get_box(issue.box_ids[0])
+            if box is None:
+                return False
+            params = verdict.params or {}
+            half_x = box.size[0] / 2.0
+            lo = -half_x if params.get("lo") is None else float(params["lo"])
+            hi = half_x if params.get("hi") is None else float(params["hi"])
+            if hi - lo < 0.25:
+                return False
+            margin = 0.15
+            # margin on the NON-cut side only: lets the refit re-capture
+            # the device's true edge where the box under-covered it; the
+            # cut side stays fixed so tail points cannot stretch it back
+            seed_lo = lo - (margin if params.get("lo") is None else 0.0)
+            seed_hi = hi + (margin if params.get("hi") is None else 0.0)
+            axis = box.rotation[:, 0]
+            mid = (seed_lo + seed_hi) / 2.0
+            new_c = np.asarray(box.center) + axis * mid
+            seed = (seed_hi - seed_lo, box.size[1], box.size[2])
+            refit = geo.fit_box_to_points(scene, new_c[:2], seed, box.yaw)
+            if refit is None or refit.size[0] >= box.size[0] - 0.03:
+                return False  # no real reduction -> rollback to original
+            refit.source = BoxSource.AGENT_FIX
+            refit.row_id = box.row_id
+            refit.device_type = box.device_type
+            scene.remove_box(box.box_id)
+            scene.boxes.append(refit)
             return True
         if verdict.action == "merge":
             ids = (verdict.params or {}).get("box_ids") or issue.box_ids

@@ -392,6 +392,118 @@ def test_agent_merges_fragments_geometrically():
     print("PASS agent geometric merge fuses front/back fragments (no VLM)")
 
 
+def _rack_pts(rng, x_lo, x_hi, n=400, y_depth=1.1, z_h=2.0):
+    """Surface points of a rack footprint [x_lo, x_hi]: front/back faces +
+    top. Dense enough for profile_cuts min_points."""
+    pts = []
+    for off in (y_depth / 2, -y_depth / 2):
+        u = rng.uniform(x_lo, x_hi, n)
+        z = rng.uniform(0, z_h, n)
+        pts.append(np.stack([u, np.full(n, off), z], axis=1))
+    u = rng.uniform(x_lo, x_hi, n // 2)
+    v = rng.uniform(-y_depth / 2, y_depth / 2, n // 2)
+    pts.append(np.stack([u, v, np.full(n // 2, z_h)], axis=1))
+    return np.vstack(pts)
+
+
+def test_profile_cuts_gap_and_tail():
+    """profile_cuts must find: the empty aisle between two racks (gap cut),
+    the sparse fading end of a half-observed device (tail truncation), and
+    nothing in a uniform dense box."""
+    from agentic_gts.core.models import OrientedBox
+    from agentic_gts.tools import geometry as geo
+
+    rng = np.random.default_rng(5)
+    # two racks with a 0.1m aisle, one box over both
+    pts = np.vstack([_rack_pts(rng, 0.0, 0.6), _rack_pts(rng, 0.7, 1.3)])
+    scene = Scene(points=pts)
+    box = OrientedBox(center=(0.65, 0, 1), size=(1.3, 1.1, 2.0), yaw=0.0)
+    prof = geo.profile_cuts(scene, box)
+    assert len(prof["gaps"]) == 1, f"aisle gap not found: {prof}"
+    assert abs(prof["gaps"][0]) < 0.06, "cut should sit at the aisle middle"
+
+    # one rack + a sparse fading half-device tail
+    pts = np.vstack([
+        _rack_pts(rng, 0.0, 0.6),
+        _rack_pts(rng, 0.6, 0.9, n=30),   # ~8x sparser
+    ])
+    scene = Scene(points=pts)
+    box = OrientedBox(center=(0.45, 0, 1), size=(0.9, 1.1, 2.0), yaw=0.0)
+    prof = geo.profile_cuts(scene, box)
+    assert not prof["gaps"], "fading tail must not read as an aisle gap"
+    assert prof["tails"][1] is not None, "fading tail not detected"
+    assert 0.1 < prof["tails"][1] < 0.25, f"tail cut {prof['tails']} misplaced"
+
+    # uniform dense wide device: neither gaps nor tails
+    scene = Scene(points=_rack_pts(rng, 0.0, 0.9, n=600))
+    box = OrientedBox(center=(0.45, 0, 1), size=(0.9, 1.1, 2.0), yaw=0.0)
+    prof = geo.profile_cuts(scene, box)
+    assert not prof["gaps"] and prof["tails"] == (None, None)
+    print("PASS profile_cuts (gap / tail / clean)")
+
+
+def test_width_misfit_splits_at_aisle_gap():
+    """A box over two racks separated by an aisle must split AT THE GAP,
+    not at the equal-division midpoint."""
+    from agentic_gts.core.models import OrientedBox
+
+    rng = np.random.default_rng(6)
+    pts = np.vstack([_rack_pts(rng, 0.0, 0.6), _rack_pts(rng, 0.7, 1.3)])
+    scene = Scene(points=pts)
+    scene.boxes = [OrientedBox(center=(0.65, 0, 1), size=(1.3, 1.1, 2.0),
+                               yaw=0.0)]
+    agent = LayoutAgent(judge=VLMJudge(backend="mock"))
+    agent.run(scene)
+    assert len(scene.boxes) == 2, f"expected 2 racks, got {len(scene.boxes)}"
+    centers = sorted(b.center[0] for b in scene.boxes)
+    assert abs(centers[0] - 0.3) < 0.08 and abs(centers[1] - 1.0) < 0.08, \
+        f"pieces not on the rack centers: {centers}"
+    print("PASS width audit splits at the aisle gap (cliff cuts)")
+
+
+def test_width_misfit_truncates_half_device():
+    """The 1.5-device box: one full rack + a sparse half-observed neighbour.
+    The fading tail must be truncated, leaving a ~0.6m box on the full rack."""
+    from agentic_gts.core.models import OrientedBox
+
+    rng = np.random.default_rng(7)
+    pts = np.vstack([
+        _rack_pts(rng, 0.0, 0.6),
+        _rack_pts(rng, 0.6, 0.9, n=30),   # half device, sparse
+    ])
+    scene = Scene(points=pts)
+    scene.boxes = [OrientedBox(center=(0.45, 0, 1), size=(0.9, 1.1, 2.0),
+                               yaw=0.0)]
+    agent = LayoutAgent(judge=VLMJudge(backend="mock"))
+    agent.run(scene)
+    assert len(scene.boxes) >= 1
+    main = max(scene.boxes, key=lambda b: b.size[0])
+    assert 0.45 < main.size[0] < 0.72, \
+        f"half-device tail not truncated: L={main.size[0]:.2f}"
+    assert abs(main.center[0] - 0.3) < 0.1, \
+        f"truncated box drifted: {main.center[0]:.2f}"
+    print(f"PASS width audit truncates half-device tail "
+          f"(0.9 -> {main.size[0]:.2f}m)")
+
+
+def test_width_misfit_keeps_wide_single_device():
+    """A genuinely wide (0.9m) device with uniform dense support: no gap,
+    no tail, mock VLM gives no 'multiple' answer -> the box must be KEPT.
+    The grid prior alone must never butcher a wide device."""
+    from agentic_gts.core.models import OrientedBox
+
+    rng = np.random.default_rng(8)
+    scene = Scene(points=_rack_pts(rng, 0.0, 0.9, n=600))
+    scene.boxes = [OrientedBox(center=(0.45, 0, 1), size=(0.9, 1.1, 2.0),
+                               yaw=0.0)]
+    agent = LayoutAgent(judge=VLMJudge(backend="mock"))
+    agent.run(scene)
+    assert len(scene.boxes) == 1, f"wide device destroyed: {len(scene.boxes)}"
+    assert scene.boxes[0].size[0] > 0.8, \
+        f"wide device shrank to {scene.boxes[0].size[0]:.2f}"
+    print("PASS width audit keeps a wide single device (no false butchery)")
+
+
 def test_ply_artifacts():
     """Output PLYs: boxes_only.ply (no cloud) + cloud_with_boxes.ply
     (height-tinted when no GS, SH-DC colored when GS available)."""

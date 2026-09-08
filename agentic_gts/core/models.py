@@ -135,6 +135,8 @@ class IssueType(str, Enum):
     OVERLAP = "overlap"              # two boxes overlapping
     MISALIGNED = "misaligned"        # not aligned with row direction
     LOW_SUPPORT = "low_support"
+    WIDTH_MISFIT = "width_misfit"    # spans a non-integer number of rack units
+                                      # (e.g. 1.5 devices: one whole + a half)
 
 
 @dataclass

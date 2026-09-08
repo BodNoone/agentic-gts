@@ -211,35 +211,122 @@ def center_field_clusters(scene: Scene, box: OrientedBox,
     return est_racks, 1.0 / est_racks, np.zeros(0, dtype=int)
 
 
-def split_box(scene: Scene, box: OrientedBox, n: int, width_unit: float | None = None) -> list[OrientedBox]:
-    """Split a (merged-row) box into n sub-boxes along the row axis."""
-    if n < 2:
-        return [box]
+def profile_cuts(scene: Scene, box: OrientedBox, cell: float = 0.05,
+                 min_points: int = 40) -> dict:
+    """Analyze the along-axis (local x) point-density profile of a box.
+
+    Two hard geometric signals for the width audit:
+      gaps  -- interior near-empty runs flanked by occupied bins on both
+               sides: a device boundary. The cut position is the middle
+               of the empty run. Both sides must still span >= 0.3 m
+               (a plausible device) -- a boundary against a 0.15 m sliver
+               is a TAIL, not a gap.
+      tails -- leading/trailing weak runs (density < 20% of peak, at least
+               0.15 m long): the box overhangs its point support with a
+               fading fragment (e.g. half an observed device). Truncation
+               bounds are the first/last strong bin edges.
+
+    Returns {"gaps": [local-x cuts], "tails": (lo | None, hi | None)} in
+    box-LOCAL coordinates. All-empty / too-sparse profiles return no cuts.
+    """
+    out = {"gaps": [], "tails": (None, None)}
+    region = _region_of_box(box, expand=0.03)
+    pts = scene.points_in_region(region)
+    if len(pts) < min_points:
+        return out
+    local = box.world_to_local(pts)
+    half = np.asarray(box.size) / 2.0
+    inside = local[np.all(np.abs(local) <= half, axis=1)]
+    if len(inside) < min_points:
+        return out
+    x = inside[:, 0]
+    lo, hi = float(-half[0]), float(half[0])
+    edges = np.arange(lo, hi + cell / 2, cell)
+    if len(edges) < 4:
+        return out
+    hist, _ = np.histogram(x, bins=edges)
+    peak = float(hist.max())
+    if peak < 5:
+        return out
+
+    # ---- gaps: interior empty runs between substantial dense runs ----
+    empty = hist < max(peak * 0.1, 2.0)
+    i = 0
+    while i < len(hist):
+        if not empty[i]:
+            i += 1
+            continue
+        j = i
+        while j < len(hist) and empty[j]:
+            j += 1
+        # interior only: occupied bins on BOTH sides, >= 2 bins wide
+        if i > 0 and j < len(hist) and (j - i) >= 2:
+            if (edges[i] - lo) >= 0.3 and (hi - edges[j]) >= 0.3:
+                out["gaps"].append(float((edges[i] + edges[j]) / 2.0))
+        i = j
+
+    # ---- tails: fading ends below 20% of the peak ----
+    thr = max(peak * 0.2, 3.0)
+    strong = hist >= thr
+    k0 = 0
+    while k0 < len(hist) and not strong[k0]:
+        k0 += 1
+    if 0 < k0 < len(hist) and (edges[k0] - lo) >= 0.15:
+        out["tails"] = (float(edges[k0]), None)
+    k1 = len(hist) - 1
+    while k1 >= 0 and not strong[k1]:
+        k1 -= 1
+    if 0 <= k1 < len(hist) - 1 and (hi - edges[k1 + 1]) >= 0.15:
+        out["tails"] = (out["tails"][0], float(edges[k1 + 1]))
+
+    # the surviving span must still be a plausible device
+    lo_t = lo if out["tails"][0] is None else out["tails"][0]
+    hi_t = hi if out["tails"][1] is None else out["tails"][1]
+    if hi_t - lo_t < 0.3:
+        out["tails"] = (None, None)
+    return out
+
+
+def split_box(scene: Scene, box: OrientedBox, n: int,
+              width_unit: float | None = None,
+              cuts: list[float] | None = None) -> list[OrientedBox]:
+    """Split a (merged-row) box along the row axis.
+
+    `cuts` (box-local x positions, e.g. density-profile gap middles) take
+    priority: pieces land on the measured device boundaries instead of an
+    equal division -- a 0.9 m "1.5-device" box must cut at 0.6, not 0.45.
+    Without cuts, falls back to equal division into n (or width_unit-derived)
+    pieces.
+    """
     L, W, H = box.size
     row_axis = box.rotation[:, 0]  # local x direction in world
-    # choose split width: use the caller's n (the count the geometry actually
-    # found) unless it is invalid; width_unit is only a fallback when n<2.
-    total = L
-    if n is not None and n >= 2:
-        k = int(n)
-    elif width_unit and width_unit > 0:
-        k = max(2, int(round(total / width_unit)))
+    half = L / 2.0
+    if cuts:
+        bounds = [-half] + sorted(float(c) for c in cuts) + [half]
     else:
-        k = 2
-    widths = np.full(k, total / k)
-    n = k
+        if n is not None and n >= 2:
+            k = int(n)
+        elif width_unit and width_unit > 0:
+            k = max(2, int(round(L / width_unit)))
+        else:
+            k = 2
+        if k < 2:
+            return [box]
+        bounds = list(np.linspace(-half, half, k + 1))
     center = np.asarray(box.center)
     result = []
-    acc = 0.0
-    for i in range(n):
-        seg_c = center - row_axis * total / 2 + row_axis * (acc + widths[i] / 2)
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        if b - a < 0.1:      # degenerate sliver segment: skip
+            continue
+        seg_c = center + row_axis * ((a + b) / 2.0)
         result.append(OrientedBox(
-            center=tuple(seg_c), size=(widths[i], W, H), yaw=box.yaw,
+            center=tuple(seg_c), size=(b - a, W, H), yaw=box.yaw,
             device_type=DeviceType.RACK, source=box.source,
             confidence=box.confidence, row_id=box.row_id,
             meta={"split_from": box.box_id},
         ))
-        acc += widths[i]
+    if len(result) < 2:
+        return [box]
     return result
 
 
