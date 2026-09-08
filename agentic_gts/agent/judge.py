@@ -118,6 +118,24 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
         cs = b.corners_2d()
         poly = plt.Polygon(cs, fill=False, edgecolor="red", linewidth=1.5)
         ax.add_patch(poly)
+        if overlay == "wire3d_axes":
+            # keep the prompt-image contract in the scatter fallback too:
+            # green = local +x (length), blue = local +y (depth), drawn
+            # from the footprint centre -- the same convention as the GS
+            # render's top-face arrows
+            c = np.asarray(b.center[:2], dtype=float)
+            rot = b.rotation[:2, :2]
+            # arrow length: proportional to the box, but always inside the
+            # view (a deep box would otherwise push its +y arrow past the
+            # crop and get clipped away entirely)
+            ax_l = min(max(b.size[0], 0.2) * 0.55, extent * 0.8)
+            ax_w = min(max(b.size[1], 0.2) * 0.55, extent * 0.8)
+            ax.annotate("", xy=c + rot[:, 0] * ax_l, xytext=c,
+                        arrowprops=dict(arrowstyle="-|>", color="lime",
+                                        lw=2.5))
+            ax.annotate("", xy=c + rot[:, 1] * ax_w, xytext=c,
+                        arrowprops=dict(arrowstyle="-|>", color="dodgerblue",
+                                        lw=2.5))
     ax.set_xticks([]); ax.set_yticks([])
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight")
@@ -135,7 +153,9 @@ _LOCAL_VIEW_DESC = (
     "front face: doors, panels, LEDs), 'side' (view along the row: depth and "
     "neighbouring racks), and 'oblique' (elevated view: top face and full "
     "outline). Red wireframes mark the candidate box(es); each wireframe is "
-    "the full 3D box, not just its top."
+    "the full 3D box, not just its top. "
+    "(Fallback rendering without a GPU rasterizer: a SINGLE top-down view "
+    "of the same region, with the axes arrows drawn on the footprint.)"
 )
 
 
@@ -341,9 +361,20 @@ def render_godview_png(points: np.ndarray, boxes, max_points: int = 250_000,
 
 
 def _extract_json(text: str):
-    """Best-effort JSON object extraction from a VLM reply."""
+    """Best-effort JSON object extraction from a VLM reply.
+
+    The fit prompt asks for reasoning sentences FIRST and the JSON on the
+    LAST line, so multiple {...} spans can appear -- prefer the last
+    well-formed one. Handles plain replies (single JSON) unchanged.
+    """
     import re
-    m = re.search(r"\{.*\}", text, re.S)
+    cands = re.findall(r"\{[^{}]*\}", text)
+    for c in reversed(cands):
+        try:
+            return json.loads(c)
+        except json.JSONDecodeError:
+            continue
+    m = re.search(r"\{.*\}", text, re.S)  # nested-JSON fallback
     if not m:
         return None
     try:
@@ -607,26 +638,38 @@ class VLMJudge:
         f"{_LOCAL_VIEW_DESC}\n"
         "Additionally, two arrows are drawn on the box's TOP face: a GREEN "
         "arrow along the box's local x axis (its length direction) and a "
-        "BLUE arrow along its local y axis (its depth direction). "
-        "(In the point-cloud scatter fallback the arrows are not "
-        "drawn.)\n\n"
-        "Compare the red wireframe (and the two arrows) with the actual "
-        "device visible in the render, and decide how the BOX must change "
-        "to fit the device tightly. Only rotation around the vertical (z) "
-        "axis is allowed.\n\n"
-        "Reply with ONLY a JSON object, no other text:\n"
-        '{"dl": 0.0, "dw": 0.0, "dh": 0.0, "dyaw_deg": 0.0}\n'
+        "BLUE arrow along its local y axis (its depth direction).\n\n"
+        "IMPORTANT: these candidate boxes come from an INITIAL rough "
+        "detection, and they usually do NOT fit the device well. The typical "
+        "errors are: the wireframe overhangs past the device edge into the "
+        "aisle or over the neighbouring device (too long/deep), the "
+        "wireframe covers only part of the device (too short), the box "
+        "misses the device's full height (too short), or the GREEN arrow is "
+        "not parallel to the device's long axis (wrong yaw). Only rotation "
+        "around the vertical (z) axis is allowed.\n\n"
+        "Work step by step:\n"
+        "1. For each of the three views, write ONE short sentence stating "
+        "whether the red wireframe matches the device outline; if not, say "
+        "in which direction it is wrong (e.g. 'oblique view: the right end "
+        "of the wireframe hangs over the aisle, the device ends earlier').\n"
+        "2. Then output ONE JSON object with your corrections.\n\n"
+        "Reply format -- a few short reasoning sentences, then the JSON "
+        "object on the LAST line:\n"
+        '{"dl": <meters>, "dw": <meters>, "dh": <meters>, '
+        '"dyaw_deg": <degrees>}\n'
         "- dl: length change along the GREEN arrow (meters, multiples of "
-        "0.05, between -0.5 and 0.5): positive if the box is too short, "
-        "negative if too long.\n"
+        "0.05, between -0.5 and 0.5): POSITIVE if the box is too short for "
+        "the device, NEGATIVE if it overhangs.\n"
         "- dw: depth change along the BLUE arrow (same rules).\n"
         "- dh: height change (meters, multiples of 0.05, between -0.3 and "
-        "0.3).\n"
+        "0.3): positive = box too low, negative = box taller than the "
+        "device.\n"
         "- dyaw_deg: rotation around the vertical axis (degrees, multiples "
         "of 5, between -15 and 15), positive = counterclockwise seen from "
-        "above. Use it when the GREEN arrow does not align with the "
-        "device's long axis.\n"
-        "If the box already fits the device well, reply with all zeros."
+        "above. Use a NON-ZERO value when the GREEN arrow is not parallel "
+        "to the device's long axis.\n"
+        "Every axis where you described a misfit MUST get a non-zero "
+        "correction; use 0.0 only for an axis that genuinely fits."
     )
 
     def adjudicate_fit(self, scene, box) -> Verdict:
@@ -653,10 +696,10 @@ class VLMJudge:
             png = self._array_png_bytes(img)
             if self.backend == "local":
                 text = self._local_image_call(png, self._FIT_PROMPT,
-                                              max_new_tokens=96)
+                                              max_new_tokens=256)
             else:
                 text = self._qwen_image_call(png, self._FIT_PROMPT,
-                                             max_tokens=96)
+                                             max_tokens=256)
         except Exception as e:
             print(f"[vlm][fit] failed ({type(e).__name__}: {e}) -> keep")
             return Verdict(action="keep", confidence=0.5,

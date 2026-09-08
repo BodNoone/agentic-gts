@@ -285,6 +285,44 @@ def test_parse_fit_reply_quantized_clamped():
     print("PASS fit reply parse (quantized + clamped + zero -> keep)")
 
 
+def test_parse_fit_reply_with_reasoning():
+    """The fit prompt now elicits reasoning sentences BEFORE the JSON (to
+    counter the copy-the-zero-template bias), so the parser must pick the
+    LAST well-formed JSON out of a reply that may contain several spans."""
+    from agentic_gts.agent.judge import VLMJudge, _extract_json
+    reply = ("front view: wireframe right end hangs over the aisle.\n"
+             "side view: depth ok {not json}.\n"
+             'oblique: GREEN arrow skewed ~10deg off the rack axis.\n'
+             '{"dl": -0.1, "dw": 0.0, "dh": 0.0, "dyaw_deg": 10}')
+    p = VLMJudge._parse_fit_reply(reply)
+    assert p is not None and abs(p["dl"] + 0.1) < 1e-9 \
+        and abs(p["dyaw_deg"] - 10.0) < 1e-9, f"reasoning reply lost: {p}"
+    # _extract_json prefers the last well-formed span
+    j = _extract_json("junk {\"a\": 1} more junk {\"b\": 2} tail")
+    assert j == {"b": 2}, f"expected last JSON, got {j}"
+    print("PASS fit reply parse with leading reasoning (last JSON wins)")
+
+
+def test_scatter_fallback_draws_axes_arrows():
+    """Without a GS rasterizer the fit evidence falls back to a scatter
+    view -- it must still draw the green (+x) / blue (+y) axis arrows so
+    the prompt-image contract (yaw is judgeable) holds on every path."""
+    from agentic_gts.agent.judge import render_topdown_image
+    from agentic_gts.core.models import OrientedBox
+    rng = np.random.default_rng(2)
+    pts = rng.uniform(-2, 2, (400, 3))
+    box = OrientedBox(center=(0, 0, 1), size=(0.6, 1.1, 2.0), yaw=0.4)
+    img = render_topdown_image(pts, [box], gs_ply=None,
+                               overlay="wire3d_axes")
+    rgb = np.asarray(img)[..., :3]
+    lime = np.all(np.abs(rgb - np.array([0.0, 1.0, 0.0])) < 0.1, axis=-1)
+    blue = np.all(np.abs(rgb - np.array([0.118, 0.565, 1.0])) < 0.1,
+                  axis=-1)
+    assert lime.any(), "no GREEN (+x) arrow in the fallback render"
+    assert blue.any(), "no BLUE (+y) arrow in the fallback render"
+    print("PASS scatter fallback draws the axis arrows (prompt contract)")
+
+
 def test_vlm_refine_corrects_yaw():
     """A refine verdict (dyaw) must rotate the box around z and re-fit it
     to the point support, preserving box_id / count -- the fine-grained
