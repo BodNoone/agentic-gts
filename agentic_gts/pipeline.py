@@ -351,6 +351,15 @@ def run_pipeline(scene: Scene,
         print(f"[warn] visualization failed: {type(e).__name__}: {e}")
     with open(os.path.join(out_dir, "agent_report.json"), "w", encoding="utf-8") as f:
         json.dump(report.to_dict(), f, ensure_ascii=False, indent=2)
+    # per-box local-view + VLM-verdict browsable report (self-contained HTML):
+    # fresh local render for every final box, verdicts from vlm_records.jsonl
+    try:
+        from agentic_gts.output.report import build_report
+        html_path = build_report(out_dir, points=scene.points,
+                                 gs_ply=scene.meta.get("gs_ply"))
+        print(f"[out] VLM verdict report -> {html_path}")
+    except Exception as e:  # report must never break the pipeline
+        print(f"[warn] VLM report failed: {type(e).__name__}: {e}")
     if evals:
         with open(os.path.join(out_dir, "eval.json"), "w", encoding="utf-8") as f:
             json.dump(evals, f, ensure_ascii=False, indent=2)

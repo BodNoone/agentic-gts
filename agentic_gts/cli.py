@@ -145,6 +145,33 @@ def cmd_view(args):
     view_3d(scene, gt_boxes=gt_boxes)
 
 
+def cmd_report(args):
+    """Build the per-box local-view + VLM-verdict HTML report for a run.
+
+    Works retroactively on any run directory (needs boxes.json; verdicts
+    come from vlm_records.jsonl when present). With --point-cloud every
+    final box gets a fresh local three-view render; without it only the
+    on-disk evidence images are shown.
+    """
+    import os
+    from agentic_gts.pipeline import load_point_cloud
+    from agentic_gts.output.report import build_report
+
+    points = None
+    gs_ply = None
+    if args.point_cloud:
+        points = load_point_cloud(args.point_cloud)
+        try:
+            from agentic_gts.tools.gs_io import is_gaussian_ply
+            if is_gaussian_ply(args.point_cloud):
+                gs_ply = args.point_cloud
+        except Exception:
+            pass
+    out = build_report(args.run_dir, out_path=args.out,
+                       points=points, gs_ply=gs_ply)
+    print(f"[report] {out} (open in a browser)")
+
+
 def main():
     p = argparse.ArgumentParser(prog="agentic-gts")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -196,6 +223,16 @@ def main():
     v.add_argument("--boxes", default=None)
     v.add_argument("--gt", default=None)
     v.set_defaults(fn=cmd_view)
+
+    rp = sub.add_parser("report", help="per-box local view + VLM verdict HTML")
+    rp.add_argument("--run-dir", required=True,
+                    help="pipeline output dir (needs boxes.json)")
+    rp.add_argument("--point-cloud", default=None,
+                    help="optional: re-render a fresh local view for every "
+                         "final box")
+    rp.add_argument("--out", default=None,
+                    help="output html path (default <run-dir>/vlm_report.html)")
+    rp.set_defaults(fn=cmd_report)
 
     args = p.parse_args()
     args.fn(args)
