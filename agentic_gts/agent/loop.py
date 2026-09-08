@@ -230,6 +230,10 @@ class LayoutAgent:
             if fresh == 0:
                 break
             issues = self.detect_issues(scene)
+        # fine-grained per-box pose refinement: the VLM proposes quantized
+        # size/yaw corrections (z-rotation only) from the axes-annotated
+        # local view; geometry tools then re-fit the box to point support
+        self._vlm_refine(scene, report)
         # final edge refinement: snap every box to its point support
         self._refine_edges(scene)
         # confidence tagging (BEFORE the final QA: the QA's LOW marks must
@@ -278,6 +282,65 @@ class LayoutAgent:
                           self._region(b),
                           detail=f"final godview: {f['reason']}", severity=0.7)
             report.unresolved.append({"issue": issue.to_dict(), "ok": False})
+
+    def _vlm_refine(self, scene: Scene, report: AgentReport) -> None:
+        """Fine-grained per-box refinement pass.
+
+        The VLM proposes RELATIVE, quantized corrections (dl/dw/dh in
+        5cm steps, dyaw in 5deg steps, z-rotation only) from the
+        axes-annotated three-view composite. Those corrections only steer a
+        SEED box: the exact geometry comes from fit_box_to_points, which
+        re-derives center/size from the point support at the corrected
+        yaw. A refinement that drifts away (IoU < 0.3 with the original)
+        or collapses support is rolled back silently -- a bad VLM number
+        can never teleport a box.
+        """
+        for b in list(scene.boxes):
+            try:
+                verdict = self.judge.adjudicate_fit(scene, b)
+            except Exception as e:
+                print(f"[diag][C] refine error on {b.box_id[:6]} "
+                      f"({type(e).__name__}) -> skipped")
+                continue
+            if verdict.action != "refine" or not verdict.params:
+                continue
+            p = verdict.params
+            new_yaw = float(b.yaw) + math.radians(float(p.get("dyaw_deg", 0.0)))
+            seed = (max(b.size[0] + float(p.get("dl", 0.0)), 0.15),
+                    max(b.size[1] + float(p.get("dw", 0.0)), 0.15),
+                    max(b.size[2] + float(p.get("dh", 0.0)), 0.2))
+            refit = geo.fit_box_to_points(scene, b.center[:2], seed, new_yaw)
+            if refit is None or refit.iou_2d(b) < 0.3:
+                print(f"[diag][C] refine {b.box_id[:6]} rejected (drift) -> keep")
+                continue
+            # accept the correction only if the point fit at the CORRECTED
+            # yaw is no worse than the fit at the OLD yaw (same seed):
+            # a rotation that makes the box fit the points worse is a bad
+            # VLM number, not a correction. This directly tests "did the
+            # rotation help", independent of how sparse the cloud is.
+            control = geo.fit_box_to_points(scene, b.center[:2], seed,
+                                             float(b.yaw))
+            sup_new = geo.support_fraction(scene, refit)
+            sup_ctrl = (geo.support_fraction(scene, control)
+                        if control is not None else 0.0)
+            if sup_new + 0.02 < sup_ctrl:
+                print(f"[diag][C] refine {b.box_id[:6]} rejected "
+                      f"(fit worse: {sup_new:.2f} < {sup_ctrl:.2f}) -> keep")
+                continue
+            refit.box_id = b.box_id
+            refit.device_type = b.device_type
+            refit.source = BoxSource.AGENT_FIX
+            refit.row_id = b.row_id
+            refit.meta = b.meta
+            refit.confidence = b.confidence
+            scene.remove_box(b.box_id)
+            scene.boxes.append(refit)
+            report.actions_taken.append({"issue_id": "vlm_refine",
+                                         "action": "refine", "params": p})
+            print(f"[diag][C] refine {b.box_id[:6]}: "
+                  f"dyaw={p.get('dyaw_deg', 0):+.0f}deg "
+                  f"dl={p.get('dl', 0):+.2f} dw={p.get('dw', 0):+.2f} "
+                  f"dh={p.get('dh', 0):+.2f}")
 
     def _refine_edges(self, scene: Scene) -> None:
         """Snap box edges to point support for the final layout accuracy.

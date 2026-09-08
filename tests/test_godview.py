@@ -266,6 +266,105 @@ def test_objects_format_roundtrip():
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_parse_fit_reply_quantized_clamped():
+    """The VLM's fit reply must be snapped to the 5cm/5deg grid and
+    clamped to the allowed ranges; all-zero / garbage -> None (keep)."""
+    from agentic_gts.agent.judge import VLMJudge
+    p = VLMJudge._parse_fit_reply(
+        '{"dl": 0.13, "dw": -9.0, "dh": 0.3, "dyaw_deg": 47}')
+    assert abs(p["dl"] - 0.15) < 1e-9   # 0.13 snapped to the 5cm grid
+    assert abs(p["dw"] - (-0.5)) < 1e-9  # clamped at the lower bound
+    assert abs(p["dh"] - 0.3) < 1e-9
+    assert abs(p["dyaw_deg"] - 15.0) < 1e-9  # clamped at the upper bound
+    assert VLMJudge._parse_fit_reply('{"dl": 0.0, "dw": 0.0, "dh": 0.0,'
+                                     ' "dyaw_deg": 0.0}') is None
+    assert VLMJudge._parse_fit_reply("not json at all") is None
+    # non-numeric fields fall back to 0 without breaking the others
+    p2 = VLMJudge._parse_fit_reply('{"dl": "huge", "dyaw_deg": 5}')
+    assert p2 is not None and p2["dl"] == 0.0 and p2["dyaw_deg"] == 5.0
+    print("PASS fit reply parse (quantized + clamped + zero -> keep)")
+
+
+def test_vlm_refine_corrects_yaw():
+    """A refine verdict (dyaw) must rotate the box around z and re-fit it
+    to the point support, preserving box_id / count -- the fine-grained
+    counterpart to the topological delete/split/merge actions. The racks
+    are GENUINELY rotated (10 deg) while the boxes sit at yaw=0, so the
+    +5deg correction moves the boxes toward truth and the fit-improvement
+    guard must accept it."""
+    import math as _m
+    from agentic_gts.agent.judge import Verdict
+    from agentic_gts.core.models import OrientedBox
+
+    class RotatingJudge(VLMJudge):
+        def adjudicate_fit(self, scene, box):
+            return Verdict(action="refine", confidence=0.8,
+                           params={"dl": 0.0, "dw": 0.0, "dh": 0.0,
+                                   "dyaw_deg": 5.0})
+
+    # racks physically rotated 10 deg; boxes placed at yaw=0 (wrong)
+    ang = _m.radians(10.0)
+    fwd = np.array([_m.cos(ang), _m.sin(ang)])
+    cross = np.array([-_m.sin(ang), _m.cos(ang)])
+    rng = np.random.default_rng(2)
+    pts = []
+    for k in range(3):
+        c = fwd * (k * 0.62)
+        u = rng.uniform(-0.3, 0.3, 400)
+        z = rng.uniform(0, 2.0, 400)
+        for off in (0.55, -0.55):
+            p2 = c + np.outer(u, fwd) + cross * off
+            pts.append(np.stack([p2[:, 0], p2[:, 1], z], axis=1))
+        tv = rng.uniform(-0.55, 0.55, 300)
+        tu = rng.uniform(-0.3, 0.3, 300)
+        p2 = c + np.outer(tu, fwd) + np.outer(tv, cross)
+        pts.append(np.stack([p2[:, 0], p2[:, 1],
+                             np.full(300, 2.0)], axis=1))
+    scene = Scene(points=np.vstack(pts))
+    scene.boxes = [OrientedBox(
+        center=(float(fwd[0] * (k * 0.62)), float(fwd[1] * (k * 0.62)), 1),
+        size=(0.6, 1.1, 2.0), yaw=0.0) for k in range(3)]
+    ids = {b.box_id for b in scene.boxes}
+    agent = LayoutAgent(judge=RotatingJudge(backend="qwen"))
+    report = agent.run(scene)
+    assert len(scene.boxes) == 3
+    assert {b.box_id for b in scene.boxes} == ids, "box_id must survive refine"
+    assert any(abs(b.yaw) > 0.01 for b in scene.boxes), "yaw not corrected"
+    assert any(a.get("action") == "refine" for a in report.actions_taken)
+    print("PASS vlm refine applies yaw correction (id preserved)")
+
+
+def test_vlm_refine_bounds_hallucinated_growth():
+    """A hallucinated +0.5m growth must NOT materialize: the geometry
+    re-fit trims the seed back to the actual point support, so a bad VLM
+    number can never teleport the box."""
+    from agentic_gts.agent.judge import Verdict
+    from agentic_gts.core.models import OrientedBox
+
+    class GrowJudge(VLMJudge):
+        def adjudicate_fit(self, scene, box):
+            return Verdict(action="refine", confidence=0.8,
+                           params={"dl": 0.5, "dw": 0.5, "dh": 0.3,
+                                   "dyaw_deg": 0.0})
+
+    # ONE isolated rack (a dense scene would let the grown seed swallow
+    # neighbouring racks and muddy the assertion)
+    rng = np.random.default_rng(1)
+    u = rng.uniform(-0.3, 0.3, 600)
+    v = rng.uniform(-0.55, 0.55, 600)
+    z = rng.uniform(0, 2.0, 600)
+    scene = Scene(points=np.stack([u, v, z], axis=1))
+    scene.boxes = [OrientedBox(center=(0, 0, 1), size=(0.6, 1.1, 2.0),
+                               yaw=0.0)]
+    agent = LayoutAgent(judge=GrowJudge(backend="qwen"))
+    agent.run(scene)
+    assert len(scene.boxes) == 1
+    for b in scene.boxes:
+        assert b.size[0] < 0.75, f"length hallucinated to {b.size[0]:.2f}"
+        assert b.size[1] < 1.25, f"depth hallucinated to {b.size[1]:.2f}"
+    print("PASS vlm refine bounds hallucinated growth (fit trims to support)")
+
+
 def test_ply_artifacts():
     """Output PLYs: boxes_only.ply (no cloud) + cloud_with_boxes.ply
     (height-tinted when no GS, SH-DC colored when GS available)."""

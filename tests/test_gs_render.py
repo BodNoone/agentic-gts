@@ -153,6 +153,32 @@ def test_godview_overlay_wire3d():
     print("PASS godview overlay draws full 3D wireframe (both rings in frame)")
 
 
+def test_overlay_wire3d_axes_draws_axis_arrows():
+    """mode='wire3d_axes' must draw the wire3d frame PLUS the two local
+    axis arrows (green = +x length, blue = +y depth) so the VLM can see
+    the box's orientation and propose yaw/size corrections."""
+    from agentic_gts.output.gs_render import make_local_cam, overlay_boxes
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(1.2, 0.7, 2.0),
+                      yaw=math.radians(20.0))
+    cam = make_local_cam(box, extent=1.0)
+    img = np.full((cam.H, cam.W, 3), 0.3, dtype=np.float32)
+    out = overlay_boxes(img, [box], cam, mode="wire3d_axes")
+    assert out.shape == (cam.H, cam.W, 3)
+    arr = (np.clip(out, 0, 1) * 255).astype(np.int16)
+    green = np.all(np.abs(arr - np.array([0, 255, 80])) <= 12, axis=-1)
+    blue = np.all(np.abs(arr - np.array([80, 160, 255])) <= 12, axis=-1)
+    red = np.all(np.abs(arr - np.array([255, 60, 50])) <= 12, axis=-1)
+    assert green.sum() > 10, "no green +x arrow pixels"
+    assert blue.sum() > 10, "no blue +y arrow pixels"
+    assert red.sum() > 20, "wireframe itself missing"
+    # plain wire3d mode must NOT draw the arrows (unchanged behaviour)
+    out2 = overlay_boxes(img, [box], cam, mode="wire3d")
+    arr2 = (np.clip(out2, 0, 1) * 255).astype(np.int16)
+    green2 = np.all(np.abs(arr2 - np.array([0, 255, 80])) <= 12, axis=-1)
+    assert green2.sum() == 0, "axes leaked into plain wire3d mode"
+    print("PASS wire3d_axes overlay draws green/blue axis arrows")
+
+
 def test_godview_nadir_camera():
     """True top-down godview: frames the whole footprint, no flip, and the
     on-screen axes are axis-aligned with world x/y (no mirroring). The camera

@@ -40,7 +40,8 @@ class Verdict:
 # ---------- image rendering helpers ----------
 
 def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
-                         size: int = 320, gs_ply: str | None = None) -> np.ndarray:
+                         size: int = 320, gs_ply: str | None = None,
+                         overlay: str = "wire3d") -> np.ndarray:
     """Render the local evidence image the VLM adjudicates on.
 
     If the scene comes from a 3DGS model (gs_ply set and a CUDA rasterizer
@@ -77,7 +78,7 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
                 cam = make_local_cam(boxes, extent=extent * 2,
                                      elev_deg=elev, azim_deg=azim)
                 v = render_gs_view(gs, boxes, cam, cut_z=cut_z,
-                                   overlay="wire3d", isolate_boxes=True)
+                                   overlay=overlay, isolate_boxes=True)
                 if v is not None:
                     views.append(v)
             if views:
@@ -599,6 +600,116 @@ class VLMJudge:
                 out.append({"index": idx,
                            "reason": str(item.get("reason", ""))[:80]})
         return out
+
+    # ---- fine-grained fit refinement (size + yaw around z) ----
+    _FIT_PROMPT = (
+        "You are fine-tuning a 3D bounding box around ONE data-center rack.\n"
+        f"{_LOCAL_VIEW_DESC}\n"
+        "Additionally, two arrows are drawn on the box's TOP face: a GREEN "
+        "arrow along the box's local x axis (its length direction) and a "
+        "BLUE arrow along its local y axis (its depth direction). "
+        "(In the point-cloud scatter fallback the arrows are not "
+        "drawn.)\n\n"
+        "Compare the red wireframe (and the two arrows) with the actual "
+        "device visible in the render, and decide how the BOX must change "
+        "to fit the device tightly. Only rotation around the vertical (z) "
+        "axis is allowed.\n\n"
+        "Reply with ONLY a JSON object, no other text:\n"
+        '{"dl": 0.0, "dw": 0.0, "dh": 0.0, "dyaw_deg": 0.0}\n'
+        "- dl: length change along the GREEN arrow (meters, multiples of "
+        "0.05, between -0.5 and 0.5): positive if the box is too short, "
+        "negative if too long.\n"
+        "- dw: depth change along the BLUE arrow (same rules).\n"
+        "- dh: height change (meters, multiples of 0.05, between -0.3 and "
+        "0.3).\n"
+        "- dyaw_deg: rotation around the vertical axis (degrees, multiples "
+        "of 5, between -15 and 15), positive = counterclockwise seen from "
+        "above. Use it when the GREEN arrow does not align with the "
+        "device's long axis.\n"
+        "If the box already fits the device well, reply with all zeros."
+    )
+
+    def adjudicate_fit(self, scene, box) -> Verdict:
+        """Ask the VLM for fine-grained size/yaw corrections for ONE box.
+
+        The evidence image is the three-view local composite WITH the
+        box's local axes drawn (green = length, blue = depth), so the VLM
+        can see both the box's orientation and its extent relative to the
+        device. The reply is quantized (5cm / 5deg) and clamped; the exact
+        geometry always comes from the geometry tools that re-fit the box
+        to the point support afterwards. Mock backend / any failure ->
+        keep (no refinement).
+        """
+        if self.backend == "mock":
+            return Verdict(action="keep", confidence=0.5,
+                           detail="mock: no pose refinement")
+        png_path = None
+        try:
+            img = render_topdown_image(scene.points, [box],
+                                       gs_ply=scene.meta.get("gs_ply"),
+                                       overlay="wire3d_axes")
+            png_path = self._save_evidence_png(
+                img, f"fit_evidence_{box.box_id[:8]}.png")
+            png = self._array_png_bytes(img)
+            if self.backend == "local":
+                text = self._local_image_call(png, self._FIT_PROMPT,
+                                              max_new_tokens=96)
+            else:
+                text = self._qwen_image_call(png, self._FIT_PROMPT,
+                                             max_tokens=96)
+        except Exception as e:
+            print(f"[vlm][fit] failed ({type(e).__name__}: {e}) -> keep")
+            return Verdict(action="keep", confidence=0.5,
+                           detail=type(e).__name__)
+        params = self._parse_fit_reply(text)
+        self._record("fit", self._FIT_PROMPT, text, "",
+                     0.8 if params else 0.5,
+                     str(params) if params else "no change",
+                     png_path=png_path)
+        if not params:
+            return Verdict(action="keep", confidence=0.5, detail=text[:80],
+                           raw=text, png_path=png_path)
+        return Verdict(action="refine", params=params, confidence=0.8,
+                       detail=text[:80], raw=text, png_path=png_path)
+
+    @staticmethod
+    def _parse_fit_reply(text: str) -> dict | None:
+        """Quantize + clamp the VLM's fit reply. None if no real change.
+
+        The VLM's raw numbers are coarse by design; snapping to a 5cm /
+        5deg grid keeps the search space discrete (like every other
+        action) and clamping bounds the damage a hallucinated number can
+        do. All-zero replies map to None = keep.
+        """
+        data = _extract_json(text)
+        if not isinstance(data, dict):
+            return None
+
+        def _q(v, step, lo, hi):
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return 0.0
+            return float(np.clip(round(v / step) * step, lo, hi))
+
+        p = {
+            "dl": _q(data.get("dl", 0), 0.05, -0.5, 0.5),
+            "dw": _q(data.get("dw", 0), 0.05, -0.5, 0.5),
+            "dh": _q(data.get("dh", 0), 0.05, -0.3, 0.3),
+            "dyaw_deg": _q(data.get("dyaw_deg", 0), 5.0, -15.0, 15.0),
+        }
+        if not any(abs(v) > 1e-9 for v in p.values()):
+            return None
+        return p
+
+    @staticmethod
+    def _array_png_bytes(arr: np.ndarray) -> bytes:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        buf = io.BytesIO()
+        plt.imsave(buf, arr, format="png")
+        return buf.getvalue()
 
     # ---- mock (rule) fallback ----
     def _mock_adjudicate(self, box, question: str) -> Verdict:

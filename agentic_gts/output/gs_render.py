@@ -419,15 +419,37 @@ def overlay_boxes(img: np.ndarray, boxes, cam: Cam,
     lone top rectangle would float mid-air over an oblique render; the full
     wireframe hugs the rack's visible faces and shows the VLM exactly which
     volume the candidate box claims.
+
+    mode="wire3d_axes" (fit refinement): wire3d PLUS two arrows on the
+    box's TOP face -- green along the box's local +x (length) axis, blue
+    along local +y (depth) -- so the VLM can SEE the box's orientation and
+    propose yaw / size corrections relative to those axes.
     """
     from PIL import Image, ImageDraw
     pil = Image.fromarray((np.clip(img, 0, 1) * 255).astype(np.uint8))
     dr = ImageDraw.Draw(pil)
+
+    def _arrow(dr, cam, p0_w, p1_w, color):
+        """3D segment p0_w->p1_w drawn as a pixel arrow with a head."""
+        p0 = cam.project_cv(np.asarray(p0_w, dtype=float)[None])[0]
+        p1 = cam.project_cv(np.asarray(p1_w, dtype=float)[None])[0]
+        dr.line([tuple(p0), tuple(p1)], fill=color, width=3)
+        d = np.array([p1[0] - p0[0], p1[1] - p0[1]], dtype=float)
+        n = float(np.linalg.norm(d))
+        if n < 1e-6:
+            return
+        d /= n
+        perp = np.array([-d[1], d[0]])
+        tip = np.asarray(p1, dtype=float)
+        for s in (1.0, -1.0):
+            head = tip - 9.0 * d + 4.0 * s * perp
+            dr.line([tuple(tip), tuple(head)], fill=color, width=3)
+
     for i, b in enumerate(boxes):
         cs = _box_corners_3d(b)
         color = (255, 60, 50) if getattr(b.confidence, "value", "") != "low" \
             else (255, 190, 40)
-        if mode == "wire3d":
+        if mode in ("wire3d", "wire3d_axes"):
             # corner ordering (x,y,z) in ((-l,l),(-w,w),(-h,h)):
             # idx = 4*xi + 2*yi + zi, so 0..7. Full 12-edge wireframe.
             uv = cam.project_cv(cs)
@@ -444,6 +466,20 @@ def overlay_boxes(img: np.ndarray, boxes, cam: Cam,
             wpx = dr.textlength(chip, font=None)
             dr.rectangle([cx - 3, cy - 9, cx + wpx + 5, cy + 5], fill=(0, 0, 0))
             dr.text((cx + 2, cy - 8), chip, fill=(255, 255, 255))
+            if mode == "wire3d_axes":
+                # local axis arrows on the top face: green = +x (length),
+                # blue = +y (depth). Drawn slightly PAST the face so they
+                # stay visible against the wireframe.
+                c = np.asarray(b.center, dtype=float)
+                h = b.size[2] / 2.0
+                cyy, syy = math.cos(b.yaw), math.sin(b.yaw)
+                xlen = b.size[0] / 2.0 + 0.12
+                ylen = b.size[1] / 2.0 + 0.12
+                x_tip = c + np.array([xlen * cyy, xlen * syy, h])
+                y_tip = c + np.array([-ylen * syy, ylen * cyy, h])
+                top_c = c + np.array([0.0, 0.0, h])
+                _arrow(dr, cam, top_c, x_tip, (0, 255, 80))
+                _arrow(dr, cam, top_c, y_tip, (80, 160, 255))
             continue
         # ---- footprint mode (god-view) ----
         # Project the TOP ring (z=+h) in polygon order. The god view is a
