@@ -89,6 +89,29 @@ def _confidence_chip(conf: float) -> str:
             f'border-radius:9px;font-size:12px">置信度 {conf:.2f}</span>')
 
 
+def _quality_chip(quality) -> str:
+    """Render-quality badge for a verdict record (per-slot scores from the
+    no-reference scorer). Shows the WORST slot -- that is the evidence the
+    verdict should be least trusted on."""
+    if not isinstance(quality, dict):
+        return ""
+    scores = [v.get("score") for v in quality.values() if isinstance(v, dict)]
+    if not scores:
+        return ""
+    worst = min(scores)
+    if worst >= 0.5:
+        color = "#1a7f37"
+    elif worst >= 0.35:
+        color = "#b26a00"
+    else:
+        color = "#c62828"
+    slots = " ".join(
+        f"{k} {v.get('score', 0):.2f}" for k, v in quality.items()
+        if isinstance(v, dict))
+    return (f'<span title="{_html.escape(slots)}" '
+            f'style="color:{color};font-size:12px">渲染质量 ≥ {worst:.2f}</span>')
+
+
 def _verdict_block(rec: dict, run_dir: str, idx: int) -> str:
     kind = str(rec.get("kind", "?"))
     label = _KIND_LABEL.get(kind, kind)
@@ -111,6 +134,7 @@ def _verdict_block(rec: dict, run_dir: str, idx: int) -> str:
                      font-size:12px">{_html.escape(label)}</span>
         <b>判定: {_html.escape(choice)}</b>
         {_confidence_chip(rec.get("confidence", 0.5))}
+        {_quality_chip(rec.get("quality"))}
         {ids_html}
       </div>
       <div style="margin:4px 0;font-size:13px;color:#333">

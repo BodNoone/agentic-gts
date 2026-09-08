@@ -538,3 +538,88 @@ def png_bytes(img: np.ndarray) -> bytes:
     Image.fromarray((np.clip(img, 0, 1) * 255).astype(np.uint8)).save(
         buf, format="png")
     return buf.getvalue()
+
+
+# ------------------------------------------------------- render quality
+def view_quality(img: np.ndarray) -> dict:
+    """No-reference quality score for ONE rendered view, in [0,1] higher =
+    better. 3DGS quality is anisotropic: views near the training cameras
+    are sharp, extrapolated ones blur and grow floaters. Before handing a
+    view to the VLM we score the candidates and keep the best.
+
+    Three orthogonal signals, all pure numpy:
+      sharpness  -- variance of the image Laplacian. The typical 3DGS
+                    out-of-distribution failure is blur (underconstrained
+                    gaussians inflate), which kills high frequencies first.
+      coverage   -- fraction of pixels with actual content (background is
+                    black). Too little = the view barely rendered anything
+                    (undertrained direction); ~everything = a wall or floor
+                    slab occludes the whole frame.
+      speckle    -- fraction of foreground pixels isolated from any
+                    neighbour (4-connectivity on a coarse grid). Small
+                    disconnected blobs are the classic floater signature.
+    """
+    g = np.asarray(img, dtype=np.float32)[..., :3]
+    gray = g @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    step = max(1, min(gray.shape) // 256)
+    if step > 1:
+        gray = gray[::step, ::step]
+    if gray.size < 16:
+        return {"score": 0.0, "sharpness": 0.0, "coverage": 0.0,
+                "speckle": 1.0}
+
+    # sharpness: Laplacian variance (log-compressed to a usable range)
+    lap = (gray[:-2, 1:-1] + gray[2:, 1:-1] + gray[1:-1, :-2]
+           + gray[1:-1, 2:] - 4.0 * gray[1:-1, 1:-1])
+    lap_var = float(lap.var()) if lap.size else 0.0
+    sharp_n = float(np.clip(np.log10(1.0 + 100.0 * lap_var) / 2.0, 0.0, 1.0))
+
+    # coverage: foreground band score
+    fg = gray > 0.05
+    cov = float(fg.mean())
+    if cov <= 0.2:
+        cov_score = max(cov / 0.2, 0.0)
+    elif cov <= 0.9:
+        cov_score = 1.0
+    else:
+        cov_score = max(0.0, 1.0 - (cov - 0.9) / 0.1 * 0.7)
+
+    # speckle: isolated foreground pixels on the coarse grid
+    n_fg = int(fg.sum())
+    if n_fg == 0:
+        speck_n = 1.0
+    else:
+        pad = np.pad(fg, 1)
+        neigh = (pad[:-2, 1:-1].astype(np.int8) + pad[2:, 1:-1]
+                 + pad[1:-1, :-2] + pad[1:-1, 2:])
+        isolated = int(((fg) & (neigh == 0)).sum())
+        speck_n = float(np.clip(isolated / (0.15 * n_fg), 0.0, 1.0))
+
+    score = 0.55 * sharp_n + 0.25 * cov_score + 0.20 * (1.0 - speck_n)
+    return {"score": round(score, 4), "sharpness": round(sharp_n, 4),
+            "coverage": round(cov, 4), "speckle": round(speck_n, 4)}
+
+
+def render_slot_candidates(gs, boxes, cam_fn, candidates, cut_z,
+                            overlay: str, iso_margin: float):
+    """Render several (elev, azim) candidates for ONE view slot, score each
+    on the RAW render (before the wireframe overlay -- drawn lines would
+    pollute the sharpness/speckle metrics), and return the best.
+
+    cam_fn(elev_deg, azim_deg) -> Cam. The isolation mask is computed ONCE
+    for all candidates (it depends only on the boxes, not the camera).
+    Returns (img, quality, (elev, azim)) or (None, None, None).
+    """
+    keep = _near_boxes_mask(gs, boxes, margin=iso_margin) if boxes else None
+    best = (None, None, None)
+    for elev, azim in candidates:
+        cam = cam_fn(elev, azim)
+        img = rasterize_gs(gs, cam, cut_z=cut_z, keep_mask=keep)
+        if img is None:
+            continue
+        q = view_quality(img)
+        if boxes:
+            img = overlay_boxes(img, boxes, cam, mode=overlay)
+        if best[1] is None or q["score"] > best[1]["score"]:
+            best = (img, q, (elev, azim))
+    return best

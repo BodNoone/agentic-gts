@@ -378,6 +378,97 @@ def test_local_cam_azim_rotates_view():
     print("PASS local cam azim rotates the view (side view framed)")
 
 
+def _box_blur(gray: np.ndarray, k: int = 15) -> np.ndarray:
+    """numpy-only box blur (no scipy dependency in tests)."""
+    pad = k // 2
+    p = np.pad(gray, pad)
+    acc = np.zeros_like(gray, dtype=np.float64)
+    for i in range(k):
+        for j in range(k):
+            acc += p[i:i + gray.shape[0], j:j + gray.shape[1]]
+    return acc / (k * k)
+
+
+def test_view_quality_scoring():
+    """The no-reference scorer must separate the three 3DGS failure modes:
+    blur (out-of-distribution views), near-empty frames (undertrained
+    direction) and floaters (isolated speckle). A sharp textured render
+    must outscore all of them."""
+    from agentic_gts.output.gs_render import view_quality
+    rng = np.random.default_rng(7)
+    # sharp textured render (door panels / LED grid style texture)
+    xx, yy = np.meshgrid(np.arange(256), np.arange(256))
+    sharp = (0.5 + 0.4 * np.sin(xx * 0.7) * np.cos(yy * 0.9))
+    sharp = np.clip(sharp + rng.normal(0, 0.03, sharp.shape), 0, 1)
+    sharp_img = np.stack([sharp] * 3, axis=-1).astype(np.float32)
+
+    # blurred version: the classic out-of-distribution 3DGS render
+    blur_img = np.stack([_box_blur(sharp)] * 3, axis=-1).astype(np.float32)
+
+    # near-empty frame: an undertrained viewing direction renders almost
+    # nothing (background is black)
+    empty_img = np.zeros((256, 256, 3), dtype=np.float32)
+    empty_img[100:140, 100:140] = 0.6   # a small distant blob only
+
+    # floater frame: scattered isolated specks
+    float_img = np.zeros((256, 256, 3), dtype=np.float32)
+    for _ in range(400):
+        y, x = rng.integers(0, 256, 2)
+        float_img[y, x] = 0.7
+
+    qs = view_quality(sharp_img)
+    qb = view_quality(blur_img)
+    qe = view_quality(empty_img)
+    qf = view_quality(float_img)
+    assert qs["score"] > qb["score"], \
+        f"sharp {qs} must outscore blurred {qb}"
+    assert qs["score"] > qe["score"], \
+        f"sharp {qs} must outscore near-empty {qe}"
+    assert qs["score"] > qf["score"], \
+        f"sharp {qs} must outscore floater {qf}"
+    assert qb["sharpness"] < qs["sharpness"], "blur must reduce sharpness"
+    assert qf["speckle"] > 0.5, f"specks must raise speckle score, got {qf}"
+    assert 0.0 <= qe["score"] < 0.35, f"near-empty must score low, got {qe}"
+    print(f"PASS view quality scoring "
+          f"(sharp={qs['score']:.2f} blur={qb['score']:.2f} "
+          f"empty={qe['score']:.2f} floater={qf['score']:.2f})")
+
+
+def test_quality_out_and_gating():
+    """render_topdown_image must fill quality_out on the scatter fallback
+    (mode marker), and the judge must cap a verdict's confidence when the
+    worst per-slot score is below the 0.35 floor."""
+    from agentic_gts.agent.judge import VLMJudge, render_topdown_image
+    rng = np.random.default_rng(3)
+    pts = np.column_stack([rng.uniform(0, 4, 400), rng.uniform(0, 4, 400),
+                           rng.uniform(0, 2, 400)])
+    box = OrientedBox(center=(2.0, 2.0, 1.0), size=(0.6, 1.1, 2.0), yaw=0.0)
+    q = {}
+    img = render_topdown_image(pts, [box], gs_ply=None, quality_out=q)
+    assert img is not None and img.size
+    assert q.get("mode") == "scatter_fallback", \
+        f"scatter fallback must mark quality_out, got {q}"
+
+    j = VLMJudge(backend="mock")
+    # unknown / scatter quality -> floor 1.0 -> no gating
+    assert j._quality_floor(None) == 1.0
+    assert j._quality_floor({}) == 1.0
+    assert j._quality_floor({"mode": "scatter_fallback"}) == 1.0
+    # one bad slot drags the floor down
+    qbad = {"front": {"score": 0.9}, "side": {"score": 0.2},
+            "oblique": {"score": 0.7}}
+    assert abs(j._quality_floor(qbad) - 0.2) < 1e-9
+    from agentic_gts.agent.judge import Verdict
+    v = Verdict(action="delete", confidence=0.9)
+    j._gate_quality(v, [box], quality=qbad)
+    assert v.confidence <= 0.5, "low-quality render must cap confidence"
+    assert "low render quality" in (v.detail or "")
+    v2 = Verdict(action="delete", confidence=0.9)
+    j._gate_quality(v2, [box], quality={"front": {"score": 0.8}})
+    assert v2.confidence == 0.9, "good render must not cap confidence"
+    print("PASS quality_out fill + verdict confidence gating")
+
+
 if __name__ == "__main__":
     test_gs_roundtrip_binary()
     test_gs_parse_ascii()
@@ -394,4 +485,6 @@ if __name__ == "__main__":
     test_godview_frames_box_footprint()
     test_prep_cuts_ceiling()
     test_prep_cuts_floor()
+    test_view_quality_scoring()
+    test_quality_out_and_gating()
     print("ALL GS TESTS PASSED")

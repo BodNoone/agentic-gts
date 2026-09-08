@@ -41,7 +41,8 @@ class Verdict:
 
 def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
                          size: int = 768, gs_ply: str | None = None,
-                         overlay: str = "wire3d") -> np.ndarray:
+                         overlay: str = "wire3d",
+                         quality_out: dict | None = None) -> np.ndarray:
     """Render the local evidence image the VLM adjudicates on.
 
     If the scene comes from a 3DGS model (gs_ply set and a CUDA rasterizer
@@ -55,22 +56,32 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
     the box union + extent fits, and gaussians within ISOLATE_MARGIN of
     the boxes stay visible (neighbouring racks, the adjacent aisle) --
     judging overhang/misfit needs the row rhythm, not the box alone.
+
+    Quality-aware view selection: 3DGS render quality is anisotropic (a
+    view that extrapolates away from the training cameras blurs / grows
+    floaters), so each of the three slots is rendered at SEVERAL nearby
+    azimuths, scored no-reference (sharpness / coverage / speckle, see
+    gs_render.view_quality), and the best candidate wins. Role coverage
+    is preserved by construction: candidates only jitter WITHIN a slot's
+    role (front / side / oblique elevations stay distinct). If
+    `quality_out` is given it is filled with {"front": {...}, "side":
+    {...}, "oblique": {...}} per-slot scores -- callers gate VLM verdict
+    confidence on it (a bad render must not produce a confident delete).
     """
     # ---- 3DGS true render (preferred when available) ----
     if gs_ply and boxes:
         try:
             from agentic_gts.tools.gs_io import read_gaussian_ply
             from agentic_gts.output.gs_render import (make_local_cam,
-                                                      render_gs_view)
+                                                      render_slot_candidates)
             gs = read_gaussian_ply(gs_ply)
-            # THREE views per adjudication (tiled into one image): a single
-            # front view can be ambiguous -- reflections, blank panels, a
-            # door seam hidden from one azimuth. Front shows door/panel
+            # THREE view slots (tiled into one image), each with azimuth
+            # candidates scored by render quality: front shows door/panel
             # detail, side shows the row context and depth, oblique (55
-            # deg tilt) shows the top and the full outline. All views keep
-            # the same rules: a mild top cut (see below), wire3d overlay,
-            # gaussians isolated to the boxes' neighbourhood so unrelated
-            # structure cannot occlude what is being adjudicated.
+            # deg tilt) shows the top and the full outline. A fixed single
+            # azimuth per slot gambles on that exact direction being
+            # well-trained; picking the best of ~3 costs milliseconds per
+            # extra rasterization.
             # Mild ceiling cut: remove everything above the boxes' top so
             # cable trays / ceiling clutter near the rack do not pile up at
             # the top of the image. The cut dips ~8cm INTO the rack top
@@ -83,20 +94,32 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
             # overhang / one-or-many judgements), drops the rest of the
             # room so it cannot occlude what is being adjudicated
             iso_margin = extent + 1.0
-            views = []
-            for elev, azim in ((18.0, 0.0), (18.0, 90.0), (55.0, 35.0)):
-                cam = make_local_cam(boxes, extent=extent * 2,
-                                     elev_deg=elev, azim_deg=azim)
-                v = render_gs_view(gs, boxes, cam, cut_z=cut_z,
-                                   overlay=overlay, isolate_boxes=True,
-                                   isolate_margin=iso_margin)
-                if v is not None:
-                    views.append(v)
+            slots = {
+                "front": ((18.0, 0.0), (18.0, 12.0), (18.0, -12.0)),
+                "side": ((18.0, 90.0), (18.0, 76.0), (18.0, 104.0)),
+                "oblique": ((55.0, 35.0), (55.0, 48.0), (50.0, 22.0)),
+            }
+            views, quality = [], {}
+            for name, cands in slots.items():
+                img, q, chosen = render_slot_candidates(
+                    gs, boxes,
+                    lambda e, a: make_local_cam(boxes, extent=extent * 2,
+                                                elev_deg=e, azim_deg=a),
+                    cands, cut_z=cut_z, overlay=overlay,
+                    iso_margin=iso_margin)
+                if img is None:
+                    continue
+                views.append(img)
+                quality[name] = dict(q, view=[chosen[0], chosen[1]])
             if views:
+                if quality_out is not None:
+                    quality_out.update(quality)
                 return _tile_views(views)
         except Exception as e:
             print(f"[gs][local] true render failed ({type(e).__name__}: {e}) "
                   f"-> scatter fallback")
+    if quality_out is not None:
+        quality_out["mode"] = "scatter_fallback"
 
     import matplotlib
     matplotlib.use("Agg")
@@ -164,7 +187,9 @@ _LOCAL_VIEW_DESC = (
     "front face: doors, panels, LEDs), 'side' (view along the row: depth and "
     "neighbouring racks), and 'oblique' (elevated view: top face and full "
     "outline). Red wireframes mark the candidate box(es); each wireframe is "
-    "the full 3D box, not just its top. "
+    "the full 3D box, not just its top. Each panel's exact viewing angle is "
+    "auto-selected for the clearest render, so panels may be rotated "
+    "slightly within their role. "
     "(Fallback rendering without a GPU rasterizer: a SINGLE top-down view "
     "of the same region, with the axes arrows drawn on the footprint.)"
 )
@@ -417,6 +442,7 @@ class VLMJudge:
         self.record_path = None    # if set, append JSONL records of adjudications
         self.evidence_dir = None   # if set, persist adjudication images here
         self._render_cache = {}    # render cache: box-geometry key -> image
+        self._render_quality = {}  # same key -> per-slot view quality dict
 
     @staticmethod
     def _render_cache_key(boxes) -> tuple:
@@ -433,12 +459,43 @@ class VLMJudge:
         """render_topdown_image with caching: the agent loop re-decides the
         same issue up to max_retries times, and after a rollback the box
         geometry is identical -- the three-view composite (3 rasterizations)
-        is then needlessly recomputed."""
+        is then needlessly recomputed. Per-slot view quality is cached
+        alongside so verdicts can be confidence-gated on render quality."""
         key = self._render_cache_key(boxes)
         if key not in self._render_cache:
+            q = {}
             self._render_cache[key] = render_topdown_image(
-                scene.points, boxes, gs_ply=scene.meta.get("gs_ply"))
+                scene.points, boxes, gs_ply=scene.meta.get("gs_ply"),
+                quality_out=q)
+            self._render_quality[key] = q
         return self._render_cache[key]
+
+    @staticmethod
+    def _quality_floor(quality: dict | None) -> float:
+        """Worst per-slot view score (1.0 when unknown, e.g. scatter
+        fallback where 'quality' is not a trained-view property). Callers
+        cap the VLM verdict confidence when this is low: a blurry /
+        floater-ridden evidence image must not produce a confident
+        delete."""
+        if not quality:
+            return 1.0
+        scores = [v.get("score") for v in quality.values()
+                  if isinstance(v, dict)]
+        return min(scores) if scores else 1.0
+
+    def _gate_quality(self, v: Verdict, boxes, quality: dict | None = None) -> dict:
+        """Cap a verdict's confidence when its evidence render scored low
+        (in-place on the Verdict). A blurry / floater-ridden image must not
+        yield a confident delete -- the FP deletion threshold (0.6) then
+        blocks the deletion, degrading it to the safer shrink path.
+        Returns the quality dict so callers can pass it to _record."""
+        q = quality if quality is not None else \
+            self._render_quality.get(self._render_cache_key(boxes), {})
+        qfloor = self._quality_floor(q)
+        if qfloor < 0.35:
+            v.confidence = min(v.confidence, 0.5)
+            v.detail = f"{v.detail or ''} [low render quality {qfloor:.2f}]"
+        return q
 
     def set_record(self, record_path: str) -> None:
         """Enable structured recording of every adjudication to a JSONL file.
@@ -468,7 +525,8 @@ class VLMJudge:
 
     def _record(self, kind: str, prompt: str, answer: str,
                 choice: str, confidence: float, detail: str,
-                png_path: str | None = None) -> None:
+                png_path: str | None = None,
+                quality: dict | None = None) -> None:
         """Append one adjudication record (image path + prompt + answer)."""
         if not self.record_path:
             return
@@ -476,6 +534,8 @@ class VLMJudge:
         rec = {"kind": kind, "prompt": prompt, "answer": answer,
                "choice": choice, "confidence": confidence,
                "detail": detail, "image": png_path}
+        if quality:
+            rec["quality"] = quality
         try:
             _os.makedirs(_os.path.dirname(self.record_path), exist_ok=True)
             with open(self.record_path, "a", encoding="utf-8") as f:
@@ -493,9 +553,12 @@ class VLMJudge:
             v = self._local_adjudicate(scene, box, question, options)
         else:
             v = self._qwen_adjudicate(scene, box, question, options)
+        self._gate_quality(v, [box])
         self._record("box", question, v.raw or v.detail,
                      (v.params or {}).get("choice", ""), v.confidence, v.detail,
-                     png_path=v.png_path)
+                     png_path=v.png_path,
+                     quality=self._render_quality.get(
+                         self._render_cache_key([box])) or None)
         return v
 
     def adjudicate_pair(self, scene, a, b, question: str,
@@ -511,9 +574,11 @@ class VLMJudge:
         boxes = [a, b]
         v = None
         png_path = None
+        q = {}
         try:
             img_arr = render_topdown_image(scene.points, boxes,
-                                           gs_ply=scene.meta.get("gs_ply"))
+                                           gs_ply=scene.meta.get("gs_ply"),
+                                           quality_out=q)
             # persist the exact image the VLM reasons over: for a merge
             # decision this crop (both boxes + surrounding structure) is the
             # single most useful artifact when auditing a wrong merge/keep
@@ -530,9 +595,10 @@ class VLMJudge:
             print(f"[vlm][pair] failed ({type(e).__name__}: {e}) -> keep")
             v = Verdict(action="keep", confidence=0.5, detail=f"{type(e).__name__}")
         v.png_path = png_path
+        q = self._gate_quality(v, boxes, quality=q)
         self._record("pair", question, v.raw or v.detail,
                      (v.params or {}).get("choice", ""), v.confidence, v.detail,
-                     png_path=png_path)
+                     png_path=png_path, quality=q)
         return v
 
     def _local_pair_call(self, img_arr, question, options) -> Verdict:
@@ -698,10 +764,11 @@ class VLMJudge:
             return Verdict(action="keep", confidence=0.5,
                            detail="mock: no pose refinement")
         png_path = None
+        q = {}
         try:
             img = render_topdown_image(scene.points, [box],
                                        gs_ply=scene.meta.get("gs_ply"),
-                                       overlay="wire3d_axes")
+                                       overlay="wire3d_axes", quality_out=q)
             png_path = self._save_evidence_png(
                 img, f"fit_evidence_{box.box_id[:8]}.png")
             png = self._array_png_bytes(img)
@@ -719,12 +786,17 @@ class VLMJudge:
         self._record("fit", self._FIT_PROMPT, text, "",
                      0.8 if params else 0.5,
                      str(params) if params else "no change",
-                     png_path=png_path)
+                     png_path=png_path, quality=q or None)
         if not params:
             return Verdict(action="keep", confidence=0.5, detail=text[:80],
                            raw=text, png_path=png_path)
-        return Verdict(action="refine", params=params, confidence=0.8,
-                       detail=text[:80], raw=text, png_path=png_path)
+        v = Verdict(action="refine", params=params, confidence=0.8,
+                    detail=text[:80], raw=text, png_path=png_path)
+        # a low-quality render weakens the visual evidence the corrections
+        # were derived from -- cap the confidence so the loop's guards
+        # (which weigh confidence) treat the proposal more sceptically
+        self._gate_quality(v, [box], quality=q)
+        return v
 
     @staticmethod
     def _parse_fit_reply(text: str) -> dict | None:
