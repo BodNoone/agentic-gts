@@ -39,7 +39,7 @@ class Verdict:
 
 # ---------- image rendering helpers ----------
 
-def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
+def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
                          size: int = 768, gs_ply: str | None = None,
                          overlay: str = "wire3d") -> np.ndarray:
     """Render the local evidence image the VLM adjudicates on.
@@ -50,6 +50,11 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
     and unrelated gaussians hidden -- the fine-detail counterpart to the
     god-view's coarse positioning. Otherwise it falls back to the 2D
     scatter density view.
+
+    extent controls the surrounding context: the camera backs off until
+    the box union + extent fits, and gaussians within ISOLATE_MARGIN of
+    the boxes stay visible (neighbouring racks, the adjacent aisle) --
+    judging overhang/misfit needs the row rhythm, not the box alone.
     """
     # ---- 3DGS true render (preferred when available) ----
     if gs_ply and boxes:
@@ -73,12 +78,18 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 0.5,
             # (trays, ducts) otherwise survives a cut at exactly the top.
             top = max(b.center[2] + b.size[2] / 2.0 for b in boxes)
             cut_z = top - 0.08
+            # context isolation margin: keeps the 1-2 neighbouring racks
+            # and the adjacent aisle visible (row rhythm is evidence for
+            # overhang / one-or-many judgements), drops the rest of the
+            # room so it cannot occlude what is being adjudicated
+            iso_margin = extent + 1.0
             views = []
             for elev, azim in ((18.0, 0.0), (18.0, 90.0), (55.0, 35.0)):
                 cam = make_local_cam(boxes, extent=extent * 2,
                                      elev_deg=elev, azim_deg=azim)
                 v = render_gs_view(gs, boxes, cam, cut_z=cut_z,
-                                   overlay=overlay, isolate_boxes=True)
+                                   overlay=overlay, isolate_boxes=True,
+                                   isolate_margin=iso_margin)
                 if v is not None:
                     views.append(v)
             if views:
