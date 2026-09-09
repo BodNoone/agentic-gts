@@ -198,9 +198,10 @@ def make_local_cam(boxes, extent: float = 1.2, W: int = 768, H: int = 768,
     The camera looks at the box from its FRONT (perpendicular to the row
     direction), rotated around the box by `azim_deg` (0 = front face, 90 =
     side face), tilted down by `elev_deg`. A slight tilt shows the face
-    detail (doors/panels/LED); a steeper one (e.g. 55) shows the top and
-    the box's full outline. `up` stays world-vertical so the rack renders
-    upright.
+    detail (doors/panels/LED); a steep one (e.g. ~70) shows the top face
+    with little foreshortening -- the row-direction thickness stays
+    measurable in continuous rows. `up` stays world-vertical so the rack
+    renders upright.
 
     W/H default 768: each tile of the three-view composite the VLM
     adjudicates on carries ~5cm-scale misfits (wireframe overhang); at

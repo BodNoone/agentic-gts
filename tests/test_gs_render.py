@@ -286,6 +286,34 @@ def test_local_cam_front_face():
     print(f"PASS local cam front-face view (tilt {tilt:.1f} deg, box framed)")
 
 
+def test_local_cam_steep_oblique_measures_thickness():
+    """The 'oblique' slot runs near-top-down (~70 deg): the look direction
+    is steep enough that the row-direction depth of the box projects with
+    little foreshortening (a 55-deg view compresses the row and fuses
+    neighbouring racks), while the box stays fully in frame."""
+    import math as _m
+    from agentic_gts.output.gs_render import make_local_cam, _box_corners_3d
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(0.6, 1.1, 2.0), yaw=0.0)
+    cam = make_local_cam(box, extent=1.0, elev_deg=70.0, azim_deg=35.0)
+    look = cam.target - cam.eye
+    look = look / np.linalg.norm(look)
+    tilt = _m.degrees(_m.asin(np.clip(-look[2], -1, 1)))
+    assert tilt > 60, f"oblique slot must be near-top-down, tilt={tilt:.1f}"
+    # foreshortening of the row (y) axis on screen: project the top-face
+    # y-diagonal; at ~70 deg tilt its screen length must keep >= 70% of
+    # the x-axis length per metre of world size (depth 1.1m vs length 0.6m)
+    cs = _box_corners_3d(box)
+    uv = cam.project_cv(cs)
+    w_px = np.linalg.norm(uv[5] - uv[1])          # top-face edge along +x
+    d_px = np.linalg.norm(uv[3] - uv[1])          # top-face edge along +y
+    ratio = (d_px / 1.1) / (w_px / 0.6)          # px per metre, y vs x
+    assert ratio > 0.7, f"row depth over-foreshortened: {ratio:.2f}"
+    assert (uv[:, 0].min() > 0 and uv[:, 0].max() < cam.W and
+            uv[:, 1].min() > 0 and uv[:, 1].max() < cam.H), f"off-frame: {uv}"
+    print(f"PASS local cam steep oblique (tilt {tilt:.1f} deg, "
+          f"depth ratio {ratio:.2f})")
+
+
 def test_overlay_wire3d_for_local_view():
     """Local evidence overlay must draw the FULL 12-edge wireframe (the
     camera is oblique; a lone top rectangle would float mid-air)."""
@@ -605,6 +633,7 @@ if __name__ == "__main__":
     test_render_falls_back_without_cuda()
     test_camera_projection_sanity()
     test_local_cam_front_face()
+    test_local_cam_steep_oblique_measures_thickness()
     test_local_cam_frames_pair()
     test_near_boxes_mask_isolates()
     test_local_cam_azim_rotates_view()
