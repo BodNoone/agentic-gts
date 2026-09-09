@@ -42,15 +42,16 @@ class Verdict:
 def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
                          size: int = 768, gs_ply: str | None = None,
                          overlay: str = "wire3d",
-                         quality_out: dict | None = None) -> np.ndarray:
+                         quality_out: dict | None = None,
+                         slots: tuple[str, ...] | None = None) -> np.ndarray:
     """Render the local evidence image the VLM adjudicates on.
 
     If the scene comes from a 3DGS model (gs_ply set and a CUDA rasterizer
-    is available), this is a TRUE Gaussian-splat composite of THREE views
-    (front / side / oblique-top), each with the full 3D wireframe overlaid
-    and unrelated gaussians hidden -- the fine-detail counterpart to the
-    god-view's coarse positioning. Otherwise it falls back to the 2D
-    scatter density view.
+    is available), this is a TRUE Gaussian-splat composite of up to THREE
+    views (front / side / oblique-top), each with the full 3D wireframe
+    overlaid and unrelated gaussians hidden -- the fine-detail counterpart
+    to the god-view's coarse positioning. Otherwise it falls back to the
+    2D scatter density view.
 
     extent controls the surrounding context: the camera backs off until
     the box union + extent fits, and gaussians within ISOLATE_MARGIN of
@@ -64,9 +65,15 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
     gs_render.view_quality), and the best candidate wins. Role coverage
     is preserved by construction: candidates only jitter WITHIN a slot's
     role (front / side / oblique elevations stay distinct). If
-    `quality_out` is given it is filled with {"front": {...}, "side":
-    {...}, "oblique": {...}} per-slot scores -- callers gate VLM verdict
-    confidence on it (a bad render must not produce a confident delete).
+    `quality_out` is given it is filled with per-slot scores (only the
+    slots actually rendered) -- callers gate VLM verdict confidence on it
+    (a bad render must not produce a confident delete).
+
+    slots: optional subset to render, e.g. ("oblique",) or ("front",
+    "side"). The two-phase refine asks ONE question per render -- yaw
+    from the near-top-down view, extents from the horizontal views --
+    and each phase's prompt describes exactly what its image shows.
+    None renders all three.
     """
     # ---- 3DGS true render (preferred when available) ----
     if gs_ply and boxes:
@@ -111,7 +118,7 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
             # overhang / one-or-many judgements), drops the rest of the
             # room so it cannot occlude what is being adjudicated
             iso_margin = extent + 1.0
-            slots = {
+            all_slots = {
                 "front": (((18.0, 0.0), (18.0, 12.0), (18.0, -12.0),
                            (18.0, 180.0), (18.0, 168.0), (18.0, 192.0)),
                           ((58.0, 0.0), (58.0, 12.0), (58.0, -12.0),
@@ -121,8 +128,13 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
                          ((58.0, 90.0), (58.0, 104.0), (58.0, 270.0))),
                 "oblique": (((70.0, 35.0), (72.0, 48.0), (66.0, 22.0)), ()),
             }
-            views, quality = [], {}
-            for name, (cands, fb) in slots.items():
+            # optional subset (two-phase refine renders one question's
+            # evidence per image, so each prompt describes exactly the
+            # views it can see)
+            sel = {k: v for k, v in all_slots.items()
+                   if slots is None or k in slots}
+            views, quality, names = [], {}, []
+            for name, (cands, fb) in sel.items():
                 img, q, chosen = render_slot_candidates(
                     gs, boxes,
                     lambda e, a: make_local_cam(boxes, extent=extent * 2,
@@ -132,11 +144,12 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
                 if img is None:
                     continue
                 views.append(img)
+                names.append(name)
                 quality[name] = dict(q, view=[chosen[0], chosen[1]])
             if views:
                 if quality_out is not None:
                     quality_out.update(quality)
-                return _tile_views(views)
+                return _tile_views(views, labels=names)
         except Exception as e:
             print(f"[gs][local] true render failed ({type(e).__name__}: {e}) "
                   f"-> scatter fallback")
@@ -939,41 +952,94 @@ class VLMJudge:
         "Use 'ok' only for a judgment that genuinely fits."
     )
 
-    def adjudicate_fit(self, scene, box) -> Verdict:
-        """Ask the VLM to NOMINATE directions for correcting ONE box.
+    _YAW_PROMPT = (
+        "You are auditing the 3D bounding box around ONE data-center rack.\n"
+        "The image is ONE near-top-down oblique view of the candidate "
+        "region: the rack's TOP face is visible with little perspective "
+        "foreshortening, together with the tops of its neighbours along "
+        "the row. The red wireframe marks the candidate box (the full 3D "
+        "box). Two arrows are drawn on its top face: a GREEN arrow along "
+        "the box's local x axis (its length direction) and a BLUE arrow "
+        "along its local y axis (its depth direction).\n\n"
+        "ONE question only: is the GREEN arrow parallel to the device's "
+        "long axis (the row direction)? If not, decide which way the box "
+        "must rotate around the vertical z-axis, SEEN FROM ABOVE, to "
+        "make it parallel. Length and depth judgments are handled by "
+        "other stages -- do NOT judge them here.\n\n"
+        "Work step by step:\n"
+        "1. Write ONE short sentence comparing the GREEN arrow's "
+        "direction against the row's direction.\n"
+        "2. Then output ONE JSON object on the LAST line:\n"
+        '{"yaw_dir": "cw"|"ccw"|"ok"}\n'
+        "- 'cw' = the green arrow must rotate clockwise (seen from "
+        "above),\n"
+        "- 'ccw' = counterclockwise,\n"
+        "- 'ok' = already parallel. Use 'ok' only when it genuinely fits."
+    )
 
-        The evidence image is the three-view local composite WITH the
-        box's local axes drawn (green = length, blue = depth), so the VLM
-        can see both the box's orientation and its extent relative to the
-        device. The reply is categorical (which x-end is short/over, which
-        way the yaw rotates) -- magnitude is pseudo-precision from an
-        image and is searched geometrically downstream (yaw sweep to the
-        support peak, edge snap to the density profile). Mock backend /
-        any failure -> keep (no refinement).
+    _EXTENT_PROMPT = (
+        "You are auditing the 3D bounding box around ONE data-center rack.\n"
+        "The image is a composite of TWO views of the same candidate "
+        "region, tiled side by side, each labeled above the panel: "
+        "'front' (the rack's front face: doors, panels, LEDs) and 'side' "
+        "(view along the row: neighbouring racks give the row rhythm). "
+        "Red wireframes mark the candidate box (the full 3D box). A "
+        "GREEN arrow on its top face shows the box's local x axis (its "
+        "length direction).\n\n"
+        "The box's ORIENTATION has already been corrected by a previous "
+        "stage -- assume the green arrow is parallel to the row. ONE "
+        "question only: do the wireframe's ends along the GREEN axis "
+        "match the device's edges? For each end: 'short' = the device "
+        "continues past the wireframe end, 'over' = the wireframe hangs "
+        "past the device edge (into the aisle or over the neighbour), "
+        "'ok' = they match. Rotation and depth are other stages' "
+        "concerns -- do NOT judge them.\n\n"
+        "Work step by step:\n"
+        "1. For each view, write ONE short sentence about whether the "
+        "wireframe's two ends along the green axis match the device "
+        "edges.\n"
+        "2. Then output ONE JSON object on the LAST line:\n"
+        '{"x_minus": "short"|"over"|"ok", '
+        '"x_plus": "short"|"over"|"ok"}\n'
+        "- x_minus: the wireframe end OPPOSITE the GREEN arrow,\n"
+        "- x_plus: the end the GREEN arrow points at.\n"
+        "Use 'ok' only for a judgment that genuinely fits."
+    )
+
+    def _adjudicate_views(self, scene, box, kind: str, prompt: str,
+                         slots: tuple, parser) -> Verdict:
+        """Shared per-box single-question adjudication on SELECTED views.
+
+        Renders the given view slots (see render_topdown_image), asks ONE
+        focused question, parses the categorical reply. Guards identical
+        to the combined fit pass: mock / any failure -> keep; thinking
+        escalation on hard evidence (keep_allok lets a careful 'it fits'
+        override a shaky fast nomination); the quality cap applies only
+        to the fast tier.
         """
         if self.backend == "mock":
             return Verdict(action="keep", confidence=0.5,
-                           detail="mock: no pose refinement")
+                           detail=f"mock: no {kind} refinement")
         png_path = None
         q = {}
         try:
             img = render_topdown_image(scene.points, [box],
                                        gs_ply=scene.meta.get("gs_ply"),
-                                       overlay="wire3d_axes", quality_out=q)
+                                       overlay="wire3d_axes", quality_out=q,
+                                       slots=slots)
             png_path = self._save_evidence_png(
-                img, f"fit_evidence_{box.box_id[:8]}.png")
+                img, f"{kind}_evidence_{box.box_id[:8]}.png")
             png = self._array_png_bytes(img)
             if self.backend == "local":
-                text = self._local_image_call(png, self._FIT_PROMPT,
+                text = self._local_image_call(png, prompt,
                                               max_new_tokens=256)
             else:
-                text = self._qwen_image_call(png, self._FIT_PROMPT,
-                                             max_tokens=256)
+                text = self._qwen_image_call(png, prompt, max_tokens=256)
         except Exception as e:
-            print(f"[vlm][fit] failed ({type(e).__name__}: {e}) -> keep")
+            print(f"[vlm][{kind}] failed ({type(e).__name__}: {e}) -> keep")
             return Verdict(action="keep", confidence=0.5,
                            detail=type(e).__name__)
-        params = self._parse_fit_reply(text)
+        params = parser(text)
         # hard evidence (blurry / occluded / steep-fallback view) -> re-ask
         # on the thinking tier. keep_allok distinguishes "careful reader
         # says it fits" from an unparseable reply, so the escalation can
@@ -982,24 +1048,24 @@ class VLMJudge:
         if self._should_escalate(q):
             try:
                 if self.backend == "local":
-                    text2 = self._local_image_call(png, self._FIT_PROMPT,
+                    text2 = self._local_image_call(png, prompt,
                                                   max_new_tokens=2048,
                                                   thinking=True)
                 else:
-                    text2 = self._qwen_image_call(png, self._FIT_PROMPT,
+                    text2 = self._qwen_image_call(png, prompt,
                                                   max_tokens=2048,
                                                   thinking=True)
-                p2 = self._parse_fit_reply(text2, keep_allok=True)
+                p2 = parser(text2, keep_allok=True)
                 if p2 is not None:
                     params = p2
                     text = text2
                     escalated = True
             except Exception as e:
-                print(f"[vlm][fit][thinking] failed "
+                print(f"[vlm][{kind}][thinking] failed "
                       f"({type(e).__name__}: {e}) -> keeping primary")
         # an escalated all-ok is a real "it fits" verdict -> keep, not refine
-        has_nom = bool(params) and not all(v == "ok" for v in params.values())
-        self._record("fit", self._FIT_PROMPT, text, "",
+        has_nom = bool(params) and any(v != "ok" for v in params.values())
+        self._record(kind, prompt, text, "",
                      0.8 if has_nom else 0.5,
                      str(params) if params else "no change",
                      png_path=png_path, quality=q or None,
@@ -1022,6 +1088,41 @@ class VLMJudge:
             # conservative path the escalation was meant to escape.
             self._gate_quality(v, [box], quality=q)
         return v
+
+    def adjudicate_fit(self, scene, box) -> Verdict:
+        """COMBINED single-call variant: all three questions (yaw + both
+        x-ends) on the three-view composite. Kept for auditing and tests;
+        the production refine loop now asks them SEQUENTIALLY (see
+        adjudicate_yaw / adjudicate_extent) -- a skewed box contaminates
+        every horizontal-view extent judgment, so orientation is
+        corrected FIRST and the extent question re-rendered on the
+        corrected geometry.
+        """
+        return self._adjudicate_views(scene, box, "fit", self._FIT_PROMPT,
+                                      ("front", "side", "oblique"),
+                                      self._parse_fit_reply)
+
+    def adjudicate_yaw(self, scene, box) -> Verdict:
+        """Phase 1 of the two-phase refine: ORIENTATION only, judged from
+        the oblique near-top-down view -- the row direction reads best
+        with little perspective foreshortening, and every horizontal-view
+        extent judgment downstream is unreliable until the yaw is right.
+        Categorical cw/ccw reply; the magnitude is swept geometrically
+        downstream (geo.sweep_yaw).
+        """
+        return self._adjudicate_views(scene, box, "yaw", self._YAW_PROMPT,
+                                      ("oblique",), self._parse_yaw_reply)
+
+    def adjudicate_extent(self, scene, box) -> Verdict:
+        """Phase 2: LENGTH ends only, judged from the front/side views of
+        the ALREADY yaw-corrected box (the caller re-renders after phase
+        1 adopted a correction). Depth is complete_row_depth's domain,
+        rotation phase 1's -- neither is asked here.
+        """
+        return self._adjudicate_views(scene, box, "extent",
+                                      self._EXTENT_PROMPT,
+                                      ("front", "side"),
+                                      self._parse_extent_reply)
 
     @staticmethod
     def _parse_fit_reply(text: str, keep_allok: bool = False) -> dict | None:
@@ -1051,6 +1152,38 @@ class VLMJudge:
             "x_plus": _cat("x_plus", {"short", "over", "ok"}),
             "yaw_dir": _cat("yaw_dir", {"cw", "ccw", "ok"}),
         }
+        if all(v == "ok" for v in p.values()):
+            return p if keep_allok else None
+        return p
+
+    @staticmethod
+    def _parse_yaw_reply(text: str, keep_allok: bool = False) -> dict | None:
+        """Parse the phase-1 orientation nomination: which way the yaw
+        rotates (cw/ccw), magnitude measured geometrically downstream.
+        Same keep_allok contract as _parse_fit_reply."""
+        data = _extract_json(text)
+        if not isinstance(data, dict):
+            return None
+        v = str(data.get("yaw_dir", "ok")).strip().lower()
+        if v not in ("cw", "ccw"):
+            v = "ok"
+        if v == "ok" and not keep_allok:
+            return None
+        return {"yaw_dir": v}
+
+    @staticmethod
+    def _parse_extent_reply(text: str, keep_allok: bool = False) -> dict | None:
+        """Parse the phase-2 length-end nomination (short/over per x-end).
+        Same keep_allok contract as _parse_fit_reply."""
+        data = _extract_json(text)
+        if not isinstance(data, dict):
+            return None
+
+        def _cat(key: str) -> str:
+            v = str(data.get(key, "ok")).strip().lower()
+            return v if v in ("short", "over", "ok") else "ok"
+
+        p = {"x_minus": _cat("x_minus"), "x_plus": _cat("x_plus")}
         if all(v == "ok" for v in p.values()):
             return p if keep_allok else None
         return p

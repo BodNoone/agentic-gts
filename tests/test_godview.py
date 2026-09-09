@@ -338,10 +338,12 @@ def test_vlm_refine_corrects_yaw():
     from agentic_gts.core.models import OrientedBox
 
     class RotatingJudge(VLMJudge):
-        def adjudicate_fit(self, scene, box):
+        def adjudicate_yaw(self, scene, box):
             return Verdict(action="refine", confidence=0.8,
-                           params={"x_minus": "ok", "x_plus": "ok",
-                                   "yaw_dir": "ccw"})
+                           params={"yaw_dir": "ccw"})
+
+        def adjudicate_extent(self, scene, box):
+            return Verdict(action="keep", confidence=0.5, detail="ok")
 
     # racks physically rotated 10 deg; boxes placed at yaw=0 (wrong)
     ang = _m.radians(10.0)
@@ -385,10 +387,12 @@ def test_vlm_refine_bounds_hallucinated_growth():
     from agentic_gts.core.models import OrientedBox
 
     class GrowJudge(VLMJudge):
-        def adjudicate_fit(self, scene, box):
+        def adjudicate_yaw(self, scene, box):
+            return Verdict(action="keep", confidence=0.5, detail="ok")
+
+        def adjudicate_extent(self, scene, box):
             return Verdict(action="refine", confidence=0.8,
-                           params={"x_minus": "short", "x_plus": "short",
-                                   "yaw_dir": "ok"})
+                           params={"x_minus": "short", "x_plus": "short"})
 
     # ONE isolated rack (a dense scene would let the grown seed swallow
     # neighbouring racks and muddy the assertion)
@@ -417,10 +421,12 @@ def test_vlm_refine_preserves_trusted_height():
     from agentic_gts.core.models import OrientedBox
 
     class NudgeJudge(VLMJudge):
-        def adjudicate_fit(self, scene, box):
+        def adjudicate_yaw(self, scene, box):
+            return Verdict(action="keep", confidence=0.5, detail="ok")
+
+        def adjudicate_extent(self, scene, box):
             return Verdict(action="refine", confidence=0.8,
-                           params={"x_minus": "over", "x_plus": "over",
-                                   "yaw_dir": "ok"})
+                           params={"x_minus": "over", "x_plus": "over"})
 
     # points cover only the lower 1.2m of a 2.0m-high rack
     rng = np.random.default_rng(5)
@@ -483,10 +489,12 @@ def test_vlm_refine_extends_short_end():
     from agentic_gts.core.models import OrientedBox
 
     class ShortJudge(VLMJudge):
-        def adjudicate_fit(self, scene, box):
+        def adjudicate_yaw(self, scene, box):
+            return Verdict(action="keep", confidence=0.5, detail="ok")
+
+        def adjudicate_extent(self, scene, box):
             return Verdict(action="refine", confidence=0.8,
-                           params={"x_minus": "ok", "x_plus": "short",
-                                   "yaw_dir": "ok"})
+                           params={"x_minus": "ok", "x_plus": "short"})
 
     # device truly spans x in [-0.3, +0.55] (0.85m); the box only covers
     # [-0.3, +0.3] -- the +x end is short by 0.25m. Test the refine pass

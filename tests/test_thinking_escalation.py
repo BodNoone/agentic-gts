@@ -176,7 +176,8 @@ def test_adjudicate_fit_escalated_allok_overrides():
     nom = json.dumps({"x_minus": "short", "x_plus": "ok", "yaw_dir": "ok"})
     allok = json.dumps({"x_minus": "ok", "x_plus": "ok", "yaw_dir": "ok"})
 
-    def fake_render(points, boxes, gs_ply=None, overlay=None, quality_out=None):
+    def fake_render(points, boxes, gs_ply=None, overlay=None, quality_out=None,
+                    slots=None):
         if quality_out is not None:
             quality_out.update(_low_quality())
         return np.zeros((8, 8, 3), dtype=np.float32)
@@ -210,7 +211,8 @@ def test_adjudicate_fit_escalated_nomination_wins():
     nom_think = json.dumps({"x_minus": "ok", "x_plus": "short",
                             "yaw_dir": "cw"})
 
-    def fake_render(points, boxes, gs_ply=None, overlay=None, quality_out=None):
+    def fake_render(points, boxes, gs_ply=None, overlay=None, quality_out=None,
+                    slots=None):
         if quality_out is not None:
             quality_out.update(_low_quality())
         return np.zeros((8, 8, 3), dtype=np.float32)
@@ -234,6 +236,71 @@ def test_adjudicate_fit_escalated_nomination_wins():
     print("PASS adjudicate_fit escalated nomination wins uncapped")
 
 
+def test_parse_yaw_and_extent_replies():
+    yaw = VLMJudge._parse_yaw_reply
+    ext = VLMJudge._parse_extent_reply
+    # valid nominations
+    assert yaw('rotate it {"yaw_dir": "cw"}') == {"yaw_dir": "cw"}
+    assert ext('{"x_minus": "short", "x_plus": "over"}') == {
+        "x_minus": "short", "x_plus": "over"}
+    # all-ok -> None (keep) by default, dict with keep_allok
+    assert yaw('{"yaw_dir": "ok"}') is None
+    assert yaw('{"yaw_dir": "ok"}', keep_allok=True) == {"yaw_dir": "ok"}
+    assert ext('{"x_minus": "ok", "x_plus": "ok"}') is None
+    assert ext('{"x_minus": "ok", "x_plus": "ok"}', keep_allok=True) == {
+        "x_minus": "ok", "x_plus": "ok"}
+    # unknown / garbage values fall back to ok / None
+    assert yaw('{"yaw_dir": "left"}') is None
+    assert ext('{"x_minus": "sideways", "x_plus": "ok"}') is None
+    assert yaw("no json here") is None
+    print("PASS parse yaw/extent replies")
+
+
+def test_adjudicate_yaw_and_extent_route_slots():
+    """adjudicate_yaw renders ONLY the oblique slot, adjudicate_extent
+    ONLY front+side -- each phase's prompt describes exactly the views
+    its image shows (two-phase refine contract)."""
+    import types
+
+    j = VLMJudge(backend="qwen")
+    scene = types.SimpleNamespace(points=np.zeros((5, 3)), meta={})
+    box = _mk_box()
+    seen = {"slots": [], "kinds": []}
+
+    def fake_render(points, boxes, gs_ply=None, overlay=None, quality_out=None,
+                    slots=None):
+        seen["slots"].append(tuple(slots) if slots else None)
+        return np.zeros((8, 8, 3), dtype=np.float32)
+
+    def fake_call(png, prompt, max_tokens=256, thinking=False):
+        seen["kinds"].append(prompt)
+        return '{"yaw_dir": "ccw"}'
+
+    import agentic_gts.agent.judge as J
+    orig_render = J.render_topdown_image
+    J.render_topdown_image = fake_render
+    j._qwen_image_call = fake_call
+    try:
+        v = j.adjudicate_yaw(scene, box)
+        assert v.action == "refine" and v.params == {"yaw_dir": "ccw"}
+        assert seen["slots"][-1] == ("oblique",), \
+            f"yaw must render oblique only, got {seen['slots']}"
+        assert j._YAW_PROMPT in seen["kinds"], "yaw prompt not used"
+
+        def fake_call2(png, prompt, max_tokens=256, thinking=False):
+            return '{"x_minus": "short", "x_plus": "ok"}'
+
+        j._qwen_image_call = fake_call2
+        v2 = j.adjudicate_extent(scene, box)
+        assert v2.action == "refine" and v2.params["x_minus"] == "short"
+        assert seen["slots"][-1] == ("front", "side"), \
+            f"extent must render front+side, got {seen['slots']}"
+        assert j._EXTENT_PROMPT in seen["kinds"], "extent prompt not used"
+    finally:
+        J.render_topdown_image = orig_render
+    print("PASS yaw/extent adjudications route their view slots")
+
+
 if __name__ == "__main__":
     test_strip_think_variants()
     test_should_escalate_gating()
@@ -244,4 +311,6 @@ if __name__ == "__main__":
     test_adjudicate_box_no_escalation_without_thinking_model()
     test_adjudicate_fit_escalated_allok_overrides()
     test_adjudicate_fit_escalated_nomination_wins()
+    test_parse_yaw_and_extent_replies()
+    test_adjudicate_yaw_and_extent_route_slots()
     print("ALL THINKING-ESCALATION TESTS PASSED")

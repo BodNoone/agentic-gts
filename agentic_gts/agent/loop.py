@@ -393,42 +393,46 @@ class LayoutAgent:
                   f"{e}) -> skipped")
 
     def _vlm_refine(self, scene: Scene, report: AgentReport) -> None:
-        """Per-box refinement: the VLM nominates DIRECTIONS, geometry
-        measures magnitudes.
+        """Two-phase per-box refinement, SEQUENTIAL by dependency:
 
-        The VLM's fit reply is categorical (which x-end is short/over,
-        which way the yaw rotates) -- metres/degrees from an image are
-        pseudo-precision. Each nomination is executed by a geometric
-        search:
-          - yaw: sweep the nominated direction (opposite direction as
-            fallback -- point evidence overrules a wrong nomination) to
-            the support peak (geo.sweep_yaw);
-          - 'short' end: growth re-fit -- the seed's x is enlarged (max
-            0.25m: edge-level misalignment; a full grid-unit shortfall is
-            WIDTH_MISFIT's split/merge domain, not fine refine) so the
-            density span can extend to the device's true edge, stopping
-            at the gap to the neighbour;
-          - 'over' end: plain re-fit -- the shrink-only span snaps back
-            to the point support.
+          phase 1 -- ORIENTATION from the oblique near-top-down view:
+          the row direction reads best with little perspective
+          foreshortening, and a skewed box makes every horizontal-view
+          extent judgment unreliable (its wireframe edges no longer run
+          parallel to the device faces);
+          phase 2 -- LENGTH ends from the front/side views, RE-RENDERED
+          on the corrected box so the extent question sees honest
+          geometry.
+
+        The VLM nominates DIRECTIONS only, geometry measures magnitudes
+        (metres/degrees from an image are pseudo-precision):
+          - phase 1: sweep the nominated direction (opposite direction
+            as fallback -- point evidence overrules a wrong nomination)
+            to the support peak (geo.sweep_yaw);
+          - phase 2: 'short' end -> growth re-fit -- the seed's x is
+            enlarged (max 0.25m: edge-level misalignment; a full
+            grid-unit shortfall is WIDTH_MISFIT's split/merge domain,
+            not fine refine) so the density span can extend to the
+            device's true edge, stopping at the gap to the neighbour;
+            'over' end -> plain re-fit -- the shrink-only span snaps
+            back to the point support.
         Guards: IoU < 0.3 with the original rolls back; height (and
         completed depth) trusted throughout. A hallucinated nomination
         is inert by construction: 'short' with no points beyond the edge
         re-fits to the same span, 'over' with full support keeps it.
         """
         for b in list(scene.boxes):
-            try:
-                verdict = self.judge.adjudicate_fit(scene, b)
-            except Exception as e:
-                print(f"[diag][C] refine error on {b.box_id[:6]} "
-                      f"({type(e).__name__}) -> skipped")
-                continue
-            if verdict.action != "refine" or not verdict.params:
-                continue
-            p = verdict.params
             cur = b
-            # -- yaw first: the edge re-fits below run at the corrected yaw --
-            if p.get("yaw_dir") in ("cw", "ccw"):
-                direction = 1.0 if p.get("yaw_dir") == "ccw" else -1.0
+            # ---- phase 1: yaw from the oblique near-top-down view ----
+            try:
+                v1 = self.judge.adjudicate_yaw(scene, cur)
+            except Exception as e:
+                print(f"[diag][C] yaw refine error on {b.box_id[:6]} "
+                      f"({type(e).__name__}) -> skipped")
+                v1 = None
+            if (v1 is not None and v1.action == "refine"
+                    and v1.params.get("yaw_dir") in ("cw", "ccw")):
+                direction = 1.0 if v1.params["yaw_dir"] == "ccw" else -1.0
                 swept = None
                 try:
                     swept = geo.sweep_yaw(scene, cur, direction=direction)
@@ -440,14 +444,23 @@ class LayoutAgent:
                     if refit.iou_2d(b) >= 0.3:
                         print(f"[diag][C] refine {b.box_id[:6]}: yaw "
                               f"sweep -> {math.degrees(yaw - b.yaw):+.1f}deg "
-                              f"(nominated {p['yaw_dir']})")
-                        cur = self._adopt_refit(scene, b, refit)
+                              f"(nominated {v1.params['yaw_dir']})")
+                        cur = self._adopt_refit(scene, cur, refit)
                         report.actions_taken.append(
                             {"issue_id": "vlm_refine", "action": "refine",
-                             "params": {"yaw_dir": p["yaw_dir"],
+                             "params": {"yaw_dir": v1.params["yaw_dir"],
                                         "applied_deg":
                                         round(math.degrees(yaw - b.yaw), 1)}})
-            # -- x-ends: growth ('short') / shrink ('over') re-fit --
+            # ---- phase 2: x-ends on the CORRECTED box ----
+            try:
+                verdict = self.judge.adjudicate_extent(scene, cur)
+            except Exception as e:
+                print(f"[diag][C] extent refine error on {b.box_id[:6]} "
+                      f"({type(e).__name__}) -> skipped")
+                continue
+            if verdict.action != "refine" or not verdict.params:
+                continue
+            p = verdict.params
             ends = (p.get("x_minus"), p.get("x_plus"))
             if "short" in ends or "over" in ends:
                 keep_depth = bool(cur.meta.get("depth_completed"))
