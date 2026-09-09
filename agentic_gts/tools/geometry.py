@@ -15,7 +15,8 @@ from agentic_gts.core.models import BoxSource, Confidence, DeviceType, OrientedB
 def fit_box_to_points(scene: Scene, seed_center: tuple[float, float],
                       seed_size: tuple[float, float, float], yaw: float,
                       inlier_frac: float = 0.9,
-                      keep_height: bool = False) -> OrientedBox | None:
+                      keep_height: bool = False,
+                      keep_depth: bool = False) -> OrientedBox | None:
     """Refit an oriented box to the local point support.
 
     Boundary estimation via 1D occupancy histograms per axis: find the
@@ -26,7 +27,13 @@ def fit_box_to_points(scene: Scene, seed_center: tuple[float, float],
     output) -- keep the seed's z-extent untouched instead of re-deriving
     it from point percentiles (surface fragments / ceiling cuts make
     point-based z unreliable).
+
+    keep_depth=True: same trust for the cross-row DEPTH (size[1]). A
+    completed row-depth box (see complete_row_depth) spans the hollow
+    interior of a closed cabinet whose 3DGS interior is empty -- the
+    point-percentile span would collapse it back to a thin face shell.
     """
+
     seed = OrientedBox(center=(seed_center[0], seed_center[1], seed_size[2] / 2),
                        size=seed_size, yaw=yaw)
     region = _region_of_box(seed, expand=0.3)
@@ -50,6 +57,8 @@ def fit_box_to_points(scene: Scene, seed_center: tuple[float, float],
         zmin, zmax = -half[2], half[2]
     else:
         zmin, zmax = float(qlo[2]), float(qhi[2])
+    if keep_depth:
+        ymin, ymax = -half[1], half[1]
 
     new_size = (max(xmax - xmin, 0.15), max(ymax - ymin, 0.15), max(zmax - zmin, 0.2))
     local_center = np.array([(xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2])
@@ -57,7 +66,10 @@ def fit_box_to_points(scene: Scene, seed_center: tuple[float, float],
     box = OrientedBox(center=tuple(center), size=new_size, yaw=yaw,
                       device_type=DeviceType.RACK)
     coverage = support_fraction(scene, box)
-    if coverage < 0.12:
+    # keep_depth boxes span the hollow cabinet interior BY DESIGN -- their
+    # interior occupancy is structurally low (one observed face band), so
+    # the trust flag also relaxes the coverage floor.
+    if coverage < (0.05 if keep_depth else 0.12):
         return None
     return box
 
@@ -294,6 +306,156 @@ def profile_cuts(scene: Scene, box: OrientedBox, cell: float = 0.05,
     if hi_t - lo_t < 0.3:
         out["tails"] = (None, None)
     return out
+
+
+def complete_row_depth(scene: Scene, box: OrientedBox, row_mates: list,
+                       cell: float = 0.05, min_depth: float = 0.4,
+                       max_depth: float = 2.2) -> OrientedBox | None:
+    """Expand a thin single-face fragment to the device's full depth.
+
+    A row scanned only from its facades leaves every initial box thin:
+    each hugs the one face its view observed (single-view back-projection
+    shells). The device's TRUE depth -- the whole row's thickness -- is
+    visible in the cross-axis (local y) density profile as TWO dense
+    surface bands separated by the hollow cabinet interior, with the
+    aisle empty beyond. This is pure geometry: the oblique top-down view
+    shows the VLM the evidence, but no VLM-driven stage can act on it
+    (dw is clamped to ±0.5m and the shrink-only refit collapses any
+    growth back to the observed face shell).
+
+    Direction: toward the row interior -- the median cross coordinate of
+    the row-mates (same-row boxes, possibly hugging the opposite face).
+    The nearest band on that side is the device's other face.
+
+    Guards:
+      - requires at least one row-mate (an isolated thin box next to a
+        wall would otherwise absorb the wall);
+      - a candidate band with dense points well ABOVE the box top is a
+        wall / tall structure, not a rack face -> rejected;
+      - depth bounded to [min_depth, max_depth] and must exceed the
+        current depth by >= 0.2m (no churn on already-decent boxes).
+
+    Returns a new OrientedBox (same length / height / yaw / box_id-free
+    attributes) or None. The CALLER keeps the original box_id / meta.
+    """
+    if not row_mates:
+        return None
+    half = np.asarray(box.size, dtype=float) / 2.0
+    reach = max_depth + 0.8
+    region = _region_of_box(box, expand=reach)
+    pts = scene.points_in_region(region)
+    if len(pts) < 30:
+        return None
+    local = box.world_to_local(pts)
+    # device height band only: floor clutter (z~0) and anything above the
+    # box top stay out of the profile
+    m = ((np.abs(local[:, 0]) <= half[0] + 0.05) &
+         (local[:, 2] >= -half[2] + 0.10) &
+         (local[:, 2] <= half[2] - 0.10))
+    band = local[m]
+    if len(band) < 30:
+        return None
+    # ---- cross-axis density profile: contiguous dense runs = faces ----
+    lo, hi = -reach, reach
+    edges = np.arange(lo, hi + cell / 2, cell)
+    hist, _ = np.histogram(band[:, 1], bins=edges)
+    peak = float(hist.max())
+    if peak < 5:
+        return None
+    dense = hist >= max(3.0, peak * 0.15)
+    runs, i = [], 0
+    while i < len(dense):
+        if not dense[i]:
+            i += 1
+            continue
+        j = i
+        while j < len(dense) and dense[j]:
+            j += 1
+        runs.append((float(edges[i]), float(edges[j])))
+        i = j
+    # merge sub-0.2m splits (surface noise cracks a face band in two)
+    merged = []
+    for r in runs:
+        if merged and r[0] - merged[-1][1] < 0.20:
+            merged[-1] = (merged[-1][0], r[1])
+        else:
+            merged.append(r)
+    runs = merged
+    # the run the box itself hugs (its observed face)
+    own = None
+    for r in runs:
+        if r[0] <= half[1] and r[1] >= -half[1]:
+            own = r
+            break
+    if own is None:
+        return None
+    # direction: toward the row interior (mates' median cross coordinate).
+    # Mates on the OPPOSITE face give a clear sign; mates all on the same
+    # face (single-side scan of the row) leave the median at ~0 -- then
+    # fall back to the nearest band on EITHER side (the observed face
+    # looks into the open aisle it was scanned from, so the nearest band
+    # is the device's other face; a wall behind is caught by the guard
+    # below).
+    med = float(np.median([
+        box.world_to_local(np.asarray([mb.center], dtype=float))[0, 1]
+        for mb in row_mates]))
+    side = None if abs(med) < 0.25 else (1.0 if med >= 0.0 else -1.0)
+    # nearest candidate band on the chosen side (either side if unknown)
+    best = None
+    for r in runs:
+        if r is own:
+            continue
+        if side is not None and side > 0 and r[0] <= own[1]:
+            continue
+        if side is not None and side < 0 and r[1] >= own[0]:
+            continue
+        if r[0] > own[1]:
+            span = (own[0], r[1])
+        elif r[1] < own[0]:
+            span = (r[0], own[1])
+        else:
+            continue
+        depth = span[1] - span[0]
+        if not (min_depth <= depth <= max_depth):
+            continue
+        if depth <= box.size[1] + 0.20:
+            continue
+        dist = abs((r[0] + r[1]) / 2.0 - (own[0] + own[1]) / 2.0)
+        if best is None or dist < best[1]:
+            best = (span, dist)
+    if best is None:
+        return None
+    span = best[0]
+    # ---- wall guard: a band dense well above the box top is a wall ----
+    # target band center: the candidate band, not the midpoint of the span
+    t_c = _target_band_center(runs, span, own)
+    col = np.abs(local[:, 0]) <= half[0] + 0.05
+    near_t = col & (np.abs(local[:, 1] - t_c) <= 0.15)
+    below = near_t & (local[:, 2] > -half[2] + 0.1) & (local[:, 2] < half[2] - 0.1)
+    above = near_t & (local[:, 2] > half[2] + 0.25) & (local[:, 2] < half[2] + 1.2)
+    if below.sum() == 0:
+        return None
+    if above.sum() >= 0.5 * below.sum():
+        return None          # tall structure behind, not a rack face
+    # ---- build the completed box ----
+    new_depth = span[1] - span[0]
+    cy = (span[0] + span[1]) / 2.0
+    c = box.local_to_world(np.array([[0.0, cy, 0.0]]))[0]
+    new_box = OrientedBox(center=(float(c[0]), float(c[1]), box.center[2]),
+                          size=(box.size[0], new_depth, box.size[2]),
+                          yaw=box.yaw, device_type=box.device_type)
+    new_box.row_id = box.row_id
+    return new_box
+
+
+def _target_band_center(runs, span, own):
+    """Center of the candidate (non-own) band inside the completed span."""
+    for r in runs:
+        if r is own:
+            continue
+        if r[0] >= span[0] - 1e-9 and r[1] <= span[1] + 1e-9:
+            return (r[0] + r[1]) / 2.0
+    return (span[0] + span[1]) / 2.0
 
 
 def split_box(scene: Scene, box: OrientedBox, n: int,

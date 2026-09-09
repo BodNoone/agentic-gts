@@ -177,6 +177,12 @@ class LayoutAgent:
         # + side complement rules, and the VLM merge adjudication is no
         # longer needed (the old MERGED_NEIGHBORS VLM pass is retired).
         self._geometric_merge(scene, report)
+        # 2.5 row-depth completion: thin single-face fragments (rows
+        # scanned only from their facades) are expanded to the full row
+        # thickness from the cross-axis surface-band profile BEFORE the
+        # repair loop audits anything -- no VLM stage can grow a depth
+        # (dw clamp + shrink-only refit), so this must be geometry.
+        self._depth_completion(scene, report)
         # 3. repair loop: false positives, fused rows, overlaps.
         # fixes cascade: a split creates fragments that may need merging, a
         # merge may overlap a neighbour. One detection pass cannot see the
@@ -213,6 +219,11 @@ class LayoutAgent:
         # good support fraction)
         for b in scene.boxes:
             sup = geo.support_fraction(scene, b)
+            if b.meta.get("depth_completed"):
+                # a completed box spans the hollow cabinet interior by
+                # design -- interior occupancy is structurally low, the
+                # faces (both observed) are the honest support signal
+                sup = max(sup, geo.face_support_fraction(scene, b))
             if sup > 0.3 and b.source != BoxSource.ROW_COMPLETION:
                 b.confidence = Confidence.HIGH
             elif sup > 0.15:
@@ -280,6 +291,100 @@ class LayoutAgent:
                       f"fragments ({before} -> {len(scene.boxes)} boxes)")
         except Exception as e:
             print(f"[diag][C] geometric merge failed ({type(e).__name__}: "
+                  f"{e}) -> skipped")
+
+    @staticmethod
+    def _row_mates(scene: Scene, box: OrientedBox) -> list:
+        """Other boxes of the SAME row: yaw aligned (mod 180 deg -- a
+        back-view fragment's yaw is flipped), near the row line. Facing
+        rows across the aisle sit one row-pitch away and are excluded by
+        the cross-offset cap."""
+        mates = []
+        for b in scene.boxes:
+            if b is box:
+                continue
+            dyaw = abs(math.atan2(math.sin(b.yaw - box.yaw),
+                                  math.cos(b.yaw - box.yaw)))
+            dyaw = min(dyaw, abs(math.pi - dyaw))
+            if dyaw > math.radians(12):
+                continue
+            if abs(b.center[2] - box.center[2]) > 1.2:
+                continue
+            loc = box.world_to_local(np.asarray([b.center], dtype=float))[0]
+            if abs(loc[1]) > 1.7 or abs(loc[0]) > 5.0:
+                continue
+            mates.append(b)
+        return mates
+
+    def _depth_completion(self, scene: Scene, report: AgentReport) -> None:
+        """Expand thin single-face fragments to the full row depth.
+
+        A row scanned only from its facades leaves middle-of-row devices
+        as thin boxes (each initial box hugs the one face its view
+        observed). The oblique top-down view can SHOW the VLM the
+        mismatch, but nothing downstream can act on it: the VLM's dw is
+        clamped to +/-0.5m and the deliberately shrink-only refit
+        collapses any growth back to the observed face shell. The row's
+        own two surface bands in the cross-axis density profile are the
+        ground truth -- complete the depth geometrically BEFORE the
+        repair loop audits anything (see geo.complete_row_depth).
+
+        Opposite-face fragments of the same device (the expansion target
+        band is their observed face) are absorbed instead of left to
+        collide as OVERLAP issues. Completed boxes are marked
+        meta['depth_completed'] so the final edge refinement and the
+        confidence tagging treat the hollow interior correctly.
+        """
+        try:
+            n_done, n_absorbed = 0, 0
+            live = {x.box_id for x in scene.boxes}
+            for b in list(scene.boxes):
+                if b.box_id not in live:    # absorbed by an earlier completion
+                    live.discard(b.box_id)
+                    continue
+                if b.size[1] >= 0.5:
+                    continue
+                mates = self._row_mates(scene, b)
+                new = None
+                try:
+                    new = geo.complete_row_depth(scene, b, mates)
+                except Exception as e:
+                    print(f"[diag][C] depth completion error on "
+                          f"{b.box_id[:6]} ({type(e).__name__}: {e})")
+                    continue
+                if new is None:
+                    continue
+                # absorb opposite-face fragments of the same device: thin
+                # boxes whose centre falls inside the completed footprint
+                absorbed = []
+                for o in list(scene.boxes):
+                    if o is b or o.size[1] >= 0.5:
+                        continue
+                    if new.contains(np.asarray([o.center], dtype=float),
+                                   margin=0.15):
+                        absorbed.append(o)
+                # overlap guard against everything that survives
+                rest = [o for o in scene.boxes
+                        if o is not b and o not in absorbed]
+                if any(new.iou_2d(o) > 0.25 for o in rest):
+                    continue
+                old_d = b.size[1]
+                b.center = new.center
+                b.size = new.size
+                b.meta["depth_completed"] = True
+                for o in absorbed:
+                    scene.remove_box(o.box_id)
+                n_done += 1
+                n_absorbed += len(absorbed)
+                print(f"[diag][C] depth completion: box {b.box_id[:6]} "
+                      f"{old_d:.2f} -> {b.size[1]:.2f} m"
+                      + (f" (absorbed {len(absorbed)})" if absorbed else ""))
+            if n_done:
+                report.actions_taken.append(
+                    {"issue_id": "depth_completion", "action": "expand_depth",
+                     "params": {"completed": n_done, "absorbed": n_absorbed}})
+        except Exception as e:
+            print(f"[diag][C] depth completion failed ({type(e).__name__}: "
                   f"{e}) -> skipped")
 
     def _vlm_refine(self, scene: Scene, report: AgentReport) -> None:
@@ -354,7 +459,8 @@ class LayoutAgent:
         for b in scene.boxes:
             refit = geo.fit_box_to_points(scene, b.center[:2],
                                           (b.size[0] + 0.02, b.size[1] + 0.02, b.size[2]),
-                                          b.yaw, keep_height=True)
+                                          b.yaw, keep_height=True,
+                                          keep_depth=bool(b.meta.get("depth_completed")))
             if refit is not None and refit.iou_2d(b) > 0.3:
                 refit.box_id = b.box_id
                 refit.device_type = b.device_type

@@ -658,6 +658,122 @@ def _tiny_gs_ply(out: str) -> str:
     return p
 
 
+def _hollow_row_points(n_dev=3, pitch=0.62, depth=1.1, height=2.0, seed=3):
+    """Surface-only points for a row of CLOSED cabinets: two face bands
+    per device (the row observed from its two facades), hollow interior,
+    open aisle on both sides. 3DGS of a closed cabinet has no interior
+    points -- the depth-completion scenario's point cloud."""
+    rng = np.random.default_rng(seed)
+    pts = []
+    for k in range(n_dev):
+        cx = k * pitch
+        for off in (depth / 2, -depth / 2):
+            u = rng.uniform(cx - 0.28, cx + 0.28, 400)
+            z = rng.uniform(0.05, height - 0.05, 400)
+            c = off + rng.uniform(-0.03, 0.03, 400)
+            pts.append(np.stack([u, c, z], axis=1))
+    return np.vstack(pts)
+
+
+def test_complete_row_depth_geometry():
+    """A thin front-face fragment must expand to the row's full depth from
+    the cross-axis surface-band profile (front band + back band = the
+    two faces of the row; the hollow interior is empty)."""
+    from agentic_gts.core.models import OrientedBox
+    from agentic_gts.tools import geometry as geo
+    scene = Scene(points=_hollow_row_points())
+    # thin fragments on the FRONT face of each device (single-side scan:
+    # all row mates hug the same face -- direction must fall back to the
+    # nearest band, which is the device's other face)
+    frags = [OrientedBox(center=(k * 0.62, 0.52, 1.0),
+                         size=(0.6, 0.12, 2.0), yaw=0.0)
+             for k in range(3)]
+    new = geo.complete_row_depth(scene, frags[0], frags[1:])
+    assert new is not None, "thin fragment must find the opposite face"
+    assert 1.0 < new.size[1] < 1.3, f"depth not completed: {new.size[1]}"
+    assert abs(new.center[1]) < 0.1, "completed box must straddle the row"
+    assert new.size[0] == frags[0].size[0] and new.size[2] == frags[0].size[2]
+    print(f"PASS complete_row_depth geometry ({frags[0].size[1]:.2f} -> "
+          f"{new.size[1]:.2f} m)")
+
+
+def test_complete_row_depth_rejects_wall():
+    """A tall structure (wall) behind the observed face must NOT be taken
+    as the device's opposite face: its points continue well above the box
+    top, a rack face does not."""
+    from agentic_gts.core.models import OrientedBox
+    from agentic_gts.tools import geometry as geo
+    rng = np.random.default_rng(5)
+    pts = []
+    for cx in (0.0, 0.8):     # two devices in the row
+        u = rng.uniform(cx - 0.28, cx + 0.28, 400)
+        z = rng.uniform(0.05, 1.95, 400)
+        c = 0.55 + rng.uniform(-0.03, 0.03, 400)
+        pts.append(np.stack([u, c, z], axis=1))
+    # wall right behind the row, full height to 3.5 m
+    u = rng.uniform(-0.5, 1.1, 800)
+    z = rng.uniform(0.05, 3.45, 800)
+    c = -0.55 + rng.uniform(-0.05, 0.05, 800)
+    pts.append(np.stack([u, c, z], axis=1))
+    scene = Scene(points=np.vstack(pts))
+    frags = [OrientedBox(center=(cx, 0.52, 1.0), size=(0.6, 0.12, 2.0),
+                        yaw=0.0) for cx in (0.0, 0.8)]
+    new = geo.complete_row_depth(scene, frags[0], frags[1:])
+    assert new is None, f"wall must be rejected, got depth {new.size[1]}"
+    print("PASS complete_row_depth rejects wall behind the row")
+
+
+def test_depth_completion_agent_pass():
+    """The agent's depth-completion pass expands every thin front-face
+    fragment of a row to the full row depth and absorbs the opposite-face
+    fragment of the same device (its observed face IS the expansion
+    target band)."""
+    from agentic_gts.core.models import OrientedBox
+    from agentic_gts.agent.loop import AgentReport
+    scene = Scene(points=_hollow_row_points())
+    scene.boxes = [OrientedBox(center=(k * 0.62, 0.52, 1.0),
+                               size=(0.6, 0.12, 2.0), yaw=0.0)
+                   for k in range(3)]
+    # back-face fragment of the MIDDLE device (the row was also scanned
+    # from behind; this fragment survived B0 un-paired)
+    scene.boxes.append(OrientedBox(center=(0.62, -0.52, 1.0),
+                                   size=(0.6, 0.12, 2.0), yaw=0.0))
+    agent = LayoutAgent(judge=VLMJudge(backend="qwen"))
+    agent._depth_completion(scene, AgentReport())
+    assert len(scene.boxes) == 3, \
+        f"back-face fragment must be absorbed, got {len(scene.boxes)}"
+    for b in scene.boxes:
+        assert b.size[1] > 0.9, f"depth not completed: {b.size[1]}"
+        assert b.meta.get("depth_completed"), "completion marker missing"
+    print(f"PASS depth completion agent pass "
+          f"(3 fragments -> {[round(b.size[1], 2) for b in scene.boxes]})")
+
+
+def test_fit_box_to_points_keep_depth():
+    """keep_depth=True must preserve the seed's cross extent even when
+    the interior is hollow and only ONE face has points (the completed
+    box's span is trusted knowledge, not point support); without it the
+    percentile refit collapses the box back to the observed face shell."""
+    from agentic_gts.tools import geometry as geo
+    rng = np.random.default_rng(7)
+    # ONE observed face (single-side scan): points only at y ~ +0.55
+    u = rng.uniform(-0.28, 0.28, 500)
+    z = rng.uniform(0.1, 1.9, 500)
+    c = 0.55 + rng.uniform(-0.03, 0.03, 500)
+    scene = Scene(points=np.stack([u, c, z], axis=1))
+    refit = geo.fit_box_to_points(scene, (0.0, 0.0), (0.6, 1.1, 2.0), 0.0,
+                                  keep_height=True, keep_depth=True)
+    assert refit is not None
+    assert abs(refit.size[1] - 1.1) < 0.05, \
+        f"keep_depth must preserve the span, got {refit.size[1]}"
+    collapsed = geo.fit_box_to_points(scene, (0.0, 0.0), (0.6, 1.1, 2.0),
+                                      0.0, keep_height=True)
+    assert collapsed.size[1] < 0.5, \
+        f"without keep_depth the refit must collapse, got {collapsed.size[1]}"
+    print(f"PASS fit_box_to_points keep_depth "
+          f"(keep={refit.size[1]:.2f} collapse={collapsed.size[1]:.2f})")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed = 0
