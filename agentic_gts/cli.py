@@ -88,6 +88,8 @@ def cmd_run(args):
                        vlm_backend=args.vlm,
                        vlm_api_base=args.vlm_base,
                        vlm_model=args.vlm_model,
+                       vlm_thinking_model=args.vlm_thinking_model,
+                       vlm_thinking_base=args.vlm_thinking_base,
                        opts=opts,
                        out_dir=args.out,
                        edge_threshold_m=args.edge_thr)
@@ -194,6 +196,14 @@ def main():
                    help="served model name (qwen) or local checkpoint dir (local), "
                         "e.g. Qwen/Qwen3-VL-8B-Instruct or /models/qwen3-vl "
                         "(also env VLM_MODEL)")
+    r.add_argument("--vlm-thinking-model", default=None,
+                   help="optional thinking checkpoint for hard-case escalation, "
+                        "e.g. Qwen/Qwen3-VL-8B-Thinking (also env "
+                        "VLM_THINKING_MODEL). Low-quality evidence renders are "
+                        "re-asked on it; godview audits run on it directly")
+    r.add_argument("--vlm-thinking-base", default=None,
+                   help="API base for the thinking model if served separately "
+                        "(defaults to --vlm-base, also env VLM_THINKING_API_BASE)")
     r.add_argument("--edge-thr", type=float, default=0.05)
     r.add_argument("--yaw", type=float, default=None,
                    help="pin device row yaw in degrees (skips estimation)")

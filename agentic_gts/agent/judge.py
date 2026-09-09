@@ -459,7 +459,10 @@ class VLMJudge:
     def __init__(self, backend: str = "mock",
                  model: str | None = None,
                  api_base: str | None = None, api_key: str | None = None,
-                 timeout: int = 60):
+                 timeout: int = 60,
+                 thinking_model: str | None = None,
+                 thinking_api_base: str | None = None,
+                 thinking_timeout: int = 300):
         self.backend = backend
         self.model = (model or os.environ.get("VLM_MODEL") or
                       "Qwen/Qwen3-VL-8B-Instruct")
@@ -467,7 +470,20 @@ class VLMJudge:
                          "http://127.0.0.1:8000/v1")
         self.api_key = api_key or os.environ.get("VLM_API_KEY", "EMPTY")
         self.timeout = timeout
+        # ---- escalation tier (optional thinking checkpoint) ----
+        # When set, verdicts whose evidence render scored below the
+        # quality floor are re-asked on the thinking model (and the
+        # god-view audit runs on it directly): multi-step visual
+        # reasoning is exactly where thinking checkpoints gain, and the
+        # 1.5-5x latency is paid only on the (few) hard cases.
+        self.thinking_model = (thinking_model or
+                               os.environ.get("VLM_THINKING_MODEL"))
+        self.thinking_api_base = (thinking_api_base or
+                                  os.environ.get("VLM_THINKING_API_BASE") or
+                                  self.api_base)
+        self.thinking_timeout = thinking_timeout
         self._local_model = None   # lazy: (processor, model), loaded once
+        self._thinking_local_model = None  # lazy second slot, thinking only
         self.record_path = None    # if set, append JSONL records of adjudications
         self.evidence_dir = None   # if set, persist adjudication images here
         self._render_cache = {}    # render cache: box-geometry key -> image
@@ -541,6 +557,55 @@ class VLMJudge:
             v.detail = f"{v.detail or ''} [low render quality {qfloor:.2f}]"
         return q
 
+    def _should_escalate(self, quality: dict | None) -> bool:
+        """Should this adjudication be re-asked on the thinking model?
+
+        True when a thinking checkpoint is configured AND the evidence
+        render scored below the quality floor (blurry extrapolated view,
+        occluded box, or a camera still embedded in structure). Those are
+        exactly the images where multi-step visual reasoning beats a
+        single forward pass; every other verdict stays on the fast tier.
+        No thinking model configured -> never escalate (the plain
+        confidence cap from _gate_quality remains the only penalty)."""
+        return bool(self.thinking_model) and self._quality_floor(quality) < 0.35
+
+    def _api_target(self, thinking: bool):
+        """(api_base, api_key, model, timeout) for the tier in question."""
+        if thinking:
+            return (self.thinking_api_base, self.api_key,
+                    self.thinking_model, self.thinking_timeout)
+        return (self.api_base, self.api_key, self.model, self.timeout)
+
+    # built via concatenation so the literal tags survive any tooling that
+    # strips angle-bracket markup from source edits
+    _THINK_O = "<" + "think>"
+    _THINK_C = "</" + "think>"
+
+    @classmethod
+    def _strip_think(cls, text: str) -> str:
+        """Remove inline chain-of-thought blocks from a thinking model's
+        reply. Served without a reasoning parser, Qwen3-VL Thinking emits
+        an explicit think block (or the newer channel syntax) before the
+        final answer. vLLM with a reasoning parser puts the chain in a
+        separate field and the content arrives clean -- stripping is a
+        no-op then. A truncated chain (max_tokens hit inside the block)
+        leaves no closing tag: everything from the opener on is dropped.
+        """
+        if not text:
+            return text
+        import re
+        text = re.sub(re.escape(cls._THINK_O) + r".*?" + re.escape(cls._THINK_C),
+                      "", text, flags=re.DOTALL)
+        text = re.sub(r"<\|channel\|>analysis<\|message\|>.*?(<\|end\|>|$)",
+                      "", text, flags=re.DOTALL)
+        text = re.sub(r"<\|channel\|>\s*final\s*<\|message\|>", "", text)
+        # unclosed think block: max_tokens truncated inside the chain --
+        # nothing after the opener is trustworthy
+        i = text.find(cls._THINK_O)
+        if i >= 0:
+            text = text[:i]
+        return text.strip()
+
     def set_record(self, record_path: str) -> None:
         """Enable structured recording of every adjudication to a JSONL file.
         Also enables persisting every evidence image the VLM actually saw
@@ -570,7 +635,8 @@ class VLMJudge:
     def _record(self, kind: str, prompt: str, answer: str,
                 choice: str, confidence: float, detail: str,
                 png_path: str | None = None,
-                quality: dict | None = None) -> None:
+                quality: dict | None = None,
+                escalated: bool = False) -> None:
         """Append one adjudication record (image path + prompt + answer)."""
         if not self.record_path:
             return
@@ -578,6 +644,8 @@ class VLMJudge:
         rec = {"kind": kind, "prompt": prompt, "answer": answer,
                "choice": choice, "confidence": confidence,
                "detail": detail, "image": png_path}
+        if escalated:
+            rec["escalated"] = True
         if quality:
             rec["quality"] = quality
         try:
@@ -590,19 +658,41 @@ class VLMJudge:
     # ---- backend-agnostic interface ----
     def adjudicate_box(self, scene, box, question: str,
                        options: list[str]) -> Verdict:
-        """Ask the VLM a multiple-choice question about a candidate box."""
+        """Ask the VLM a multiple-choice question about a candidate box.
+
+        Hard-evidence escalation: when the render scored below the
+        quality floor and a thinking model is configured, the question
+        is re-asked there (multi-step visual reasoning) and its verdict
+        REPLACES the fast one -- that is the whole point of the tier.
+        The escalated verdict keeps normal confidence: the quality cap
+        punished the FAST model's shallow read, not the image's
+        usability for a careful reader."""
         if self.backend == "mock":
             return self._mock_adjudicate(box, question)
+        escalated = False
         if self.backend == "local":
             v = self._local_adjudicate(scene, box, question, options)
         else:
             v = self._qwen_adjudicate(scene, box, question, options)
-        self._gate_quality(v, [box])
+        quality = self._render_quality.get(self._render_cache_key([box])) or {}
+        self._gate_quality(v, [box], quality=quality)
+        if self._should_escalate(quality):
+            if self.backend == "local":
+                v2 = self._local_adjudicate(scene, box, question, options,
+                                            thinking=True)
+            else:
+                v2 = self._qwen_adjudicate(scene, box, question, options,
+                                           thinking=True)
+            if v2 is not None and "mock" not in (v2.detail or ""):
+                v2.png_path = v2.png_path or v.png_path
+                v2.detail = f"[thinking-escalated] {v2.detail or ''}".strip()
+                v = v2
+                escalated = True
         self._record("box", question, v.raw or v.detail,
                      (v.params or {}).get("choice", ""), v.confidence, v.detail,
                      png_path=v.png_path,
-                     quality=self._render_quality.get(
-                         self._render_cache_key([box])) or None)
+                     quality=quality or None,
+                     escalated=escalated)
         return v
 
     def adjudicate_pair(self, scene, a, b, question: str,
@@ -618,6 +708,7 @@ class VLMJudge:
         boxes = [a, b]
         v = None
         png_path = None
+        img_arr = None
         q = {}
         try:
             img_arr = render_topdown_image(scene.points, boxes,
@@ -639,17 +730,41 @@ class VLMJudge:
             print(f"[vlm][pair] failed ({type(e).__name__}: {e}) -> keep")
             v = Verdict(action="keep", confidence=0.5, detail=f"{type(e).__name__}")
         v.png_path = png_path
+        escalated = False
+        if (self.backend in ("local", "qwen") and img_arr is not None
+                and self._should_escalate(q)):
+            # hard evidence -> re-ask on the thinking tier (see
+            # adjudicate_box); a failed escalation keeps the fast verdict
+            try:
+                if self.backend == "local":
+                    v2 = self._local_pair_call(img_arr, question, options,
+                                               thinking=True)
+                else:
+                    v2 = self._qwen_pair_call(img_arr, question, options,
+                                              thinking=True)
+                if v2 is not None and "mock" not in (v2.detail or ""):
+                    v2.png_path = png_path
+                    v2.detail = (f"[thinking-escalated] {v2.detail or ''}").strip()
+                    v = v2
+                    escalated = True
+            except Exception as e:
+                print(f"[vlm][pair][thinking] failed "
+                      f"({type(e).__name__}: {e}) -> keeping primary")
         q = self._gate_quality(v, boxes, quality=q)
         self._record("pair", question, v.raw or v.detail,
                      (v.params or {}).get("choice", ""), v.confidence, v.detail,
-                     png_path=png_path, quality=q)
+                     png_path=png_path, quality=q, escalated=escalated)
         return v
 
-    def _local_pair_call(self, img_arr, question, options) -> Verdict:
+    def _local_pair_call(self, img_arr, question, options,
+                         thinking: bool = False) -> Verdict:
         from PIL import Image
         import io as _io
-        self._ensure_local_model()
-        processor, model = self._local_model
+        self._ensure_local_model(thinking=thinking)
+        if thinking:
+            processor, model = self._thinking_local_model
+        else:
+            processor, model = self._local_model
         buf = _io.BytesIO()
         import matplotlib.pyplot as plt
         plt.imsave(buf, img_arr, format="png")
@@ -667,14 +782,19 @@ class VLMJudge:
                            return_tensors="pt").to(model.device)
         import torch
         with torch.inference_mode():
-            out = model.generate(**inputs, max_new_tokens=64, do_sample=False)
+            # the thinking tier needs room for its reasoning chain
+            out = model.generate(**inputs,
+                                 max_new_tokens=1024 if thinking else 64,
+                                 do_sample=False)
         trimmed = [o[len(i):] for i, o in zip(inputs.input_ids, out)]
-        answer = processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
+        answer = self._strip_think(processor.batch_decode(
+            trimmed, skip_special_tokens=True)[0].strip())
         matched = self._match_option(answer, options)
         return Verdict(action="answer", params={"choice": matched},
                        confidence=0.8, detail=answer, raw=answer)
 
-    def _qwen_pair_call(self, img_arr, question, options) -> Verdict:
+    def _qwen_pair_call(self, img_arr, question, options,
+                        thinking: bool = False) -> Verdict:
         b64 = self._array_to_png_b64(img_arr)
         prompt = (f"Decide the best answer from the evidence image "
                   f"(two red wireframes = two candidate boxes).\n\n"
@@ -682,17 +802,20 @@ class VLMJudge:
                   f"QUESTION: {question}\n"
                   f"OPTIONS:\n" + "\n".join(f"- {o}" for o in options) +
                   f"\n\nReply with the exact option text only.")
+        api_base, api_key, model_name, timeout = self._api_target(thinking)
         r = requests.post(
-            self.api_base + "/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json={"model": self.model, "messages": [{"role": "user", "content": [
+            api_base + "/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"model": model_name, "messages": [{"role": "user", "content": [
                 {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]}],
-                "max_tokens": 64, "temperature": 0.0},
-            timeout=self.timeout,
+                # the thinking tier needs room for its reasoning chain
+                "max_tokens": 1024 if thinking else 64, "temperature": 0.0},
+            timeout=timeout,
         )
         r.raise_for_status()
-        text = r.json()["choices"][0]["message"]["content"].strip()
+        text = self._strip_think(
+            r.json()["choices"][0]["message"]["content"].strip())
         matched = self._match_option(text, options)
         return Verdict(action="answer", params={"choice": matched},
                        confidence=0.8, detail=text, raw=text)
@@ -729,13 +852,31 @@ class VLMJudge:
             return []
         png = render_godview_png(scene.points, boxes,
                                  gs_ply=scene.meta.get("gs_ply"))
+        # god-view runs on the thinking tier outright when configured:
+        # it fires once per repair-loop pass (low frequency) and its
+        # false-positive nominations drive box DELETION (high stakes) --
+        # exactly the latency/quality trade worth paying. A failure
+        # there falls back to the fast model, then to skipping.
+        use_thinking = bool(self.thinking_model)
         try:
-            if self.backend == "local":
-                text = self._local_image_call(png, self._GODVIEW_PROMPT,
-                                              max_new_tokens=400)
-            else:
-                text = self._qwen_image_call(png, self._GODVIEW_PROMPT,
-                                              max_tokens=400)
+            for thinking in ((True, False) if use_thinking else (False,)):
+                try:
+                    if self.backend == "local":
+                        text = self._local_image_call(
+                            png, self._GODVIEW_PROMPT,
+                            max_new_tokens=2048 if thinking else 400,
+                            thinking=thinking)
+                    else:
+                        text = self._qwen_image_call(
+                            png, self._GODVIEW_PROMPT,
+                            max_tokens=2048 if thinking else 400,
+                            thinking=thinking)
+                    break
+                except Exception as e:
+                    if not thinking:
+                        raise
+                    print(f"[vlm][godview][thinking] failed "
+                          f"({type(e).__name__}: {e}) -> fast model")
         except Exception as e:
             print(f"[vlm][godview] failed ({type(e).__name__}: {e}) -> skipped")
             return []
@@ -833,23 +974,57 @@ class VLMJudge:
             return Verdict(action="keep", confidence=0.5,
                            detail=type(e).__name__)
         params = self._parse_fit_reply(text)
+        # hard evidence (blurry / occluded / steep-fallback view) -> re-ask
+        # on the thinking tier. keep_allok distinguishes "careful reader
+        # says it fits" from an unparseable reply, so the escalation can
+        # OVERRIDE a shaky fast nomination with a considered all-ok.
+        escalated = False
+        if self._should_escalate(q):
+            try:
+                if self.backend == "local":
+                    text2 = self._local_image_call(png, self._FIT_PROMPT,
+                                                  max_new_tokens=2048,
+                                                  thinking=True)
+                else:
+                    text2 = self._qwen_image_call(png, self._FIT_PROMPT,
+                                                  max_tokens=2048,
+                                                  thinking=True)
+                p2 = self._parse_fit_reply(text2, keep_allok=True)
+                if p2 is not None:
+                    params = p2
+                    text = text2
+                    escalated = True
+            except Exception as e:
+                print(f"[vlm][fit][thinking] failed "
+                      f"({type(e).__name__}: {e}) -> keeping primary")
+        # an escalated all-ok is a real "it fits" verdict -> keep, not refine
+        has_nom = bool(params) and not all(v == "ok" for v in params.values())
         self._record("fit", self._FIT_PROMPT, text, "",
-                     0.8 if params else 0.5,
+                     0.8 if has_nom else 0.5,
                      str(params) if params else "no change",
-                     png_path=png_path, quality=q or None)
-        if not params:
-            return Verdict(action="keep", confidence=0.5, detail=text[:80],
+                     png_path=png_path, quality=q or None,
+                     escalated=escalated)
+        if not has_nom:
+            tag = "[thinking-escalated] " if escalated else ""
+            return Verdict(action="keep", confidence=0.5,
+                           detail=tag + text[:80],
                            raw=text, png_path=png_path)
+        tag = "[thinking-escalated] " if escalated else ""
         v = Verdict(action="refine", params=params, confidence=0.8,
-                    detail=text[:80], raw=text, png_path=png_path)
-        # a low-quality render weakens the visual evidence the corrections
-        # were derived from -- cap the confidence so the loop's guards
-        # (which weigh confidence) treat the proposal more sceptically
-        self._gate_quality(v, [box], quality=q)
+                    detail=tag + text[:80], raw=text, png_path=png_path)
+        if not escalated:
+            # a low-quality render weakens the visual evidence the
+            # corrections were derived from -- cap the confidence so the
+            # loop's guards (which weigh confidence) treat the proposal
+            # more sceptically. An ESCALATED verdict skips the cap: the
+            # thinking tier already reasoned carefully over the hard
+            # image, re-penalising it would just push it back into the
+            # conservative path the escalation was meant to escape.
+            self._gate_quality(v, [box], quality=q)
         return v
 
     @staticmethod
-    def _parse_fit_reply(text: str) -> dict | None:
+    def _parse_fit_reply(text: str, keep_allok: bool = False) -> dict | None:
         """Parse the VLM's categorical fit nomination. None if no change.
 
         The VLM no longer outputs metres/degrees: pseudo-precision from
@@ -858,6 +1033,10 @@ class VLMJudge:
         magnitude is a geometric quantity searched downstream (yaw sweep
         to the support peak, edge snap to the density profile). Unknown
         category values fall back to 'ok'; an all-ok reply is a keep.
+        keep_allok=True returns the all-ok dict instead of None -- used
+        by the thinking escalation, which must be able to OVERRIDE a
+        shaky fast nomination with a considered all-ok (a None there
+        would mean "could not parse" and keep the fast verdict).
         """
         data = _extract_json(text)
         if not isinstance(data, dict):
@@ -873,7 +1052,7 @@ class VLMJudge:
             "yaw_dir": _cat("yaw_dir", {"cw", "ccw", "ok"}),
         }
         if all(v == "ok" for v in p.values()):
-            return None
+            return p if keep_allok else None
         return p
 
     @staticmethod
@@ -899,11 +1078,15 @@ class VLMJudge:
 
     # ---- shared image-call helpers (used by godview and box adjudication) ----
     def _local_image_call(self, png_bytes: bytes, prompt: str,
-                          max_new_tokens: int = 64) -> str:
+                          max_new_tokens: int = 64,
+                          thinking: bool = False) -> str:
         """In-process transformers call with a PNG image + text prompt."""
         from PIL import Image
-        self._ensure_local_model()
-        processor, model = self._local_model
+        self._ensure_local_model(thinking=thinking)
+        if thinking:
+            processor, model = self._thinking_local_model
+        else:
+            processor, model = self._local_model
         image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
         messages = [{
             "role": "user",
@@ -921,17 +1104,20 @@ class VLMJudge:
             out = model.generate(**inputs, max_new_tokens=max_new_tokens,
                                   do_sample=False)
         trimmed = [o[len(i):] for i, o in zip(inputs.input_ids, out)]
-        return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
+        return self._strip_think(
+            processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip())
 
     def _qwen_image_call(self, png_bytes: bytes, prompt: str,
-                         max_tokens: int = 64) -> str:
+                         max_tokens: int = 64,
+                         thinking: bool = False) -> str:
         """OpenAI-compatible chat call with a base64 PNG image."""
         b64 = base64.b64encode(png_bytes).decode("ascii")
+        api_base, api_key, model, timeout = self._api_target(thinking)
         r = requests.post(
-            self.api_base + "/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
+            api_base + "/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
             json={
-                "model": self.model,
+                "model": model,
                 "messages": [{
                     "role": "user",
                     "content": [
@@ -943,16 +1129,24 @@ class VLMJudge:
                 "max_tokens": max_tokens,
                 "temperature": 0.0,
             },
-            timeout=self.timeout,
+            timeout=timeout,
         )
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
+        return self._strip_think(
+            r.json()["choices"][0]["message"]["content"].strip())
 
     # ---- local in-process transformers model ----
-    def _ensure_local_model(self):
-        """Load the model once; subsequent adjudications reuse it."""
-        if self._local_model is not None:
+    def _ensure_local_model(self, thinking: bool = False):
+        """Load the model once; subsequent adjudications reuse it.
+        thinking=True loads the ESCALATION checkpoint into a separate
+        slot (lazily -- only if an escalation ever fires)."""
+        if not thinking and self._local_model is not None:
             return
+        if thinking and self._thinking_local_model is not None:
+            return
+        if thinking and not self.thinking_model:
+            raise RuntimeError("no thinking model configured")
+        model_path = self.thinking_model if thinking else self.model
         import torch
         import transformers
         from transformers import AutoProcessor
@@ -961,9 +1155,9 @@ class VLMJudge:
             from transformers import Qwen3VLForConditionalGeneration as ModelCls
         except ImportError:
             from transformers import AutoModelForImageTextToText as ModelCls
-        print(f"[vlm][local] loading {self.model} (transformers "
+        print(f"[vlm][local] loading {model_path} (transformers "
               f"{transformers.__version__}) ... first call only")
-        processor = AutoProcessor.from_pretrained(self.model)
+        processor = AutoProcessor.from_pretrained(model_path)
         # Pick the best available attention backend. flash_attention_2 is the
         # fastest on CUDA but requires the flash-attn package; if it is not
         # importable, fall back to sdpa (the default efficient path in
@@ -1000,20 +1194,27 @@ class VLMJudge:
         kwargs = {"torch_dtype": torch.bfloat16, "device_map": "auto"}
         if attn:
             kwargs["attn_implementation"] = attn
-        model = ModelCls.from_pretrained(self.model, **kwargs)
+        model = ModelCls.from_pretrained(model_path, **kwargs)
         model.eval()
-        self._local_model = (processor, model)
+        if thinking:
+            self._thinking_local_model = (processor, model)
+        else:
+            self._local_model = (processor, model)
 
     def _local_adjudicate(self, scene, box, question: str,
-                          options: list[str]) -> Verdict:
+                          options: list[str],
+                          thinking: bool = False) -> Verdict | None:
         try:
             import matplotlib
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
             from PIL import Image
 
-            self._ensure_local_model()
-            processor, model = self._local_model
+            self._ensure_local_model(thinking=thinking)
+            if thinking:
+                processor, model = self._thinking_local_model
+            else:
+                processor, model = self._local_model
 
             img_arr = self._render_cached(scene, [box])
             png_path = self._save_evidence_png(
@@ -1044,23 +1245,31 @@ class VLMJudge:
                                 return_tensors="pt").to(model.device)
             import torch
             with torch.inference_mode():
-                out = model.generate(**inputs, max_new_tokens=64,
-                                      do_sample=False)
+                # the thinking tier needs room for its reasoning chain
+                out = model.generate(**inputs,
+                                     max_new_tokens=1024 if thinking else 64,
+                                     do_sample=False)
             trimmed = [o[len(i):] for i, o in zip(inputs.input_ids, out)]
-            answer = processor.batch_decode(
-                trimmed, skip_special_tokens=True)[0].strip()
+            answer = self._strip_think(processor.batch_decode(
+                trimmed, skip_special_tokens=True)[0].strip())
             matched = self._match_option(answer, options)
             return Verdict(action="answer", params={"choice": matched},
                            confidence=0.8, detail=answer, raw=answer,
                            png_path=png_path)
         except Exception as e:
+            if thinking:
+                # escalation failure must not clobber the primary verdict
+                print(f"[vlm][local][thinking] failed "
+                      f"({type(e).__name__}: {e}) -> keeping primary")
+                return None
             print(f"[vlm][local] inference failed ({type(e).__name__}: {e}) "
                   f"-> falling back to mock")
             return self._mock_adjudicate(box, question)
 
     # ---- Qwen (OpenAI-compatible chat completions with image) ----
     def _qwen_adjudicate(self, scene, box, question: str,
-                         options: list[str]) -> Verdict:
+                         options: list[str],
+                         thinking: bool = False) -> Verdict | None:
         img_arr = self._render_cached(scene, [box])
         png_path = self._save_evidence_png(
             img_arr, f"evidence_{box.box_id[:8]}.png")
@@ -1074,12 +1283,13 @@ class VLMJudge:
             f"OPTIONS:\n" + "\n".join(f"- {o}" for o in options) +
             f"\n\nReply with the exact option text only."
         )
+        api_base, api_key, model_name, timeout = self._api_target(thinking)
         try:
             r = requests.post(
-                self.api_base + "/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
+                api_base + "/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
                 json={
-                    "model": self.model,
+                    "model": model_name,
                     "messages": [{
                         "role": "user",
                         "content": [
@@ -1088,18 +1298,25 @@ class VLMJudge:
                              "image_url": {"url": f"data:image/png;base64,{b64}"}},
                         ],
                     }],
-                    "max_tokens": 64,
+                    # the thinking tier needs room for its reasoning chain
+                    "max_tokens": 1024 if thinking else 64,
                     "temperature": 0.0,
                 },
-                timeout=self.timeout,
+                timeout=timeout,
             )
             r.raise_for_status()
-            text = r.json()["choices"][0]["message"]["content"].strip()
+            text = self._strip_think(
+                r.json()["choices"][0]["message"]["content"].strip())
             matched = self._match_option(text, options)
             return Verdict(action="answer", params={"choice": matched},
                            confidence=0.8, detail=text, raw=text,
                            png_path=png_path)
         except Exception as e:  # fallback to mock on any failure
+            if thinking:
+                # escalation failure must not clobber the primary verdict
+                print(f"[vlm][qwen][thinking] failed "
+                      f"({type(e).__name__}: {e}) -> keeping primary")
+                return None
             return self._mock_adjudicate(box, question)
 
     @staticmethod

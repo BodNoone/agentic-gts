@@ -246,6 +246,8 @@ def run_pipeline(scene: Scene,
                  vlm_backend: str = "mock",
                  vlm_api_base: str | None = None,
                  vlm_model: str | None = None,
+                 vlm_thinking_model: str | None = None,
+                 vlm_thinking_base: str | None = None,
                  opts: dict | None = None,
                  out_dir: str = "runs/latest",
                  edge_threshold_m: float = 0.05) -> PipelineResult:
@@ -301,7 +303,9 @@ def run_pipeline(scene: Scene,
 
     # --- stage C: agent loop ---
     judge = VLMJudge(backend=vlm_backend, api_base=vlm_api_base,
-                     model=vlm_model)
+                     model=vlm_model,
+                     thinking_model=vlm_thinking_model,
+                     thinking_api_base=vlm_thinking_base)
     # record every adjudication (prompt + answer + choice + confidence) to a
     # JSONL so the user can audit why the agent decided each issue
     try:
