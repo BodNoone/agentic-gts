@@ -592,15 +592,19 @@ def test_camera_pullout_of_sandwich():
         )
 
     box = OrientedBox(center=(0.0, 0.0, 1.0), size=(0.6, 1.1, 2.0), yaw=0.0)
-    # a continuous row along x: gaps only where the adjudicated box sits
+    # a continuous row along x: gaps only where the adjudicated box sits.
+    # Dense (40k pts, real 3DGS spacing): the eye lands INSIDE the row
+    # volume, so the nearest gaussian must sit within its own radius ->
+    # negative clearance. A sparse cloud leaves cm-sized holes the eye
+    # can hide in and the flag becomes density-dependent.
     rng = np.random.default_rng(1)
     row = []
-    for _ in range(3000):
+    for _ in range(40000):
         x = rng.uniform(-6.0, 6.0)
         if -0.65 < x < 0.65:        # the box's own slot in the row
             continue
         row.append([x, rng.uniform(-0.5, 0.5), rng.uniform(0.0, 2.0)])
-    gs = _gs(row, 0.04)
+    gs = _gs(row, 0.08)
 
     # side view (azim 90): eye along the row -> embedded in the row
     cam_side = make_local_cam(box, azim_deg=90.0)
@@ -617,6 +621,105 @@ def test_camera_pullout_of_sandwich():
     cross = abs(eye_in[0] * eye_out[1] - eye_in[1] * eye_out[0])
     scale = np.linalg.norm(eye_in) * np.linalg.norm(eye_out)
     assert cross / scale < 0.05, "rescue must keep the side-view azimuth"
+
+
+def test_narrow_aisle_front_view_blocked_steep_sees():
+    """Two facing FULL-HEIGHT rows with a ~0.5 m aisle between them: there
+    is NO horizontal sightline to the target rack's aisle-side face (the
+    sightline would have to pass over a flush row of the same height), and
+    the horizontal front camera's eye lands inside the facing row. The
+    steep (~58 deg) fallback camera looks down over the aisle from close
+    range and must see the box (top face + upper front) -- that is the
+    honest evidence a narrow aisle allows."""
+    from agentic_gts.output.gs_render import (box_visibility,
+                                              camera_clearance,
+                                              make_local_cam)
+    from agentic_gts.tools.gs_io import GaussianData
+
+    def _gs(means, radius):
+        means = np.asarray(means, dtype=float)
+        n = len(means)
+        return GaussianData(
+            means=means,
+            log_scales=np.full((n, 3), float(np.log(radius))),
+            quats=np.tile([[1.0, 0.0, 0.0, 0.0]], (n, 1)),
+            raw_opacity=np.full(n, 8.0),
+            f_dc=np.zeros((n, 3)),
+        )
+
+    # target rack: y in [-0.55, 0.55], front (+y) faces the aisle
+    box = OrientedBox(center=(0.0, 0.0, 1.15), size=(0.6, 1.1, 2.3),
+                      yaw=0.0)
+    rng = np.random.default_rng(3)
+    own = np.column_stack([rng.uniform(-2.0, 2.0, 3000),
+                           rng.uniform(-0.55, 0.55, 3000),
+                           rng.uniform(0.0, 2.3, 3000)])
+    # facing row across a 0.5 m aisle: y in [1.05, 2.15], full height
+    facing = np.column_stack([rng.uniform(-2.0, 2.0, 3000),
+                              rng.uniform(1.05, 2.15, 3000),
+                              rng.uniform(0.0, 2.3, 3000)])
+    gs = _gs(np.vstack([own, facing]), 0.05)
+    cut_z = 2.3 - 0.08                      # judge.py's local-view cut
+
+    cam_h = make_local_cam(box, extent=2.0, elev_deg=18.0, azim_deg=0.0)
+    vis_h = box_visibility(gs, [box], cam_h, cut_z=cut_z)
+    clr_h = camera_clearance(gs, [box], cam_h, None, cut_z)
+    assert vis_h < 0.25 or clr_h < 0.0, (
+        f"horizontal front view across a 0.5m aisle must be flagged "
+        f"(vis={vis_h:.2f} clr={clr_h:.2f})")
+
+    cam_s = make_local_cam(box, extent=2.0, elev_deg=58.0, azim_deg=0.0)
+    vis_s = box_visibility(gs, [box], cam_s, cut_z=cut_z)
+    clr_s = camera_clearance(gs, [box], cam_s, None, cut_z)
+    assert vis_s >= 0.25, \
+        f"steep over-the-aisle camera must see the box, vis={vis_s:.2f}"
+    assert clr_s >= 0.0, \
+        f"steep camera must clear the facing row, clr={clr_s:.2f}"
+    # the steep camera stays CLOSE (the whole point: avoid the far
+    # extrapolated pullback view that blurs)
+    d_h = float(np.linalg.norm(
+        np.asarray(cam_h.eye)[:2] - np.asarray(box.center)[:2]))
+    d_s = float(np.linalg.norm(
+        np.asarray(cam_s.eye)[:2] - np.asarray(box.center)[:2]))
+    assert d_s <= d_h + 0.1, \
+        f"steep camera drifted far (d_s={d_s:.2f} vs d_h={d_h:.2f})"
+    print(f"PASS narrow aisle: horizontal front blocked "
+          f"(vis={vis_h:.2f} clr={clr_h:.2f}), steep fallback sees "
+          f"(vis={vis_s:.2f} clr={clr_s:.2f}, standoff {d_s:.2f}m)")
+
+
+def test_camera_pullout_of_sandwich_tail():
+    """Continuation of the sandwich rescue contract: the rescue must raise
+    the camera above the rack tops, and a camera already in the open must
+    be returned untouched."""
+    from agentic_gts.output.gs_render import make_local_cam, _pullback_cam
+    from agentic_gts.tools.gs_io import GaussianData
+
+    def _gs(means, radius):
+        means = np.asarray(means, dtype=float)
+        n = len(means)
+        return GaussianData(
+            means=means,
+            log_scales=np.full((n, 3), float(np.log(radius))),
+            quats=np.tile([[1.0, 0.0, 0.0, 0.0]], (n, 1)),
+            raw_opacity=np.full(n, 8.0),
+            f_dc=np.zeros((n, 3)),
+        )
+
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(0.6, 1.1, 2.0), yaw=0.0)
+    rng = np.random.default_rng(1)
+    row = []
+    for _ in range(40000):
+        x = rng.uniform(-6.0, 6.0)
+        if -0.65 < x < 0.65:
+            continue
+        row.append([x, rng.uniform(-0.5, 0.5), rng.uniform(0.0, 2.0)])
+    gs = _gs(row, 0.08)
+    cam_side = make_local_cam(box, azim_deg=90.0)
+    cam_out, clr_out = _pullback_cam(gs, [box], cam_side, None,
+                                     float("inf"))
+    eye_in = np.asarray(cam_side.eye) - np.asarray(cam_side.target)
+    eye_out = np.asarray(cam_out.eye) - np.asarray(cam_out.target)
     assert eye_out[2] > eye_in[2] + 0.5, \
         "continuous-row rescue must raise the camera above the rack tops"
     # a camera already in the open is returned untouched
@@ -628,8 +731,7 @@ def test_camera_pullout_of_sandwich():
         assert np.allclose(cam_same.eye, cam_free.eye), \
             "clear camera must not be moved"
     print(f"PASS camera pullout of sandwich "
-          f"(embedded={clr_in:.2f} rescued={clr_out:.2f} "
-          f"lift={eye_out[2] - eye_in[2]:.2f}m)")
+          f"(rescued={clr_out:.2f} lift={eye_out[2] - eye_in[2]:.2f}m)")
 
 
 def test_quality_out_and_gating():
@@ -695,5 +797,8 @@ if __name__ == "__main__":
     test_view_quality_scoring()
     test_box_visibility_detects_occlusion()
     test_fragment_box_flips_to_visible_side()
+    test_camera_pullout_of_sandwich()
+    test_narrow_aisle_front_view_blocked_steep_sees()
+    test_camera_pullout_of_sandwich_tail()
     test_quality_out_and_gating()
     print("ALL GS TESTS PASSED")

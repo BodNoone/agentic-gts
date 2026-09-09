@@ -749,7 +749,8 @@ def _pullback_cam(gs: GaussianData, boxes, cam: Cam,
 
 
 def render_slot_candidates(gs, boxes, cam_fn, candidates, cut_z,
-                            overlay: str, iso_margin: float):
+                            overlay: str, iso_margin: float,
+                            fallback_candidates=()):
     """Render several (elev, azim) candidates for ONE view slot, score each
     on the RAW render (before the wireframe overlay -- drawn lines would
     pollute the sharpness/speckle metrics), and return the best.
@@ -775,30 +776,56 @@ def render_slot_candidates(gs, boxes, cam_fn, candidates, cut_z,
     flows into the confidence gating downstream -- the verdict is then
     distrusted instead of silently judged on a wall of near splats).
 
+    fallback_candidates: a SECOND tier of steep (~58 deg) elevations at
+    the slot's azimuths, rendered ONLY when the primary tier comes out
+    weak -- ineligible, or eligible but blurry (score < 0.35: the
+    pullback rescue tends to leave the camera far away in an extrapolated
+    direction). The narrow-aisle case: two facing full-height rows with
+    a ~0.5 m aisle between them have NO horizontal sightline to either
+    row's inner face (the sightline must pass over a flush row of the
+    same height), so the horizontal camera ends up far away, lifted, and
+    blurry; the steep near camera looks down over the aisle instead --
+    top face + aisle context, close enough to stay sharp. Normal-width
+    aisles never trigger the fallback, so the front role (door/panel
+    detail) is preserved where it is actually achievable.
+
     cam_fn(elev_deg, azim_deg) -> Cam. The isolation mask is computed ONCE
     for all candidates (it depends only on the boxes, not the camera).
     Returns (img, quality, (elev, azim)) or (None, None, None).
     """
     keep = _near_boxes_mask(gs, boxes, margin=iso_margin) if boxes else None
-    scored = []
-    for elev, azim in candidates:
+
+    def _score_one(elev, azim):
         cam = cam_fn(elev, azim)
         cam, clr = _pullback_cam(gs, boxes, cam, keep, cut_z)
         vis = box_visibility(gs, boxes, cam, keep_mask=keep, cut_z=cut_z)
         img = rasterize_gs(gs, cam, cut_z=cut_z, keep_mask=keep)
         if img is None:
-            continue
+            return None
         q = view_quality(img)
         q["visibility"] = round(vis, 4)
         q["clearance"] = round(clr, 3) if np.isfinite(clr) else None
         if boxes:
             img = overlay_boxes(img, boxes, cam, mode=overlay)
-        scored.append((img, q, (elev, azim)))
+        return (img, q, (elev, azim))
+
+    def _select(pool):
+        eligible = [s for s in pool
+                    if s[1]["visibility"] >= 0.25
+                    and (s[1]["clearance"] is None or s[1]["clearance"] >= 0.0)]
+        if eligible:
+            return max(eligible, key=lambda s: s[1]["score"]), True
+        return max(pool, key=lambda s: s[1]["visibility"]), False
+
+    scored = [s for s in (_score_one(e, a) for e, a in candidates) if s]
     if not scored:
         return (None, None, None)
-    eligible = [s for s in scored
-                if s[1]["visibility"] >= 0.25
-                and (s[1]["clearance"] is None or s[1]["clearance"] >= 0.0)]
-    if eligible:
-        return max(eligible, key=lambda s: s[1]["score"])
-    return max(scored, key=lambda s: s[1]["visibility"])
+    best, was_eligible = _select(scored)
+    if fallback_candidates and (not was_eligible
+                                 or best[1]["score"] < 0.35):
+        for e, a in fallback_candidates:
+            s = _score_one(e, a)
+            if s is not None:
+                scored.append(s)
+        best, _ = _select(scored)
+    return best
