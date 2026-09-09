@@ -266,39 +266,41 @@ def test_objects_format_roundtrip():
         shutil.rmtree(out, ignore_errors=True)
 
 
-def test_parse_fit_reply_quantized_clamped():
-    """The VLM's fit reply must be snapped to the 5cm/5deg grid and
-    clamped to the allowed ranges; all-zero / garbage -> None (keep).
-    Height is trusted input -> dh is not part of the action space; a
-    stray dh in the reply must be ignored, not break the parse."""
+def test_parse_fit_reply_categorical():
+    """The VLM's fit reply is categorical direction nominations (metres/
+    degrees from an image are pseudo-precision): valid categories parse,
+    unknown values fall back to 'ok', an all-ok reply is a keep, garbage
+    is None. Stray numeric fields (the old dl/dw/dyaw format) must not
+    break the parse."""
     from agentic_gts.agent.judge import VLMJudge
     p = VLMJudge._parse_fit_reply(
-        '{"dl": 0.13, "dw": -9.0, "dh": 0.3, "dyaw_deg": 47}')
-    assert abs(p["dl"] - 0.15) < 1e-9   # 0.13 snapped to the 5cm grid
-    assert abs(p["dw"] - (-0.5)) < 1e-9  # clamped at the lower bound
-    assert "dh" not in p                 # height axis retired
-    assert abs(p["dyaw_deg"] - 15.0) < 1e-9  # clamped at the upper bound
-    assert VLMJudge._parse_fit_reply('{"dl": 0.0, "dw": 0.0, "dh": 0.0,'
-                                     ' "dyaw_deg": 0.0}') is None
+        '{"x_minus": "over", "x_plus": "short", "yaw_dir": "ccw"}')
+    assert p == {"x_minus": "over", "x_plus": "short", "yaw_dir": "ccw"}
+    # all-ok -> keep
+    assert VLMJudge._parse_fit_reply(
+        '{"x_minus": "ok", "x_plus": "ok", "yaw_dir": "ok"}') is None
     assert VLMJudge._parse_fit_reply("not json at all") is None
-    # non-numeric fields fall back to 0 without breaking the others
-    p2 = VLMJudge._parse_fit_reply('{"dl": "huge", "dyaw_deg": 5}')
-    assert p2 is not None and p2["dl"] == 0.0 and p2["dyaw_deg"] == 5.0
-    print("PASS fit reply parse (quantized + clamped + zero -> keep)")
+    # unknown / legacy numeric values degrade to 'ok' without breaking
+    # the other fields
+    p2 = VLMJudge._parse_fit_reply(
+        '{"x_minus": 0.5, "x_plus": "short", "dyaw_deg": 10}')
+    assert p2 is not None and p2["x_minus"] == "ok" \
+        and p2["x_plus"] == "short" and p2["yaw_dir"] == "ok"
+    print("PASS fit reply parse (categorical nominations + fallbacks)")
 
 
 def test_parse_fit_reply_with_reasoning():
-    """The fit prompt now elicits reasoning sentences BEFORE the JSON (to
+    """The fit prompt elicits reasoning sentences BEFORE the JSON (to
     counter the copy-the-zero-template bias), so the parser must pick the
     LAST well-formed JSON out of a reply that may contain several spans."""
     from agentic_gts.agent.judge import VLMJudge, _extract_json
     reply = ("front view: wireframe right end hangs over the aisle.\n"
              "side view: depth ok {not json}.\n"
-             'oblique: GREEN arrow skewed ~10deg off the rack axis.\n'
-             '{"dl": -0.1, "dw": 0.0, "dyaw_deg": 10}')
+             'oblique: GREEN arrow skewed off the rack axis.\n'
+             '{"x_minus": "ok", "x_plus": "over", "yaw_dir": "cw"}')
     p = VLMJudge._parse_fit_reply(reply)
-    assert p is not None and abs(p["dl"] + 0.1) < 1e-9 \
-        and abs(p["dyaw_deg"] - 10.0) < 1e-9, f"reasoning reply lost: {p}"
+    assert p is not None and p["x_plus"] == "over" and p["yaw_dir"] == "cw", \
+        f"reasoning reply lost: {p}"
     # _extract_json prefers the last well-formed span
     j = _extract_json("junk {\"a\": 1} more junk {\"b\": 2} tail")
     assert j == {"b": 2}, f"expected last JSON, got {j}"
@@ -326,12 +328,11 @@ def test_scatter_fallback_draws_axes_arrows():
 
 
 def test_vlm_refine_corrects_yaw():
-    """A refine verdict (dyaw) must rotate the box around z and re-fit it
-    to the point support, preserving box_id / count -- the fine-grained
-    counterpart to the topological delete/split/merge actions. The racks
-    are GENUINELY rotated (10 deg) while the boxes sit at yaw=0, so the
-    +5deg correction moves the boxes toward truth and the fit-improvement
-    guard must accept it."""
+    """A yaw nomination (ccw) must make the geometric sweep rotate the box
+    toward the true rack orientation, preserving box_id / count. The racks
+    are GENUINELY rotated (+10 deg ccw) while the boxes sit at yaw=0, so
+    the sweep's support peak must move the boxes toward truth; the exact
+    angle comes from geometry, not from the VLM."""
     import math as _m
     from agentic_gts.agent.judge import Verdict
     from agentic_gts.core.models import OrientedBox
@@ -339,8 +340,8 @@ def test_vlm_refine_corrects_yaw():
     class RotatingJudge(VLMJudge):
         def adjudicate_fit(self, scene, box):
             return Verdict(action="refine", confidence=0.8,
-                           params={"dl": 0.0, "dw": 0.0,
-                                   "dyaw_deg": 5.0})
+                           params={"x_minus": "ok", "x_plus": "ok",
+                                   "yaw_dir": "ccw"})
 
     # racks physically rotated 10 deg; boxes placed at yaw=0 (wrong)
     ang = _m.radians(10.0)
@@ -369,23 +370,25 @@ def test_vlm_refine_corrects_yaw():
     report = agent.run(scene)
     assert len(scene.boxes) == 3
     assert {b.box_id for b in scene.boxes} == ids, "box_id must survive refine"
-    assert any(abs(b.yaw) > 0.01 for b in scene.boxes), "yaw not corrected"
+    assert any(b.yaw > 0.01 for b in scene.boxes), \
+        "yaw not corrected toward the true +10deg orientation"
     assert any(a.get("action") == "refine" for a in report.actions_taken)
     print("PASS vlm refine applies yaw correction (id preserved)")
 
 
 def test_vlm_refine_bounds_hallucinated_growth():
-    """A hallucinated +0.5m growth must NOT materialize: the geometry
-    re-fit trims the seed back to the actual point support, so a bad VLM
-    number can never teleport the box."""
+    """A hallucinated 'short' nomination on both ends must NOT
+    materialize: with no points beyond the box edges the growth re-fit's
+    span detection finds no extension, so a bad VLM nomination can never
+    teleport the box."""
     from agentic_gts.agent.judge import Verdict
     from agentic_gts.core.models import OrientedBox
 
     class GrowJudge(VLMJudge):
         def adjudicate_fit(self, scene, box):
             return Verdict(action="refine", confidence=0.8,
-                           params={"dl": 0.5, "dw": 0.5,
-                                   "dyaw_deg": 0.0})
+                           params={"x_minus": "short", "x_plus": "short",
+                                   "yaw_dir": "ok"})
 
     # ONE isolated rack (a dense scene would let the grown seed swallow
     # neighbouring racks and muddy the assertion)
@@ -416,8 +419,8 @@ def test_vlm_refine_preserves_trusted_height():
     class NudgeJudge(VLMJudge):
         def adjudicate_fit(self, scene, box):
             return Verdict(action="refine", confidence=0.8,
-                           params={"dl": -0.05, "dw": 0.0,
-                                   "dyaw_deg": 0.0})
+                           params={"x_minus": "over", "x_plus": "over",
+                                   "yaw_dir": "ok"})
 
     # points cover only the lower 1.2m of a 2.0m-high rack
     rng = np.random.default_rng(5)
@@ -436,6 +439,73 @@ def test_vlm_refine_preserves_trusted_height():
     assert abs(b.center[2] - 1.0) < 1e-6, \
         f"trusted z-center changed to {b.center[2]:.3f}"
     print("PASS vlm refine preserves trusted height (z never re-derived)")
+
+
+def test_sweep_yaw_finds_support_peak():
+    """The geometric yaw sweep must recover the rack's true orientation
+    (within one step) from the point support alone -- direction given,
+    magnitude measured. A wrong nomination (cw instead of ccw) must be
+    overruled: the opposite direction is searched as fallback."""
+    import math as _m
+    from agentic_gts.core.models import OrientedBox
+    from agentic_gts.tools import geometry as geo
+    ang = _m.radians(10.0)
+    fwd = np.array([_m.cos(ang), _m.sin(ang)])
+    cross = np.array([-_m.sin(ang), _m.cos(ang)])
+    rng = np.random.default_rng(4)
+    pts = []
+    for off in (0.55, -0.55):
+        u = rng.uniform(-0.3, 0.3, 500)
+        z = rng.uniform(0, 2.0, 500)
+        p2 = np.outer(u, fwd) + cross * off
+        pts.append(np.stack([p2[:, 0], p2[:, 1], z], axis=1))
+    scene = Scene(points=np.vstack(pts))
+    box = OrientedBox(center=(0, 0, 1), size=(0.6, 1.1, 2.0), yaw=0.0)
+    res = geo.sweep_yaw(scene, box, direction=1.0)   # nominated ccw
+    assert res is not None, "sweep must find the true orientation"
+    yaw, refit = res
+    assert abs(yaw - ang) < _m.radians(3.0), \
+        f"sweep landed {round(_m.degrees(yaw), 1)}deg, truth 10deg"
+    # WRONG nomination (cw): the fallback search must still land ccw
+    res2 = geo.sweep_yaw(scene, box, direction=-1.0)
+    assert res2 is not None and abs(res2[0] - ang) < _m.radians(3.0), \
+        "wrong cw nomination must be overruled by the fallback sweep"
+    print(f"PASS sweep yaw finds support peak "
+          f"({round(_m.degrees(yaw), 1)}deg, truth 10deg, wrong-dir safe)")
+
+
+def test_vlm_refine_extends_short_end():
+    """A 'short' nomination must extend the box to the device's true edge
+    via the growth re-fit: the density span extends to the observed
+    points and stops there (no further hallucinated growth)."""
+    from agentic_gts.agent.judge import Verdict
+    from agentic_gts.agent.loop import AgentReport
+    from agentic_gts.core.models import OrientedBox
+
+    class ShortJudge(VLMJudge):
+        def adjudicate_fit(self, scene, box):
+            return Verdict(action="refine", confidence=0.8,
+                           params={"x_minus": "ok", "x_plus": "short",
+                                   "yaw_dir": "ok"})
+
+    # device truly spans x in [-0.3, +0.55] (0.85m); the box only covers
+    # [-0.3, +0.3] -- the +x end is short by 0.25m. Test the refine pass
+    # IN ISOLATION: the full pipeline's WIDTH_MISFIT repair would also
+    # weigh in (0.85m is off the 0.6m grid) -- different concern.
+    rng = np.random.default_rng(6)
+    u = rng.uniform(-0.3, 0.55, 800)
+    v = rng.uniform(-0.55, 0.55, 800)
+    z = rng.uniform(0, 2.0, 800)
+    scene = Scene(points=np.stack([u, v, z], axis=1))
+    scene.boxes = [OrientedBox(center=(0.0, 0, 1), size=(0.6, 1.1, 2.0),
+                               yaw=0.0)]
+    agent = LayoutAgent(judge=ShortJudge(backend="qwen"))
+    agent._vlm_refine(scene, AgentReport())
+    b = scene.boxes[0]
+    assert len(scene.boxes) == 1
+    assert b.size[0] > 0.75, f"short end not extended: {b.size[0]:.2f}"
+    assert b.size[0] < 0.95, f"over-extended past the device: {b.size[0]:.2f}"
+    print(f"PASS vlm refine extends short end (0.60 -> {b.size[0]:.2f} m)")
 
 
 def test_agent_merges_fragments_geometrically():

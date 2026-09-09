@@ -744,51 +744,57 @@ class VLMJudge:
 
     # ---- fine-grained fit refinement (size + yaw around z) ----
     _FIT_PROMPT = (
-        "You are fine-tuning a 3D bounding box around ONE data-center rack.\n"
+        "You are auditing the 3D bounding box around ONE data-center rack.\n"
         f"{_LOCAL_VIEW_DESC}\n"
         "Additionally, two arrows are drawn on the box's TOP face: a GREEN "
         "arrow along the box's local x axis (its length direction) and a "
         "BLUE arrow along its local y axis (its depth direction).\n\n"
         "IMPORTANT: these candidate boxes come from an INITIAL rough "
-        "detection, and they usually do NOT fit the device well. The typical "
-        "errors are: the wireframe overhangs past the device edge into the "
-        "aisle or over the neighbouring device (too long/deep), the "
-        "wireframe covers only part of the device (too short), or the GREEN "
-        "arrow is not parallel to the device's long axis (wrong yaw). Only "
-        "rotation around the vertical (z) axis is allowed. The box HEIGHT "
-        "is already trusted -- do NOT try to change it, only judge the "
-        "horizontal extent and the yaw.\n\n"
+        "detection and usually do NOT fit the device well. Your job is NOT "
+        "to measure metres or degrees -- an image does not support that "
+        "precision, and a geometric stage re-fits the box to the point "
+        "cloud afterwards. Your job is ONLY to nominate WHICH end is off "
+        "and WHICH direction the yaw rotates. Direction judgments are "
+        "reliable from an image; magnitude judgments are not.\n\n"
+        "The typical errors are: the wireframe stops short of the device "
+        "edge (the device continues past a wireframe end), the wireframe "
+        "overhangs past the device edge into the aisle or over the "
+        "neighbouring device, or the GREEN arrow is not parallel to the "
+        "device's long axis. Only rotation around the vertical (z) axis "
+        "is relevant. The box HEIGHT and its row DEPTH are handled by "
+        "other stages -- do NOT judge them.\n\n"
         "Work step by step:\n"
         "1. For each of the three views, write ONE short sentence stating "
-        "whether the red wireframe matches the device outline; if not, say "
-        "in which direction it is wrong (e.g. 'oblique view: the right end "
-        "of the wireframe hangs over the aisle, the device ends earlier').\n"
-        "2. Then output ONE JSON object with your corrections.\n\n"
-        "Reply format -- a few short reasoning sentences, then the JSON "
-        "object on the LAST line:\n"
-        '{"dl": <meters>, "dw": <meters>, "dyaw_deg": <degrees>}\n'
-        "- dl: length change along the GREEN arrow (meters, multiples of "
-        "0.05, between -0.5 and 0.5): POSITIVE if the box is too short for "
-        "the device, NEGATIVE if it overhangs.\n"
-        "- dw: depth change along the BLUE arrow (same rules).\n"
-        "- dyaw_deg: rotation around the vertical axis (degrees, multiples "
-        "of 5, between -15 and 15), positive = counterclockwise seen from "
-        "above. Use a NON-ZERO value when the GREEN arrow is not parallel "
-        "to the device's long axis.\n"
-        "Every axis where you described a misfit MUST get a non-zero "
-        "correction; use 0.0 only for an axis that genuinely fits."
+        "whether the red wireframe matches the device outline, and if "
+        "not, which end is wrong in which direction.\n"
+        "2. Then output ONE JSON object on the LAST line:\n"
+        '{"x_minus": "short"|"over"|"ok", '
+        '"x_plus": "short"|"over"|"ok", '
+        '"yaw_dir": "cw"|"ccw"|"ok"}\n'
+        "- x_minus: the wireframe end OPPOSITE the GREEN arrow, relative "
+        "to the device edge: 'short' = the device continues past the "
+        "wireframe end, 'over' = the wireframe hangs past the device "
+        "edge, 'ok' = they match.\n"
+        "- x_plus: the wireframe end the GREEN arrow points at (same "
+        "three categories).\n"
+        "- yaw_dir: seen from ABOVE, which way the GREEN arrow must "
+        "rotate to become parallel to the device's long axis: 'cw' = "
+        "clockwise, 'ccw' = counterclockwise, 'ok' = already parallel. "
+        "Use the oblique near-top-down panel for this.\n"
+        "Use 'ok' only for a judgment that genuinely fits."
     )
 
     def adjudicate_fit(self, scene, box) -> Verdict:
-        """Ask the VLM for fine-grained size/yaw corrections for ONE box.
+        """Ask the VLM to NOMINATE directions for correcting ONE box.
 
         The evidence image is the three-view local composite WITH the
         box's local axes drawn (green = length, blue = depth), so the VLM
         can see both the box's orientation and its extent relative to the
-        device. The reply is quantized (5cm / 5deg) and clamped; the exact
-        geometry always comes from the geometry tools that re-fit the box
-        to the point support afterwards. Mock backend / any failure ->
-        keep (no refinement).
+        device. The reply is categorical (which x-end is short/over, which
+        way the yaw rotates) -- magnitude is pseudo-precision from an
+        image and is searched geometrically downstream (yaw sweep to the
+        support peak, edge snap to the density profile). Mock backend /
+        any failure -> keep (no refinement).
         """
         if self.backend == "mock":
             return Verdict(action="keep", confidence=0.5,
@@ -830,30 +836,29 @@ class VLMJudge:
 
     @staticmethod
     def _parse_fit_reply(text: str) -> dict | None:
-        """Quantize + clamp the VLM's fit reply. None if no real change.
+        """Parse the VLM's categorical fit nomination. None if no change.
 
-        The VLM's raw numbers are coarse by design; snapping to a 5cm /
-        5deg grid keeps the search space discrete (like every other
-        action) and clamping bounds the damage a hallucinated number can
-        do. All-zero replies map to None = keep.
+        The VLM no longer outputs metres/degrees: pseudo-precision from
+        an image. It nominates WHICH x-end is off in which sense
+        (short/over) and WHICH way the yaw rotates (cw/ccw); the exact
+        magnitude is a geometric quantity searched downstream (yaw sweep
+        to the support peak, edge snap to the density profile). Unknown
+        category values fall back to 'ok'; an all-ok reply is a keep.
         """
         data = _extract_json(text)
         if not isinstance(data, dict):
             return None
 
-        def _q(v, step, lo, hi):
-            try:
-                v = float(v)
-            except (TypeError, ValueError):
-                return 0.0
-            return float(np.clip(round(v / step) * step, lo, hi))
+        def _cat(key: str, allowed: set) -> str:
+            v = str(data.get(key, "ok")).strip().lower()
+            return v if v in allowed else "ok"
 
         p = {
-            "dl": _q(data.get("dl", 0), 0.05, -0.5, 0.5),
-            "dw": _q(data.get("dw", 0), 0.05, -0.5, 0.5),
-            "dyaw_deg": _q(data.get("dyaw_deg", 0), 5.0, -15.0, 15.0),
+            "x_minus": _cat("x_minus", {"short", "over", "ok"}),
+            "x_plus": _cat("x_plus", {"short", "over", "ok"}),
+            "yaw_dir": _cat("yaw_dir", {"cw", "ccw", "ok"}),
         }
-        if not any(abs(v) > 1e-9 for v in p.values()):
+        if all(v == "ok" for v in p.values()):
             return None
         return p
 

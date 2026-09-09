@@ -342,7 +342,12 @@ class LayoutAgent:
                 if b.box_id not in live:    # absorbed by an earlier completion
                     live.discard(b.box_id)
                     continue
-                if b.size[1] >= 0.5:
+                # the VLM fit no longer judges depth at all (dw retired:
+                # pseudo-precision), so geometry owns EVERY under-deep
+                # box, thin fragment or not. complete_row_depth itself
+                # requires the completed depth to exceed the current one
+                # by >= 0.2m and passes the wall/overlap guards.
+                if b.size[1] >= 0.9:
                     continue
                 mates = self._row_mates(scene, b)
                 new = None
@@ -388,17 +393,27 @@ class LayoutAgent:
                   f"{e}) -> skipped")
 
     def _vlm_refine(self, scene: Scene, report: AgentReport) -> None:
-        """Fine-grained per-box refinement pass.
+        """Per-box refinement: the VLM nominates DIRECTIONS, geometry
+        measures magnitudes.
 
-        The VLM proposes RELATIVE, quantized corrections (dl/dw in
-        5cm steps, dyaw in 5deg steps, z-rotation only) from the
-        axes-annotated three-view composite. Height is TRUSTED from the
-        input boxes and never touched here. Those corrections only steer a
-        SEED box: the exact geometry comes from fit_box_to_points, which
-        re-derives center/size from the point support at the corrected
-        yaw. A refinement that drifts away (IoU < 0.3 with the original)
-        or collapses support is rolled back silently -- a bad VLM number
-        can never teleport a box.
+        The VLM's fit reply is categorical (which x-end is short/over,
+        which way the yaw rotates) -- metres/degrees from an image are
+        pseudo-precision. Each nomination is executed by a geometric
+        search:
+          - yaw: sweep the nominated direction (opposite direction as
+            fallback -- point evidence overrules a wrong nomination) to
+            the support peak (geo.sweep_yaw);
+          - 'short' end: growth re-fit -- the seed's x is enlarged (max
+            0.25m: edge-level misalignment; a full grid-unit shortfall is
+            WIDTH_MISFIT's split/merge domain, not fine refine) so the
+            density span can extend to the device's true edge, stopping
+            at the gap to the neighbour;
+          - 'over' end: plain re-fit -- the shrink-only span snaps back
+            to the point support.
+        Guards: IoU < 0.3 with the original rolls back; height (and
+        completed depth) trusted throughout. A hallucinated nomination
+        is inert by construction: 'short' with no points beyond the edge
+        re-fits to the same span, 'over' with full support keeps it.
         """
         for b in list(scene.boxes):
             try:
@@ -410,43 +425,76 @@ class LayoutAgent:
             if verdict.action != "refine" or not verdict.params:
                 continue
             p = verdict.params
-            new_yaw = float(b.yaw) + math.radians(float(p.get("dyaw_deg", 0.0)))
-            seed = (max(b.size[0] + float(p.get("dl", 0.0)), 0.15),
-                    max(b.size[1] + float(p.get("dw", 0.0)), 0.15),
-                    b.size[2])
-            refit = geo.fit_box_to_points(scene, b.center[:2], seed, new_yaw,
-                                           keep_height=True)
-            if refit is None or refit.iou_2d(b) < 0.3:
-                print(f"[diag][C] refine {b.box_id[:6]} rejected (drift) -> keep")
-                continue
-            # accept the correction only if the point fit at the CORRECTED
-            # yaw is no worse than the fit at the OLD yaw (same seed):
-            # a rotation that makes the box fit the points worse is a bad
-            # VLM number, not a correction. This directly tests "did the
-            # rotation help", independent of how sparse the cloud is.
-            control = geo.fit_box_to_points(scene, b.center[:2], seed,
-                                             float(b.yaw),
-                                             keep_height=True)
-            sup_new = geo.support_fraction(scene, refit)
-            sup_ctrl = (geo.support_fraction(scene, control)
-                        if control is not None else 0.0)
-            if sup_new + 0.02 < sup_ctrl:
-                print(f"[diag][C] refine {b.box_id[:6]} rejected "
-                      f"(fit worse: {sup_new:.2f} < {sup_ctrl:.2f}) -> keep")
-                continue
-            refit.box_id = b.box_id
-            refit.device_type = b.device_type
-            refit.source = BoxSource.AGENT_FIX
-            refit.row_id = b.row_id
-            refit.meta = b.meta
-            refit.confidence = b.confidence
-            scene.remove_box(b.box_id)
-            scene.boxes.append(refit)
-            report.actions_taken.append({"issue_id": "vlm_refine",
-                                         "action": "refine", "params": p})
-            print(f"[diag][C] refine {b.box_id[:6]}: "
-                  f"dyaw={p.get('dyaw_deg', 0):+.0f}deg "
-                  f"dl={p.get('dl', 0):+.2f} dw={p.get('dw', 0):+.2f}")
+            cur = b
+            # -- yaw first: the edge re-fits below run at the corrected yaw --
+            if p.get("yaw_dir") in ("cw", "ccw"):
+                direction = 1.0 if p.get("yaw_dir") == "ccw" else -1.0
+                swept = None
+                try:
+                    swept = geo.sweep_yaw(scene, cur, direction=direction)
+                except Exception as e:
+                    print(f"[diag][C] yaw sweep error on {b.box_id[:6]} "
+                          f"({type(e).__name__}: {e})")
+                if swept is not None:
+                    yaw, refit = swept
+                    if refit.iou_2d(b) >= 0.3:
+                        print(f"[diag][C] refine {b.box_id[:6]}: yaw "
+                              f"sweep -> {math.degrees(yaw - b.yaw):+.1f}deg "
+                              f"(nominated {p['yaw_dir']})")
+                        cur = self._adopt_refit(scene, b, refit)
+                        report.actions_taken.append(
+                            {"issue_id": "vlm_refine", "action": "refine",
+                             "params": {"yaw_dir": p["yaw_dir"],
+                                        "applied_deg":
+                                        round(math.degrees(yaw - b.yaw), 1)}})
+            # -- x-ends: growth ('short') / shrink ('over') re-fit --
+            ends = (p.get("x_minus"), p.get("x_plus"))
+            if "short" in ends or "over" in ends:
+                keep_depth = bool(cur.meta.get("depth_completed"))
+                # one-sided 'short': shift the seed centre toward the
+                # nominated end -- a symmetric growth alone cannot reach
+                # an edge further than half(growth) from the centre, and
+                # fit_box_to_points re-centres on the trimmed point span
+                fwdx = np.array([math.cos(cur.yaw), math.sin(cur.yaw)])
+                cx, cy = cur.center[:2]
+                if p.get("x_plus") == "short" and p.get("x_minus") != "short":
+                    cx, cy = (cx + fwdx[0] * 0.125, cy + fwdx[1] * 0.125)
+                elif p.get("x_minus") == "short" and p.get("x_plus") != "short":
+                    cx, cy = (cx - fwdx[0] * 0.125, cy - fwdx[1] * 0.125)
+                seed = (cur.size[0] + 0.25 if "short" in ends else cur.size[0],
+                        cur.size[1], cur.size[2])
+                refit = geo.fit_box_to_points(scene, (cx, cy), seed,
+                                              cur.yaw, keep_height=True,
+                                              keep_depth=keep_depth)
+                if refit is not None and refit.iou_2d(b) >= 0.3:
+                    if abs(refit.size[0] - cur.size[0]) > 0.02:
+                        print(f"[diag][C] refine {b.box_id[:6]}: x re-fit "
+                              f"{cur.size[0]:.2f} -> {refit.size[0]:.2f} "
+                              f"({'+'.join(e for e in ends if e != 'ok')})")
+                        cur = self._adopt_refit(scene, cur, refit)
+                        report.actions_taken.append(
+                            {"issue_id": "vlm_refine", "action": "refine",
+                             "params": {"ends": {"x_minus": p.get("x_minus"),
+                                                 "x_plus": p.get("x_plus")},
+                                        "length":
+                                        round(float(refit.size[0]), 2)}})
+                else:
+                    print(f"[diag][C] refine {b.box_id[:6]}: x nomination "
+                          f"inert (no support change) -> keep")
+
+    @staticmethod
+    def _adopt_refit(scene: Scene, old: OrientedBox,
+                     refit: OrientedBox) -> OrientedBox:
+        """Replace `old` with `refit` in the scene, keeping identity/meta."""
+        refit.box_id = old.box_id
+        refit.device_type = old.device_type
+        refit.source = BoxSource.AGENT_FIX
+        refit.row_id = old.row_id
+        refit.meta = old.meta
+        refit.confidence = old.confidence
+        scene.remove_box(old.box_id)
+        scene.boxes.append(refit)
+        return refit
 
     def _refine_edges(self, scene: Scene) -> None:
         """Snap box edges to point support for the final layout accuracy.
