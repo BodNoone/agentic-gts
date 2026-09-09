@@ -81,10 +81,15 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
             # deg tilt, near-top-down) shows the top face with minimal
             # perspective foreshortening so the VLM can measure the
             # row-direction THICKNESS of a sandwiched rack -- at 55 deg
-            # the row depth compresses and adjacent racks fuse. A fixed
-            # single azimuth per slot gambles on that exact direction
-            # being well-trained; picking the best of ~3 costs
-            # milliseconds per extra rasterization.
+            # the row depth compresses and adjacent racks fuse. front and
+            # side ALSO carry opposite-side candidates (azim +180): a
+            # fragment box hugging the BACK of a device has its 'front'
+            # pointing INTO the device body, so every same-side candidate
+            # is fully occluded by it -- the eligible filter (visibility
+            # >= 0.25) then flips the slot to the visible outer surface.
+            # A fixed single azimuth per slot gambles on that exact
+            # direction being well-trained; picking the best of ~3-6
+            # costs milliseconds per extra rasterization.
             # Mild ceiling cut: remove everything above the boxes' top so
             # cable trays / ceiling clutter near the rack do not pile up at
             # the top of the image. The cut dips ~8cm INTO the rack top
@@ -98,8 +103,10 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
             # room so it cannot occlude what is being adjudicated
             iso_margin = extent + 1.0
             slots = {
-                "front": ((18.0, 0.0), (18.0, 12.0), (18.0, -12.0)),
-                "side": ((18.0, 90.0), (18.0, 76.0), (18.0, 104.0)),
+                "front": ((18.0, 0.0), (18.0, 12.0), (18.0, -12.0),
+                          (18.0, 180.0), (18.0, 168.0), (18.0, 192.0)),
+                "side": ((18.0, 90.0), (18.0, 76.0), (18.0, 104.0),
+                         (18.0, 270.0), (18.0, 256.0), (18.0, 284.0)),
                 "oblique": ((70.0, 35.0), (72.0, 48.0), (66.0, 22.0)),
             }
             views, quality = [], {}
@@ -194,7 +201,10 @@ _LOCAL_VIEW_DESC = (
     "the candidate box(es); each wireframe is "
     "the full 3D box, not just its top. Each panel's exact viewing angle is "
     "auto-selected for the clearest render, so panels may be rotated "
-    "slightly within their role. "
+    "slightly within their role, and a front/side panel may be rendered "
+    "from the OPPOSITE side of the box when the primary side is occluded "
+    "by the device body -- judge the wireframe against whichever device "
+    "surface is visible. "
     "(Fallback rendering without a GPU rasterizer: a SINGLE top-down view "
     "of the same region, with the axes arrows drawn on the footprint.)"
 )

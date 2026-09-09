@@ -520,6 +520,54 @@ def test_box_visibility_detects_occlusion():
           f"cut={vis_cut:.2f} nocut={vis_nocut:.2f})")
 
 
+def test_fragment_box_flips_to_visible_side():
+    """A fragment box hugging the BACK of a device: its 'front' points INTO
+    the device body, so every same-side front candidate is occluded by it
+    (zero reference value). The geometry must report that (visibility ~ 0
+    from the front azimuth) and the slot must carry OPPOSITE-side azimuth
+    candidates so the eligible filter flips the view to the visible outer
+    surface."""
+    import inspect
+    from agentic_gts.output.gs_render import box_visibility, make_local_cam
+    from agentic_gts.tools.gs_io import GaussianData
+
+    def _gs(means, radius):
+        means = np.asarray(means, dtype=float)
+        n = len(means)
+        return GaussianData(
+            means=means,
+            log_scales=np.full((n, 3), float(np.log(radius))),
+            quats=np.tile([[1.0, 0.0, 0.0, 0.0]], (n, 1)),
+            raw_opacity=np.full(n, 8.0),
+            f_dc=np.zeros((n, 3)),
+        )
+
+    # thin fragment (0.15m deep) at the BACK surface of a 1.2m-deep device:
+    # the device body sits on the fragment's FRONT (+y) side
+    frag = OrientedBox(center=(0.0, 0.0, 1.0), size=(0.6, 0.15, 2.0), yaw=0.0)
+    rng = np.random.default_rng(2)
+    body = np.column_stack([rng.uniform(-0.3, 0.3, 4000),
+                             rng.uniform(0.10, 1.20, 4000),
+                             rng.uniform(0.0, 2.2, 4000)])
+    gs = _gs(body, 0.05)
+    cam_front = make_local_cam(frag, azim_deg=0.0)      # from +y: INTO body
+    cam_back = make_local_cam(frag, azim_deg=180.0)     # from -y: clear side
+    vis_front = box_visibility(gs, [frag], cam_front)
+    vis_back = box_visibility(gs, [frag], cam_back)
+    assert vis_front < 0.25, \
+        f"front view is through the device body, must be flagged, {vis_front}"
+    assert vis_back > 0.6, \
+        f"opposite side must see the fragment, got {vis_back}"
+    # the slot definitions must carry the opposite-side candidates so the
+    # eligible filter can actually flip (regression guard on the config)
+    from agentic_gts.agent import judge as _judge
+    src = inspect.getsource(_judge.render_topdown_image)
+    assert "180.0" in src and "270.0" in src, \
+        "front/side slots lost their opposite-side azimuth candidates"
+    print(f"PASS fragment box flips to visible side "
+          f"(front vis={vis_front:.2f} back vis={vis_back:.2f})")
+
+
 def test_camera_pullout_of_sandwich():
     """A rack flush inside a CONTINUOUS row: the SIDE view camera travels
     along the row and lands INSIDE the row (a blurry wall of near splats).
@@ -646,5 +694,6 @@ if __name__ == "__main__":
     test_prep_cuts_floor()
     test_view_quality_scoring()
     test_box_visibility_detects_occlusion()
+    test_fragment_box_flips_to_visible_side()
     test_quality_out_and_gating()
     print("ALL GS TESTS PASSED")
