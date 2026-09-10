@@ -44,35 +44,50 @@ def _rot_xy(pts: np.ndarray, yaw: float) -> np.ndarray:
 def _render_ground_view(scene, hints, yaw: float, W: int = 1280, H: int = 1024):
     """Top-down evidence image for grounding, rows AXIS-ALIGNED in the image.
 
-    The camera is fitted over the yaw-rotated cloud (rows parallel to the
-    image axes, so an axis-aligned image rectangle captures a rotated row
-    exactly), then rotated back into world so the GS render and the pixel
-    back-projection share one consistent camera. Hints are drawn as thin
-    gray dashed outlines + centre crosses -- anchors for the VLM's own
-    grounding, visually distinct from the red adjudication frames.
+    Hints are drawn as thin gray dashed outlines + centre crosses --
+    anchors for the VLM's own grounding, visually distinct from the red
+    adjudication frames.
 
     Returns (png_bytes, cam, W, H).
     """
+    from agentic_gts.output.gs_render import png_bytes
+    img, cam, W, H = _render_topdown(scene, hints, yaw, W, H)
+    img = _draw_hints(img, cam, hints)
+    return png_bytes(img), cam, W, H
+
+
+def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
+                    H: int = 1024):
+    """Base top-down render, no overlays. Camera fitted over the
+    yaw-rotated cloud (rows parallel to the image axes, so an
+    axis-aligned image rectangle captures a rotated row exactly), then
+    rotated back into world so the GS render and the pixel
+    back-projection share one consistent camera. Shared by the
+    grounding input view and the grounded-result audit view.
+
+    Returns (img_float, cam, W, H).
+    """
     from agentic_gts.output.gs_render import (Cam, make_godview_cam,
-                                              png_bytes, render_gs_view)
+                                              render_gs_view)
     points = np.asarray(scene.points, dtype=np.float64)
-    # ceiling cut from the hint tops (same policy as the god-view): cut
+    # ceiling cut from the box tops (same policy as the god-view): cut
     # 0.45m into the tallest structure so trays don't bury the layout
-    top = max((b.center[2] + b.size[2] / 2.0 for b in hints), default=2.5)
-    cut = float(top) - 0.45 if hints else float("inf")
+    top = max((b.center[2] + b.size[2] / 2.0 for b in frame_boxes),
+              default=2.5)
+    cut = float(top) - 0.45 if frame_boxes else float("inf")
     band = points[points[:, 2] < cut] if np.isfinite(cut) else points
     band = band[band[:, 2] > 0.30]
     if len(band) < 100:
         band = points
     pts_rot = _rot_xy(band, -yaw)
-    # rotate the hint footprints too so the camera frames the layout
-    hints_rot = []
-    for b in hints:
+    # rotate the box footprints too so the camera frames the layout
+    boxes_rot = []
+    for b in frame_boxes:
         c = _rot_xy(np.array([[b.center[0], b.center[1], 0.0]]), -yaw)[0]
-        hints_rot.append(OrientedBox(center=(float(c[0]), float(c[1]),
+        boxes_rot.append(OrientedBox(center=(float(c[0]), float(c[1]),
                                              b.center[2]),
                                      size=b.size, yaw=0.0))
-    cam_r = make_godview_cam(pts_rot, hints_rot, nadir=True, W=W, H=H)
+    cam_r = make_godview_cam(pts_rot, boxes_rot, nadir=True, W=W, H=H)
     # rotate the camera back into world (rotation about z keeps it nadir)
     if abs(yaw) > 1e-9:
         c_, s_ = math.cos(yaw), math.sin(yaw)
@@ -96,8 +111,7 @@ def _render_ground_view(scene, hints, yaw: float, W: int = 1280, H: int = 1024):
                   f"-> scatter")
     if img is None:
         img = _projected_scatter(band, cam, W, H)
-    img = _draw_hints(img, cam, hints)
-    return png_bytes(img), cam, W, H
+    return img, cam, W, H
 
 
 def _projected_scatter(points: np.ndarray, cam, W: int, H: int) -> np.ndarray:
@@ -158,6 +172,46 @@ def _draw_hints(img: np.ndarray, cam, hints) -> np.ndarray:
 
 
 # ---------- region -> 3D box ----------
+
+def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
+    """Solid red outlines for the grounded result boxes -- the audit
+    contrast to _draw_hints' gray dashed initial hints."""
+    from PIL import Image, ImageDraw
+    u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3].copy()
+    pil = Image.fromarray(u8)
+    dr = ImageDraw.Draw(pil)
+    red = (255, 60, 60)
+    for b in boxes:
+        z = b.center[2] + b.size[2] / 2.0
+        cs = b.corners_2d()
+        uv = cam.project_cv(np.column_stack([cs, np.full(len(cs), z)]))
+        pts = [(int(round(p[0])), int(round(p[1]))) for p in uv]
+        pts.append(pts[0])
+        for a, c in zip(pts, pts[1:]):
+            dr.line((a, c), fill=red, width=2)
+    return np.asarray(pil, dtype=np.float32) / 255.0
+
+
+def _save_grounded_png(scene, hints, boxes, yaw, out_dir) -> None:
+    """The grounding RESULT audit image: gray dashed = initial hints,
+    red solid = VLM-grounded full-depth row boxes. One glance shows
+    whether the VLM outlined the right structures and whether the
+    point-support guards altered them."""
+    import os
+    try:
+        from agentic_gts.output.gs_render import png_bytes
+        img, cam, _, _ = _render_topdown(scene, list(hints) + list(boxes),
+                                         yaw)
+        img = _draw_hints(img, cam, hints)
+        img = _draw_result_boxes(img, cam, boxes)
+        path = os.path.join(out_dir, "grounded.png")
+        with open(path, "wb") as f:
+            f.write(png_bytes(img))
+        print(f"[ground] result render -> {path} "
+              f"(gray dashed = hints, red = grounded)")
+    except Exception as e:
+        print(f"[ground] result render failed ({type(e).__name__}: {e})")
+
 
 def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     """Fit a full-depth OBB (yaw=0; points already in the row-aligned
@@ -258,6 +312,8 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     print(f"[ground] {len(rects)} VLM regions -> {len(boxes)} "
           f"full-depth row boxes")
     scene.boxes = boxes
+    if out_dir:
+        _save_grounded_png(scene, hints, boxes, yaw, out_dir)
     return True
 
 

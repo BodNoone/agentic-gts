@@ -196,8 +196,11 @@ def build_report(run_dir: str, out_path: str | None = None,
         parts.append('<p style="color:#b26a00">本次运行没有 VLM 判定记录'
                      '（mock 后端或无 issue 触发）。</p>')
 
-    # god views
+    # god views + grounding views
     for name, cap in (("godview.png", "修复前 god-view"),
+                      ("groundview.png", "grounding 输入（灰虚线 = 初始提示）"),
+                      ("grounded.png", "grounding 结果（红实线 = 全深度行框，"
+                                      "灰虚线 = 初始提示）"),
                       ("godview_final.png", "终审 god-view")):
         b64 = _b64_file(os.path.join(run_dir, name))
         if b64:

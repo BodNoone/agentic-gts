@@ -140,8 +140,16 @@ def test_ground_stage_with_patched_vlm():
 
     judge = VLMJudge(backend="qwen")
     judge._qwen_image_call = lambda *a, **k: reply    # canned VLM answer
-    ok = ground.ground_stage(scene, judge, out_dir=None)
-    assert ok, "grounding must succeed with a valid VLM reply"
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        ok = ground.ground_stage(scene, judge, out_dir=td)
+        assert ok, "grounding must succeed with a valid VLM reply"
+        # the result audit image must exist: gray dashed hints vs red
+        # grounded boxes
+        assert os.path.exists(os.path.join(td, "grounded.png")), \
+            "grounded.png (result audit view) was not saved"
+        assert os.path.exists(os.path.join(td, "groundview.png")), \
+            "groundview.png (input view) was not saved"
     assert len(scene.boxes) == 2, f"want 2 row boxes, got {len(scene.boxes)}"
     rows = sorted(scene.boxes, key=lambda b: b.center[1])
     # row 1: full length ~6m, FULL depth ~1.1m, height ~2.1m
