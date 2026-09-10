@@ -81,8 +81,7 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
         try:
             from agentic_gts.tools.gs_io import (read_gaussian_ply,
                                                  read_colmap_views)
-            from agentic_gts.output.gs_render import (inject_top_filler,
-                                                      make_local_cam,
+            from agentic_gts.output.gs_render import (make_local_cam,
                                                       render_slot_candidates)
             gs = read_gaussian_ply(gs_ply)
             # training poses (COLMAP): when available, the candidate view
@@ -122,12 +121,6 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
             # (trays, ducts) otherwise survives a cut at exactly the top.
             top = max(b.center[2] + b.size[2] / 2.0 for b in boxes)
             cut_z = top - 0.08
-            # device-top filler: overhead trays hid the rack tops from the
-            # training cameras, so the exposed top gaussians render blurry.
-            # Gray filler plates are injected where the POINT SUPPORT says
-            # devices stand (never from the boxes -- see
-            # gs_render.inject_top_filler), giving the VLM a clean top view.
-            gs = inject_top_filler(gs, cut_z)
             # context isolation margin: keeps the 1-2 neighbouring racks
             # and the adjacent aisle visible (row rhythm is evidence for
             # overhang / one-or-many judgements), drops the rest of the
@@ -247,12 +240,7 @@ _LOCAL_VIEW_DESC = (
     "by the device body, and in a NARROW aisle between two facing rows "
     "the front panel is rendered from a steep angle above the aisle "
     "(top face + aisle context instead of door detail) -- judge the "
-    "wireframe against whichever device surface is visible. Device top "
-    "faces may appear as flat uniform GRAY plates: overhead cable trays "
-    "were removed for this render and where they hid a rack's top during "
-    "reconstruction, a gray filler plate marks the real device top -- its "
-    "edges follow the device's actual extent, so treat the plate as the "
-    "device's true top surface and its edges as real evidence. "
+    "wireframe against whichever device surface is visible. "
     "(Fallback rendering without a GPU rasterizer: a SINGLE top-down view "
     "of the same region, with the axes arrows drawn on the footprint.)"
 )
@@ -388,8 +376,7 @@ def render_godview_png(points: np.ndarray, boxes, max_points: int = 250_000,
     if gs_ply:
         try:
             from agentic_gts.tools.gs_io import read_gaussian_ply
-            from agentic_gts.output.gs_render import (inject_top_filler,
-                                                      make_godview_cam,
+            from agentic_gts.output.gs_render import (make_godview_cam,
                                                       render_gs_view, png_bytes)
             gs = read_gaussian_ply(gs_ply)
             # Cut slightly INTO the rack tops (negative margin): cable trays
@@ -402,12 +389,6 @@ def render_godview_png(points: np.ndarray, boxes, max_points: int = 250_000,
             # find-gaps view, the top/side identity of a rack is unaffected.
             cut = _render_cut_z(points, boxes, margin=-0.45)
             cut_low = _render_cut_z_low(boxes)
-            # gray top-filler where the point support says devices stand:
-            # the god-view cut dips 0.45m below the rack tops, which would
-            # otherwise leave a ragged hole over every row
-            gs = inject_top_filler(
-                gs, cut,
-                cut_z_low=cut_low if np.isfinite(cut_low) else 0.30)
             # True top-down camera. Height is auto-derived from the room
             # footprint (a god-view overlooks the whole layout), so it sits
             # well above every rack. Overhead structure is removed by the
@@ -872,10 +853,7 @@ class VLMJudge:
         "faces plus vertical edges), so you can see the height and total "
         "volume each candidate claims, not just its floor footprint. Under "
         "perspective an off-centre box's bottom face leans slightly outward. "
-        "(In the scatter fallback only the top-face rectangle is drawn.) "
-        "Device top faces may appear as flat uniform GRAY plates (filler "
-        "where removed cable trays hid the tops during reconstruction) -- "
-        "treat them as the devices' real top surfaces.\n\n"
+        "(In the scatter fallback only the top-face rectangle is drawn.)\n\n"
         "Look at the GLOBAL spatial structure: identify boxes that are clearly "
         "NOT real devices, e.g. a wireframe floating in the middle of an "
         "aisle with no structure inside it, a box far away from every device "

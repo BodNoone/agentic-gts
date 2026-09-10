@@ -92,82 +92,6 @@ def test_colmap_views_missing_returns_none():
     print("PASS colmap missing path -> None")
 
 
-def test_inject_top_filler_lids_cross_section():
-    """The filler classifies each column from its vertical profile and
-    caps ONLY the blurry HIGHEST top slabs, as ONE coherent plane per
-    region:
-      face columns (points floor->top: well-trained texture) -> NO cap,
-      top columns (points clustered in a thin slab: blurry top)  -> cap,
-      wall columns (structure continuing above the cut)          -> NO cap,
-      LOWER top slabs (well-trained, seen from aisles)            -> NO cap.
-    The lid must be uniform in z, sit just ABOVE the slab (so the
-    rasterizer hides the blur), and only over the HIGHEST top region."""
-    from agentic_gts.output.gs_render import inject_top_filler
-    from agentic_gts.tools.gs_io import GaussianData
-
-    def _gs(means, radius=0.04):
-        means = np.asarray(means, dtype=float)
-        n = len(means)
-        return GaussianData(
-            means=means,
-            log_scales=np.full((n, 3), float(np.log(radius))),
-            quats=np.tile([[1.0, 0.0, 0.0, 0.0]], (n, 1)),
-            raw_opacity=np.full(n, 8.0),
-            f_dc=np.zeros((n, 3)),
-        )
-
-    rng = np.random.default_rng(11)
-    n = 8000
-    # face region x in [0,1]: vertical surfaces, points 0 -> 1.95
-    face = np.column_stack([rng.uniform(0.0, 1.0, n),
-                            rng.uniform(-0.5, 0.5, n),
-                            rng.uniform(0.0, 1.95, n)])
-    # tall top region x in [1.1, 2.0]: blurry top slab, z ~1.80-1.95
-    top_hi = np.column_stack([rng.uniform(1.1, 2.0, n),
-                              rng.uniform(-0.5, 0.5, n),
-                              rng.uniform(1.80, 1.95, n)])
-    # LOWER top region x in [2.1, 3.0]: top slab at z ~1.0 (short rack)
-    # -- well-trained (seen over the aisle), must NOT be capped
-    top_lo = np.column_stack([rng.uniform(2.1, 3.0, n),
-                              rng.uniform(-0.5, 0.5, n),
-                              rng.uniform(0.90, 1.00, n)])
-    # wall region x in [3.5, 4.5]: full height 0 -> 4.0
-    wall = np.column_stack([rng.uniform(3.5, 4.5, n),
-                            rng.uniform(-0.5, 0.5, n),
-                            rng.uniform(0.0, 4.0, n)])
-    gs = _gs(np.vstack([face, top_hi, top_lo, wall]))
-    out = inject_top_filler(gs, cut_z=2.4)
-    m = np.asarray(out.means)
-    fm = m[out.raw_opacity == 12.0]      # filler points: raw opacity 12
-    assert len(fm) > 40, f"expected a lid over the tall top region, got {len(fm)}"
-    # lid ONLY over the tall top-slab region (x in [1.1, 2.0])
-    assert 1.05 <= fm[:, 0].min() and fm[:, 0].max() <= 2.05, \
-        f"lid leaked outside the tall top region: x=[{fm[:, 0].min():.2f}," \
-        f"{fm[:, 0].max():.2f}]"
-    # ONE uniform plane height, just above the tall slab (z95 ~1.945)
-    assert np.allclose(fm[:, 2], fm[0, 2]), \
-        f"lid not planar: z range [{fm[:, 2].min():.3f},{fm[:, 2].max():.3f}]"
-    assert 1.94 < fm[0, 2] < 2.4, f"lid height off: {fm[0, 2]:.3f}"
-    # THE SLAB IS REPLACED, not covered: the blurry tall-top gaussians
-    # (x in [1.1,2], z in [1.5,1.93]) are dropped from the render copy --
-    # only the lid (~1.99) remains there
-    slab_left = ((m[:, 0] > 1.1) & (m[:, 0] < 2.0)
-                 & (m[:, 2] > 1.5) & (m[:, 2] < 1.93)).sum()
-    assert slab_left <= 5, \
-        f"blurry slab still under the lid ({slab_left} pts poke through)"
-    # everything else survives untouched: faces, LOW tops, walls
-    for lo_x, hi_x, lo_z, hi_z, what in ((0.0, 1.0, 0.0, 1.95, "faces"),
-                                         (2.1, 3.0, 0.90, 1.00, "low tops"),
-                                         (3.5, 4.5, 0.0, 4.0, "walls")):
-        cnt = ((m[:, 0] > lo_x) & (m[:, 0] < hi_x)
-               & (m[:, 2] > lo_z) & (m[:, 2] < hi_z)).sum()
-        assert cnt > 500, f"{what} were damaged: only {cnt} pts left"
-    # dense opaque filler: overlapping splats, near-full opacity
-    assert abs(out.log_scales[len(m) - len(fm)].max()
-               - float(np.log(0.045))) < 1e-6
-    print(f"PASS top filler lids cross-section ({len(fm)} pts, "
-          f"plane z={fm[0, 2]:.3f}, x=[{fm[:, 0].min():.2f},"
-          f"{fm[:, 0].max():.2f}]; slab replaced, faces/low tops/walls kept)")
 
 
 def test_gs_roundtrip_binary(tmp_path=None):
@@ -922,7 +846,6 @@ if __name__ == "__main__":
     test_gs_parse_ascii()
     test_colmap_pose_parsing_and_trust()
     test_colmap_views_missing_returns_none()
-    test_inject_top_filler_lids_cross_section()
     test_render_falls_back_without_cuda()
     test_camera_projection_sanity()
     test_local_cam_front_face()
