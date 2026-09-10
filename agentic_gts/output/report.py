@@ -198,9 +198,9 @@ def build_report(run_dir: str, out_path: str | None = None,
 
     # god views + grounding views
     for name, cap in (("godview.png", "修复前 god-view"),
-                      ("groundview.png", "grounding 输入（灰虚线 = 初始提示）"),
+                      ("groundview.png", "grounding 输入（品红虚线 = 初始提示）"),
                       ("grounded.png", "grounding 结果（红实线 = 全深度行框，"
-                                      "灰虚线 = 初始提示）"),
+                                      "品红虚线 = 初始提示）"),
                       ("godview_final.png", "终审 god-view")):
         b64 = _b64_file(os.path.join(run_dir, name))
         if b64:

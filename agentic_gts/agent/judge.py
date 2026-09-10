@@ -972,7 +972,7 @@ class VLMJudge:
         "You are looking at a TOP-DOWN view of a data-center room (ceiling "
         "removed). Rows of tall server racks / cabinets appear as solid "
         "bright bands; aisles are dark or empty; walls are thin lines at "
-        "the room boundary. Thin GRAY dashed outlines with centre crosses "
+        "the room boundary. MAGENTA dashed outlines with centre crosses "
         "mark rough initial detections -- HINTS ONLY: they are often "
         "fragmented, shifted, or missing entirely. Ignore them wherever "
         "they disagree with what you actually see.\n\n"

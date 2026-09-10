@@ -44,7 +44,7 @@ def _rot_xy(pts: np.ndarray, yaw: float) -> np.ndarray:
 def _render_ground_view(scene, hints, yaw: float, W: int = 1280, H: int = 1024):
     """Top-down evidence image for grounding, rows AXIS-ALIGNED in the image.
 
-    Hints are drawn as thin gray dashed outlines + centre crosses --
+    Hints are drawn as magenta dashed outlines + centre crosses --
     anchors for the VLM's own grounding, visually distinct from the red
     adjudication frames.
 
@@ -140,18 +140,25 @@ def _projected_scatter(points: np.ndarray, cam, W: int, H: int) -> np.ndarray:
 
 
 def _draw_hints(img: np.ndarray, cam, hints) -> np.ndarray:
-    """Thin gray dashed outlines + centre crosses over the grounding view."""
+    """Magenta dashed outlines + centre crosses over the grounding view.
+
+    VLM-visible by design: 3px saturated magenta survives the vision
+    encoder's resize/patchification where the old 1px gray could vanish
+    to sub-pixel. Authority stays with the PROMPT ("hints only, ignore
+    where they disagree"), not with faintness -- a hint the model cannot
+    see is worse than one it must be told to distrust.
+    """
     from PIL import Image, ImageDraw
     u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3].copy()
     pil = Image.fromarray(u8)
     dr = ImageDraw.Draw(pil)
-    gray = (150, 150, 150)
+    magenta = (255, 0, 255)
     for b in hints:
         z = b.center[2] + b.size[2] / 2.0
         cs = b.corners_2d()
         uv = cam.project_cv(np.column_stack([cs, np.full(len(cs), z)]))
         pts = np.round(uv).astype(np.int32)
-        # dashed rectangle: alternate 6-px draw / 4-px skip per edge
+        # dashed rectangle: alternate 12-px draw / 8-px skip per edge
         for i in range(4):
             a, c = pts[i], pts[(i + 1) % 4]
             n = max(int(np.linalg.norm(c - a)) // 5, 1)
@@ -160,14 +167,14 @@ def _draw_hints(img: np.ndarray, cam, hints) -> np.ndarray:
                 p0 = a + (c - a) * t0
                 p1 = a + (c - a) * t1
                 dr.line((*np.round(p0).astype(int), *np.round(p1).astype(int)),
-                        fill=gray, width=1)
+                        fill=magenta, width=3)
         # centre cross (the 'hint point')
         cc = cam.project_cv(np.array([[b.center[0], b.center[1], z]]))[0]
         ci = np.round(cc).astype(int)
-        dr.line((int(ci[0] - 5), int(ci[1]), int(ci[0] + 5), int(ci[1])),
-                fill=gray, width=1)
-        dr.line((int(ci[0]), int(ci[1] - 5), int(ci[0]), int(ci[1] + 5)),
-                fill=gray, width=1)
+        dr.line((int(ci[0] - 10), int(ci[1]), int(ci[0] + 10), int(ci[1])),
+                fill=magenta, width=2)
+        dr.line((int(ci[0]), int(ci[1] - 10), int(ci[0]), int(ci[1] + 10)),
+                fill=magenta, width=2)
     return np.asarray(pil, dtype=np.float32) / 255.0
 
 
@@ -193,7 +200,7 @@ def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
 
 
 def _save_grounded_png(scene, hints, boxes, yaw, out_dir) -> None:
-    """The grounding RESULT audit image: gray dashed = initial hints,
+    """The grounding RESULT audit image: magenta dashed = initial hints,
     red solid = VLM-grounded full-depth row boxes. One glance shows
     whether the VLM outlined the right structures and whether the
     point-support guards altered them."""
@@ -208,7 +215,7 @@ def _save_grounded_png(scene, hints, boxes, yaw, out_dir) -> None:
         with open(path, "wb") as f:
             f.write(png_bytes(img))
         print(f"[ground] result render -> {path} "
-              f"(gray dashed = hints, red = grounded)")
+              f"(magenta dashed = hints, red = grounded)")
     except Exception as e:
         print(f"[ground] result render failed ({type(e).__name__}: {e})")
 
