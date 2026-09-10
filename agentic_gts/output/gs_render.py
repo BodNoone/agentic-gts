@@ -306,27 +306,37 @@ def inject_top_filler(gs: GaussianData, cut_z: float,
                       cut_z_low: float = 0.30, cell: float = 0.05,
                       min_pts: int = 4, gray: float = 0.45,
                       scale_m: float = 0.03) -> GaussianData:
-    """Complete device TOP faces with flat gray gaussians where the POINT
-    SUPPORT says a device stands -- never where a box claims one.
+    """Cap devices with a flat gray LID where the top surface is a blurry
+    undertrained slab -- classified from each column's vertical profile
+    (the cross-section), never from box geometry.
 
     Why: racks carry overhead cable trays that occluded the top faces
-    during 3DGS training; once the render cuts the trays away the exposed
-    top gaussians are undertrained and the near-top-down views come out
-    blurry holes. The device's side faces, scanned from the aisles, are
-    dense -- so the XY occupancy of points in the device height band
-    marks exactly where devices stand, and each column's own vertical
-    extent gives its top height.
+    during 3DGS training; once the render cuts the trays away, the exposed
+    top gaussians render as blurry smears. A naive per-column filler
+    plates EVERY occupied column at its own 95th-percentile height: face
+    columns (points spanning the full height) and walls get gray strips at
+    scattered heights -- the devices themselves look contaminated.
 
-    Filler derives from the point cloud ONLY: a mis-boxed device still
-    gets a top plate that follows the real support, so the plate's EDGES
-    are genuine evidence (an overhanging wireframe is visibly not on the
-    gray plate) instead of self-confirmation. Columns without points get
-    nothing -- the VLM sees the honest empty aisle.
+    The cross-section of a column tells what it is:
+      face column -- points spread from the floor up to the device top
+                     (a vertical surface, well-trained texture): NO cap.
+      top column  -- points clustered in a thin slab just under the device
+                     top (the blurry top itself): cap it; the whole
+                     connected region is capped at ONE uniform plane
+                     height (a lid), not per-column patches.
+      tall column -- structure continuing well above the cut in >=3 of 4
+                     sub-slabs (a wall runs to the ceiling; a tray slab
+                     occupies one band and leaves gaps): NO cap.
 
-    Points are added to a COPY in memory (the source PLY is untouched):
-    small isotropic scale, near-full opacity, flat gray. z sits at the
-    column's 95th-percentile point height, capped just below cut_z so the
-    render's ceiling cut cannot remove it.
+    Per REGION (connected component of top columns) the plane is the
+    median column top: one rack row gets one coherent lid, and cells
+    deviating from it are dropped (a taller neighbouring device must not
+    drag the lid up). The lid sits just ABOVE the slab so the rasterizer
+    (nearer to the camera = drawn over) hides the blur, and is clamped
+    below cut_z so the render's ceiling cut cannot remove it.
+
+    Everything derives from the point cloud only; the source PLY is
+    untouched (points join an in-memory copy).
     """
     if not np.isfinite(cut_z) or len(gs) == 0:
         return gs
@@ -340,29 +350,69 @@ def inject_top_filler(gs: GaussianData, cut_z: float,
     y0 = band[:, 1].min() - cell
     nx = int((band[:, 0].max() - x0) / cell) + 2
     ny = int((band[:, 1].max() - y0) / cell) + 2
-    ix = ((band[:, 0] - x0) / cell).astype(np.int64)
-    iy = ((band[:, 1] - y0) / cell).astype(np.int64)
-    flat = ix * ny + iy
-    counts = np.bincount(flat, minlength=nx * ny)
-    filled = np.nonzero(counts >= min_pts)[0]
-    if len(filled) == 0:
+    ncell = nx * ny
+    bflat = (((band[:, 0] - x0) / cell).astype(np.int64) * ny
+             + ((band[:, 1] - y0) / cell).astype(np.int64))
+
+    # ---- per-column vertical profile over the height band ----
+    order = np.argsort(bflat, kind="stable")
+    zs = band[order, 2]
+    fs = bflat[order]
+    uniq, starts, cts = np.unique(fs, return_index=True, return_counts=True)
+    z95 = np.full(ncell, np.nan)
+    lowf = np.zeros(ncell)
+    for u, s, c in zip(uniq, starts, cts):
+        colz = zs[s:s + c]
+        q = float(np.percentile(colz, 95))
+        z95[u] = q
+        lowf[u] = float((colz < q - 0.25).mean())
+    occupied = np.zeros(ncell, dtype=bool)
+    occupied[uniq] = cts >= min_pts
+
+    # ---- tall-structure (wall) test on the FULL cloud ----
+    # structure continuing well above the cut in >=3 of 4 sub-slabs: a
+    # wall runs to the ceiling; an overhead tray slab occupies one band
+    # and leaves vertical gaps
+    tall = np.zeros(ncell, dtype=bool)
+    am = (means[:, 2] >= cut_z + 0.30) & (means[:, 2] < cut_z + 1.90)
+    if am.any():
+        apts = means[am]
+        af = (np.clip(((apts[:, 0] - x0) / cell).astype(np.int64), 0, nx - 1)
+              * ny
+              + np.clip(((apts[:, 1] - y0) / cell).astype(np.int64), 0, ny - 1))
+        hits = 0
+        for k in range(4):
+            zlo = cut_z + 0.30 + 0.40 * k
+            sel = (apts[:, 2] >= zlo) & (apts[:, 2] < zlo + 0.40)
+            hits += (np.bincount(af[sel], minlength=ncell) >= 2)
+        tall = hits >= 3
+
+    # top-column candidates: occupied, not a wall, points NOT spanning
+    # down (a face does), and high enough to be a device top
+    cand = occupied & ~tall & (lowf <= 0.20) & (z95 >= 0.80)
+    if not cand.any():
         return gs
 
-    # per-column top height: group the band points by cell, 95th pct z
-    order = np.argsort(flat, kind="stable")
-    z_sorted = band[order, 2]
-    f_sorted = flat[order]
-    starts = np.searchsorted(f_sorted, filled, side="left")
-    ends = np.searchsorted(f_sorted, filled, side="right")
-    zs = np.empty(len(filled))
-    for k, (a, b) in enumerate(zip(starts, ends)):
-        zs[k] = np.percentile(z_sorted[a:b], 95)
-    zs = np.minimum(zs, cut_z - 0.02)
-    zs = np.maximum(zs, lo + 0.20 if np.isfinite(lo) else 0.20)
+    # ---- one coherent lid per connected region ----
+    from scipy.ndimage import label
+    lab, nlab = label(cand.reshape(nx, ny))
+    filler = []
+    for r in range(1, nlab + 1):
+        cells = np.nonzero((lab == r).ravel())[0]
+        if len(cells) < 6:
+            continue
+        plane = float(np.median(z95[cells]))
+        keep = cells[np.abs(z95[cells] - plane) <= 0.20]
+        if len(keep) < 6:
+            continue
+        zlid = min(plane + 0.03, cut_z - 0.02)
+        px = x0 + (keep // ny + 0.5) * cell
+        py = y0 + (keep % ny + 0.5) * cell
+        filler.extend(zip(px, py, [zlid] * len(keep)))
+    if not filler:
+        return gs
 
-    fx, fy = filled // ny, filled % ny     # flat = ix*ny + iy
-    fm = np.column_stack([x0 + (fx + 0.5) * cell,
-                           y0 + (fy + 0.5) * cell, zs])
+    fm = np.asarray(filler, dtype=np.float64)
     n = len(fm)
     from agentic_gts.tools.gs_io import GaussianData as _GD
     extra = _GD(

@@ -92,12 +92,14 @@ def test_colmap_views_missing_returns_none():
     print("PASS colmap missing path -> None")
 
 
-def test_inject_top_filler_follows_point_support_not_boxes():
-    """Gray top-filler must be derived from the POINT SUPPORT (XY
-    occupancy of the height band), never from box geometry: a rack whose
-    box is too short/shifted still gets its plate over the real support,
-    and a region with no points gets NOTHING even if a box claims it --
-    the plate edges stay honest evidence, no self-confirmation."""
+def test_inject_top_filler_lids_cross_section():
+    """The filler classifies each column from its vertical profile and
+    caps ONLY the blurry top slabs, as ONE coherent plane per region:
+      face columns (points floor->top: well-trained texture) -> NO cap,
+      top columns (points clustered in a thin slab: blurry top)  -> cap,
+      wall columns (structure continuing above the cut)          -> NO cap.
+    The lid must be uniform in z, sit just ABOVE the slab (so the
+    rasterizer hides the blur), and only over the top-column region."""
     from agentic_gts.output.gs_render import inject_top_filler
     from agentic_gts.tools.gs_io import GaussianData
 
@@ -112,36 +114,38 @@ def test_inject_top_filler_follows_point_support_not_boxes():
             f_dc=np.zeros((n, 3)),
         )
 
-    rng = np.random.default_rng(7)
-    # rack side faces: x in [0, 2], y = +/-0.55, z in [0, 2]
-    n = 6000
-    xs = rng.uniform(0.0, 2.0, n)
-    zs = rng.uniform(0.0, 2.0, n)
-    ys = np.where(rng.random(n) < 0.5, -0.55, 0.55)
-    means = np.column_stack([xs, ys, zs])
-    gs = _gs(means)
-    out = inject_top_filler(gs, cut_z=2.4)      # cut ABOVE the rack top
-    fm = np.asarray(out.means)[len(gs):]        # filler appended last
-    assert len(out) == len(gs) + len(fm)
-    assert len(fm) > 50, f"expected a plate over the rack, got {len(fm)}"
-    # plate covers the point-supported extent (up to x~2), NOT beyond it
-    assert fm[:, 0].max() > 1.8, "plate must reach the rack's far end"
-    assert fm[:, 0].max() < 2.3, "plate must not extend past the support"
-    assert fm[:, 0].min() > -0.3
-    # filler z = column top (~2.0, the 95th pct), capped below the cut
-    assert 1.5 < fm[:, 2].min() and fm[:, 2].max() < 2.4 - 0.01
-    # y span hugs the two face bands (a hollow interior is fine)
-    assert fm[:, 1].min() > -0.8 and fm[:, 1].max() < 0.8
-    # flat gray, small, opaque: the plate renders as a clean surface
-    import numpy as _np
-    assert _np.isfinite(out.f_dc[len(gs):]).all()
-    assert abs(out.log_scales[len(gs):].max() - float(_np.log(0.03))) < 1e-6
+    rng = np.random.default_rng(11)
+    n = 8000
+    # face region x in [0,1]: vertical surfaces, points 0 -> 1.95
+    face = np.column_stack([rng.uniform(0.0, 1.0, n),
+                            rng.uniform(-0.5, 0.5, n),
+                            rng.uniform(0.0, 1.95, n)])
+    # top region x in [1.1, 2.0]: blurry top slab, points near z ~1.8-1.95
+    top = np.column_stack([rng.uniform(1.1, 2.0, n),
+                           rng.uniform(-0.5, 0.5, n),
+                           rng.uniform(1.80, 1.95, n)])
+    # wall region x in [3.0, 4.0]: full height 0 -> 4.0
+    wall = np.column_stack([rng.uniform(3.0, 4.0, n),
+                            rng.uniform(-0.5, 0.5, n),
+                            rng.uniform(0.0, 4.0, n)])
+    gs = _gs(np.vstack([face, top, wall]))
+    out = inject_top_filler(gs, cut_z=2.4)
+    fm = np.asarray(out.means)[len(gs):]
+    assert len(fm) > 20, f"expected a lid over the top region, got {len(fm)}"
+    # lid ONLY over the top-slab region
+    assert 1.05 <= fm[:, 0].min() and fm[:, 0].max() <= 2.05, \
+        f"lid leaked outside the top region: x=[{fm[:, 0].min():.2f}," \
+        f"{fm[:, 0].max():.2f}]"
+    # ONE uniform plane height, just above the slab (slab z95 ~1.945)
+    assert np.allclose(fm[:, 2], fm[0, 2]), \
+        f"lid not planar: z range [{fm[:, 2].min():.3f},{fm[:, 2].max():.3f}]"
+    assert 1.94 < fm[0, 2] < 2.4, f"lid height off: {fm[0, 2]:.3f}"
+    # flat gray, small, opaque
+    assert abs(out.log_scales[len(gs):].max() - float(np.log(0.03))) < 1e-6
     assert (out.raw_opacity[len(gs):] == 6.0).all()
-    # empty region: no band points -> no filler there even though a box
-    # could claim it (verified implicitly: fm x-extent stops at support)
-    print(f"PASS top filler follows point support ({len(fm)} pts, "
-          f"x=[{fm[:, 0].min():.2f},{fm[:, 0].max():.2f}], "
-          f"z~{fm[:, 2].mean():.2f})")
+    print(f"PASS top filler lids cross-section ({len(fm)} pts, "
+          f"plane z={fm[0, 2]:.3f}, x=[{fm[:, 0].min():.2f},"
+          f"{fm[:, 0].max():.2f}]; faces and walls untouched)")
 
 
 def test_gs_roundtrip_binary(tmp_path=None):
@@ -896,7 +900,7 @@ if __name__ == "__main__":
     test_gs_parse_ascii()
     test_colmap_pose_parsing_and_trust()
     test_colmap_views_missing_returns_none()
-    test_inject_top_filler_follows_point_support_not_boxes()
+    test_inject_top_filler_lids_cross_section()
     test_render_falls_back_without_cuda()
     test_camera_projection_sanity()
     test_local_cam_front_face()
