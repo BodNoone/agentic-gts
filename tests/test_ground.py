@@ -122,7 +122,7 @@ def test_ground_stage_with_patched_vlm():
     scene.boxes = [_hint(1.0, 0.0, size=(1.6, 0.45, 2.1)),
                    _hint(4.0, 3.0, size=(1.2, 0.4, 2.1))]
     # build the same deterministic render to fabricate the VLM answer
-    png, cam, W, H = ground._render_ground_view(scene, scene.boxes, 0.0)
+    _, cam, W, H = ground._render_topdown(scene, scene.boxes, 0.0)
     true_rects = [((-0.5, 6.5), (-0.8, 0.8)),      # row 1 XY
                   ((-1.5, 5.5), (2.2, 3.8))]       # row 2 XY
     import json as _json

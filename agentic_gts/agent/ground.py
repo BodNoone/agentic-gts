@@ -346,7 +346,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
             kw = {} if obq is None else dict(elev_deg=obq[0],
                                              azim_deg=obq[1])
             img, cam, W, H = _render_topdown(scene, hints, yaw, **kw)
-            png = png_bytes(_draw_hints(img, cam, hints))
+            png = png_bytes(img)       # CLEAN view: no hint overlays
         except Exception as e:
             print(f"[ground] view {name} render failed "
                   f"({type(e).__name__}: {e}) -> view skipped")
