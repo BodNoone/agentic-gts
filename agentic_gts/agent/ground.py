@@ -57,13 +57,25 @@ def _render_ground_view(scene, hints, yaw: float, W: int = 1280, H: int = 1024):
 
 
 def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
-                    H: int = 1024):
+                    H: int = 1024, elev_deg: float | None = None,
+                    azim_deg: float = 90.0):
     """Base top-down render, no overlays. Camera fitted over the
-    yaw-rotated cloud (rows parallel to the image axes, so an
-    axis-aligned image rectangle captures a rotated row exactly), then
-    rotated back into world so the GS render and the pixel
-    back-projection share one consistent camera. Shared by the
-    grounding input view and the grounded-result audit view.
+    yaw-rotated cloud (rows parallel to the image axes), then rotated
+    back into world so the GS render and the pixel back-projection
+    share one consistent camera. Shared by the grounding input views
+    and the grounded-result audit view.
+
+    elev_deg=None: true nadir (rows axis-aligned in the image; an
+    axis-aligned image rectangle captures a row exactly, but the room
+    centre shows only the racks' TOP faces -- which a ground-level
+    3DGS training set barely observed, so they render as a blurry
+    smear the VLM cannot ground).
+    elev_deg given: OBLIQUE top-down from that elevation (azim_deg is
+    the horizontal viewing azimuth in the ROW frame; 90/270 look along
+    the cross-axis, i.e. straight down the aisles, so every row shows
+    a well-trained FACE). Rows appear as horizontal bands, slightly
+    trapezoidal under perspective -- coarse for capture, but the faces
+    are sharp and the point-support fit tightens the edges anyway.
 
     Returns (img_float, cam, W, H).
     """
@@ -87,8 +99,14 @@ def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
         boxes_rot.append(OrientedBox(center=(float(c[0]), float(c[1]),
                                              b.center[2]),
                                      size=b.size, yaw=0.0))
-    cam_r = make_godview_cam(pts_rot, boxes_rot, nadir=True, W=W, H=H)
-    # rotate the camera back into world (rotation about z keeps it nadir)
+    if elev_deg is None:
+        cam_r = make_godview_cam(pts_rot, boxes_rot, nadir=True, W=W, H=H)
+    else:
+        cam_r = make_godview_cam(pts_rot, boxes_rot, nadir=False,
+                                 elev_deg=elev_deg, azim_deg=azim_deg,
+                                 W=W, H=H)
+    # rotate the camera back into world (rotation about z: nadir stays
+    # nadir, oblique keeps its elevation and swings the azimuth)
     if abs(yaw) > 1e-9:
         c_, s_ = math.cos(yaw), math.sin(yaw)
         rz = lambda v: np.array([c_ * v[0] - s_ * v[1],
@@ -260,48 +278,106 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
                        device_type=DeviceType.RACK)
 
 
+def _merge_rects(rects: list[tuple], iou_thr: float = 0.25) -> list[tuple]:
+    """Greedy union of overlapping grounded rects (row frame).
+
+    The same row is typically outlined in SEVERAL views (nadir + the
+    two obliques); each capture is coarse in its own way (nadir: blurry
+    tops; oblique: perspective stretch). Union + a fresh point-support
+    fit keeps the most inclusive footprint per structure. Only rects
+    whose overlap is a decent fraction of the SMALLER one merge --
+    disjoint structures (different rows) never fuse.
+    """
+    rs = [list(map(float, r)) for r in rects]
+
+    def _area(r):
+        return max(0.0, r[2] - r[0]) * max(0.0, r[3] - r[1])
+
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(rs)):
+            for j in range(i + 1, len(rs)):
+                a, b = rs[i], rs[j]
+                ix = min(a[2], b[2]) - max(a[0], b[0])
+                iy = min(a[3], b[3]) - max(a[1], b[1])
+                inter = max(0.0, ix) * max(0.0, iy)
+                smaller = min(_area(a), _area(b))
+                if smaller > 0 and inter > iou_thr * smaller:
+                    rs[i] = [min(a[0], b[0]), min(a[1], b[1]),
+                             max(a[2], b[2]), max(a[3], b[3])]
+                    rs.pop(j)
+                    changed = True
+                    break
+            if changed:
+                break
+    return [tuple(r) for r in rs]
+
+
 def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     """Replace scene.boxes with VLM-grounded full-depth row boxes.
+
+    Multi-view capture: the true NADIR view (rows axis-aligned, exact
+    footprint) plus TWO opposite OBLIQUE views (~58 deg, looking down
+    the aisles) whose well-trained rack FACES compensate the nadir's
+    blind spot -- a ground-level 3DGS training set barely observed rack
+    tops, so the nadir room centre renders as an ungroundable smear
+    while the image edges (perspective showing faces) ground fine.
+    Regions from all views are back-projected, union-merged, and
+    point-support fitted into full-depth row boxes.
 
     False = grounding unavailable (mock backend / VLM failure / no
     region survived the point-support guards) and the caller keeps the
     original hint boxes -- grounding must never destroy the layout.
     """
-    from agentic_gts.output.gs_render import unproject_ground
+    import os
+    from agentic_gts.output.gs_render import png_bytes, unproject_ground
     hints = list(scene.boxes)
     if not hints:
         return False
     yaw = float(scene.meta.get("yaw", 0.0) or 0.0)
-    # ONE base render serves both images: the input view the VLM answers
-    # on (base + magenta hints) and the result audit view (same base +
-    # hints + red grounded boxes). Rendering them separately produced
-    # different ceiling cuts (fitted over hints vs hints+boxes) and
-    # camera framing -- the before/after comparison was confounded.
-    try:
-        from agentic_gts.output.gs_render import png_bytes
-        base_img, cam, W, H = _render_topdown(scene, hints, yaw)
-        png = png_bytes(_draw_hints(base_img, cam, hints))
-    except Exception as e:
-        print(f"[ground] render failed ({type(e).__name__}: {e}) -> keep hints")
-        return False
-    png_path = None
-    if out_dir:
-        import os
-        png_path = os.path.join(out_dir, "groundview.png")
+    views = (("nadir", None),
+             ("az90", (58.0, 90.0)),      # cross-axis face pair
+             ("az270", (58.0, 270.0)))
+    cam_rects: list[tuple] = []       # (cam, pixel_rect)
+    base = None                       # (img, cam) of the nadir render
+    for name, obq in views:
         try:
-            with open(png_path, "wb") as f:
-                f.write(png)
+            kw = {} if obq is None else dict(elev_deg=obq[0],
+                                             azim_deg=obq[1])
+            img, cam, W, H = _render_topdown(scene, hints, yaw, **kw)
+            png = png_bytes(_draw_hints(img, cam, hints))
         except Exception as e:
-            print(f"[ground] png save failed ({type(e).__name__}: {e})")
-            png_path = None
-    rects = judge.ground_regions(png, W, H, png_path=png_path)
-    if not rects:
+            print(f"[ground] view {name} render failed "
+                  f"({type(e).__name__}: {e}) -> view skipped")
+            continue
+        if name == "nadir":
+            base = (img, cam)
+        png_path = None
+        if out_dir:
+            fname = "groundview.png" if name == "nadir" \
+                else f"groundview_{name}.png"
+            png_path = os.path.join(out_dir, fname)
+            try:
+                with open(png_path, "wb") as f:
+                    f.write(png)
+            except Exception as e:
+                print(f"[ground] png save failed ({type(e).__name__}: {e})")
+                png_path = None
+        rects = judge.ground_regions(png, W, H, png_path=png_path,
+                                     oblique=obq is not None)
+        print(f"[ground] view {name}: {len(rects)} regions")
+        cam_rects += [(cam, r) for r in rects]
+    if not cam_rects:
         print("[ground] VLM returned no usable regions -> keep hints")
         return False
     pts_rot = _rot_xy(np.asarray(scene.points, dtype=np.float64), -yaw)
-    z_plane = 1.0      # nadir rays are parallel: any plane height works
-    boxes = []
-    for r in rects:
+    z_plane = 1.0      # oblique rays hit the device mid-height plane;
+    # the resulting rect is coarse by design -- the point-support fit
+    # tightens it. (For the nadir view the rays are parallel and the
+    # plane height is irrelevant.)
+    frame_rects = []
+    for cam, r in cam_rects:
         uv = np.array([[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]],
                       dtype=float)
         corners_w = unproject_ground(cam, uv, z_plane)[:, :2]
@@ -310,8 +386,13 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         corners_r = _rot_xy(np.column_stack([corners_w,
                                              np.zeros(len(corners_w))]),
                             -yaw)[:, :2]
-        rect_r = (float(corners_r[:, 0].min()), float(corners_r[:, 1].min()),
-                  float(corners_r[:, 0].max()), float(corners_r[:, 1].max()))
+        frame_rects.append((float(corners_r[:, 0].min()),
+                            float(corners_r[:, 1].min()),
+                            float(corners_r[:, 0].max()),
+                            float(corners_r[:, 1].max())))
+    merged = _merge_rects(frame_rects)
+    boxes = []
+    for rect_r in merged:
         bb = _fit_region_box(pts_rot, rect_r)
         if bb is None:
             continue
@@ -325,11 +406,11 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         print("[ground] no region survived the point-support guards "
               "-> keep hints")
         return False
-    print(f"[ground] {len(rects)} VLM regions -> {len(boxes)} "
-          f"full-depth row boxes")
+    print(f"[ground] {len(cam_rects)} VLM regions in {len(views)} views "
+          f"-> {len(merged)} merged -> {len(boxes)} full-depth row boxes")
     scene.boxes = boxes
-    if out_dir:
-        _save_grounded_png(base_img, cam, hints, boxes, out_dir)
+    if out_dir and base is not None:
+        _save_grounded_png(base[0], base[1], hints, boxes, out_dir)
     return True
 
 

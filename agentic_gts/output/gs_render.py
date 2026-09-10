@@ -137,10 +137,13 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
     gaussians before rasterization, so they cannot reappear overhead.)
     """
     center, half_diag, lo, hi, z_top = _footprint(points, boxes)
+    # rack-top reference height (shared by both branches: the nadir
+    # camera clears the outward-spreading rack tops, the oblique
+    # corners frame them; NaN -> fall back to the cloud max)
+    z_ref = float(z_top) if np.isfinite(z_top) else float(points[:, 2].max())
 
     if nadir:
         # look straight down (-z), up hint = +y in world (screen-up = +y)
-        z_ref = float(z_top) if np.isfinite(z_top) else float(points[:, 2].max())
         z_floor = float(points[:, 2].min())
         up = np.array([0.0, 1.0, 0.0])  # screen up aligned with world +y
         # Analytic first guess for the height, then nudge up until the whole
@@ -194,7 +197,7 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
     corners = np.array([[x, y, z] for x in (lo[0], hi[0])
                         for y in (lo[1], hi[1]) for z in (z_floor, zc)])
     for dist in [(half_diag + 1.0) * f for f in (1.0, 1.2, 1.5, 1.8, 2.2, 2.8, 3.5, 4.5, 6.0, 8.0, 11.0)]:
-        eye = center + dist * np.array(
+        eye = np.array([center[0], center[1], 0.0]) + dist * np.array(
             [math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el)])
         c = Cam(eye=eye, target=np.array([center[0], center[1], z_floor]),
                 up=up, fovy_deg=60.0, W=W, H=H)

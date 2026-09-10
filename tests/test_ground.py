@@ -139,7 +139,16 @@ def test_ground_stage_with_patched_vlm():
              + _json.dumps({"regions": regions}))
 
     judge = VLMJudge(backend="qwen")
-    judge._qwen_image_call = lambda *a, **k: reply    # canned VLM answer
+
+    def _fake_call(png, prompt, *a, **k):
+        # oblique views answer with nothing extra here: the nadir view
+        # alone grounds both rows (the multi-view UNION path is covered
+        # by test_merge_rects)
+        if "OBLIQUE" in prompt:
+            return "I see rows but nothing new.\n" + _json.dumps(
+                {"regions": []})
+        return reply
+    judge._qwen_image_call = _fake_call    # canned VLM answer
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         ok = ground.ground_stage(scene, judge, out_dir=td)
@@ -150,6 +159,12 @@ def test_ground_stage_with_patched_vlm():
             "grounded.png (result audit view) was not saved"
         assert os.path.exists(os.path.join(td, "groundview.png")), \
             "groundview.png (input view) was not saved"
+        # oblique complement views are saved too (the nadir blind-spot
+        # fix -- centre rows with untrained tops)
+        assert os.path.exists(os.path.join(td, "groundview_az90.png")), \
+            "groundview_az90.png (oblique view) was not saved"
+        assert os.path.exists(os.path.join(td, "groundview_az270.png")), \
+            "groundview_az270.png (oblique view) was not saved"
         # same-base contract: the two images must be pixel-identical
         # apart from the red result overlays -- different ceiling cuts /
         # camera framing would confound the before/after comparison
@@ -196,6 +211,28 @@ def test_split_reply_parse():
     print("PASS split reply parse (incl. think-block + range clamps)")
 
 
+def test_merge_rects_multiview_union():
+    """The same row outlined in three views (nadir tight, obliques
+    shifted/stretched by perspective) must union into ONE rect; a
+    disjoint row must never fuse into it."""
+    from agentic_gts.agent.ground import _merge_rects
+    # row 1 as seen by nadir / az90 / az270 (loose, shifted)
+    r1 = [(-0.2, -0.6, 6.1, 0.7), (0.3, -0.8, 6.4, 0.5), (-0.4, -0.5, 5.9, 0.9)]
+    # row 2: parallel, 3m away -- must stay separate
+    r2 = [(-1.0, 2.4, 5.2, 3.6)]
+    out = _merge_rects(r1 + r2)
+    assert len(out) == 2, f"expected 2 merged rects, got {len(out)}"
+    big = max(out, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
+    assert abs(big[0] - (-0.4)) < 1e-9 and abs(big[2] - 6.4) < 1e-9, \
+        "union rect must span all three captures"
+    assert abs(big[1] - (-0.8)) < 1e-9 and abs(big[3] - 0.9) < 1e-9
+    # neighbouring rows 1.2m apart with slight VLM slop still stay split
+    a = (0.0, 0.0, 6.0, 1.1)
+    b = (0.0, 1.35, 6.0, 2.45)      # overlap of 0 -> never merges
+    assert len(_merge_rects([a, b])) == 2
+    print("PASS merge rects (3-view union, disjoint rows kept)")
+
+
 def test_ground_mock_returns_false():
     """Mock backend / no VLM -> grounding must fail soft, keeping hints."""
     from agentic_gts.agent import ground
@@ -219,5 +256,6 @@ if __name__ == "__main__":
     test_split_row_snaps_to_profile_gaps()
     test_ground_stage_with_patched_vlm()
     test_split_reply_parse()
+    test_merge_rects_multiview_union()
     test_ground_mock_returns_false()
     print("ALL GROUND TESTS PASSED")

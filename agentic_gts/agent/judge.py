@@ -991,14 +991,49 @@ class VLMJudge:
         "rightward, y downward, x0 < x1, y0 < y1."
     )
 
+    _GROUND_PROMPT_OBLIQUE = (
+        "You are looking at an OBLIQUE top-down view of a data-center "
+        "room (camera tilted ~58 deg, looking down the aisles, ceiling "
+        "removed). Rows of server racks / cabinets appear as long "
+        "HORIZONTAL bands; you see each row's front or back FACE plus "
+        "its top. Perspective makes a band slightly trapezoidal "
+        "(the nearer end looks a bit larger) -- that is expected. "
+        "MAGENTA dashed outlines with centre crosses mark rough initial "
+        "detections -- HINTS ONLY: they are often fragmented, shifted, "
+        "or missing entirely. Ignore them wherever they disagree with "
+        "what you actually see.\n\n"
+        "Task: output ONE axis-aligned rectangle per DEVICE STRUCTURE, "
+        "covering the structure's full visible extent (the whole band, "
+        "including the perspective-widened near end). A continuous row "
+        "of joined cabinets counts as ONE rectangle spanning the WHOLE "
+        "row. Structures separated by an aisle or a clear gap get "
+        "separate rectangles. Do NOT box walls, pillars, columns, or "
+        "floor clutter.\n\n"
+        "Work step by step:\n"
+        "1. List each device structure you see with one short sentence.\n"
+        "2. Then output ONE JSON object on the LAST line:\n"
+        '{"regions": [{"x0": <int>, "y0": <int>, "x1": <int>, "y1": <int>}, ...]}\n'
+        "Pixel coordinates, origin at the TOP-LEFT corner of the image, x "
+        "rightward, y downward, x0 < x1, y0 < y1."
+    )
+
     def ground_regions(self, png: bytes, W: int, H: int,
-                       png_path: str | None = None) -> list[tuple]:
-        """2D grounding over the top-down view: outline EVERY device
+                       png_path: str | None = None,
+                       oblique: bool = False) -> list[tuple]:
+        """2D grounding over a top-down view: outline EVERY device
         structure (a joined row = one region).
 
+        oblique: the view is the tilted aisle-looking complement to the
+        nadir view -- rows are horizontal bands with faces visible. The
+        nadir centre shows only rack TOPS, which a ground-level 3DGS
+        training set barely observed (blurry smear); the oblique views
+        recover the faces.
+
         Returns pixel rects [(x0, y0, x1, y1)] or [] on mock / failure.
-        Runs on the thinking tier when configured: one call per run, and
-        these regions BECOME the pipeline's boxes (high stakes)."""
+        Runs on the thinking tier when configured: one call per view,
+        and these regions BECOME the pipeline's boxes (high stakes)."""
+        prompt = self._GROUND_PROMPT_OBLIQUE if oblique \
+            else self._GROUND_PROMPT
         if self.backend == "mock":
             return []
         use_thinking = bool(self.thinking_model)
@@ -1007,12 +1042,12 @@ class VLMJudge:
                 try:
                     if self.backend == "local":
                         text = self._local_image_call(
-                            png, self._GROUND_PROMPT,
+                            png, prompt,
                             max_new_tokens=2048 if thinking else 900,
                             thinking=thinking)
                     else:
                         text = self._qwen_image_call(
-                            png, self._GROUND_PROMPT,
+                            png, prompt,
                             max_tokens=2048 if thinking else 900,
                             thinking=thinking)
                     break
@@ -1043,7 +1078,7 @@ class VLMJudge:
             x1, y1 = min(float(W), x1), min(float(H), y1)
             if x1 - x0 >= 8.0 and y1 - y0 >= 8.0:
                 rects.append((x0, y0, x1, y1))
-        self._record("ground", self._GROUND_PROMPT, text or "",
+        self._record("ground", prompt, text or "",
                     f"{len(rects)} regions", 0.5, "", png_path=png_path)
         return rects
 
