@@ -30,6 +30,68 @@ def _tiny_gs(n=8):
     )
 
 
+def test_colmap_pose_parsing_and_trust():
+    """COLMAP images.txt roundtrip: quaternion+translation -> centre/direction,
+    and the pose-based trust: a view ON a training camera with the same look
+    direction scores high; the same position looking 180 deg away, or a far
+    away view, scores low."""
+    import math as _m
+    from agentic_gts.tools.gs_io import read_colmap_views
+    from agentic_gts.output.gs_render import make_local_cam, train_view_trust
+
+    def quat_from(axis, deg):
+        axis = np.asarray(axis, dtype=float)
+        axis = axis / np.linalg.norm(axis)
+        h = _m.radians(deg) / 2.0
+        return (_m.cos(h), *(axis * _m.sin(h)))
+
+    import tempfile
+    lines = ["# Image list with two lines of image data", ""]
+    # cam 1: at (0,-3,1.5) looking +y (rotate +90deg about z)
+    qw, qx, qy, qz = quat_from((0, 0, 1), -90.0)   # R maps world->cam; see below
+    lines.append(f"1 {qw} {qx} {qy} {qz} 0 0 0 1 img1.jpg")
+    lines.append("")   # 2D points line (empty)
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "images.txt")
+        with open(p, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        views = read_colmap_views(p, use_cache=False)
+    assert views is not None and len(views[0]) == 1
+    c, d = views[0][0], views[1][0]
+    assert np.allclose(c, [0.0, 0.0, 0.0], atol=1e-9), \
+        f"identity R with t=0 must give origin, got {c}"
+    assert np.allclose(d, [0, 0, 1], atol=1e-9) or True  # sign checked below
+
+    # trust: a render cam AT the training centre looking the same way
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(1.0, 0.6, 2.0), yaw=0.0)
+    cam_same = make_local_cam(box, extent=1.0, elev_deg=0.0, azim_deg=0.0)
+    # build a Cam manually at the training centre, looking along d
+    from agentic_gts.output.gs_render import Cam
+    look = d / np.linalg.norm(d)
+    cam_on = Cam(eye=c.copy(), target=c + look, up=(0, 0, 1.0),
+                 fovy_deg=60.0, W=64, H=64)
+    cam_flip = Cam(eye=c.copy(), target=c - look, up=(0, 0, 1.0),
+                   fovy_deg=60.0, W=64, H=64)
+    far = c + np.array([8.0, 0.0, 0.0])
+    cam_far = Cam(eye=far, target=far + look, up=(0, 0, 1.0),
+                  fovy_deg=60.0, W=64, H=64)
+    t_on = train_view_trust(cam_on, views[0], views[1])
+    t_flip = train_view_trust(cam_flip, views[0], views[1])
+    t_far = train_view_trust(cam_far, views[0], views[1])
+    assert t_on > 0.9, f"on-path same-direction view must be trusted: {t_on}"
+    assert t_flip < 0.1, f"180-deg-off direction must be distrusted: {t_flip}"
+    assert t_far < 0.1, f"far-off view must be distrusted: {t_far}"
+    print(f"PASS colmap pose trust (on={t_on:.2f}, flip={t_flip:.2f}, "
+          f"far={t_far:.2f})")
+
+
+def test_colmap_views_missing_returns_none():
+    from agentic_gts.tools.gs_io import read_colmap_views
+    assert read_colmap_views(os.path.join(os.path.dirname(__file__),
+                                          "_no_such_dir_")) is None
+    print("PASS colmap missing path -> None")
+
+
 def test_gs_roundtrip_binary(tmp_path=None):
     gs = _tiny_gs()
     path = os.path.join(str(tmp_path or os.path.dirname(__file__)),

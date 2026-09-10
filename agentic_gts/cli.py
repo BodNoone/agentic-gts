@@ -56,6 +56,17 @@ def cmd_run(args):
                   "rendered via Gaussian splatting")
     except Exception as e:
         print(f"[cli] GS detection failed ({type(e).__name__}: {e})")
+    # COLMAP training poses (optional): pose-based render trust
+    if getattr(args, "gs_cams", None):
+        from agentic_gts.tools.gs_io import read_colmap_views
+        tv = read_colmap_views(args.gs_cams)
+        if tv is None:
+            print(f"[cli] --gs-cams: no images.txt found under "
+                  f"{args.gs_cams} -> pose trust disabled")
+        else:
+            scene.meta["gs_cams"] = args.gs_cams
+            print(f"[cli] COLMAP poses loaded: {len(tv[0])} training "
+                  f"cameras -> render trust enabled")
     if args.boxes:
         scene.load_boxes(args.boxes)
     gt_boxes = None
@@ -185,6 +196,12 @@ def main():
 
     r = sub.add_parser("run", help="run pipeline on point cloud")
     r.add_argument("--point-cloud", required=True)
+    r.add_argument("--gs-cams", default=None, metavar="PATH",
+                   help="COLMAP training poses for render-trust scoring: "
+                        "the sparse dir (e.g. sparse/0 containing "
+                        "cameras.txt + images.txt) or images.txt itself. "
+                        "Candidate view scores then blend the distance to "
+                        "the trained ray distribution")
     r.add_argument("--boxes", default=None, help="optional pre-detected boxes json")
     r.add_argument("--gt", default=None, help="optional ground-truth boxes json")
     r.add_argument("--out", default="runs/latest")

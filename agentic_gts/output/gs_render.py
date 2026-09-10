@@ -542,6 +542,36 @@ def png_bytes(img: np.ndarray) -> bytes:
 
 
 # ------------------------------------------------------- render quality
+def train_view_trust(cam: Cam, centers: np.ndarray, dirs: np.ndarray,
+                     pos_scale: float = 2.0) -> float:
+    """How well a candidate render view is covered by the TRAINING cameras.
+
+    3DGS quality is anisotropic around the training path: a view close
+    to a training camera AND looking a similar direction renders sharp;
+    the same view extrapolated away blurs and grows floaters. The
+    image-based quality score measures the SYMPTOM (blur / speckle)
+    AFTER rendering; this measures the CAUSE (distance to the trained
+    ray distribution) BEFORE rendering, immune to floaters that happen
+    to look sharp, and available even when the rasterizer's output is
+    ambiguous.
+
+    trust = max_i  exp(-|E - C_i| / pos_scale) * max(cos(L, d_i), 0)^2
+    Position AND direction both matter: standing exactly on a training
+    spot but looking 180 deg away extrapolates rays the field never saw;
+    looking the right way from 5 m off the path does too.
+    """
+    centers = np.asarray(centers, dtype=np.float64)
+    dirs = np.asarray(dirs, dtype=np.float64)
+    E = np.asarray(cam.eye, dtype=np.float64)[:3]
+    L = np.asarray(cam.target, dtype=np.float64)[:3] - E
+    L = L / (np.linalg.norm(L) + 1e-12)
+    d = np.linalg.norm(centers - E, axis=1)                 # (N,)
+    look = dirs / (np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-12)
+    cosang = np.clip(look @ L, 0.0, 1.0)                    # (N,)
+    trust = float(np.max(np.exp(-d / pos_scale) * cosang ** 2))
+    return min(max(trust, 0.0), 1.0)
+
+
 def view_quality(img: np.ndarray) -> dict:
     """No-reference quality score for ONE rendered view, in [0,1] higher =
     better. 3DGS quality is anisotropic: views near the training cameras
@@ -750,12 +780,13 @@ def _pullback_cam(gs: GaussianData, boxes, cam: Cam,
 
 def render_slot_candidates(gs, boxes, cam_fn, candidates, cut_z,
                             overlay: str, iso_margin: float,
-                            fallback_candidates=()):
+                            fallback_candidates=(),
+                            train_views=None):
     """Render several (elev, azim) candidates for ONE view slot, score each
     on the RAW render (before the wireframe overlay -- drawn lines would
     pollute the sharpness/speckle metrics), and return the best.
 
-    Three independent signals per candidate:
+    Four independent signals per candidate:
       quality     -- image-based (sharpness/coverage/speckle): is this view
                      well-trained? A view extrapolated away from the
                      training cameras blurs and grows floaters.
@@ -768,6 +799,15 @@ def render_slot_candidates(gs, boxes, cam_fn, candidates, cut_z,
                      side view embeds the camera in the neighbouring rack
                      (a blurry wall of near splats); the camera is pulled
                      back along its sight axis until it clears.
+      train       -- pose-based (train_view_trust, from COLMAP training
+                     poses): distance of the candidate view to the
+                     TRAINED ray distribution. Known BEFORE rendering
+                     (the cause of blur, not the symptom), so when the
+                     trust is low the image quality is HALVED toward the
+                     fallback tier: an extrapolated view that happens to
+                     look sharp on no-reference metrics (floaters with
+                     texture) must not win the slot. None (no poses
+                     given) leaves the pure image score untouched.
 
     Selection: among candidates where the box is visible (visibility >=
     0.25) AND the camera is outside the structure (clearance >= 0 after
@@ -789,6 +829,8 @@ def render_slot_candidates(gs, boxes, cam_fn, candidates, cut_z,
     aisles never trigger the fallback, so the front role (door/panel
     detail) is preserved where it is actually achievable.
 
+    train_views: optional (centers Nx3, dirs Nx3) from read_colmap_views.
+
     cam_fn(elev_deg, azim_deg) -> Cam. The isolation mask is computed ONCE
     for all candidates (it depends only on the boxes, not the camera).
     Returns (img, quality, (elev, azim)) or (None, None, None).
@@ -803,6 +845,13 @@ def render_slot_candidates(gs, boxes, cam_fn, candidates, cut_z,
         if img is None:
             return None
         q = view_quality(img)
+        if train_views is not None:
+            trust = train_view_trust(cam, train_views[0], train_views[1])
+            q["train"] = round(trust, 3)
+            # low pose-trust halves the image score toward the steep
+            # fallback: extrapolation is the CAUSE of blur, and the
+            # no-reference metrics can be fooled by textured floaters
+            q["score"] = round(q["score"] * (0.5 + 0.5 * trust), 4)
         q["visibility"] = round(vis, 4)
         q["clearance"] = round(clr, 3) if np.isfinite(clr) else None
         if boxes:

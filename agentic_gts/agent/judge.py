@@ -43,7 +43,8 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
                          size: int = 768, gs_ply: str | None = None,
                          overlay: str = "wire3d",
                          quality_out: dict | None = None,
-                         slots: tuple[str, ...] | None = None) -> np.ndarray:
+                         slots: tuple[str, ...] | None = None,
+                         gs_cams: str | None = None) -> np.ndarray:
     """Render the local evidence image the VLM adjudicates on.
 
     If the scene comes from a 3DGS model (gs_ply set and a CUDA rasterizer
@@ -78,10 +79,17 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
     # ---- 3DGS true render (preferred when available) ----
     if gs_ply and boxes:
         try:
-            from agentic_gts.tools.gs_io import read_gaussian_ply
+            from agentic_gts.tools.gs_io import (read_gaussian_ply,
+                                                 read_colmap_views)
             from agentic_gts.output.gs_render import (make_local_cam,
                                                       render_slot_candidates)
             gs = read_gaussian_ply(gs_ply)
+            # training poses (COLMAP): when available, the candidate view
+            # scores blend a pose-based trust (distance to the trained
+            # ray distribution) into the image quality -- see
+            # gs_render.train_view_trust. None keeps the pure image score.
+            train_views = (read_colmap_views(gs_cams)
+                           if gs_cams else None)
             # THREE view slots (tiled into one image), each with azimuth
             # candidates scored by render quality: front shows door/panel
             # detail, side shows the row context and depth, oblique (~70
@@ -140,7 +148,8 @@ def render_topdown_image(stage_points: np.ndarray, boxes, extent: float = 1.0,
                     lambda e, a: make_local_cam(boxes, extent=extent * 2,
                                                 elev_deg=e, azim_deg=a),
                     cands, cut_z=cut_z, overlay=overlay,
-                    iso_margin=iso_margin, fallback_candidates=fb)
+                    iso_margin=iso_margin, fallback_candidates=fb,
+                    train_views=train_views)
                 if img is None:
                     continue
                 views.append(img)
@@ -524,7 +533,7 @@ class VLMJudge:
             q = {}
             self._render_cache[key] = render_topdown_image(
                 scene.points, boxes, gs_ply=scene.meta.get("gs_ply"),
-                quality_out=q)
+                quality_out=q, gs_cams=scene.meta.get("gs_cams"))
             self._render_quality[key] = q
         return self._render_cache[key]
 
@@ -1026,7 +1035,8 @@ class VLMJudge:
             img = render_topdown_image(scene.points, [box],
                                        gs_ply=scene.meta.get("gs_ply"),
                                        overlay="wire3d_axes", quality_out=q,
-                                       slots=slots)
+                                       slots=slots,
+                                       gs_cams=scene.meta.get("gs_cams"))
             png_path = self._save_evidence_png(
                 img, f"{kind}_evidence_{box.box_id[:8]}.png")
             png = self._array_png_bytes(img)

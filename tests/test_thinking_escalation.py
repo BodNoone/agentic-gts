@@ -177,7 +177,7 @@ def test_adjudicate_fit_escalated_allok_overrides():
     allok = json.dumps({"x_minus": "ok", "x_plus": "ok", "yaw_dir": "ok"})
 
     def fake_render(points, boxes, gs_ply=None, overlay=None, quality_out=None,
-                    slots=None):
+                    slots=None, gs_cams=None):
         if quality_out is not None:
             quality_out.update(_low_quality())
         return np.zeros((8, 8, 3), dtype=np.float32)
@@ -212,7 +212,7 @@ def test_adjudicate_fit_escalated_nomination_wins():
                             "yaw_dir": "cw"})
 
     def fake_render(points, boxes, gs_ply=None, overlay=None, quality_out=None,
-                    slots=None):
+                    slots=None, gs_cams=None):
         if quality_out is not None:
             quality_out.update(_low_quality())
         return np.zeros((8, 8, 3), dtype=np.float32)
@@ -268,7 +268,7 @@ def test_adjudicate_yaw_and_extent_route_slots():
     seen = {"slots": [], "kinds": []}
 
     def fake_render(points, boxes, gs_ply=None, overlay=None, quality_out=None,
-                    slots=None):
+                    slots=None, gs_cams=None):
         seen["slots"].append(tuple(slots) if slots else None)
         return np.zeros((8, 8, 3), dtype=np.float32)
 
@@ -288,6 +288,7 @@ def test_adjudicate_yaw_and_extent_route_slots():
         assert j._YAW_PROMPT in seen["kinds"], "yaw prompt not used"
 
         def fake_call2(png, prompt, max_tokens=256, thinking=False):
+            seen["kinds"].append(prompt)
             return '{"x_minus": "short", "x_plus": "ok"}'
 
         j._qwen_image_call = fake_call2

@@ -77,6 +77,81 @@ def is_gaussian_ply(path: str) -> bool:
         return False
 
 
+_CAM_CACHE: dict = {}
+
+
+def _quat_to_R(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
+    """COLMAP quaternion (w,x,y,z) -> 3x3 rotation (world->cam)."""
+    return np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw),
+         2 * (qx * qz + qy * qw)],
+        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz),
+         2 * (qy * qz - qx * qw)],
+        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw),
+         1 - 2 * (qx * qx + qy * qy)]])
+
+
+def read_colmap_views(path: str, use_cache: bool = True):
+    """Training camera poses from a COLMAP reconstruction.
+
+    path: the images.txt itself, or a directory containing it (e.g.
+    sparse/0). Returns (centers Nx3, dirs Nx3) -- camera CENTRE and
+    world-space view DIRECTION per training image -- or None when the
+    file is missing/empty.
+
+    Convention: COLMAP maps world->cam as x_cam = R @ X + t with the
+    camera looking along +z in its own frame, so
+        centre = -R^T t,   dir = R^T [0,0,1] (= third row of R).
+    These are exactly the poses the 3DGS field was trained on: a render
+    view close to a training camera (position AND direction) is inside
+    the trained ray distribution and renders sharp; an extrapolated view
+    blurs and grows floaters (see gs_render.train_view_trust).
+    """
+    import glob as _glob
+    p = path
+    if os.path.isdir(p):
+        p = os.path.join(p, "images.txt")
+        if not os.path.exists(p):
+            cands = _glob.glob(os.path.join(path, "**", "images.txt"),
+                               recursive=True)
+            if not cands:
+                return None
+            p = cands[0]
+    if not os.path.exists(p):
+        return None
+    key = os.path.abspath(p)
+    if use_cache and key in _CAM_CACHE:
+        return _CAM_CACHE[key]
+    centers, dirs = [], []
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if not parts or parts[0].startswith("#"):
+                    continue
+                # header line: IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
+                if len(parts) < 10:
+                    continue
+                try:
+                    qw, qx, qy, qz = (float(x) for x in parts[1:5])
+                    t = np.array([float(x) for x in parts[5:8]])
+                except ValueError:
+                    continue          # not a header line after all
+                R = _quat_to_R(qw, qx, qy, qz)
+                centers.append(-R.T @ t)
+                dirs.append(R[2, :])
+                # the NEXT line holds that image's 2D points -> skip it
+                f.readline()
+    except OSError:
+        return None
+    if not centers:
+        return None
+    out = (np.asarray(centers, dtype=np.float64),
+           np.asarray(dirs, dtype=np.float64))
+    _CAM_CACHE[key] = out
+    return out
+
+
 def read_gaussian_ply(path: str, use_cache: bool = True) -> GaussianData:
     """Parse a 3DGS PLY into GaussianData. Cached by absolute path."""
     key = os.path.abspath(path)
