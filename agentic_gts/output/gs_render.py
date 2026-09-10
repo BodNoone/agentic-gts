@@ -302,6 +302,86 @@ def _subset_gs(gs: GaussianData, mask: np.ndarray) -> GaussianData:
     return sub
 
 
+def inject_top_filler(gs: GaussianData, cut_z: float,
+                      cut_z_low: float = 0.30, cell: float = 0.05,
+                      min_pts: int = 4, gray: float = 0.45,
+                      scale_m: float = 0.03) -> GaussianData:
+    """Complete device TOP faces with flat gray gaussians where the POINT
+    SUPPORT says a device stands -- never where a box claims one.
+
+    Why: racks carry overhead cable trays that occluded the top faces
+    during 3DGS training; once the render cuts the trays away the exposed
+    top gaussians are undertrained and the near-top-down views come out
+    blurry holes. The device's side faces, scanned from the aisles, are
+    dense -- so the XY occupancy of points in the device height band
+    marks exactly where devices stand, and each column's own vertical
+    extent gives its top height.
+
+    Filler derives from the point cloud ONLY: a mis-boxed device still
+    gets a top plate that follows the real support, so the plate's EDGES
+    are genuine evidence (an overhanging wireframe is visibly not on the
+    gray plate) instead of self-confirmation. Columns without points get
+    nothing -- the VLM sees the honest empty aisle.
+
+    Points are added to a COPY in memory (the source PLY is untouched):
+    small isotropic scale, near-full opacity, flat gray. z sits at the
+    column's 95th-percentile point height, capped just below cut_z so the
+    render's ceiling cut cannot remove it.
+    """
+    if not np.isfinite(cut_z) or len(gs) == 0:
+        return gs
+    means = np.asarray(gs.means, dtype=np.float64)
+    lo = cut_z_low if np.isfinite(cut_z_low) else float("-inf")
+    band = means[(means[:, 2] > lo) & (means[:, 2] < cut_z)]
+    if len(band) < 50:
+        return gs
+
+    x0 = band[:, 0].min() - cell
+    y0 = band[:, 1].min() - cell
+    nx = int((band[:, 0].max() - x0) / cell) + 2
+    ny = int((band[:, 1].max() - y0) / cell) + 2
+    ix = ((band[:, 0] - x0) / cell).astype(np.int64)
+    iy = ((band[:, 1] - y0) / cell).astype(np.int64)
+    flat = ix * ny + iy
+    counts = np.bincount(flat, minlength=nx * ny)
+    filled = np.nonzero(counts >= min_pts)[0]
+    if len(filled) == 0:
+        return gs
+
+    # per-column top height: group the band points by cell, 95th pct z
+    order = np.argsort(flat, kind="stable")
+    z_sorted = band[order, 2]
+    f_sorted = flat[order]
+    starts = np.searchsorted(f_sorted, filled, side="left")
+    ends = np.searchsorted(f_sorted, filled, side="right")
+    zs = np.empty(len(filled))
+    for k, (a, b) in enumerate(zip(starts, ends)):
+        zs[k] = np.percentile(z_sorted[a:b], 95)
+    zs = np.minimum(zs, cut_z - 0.02)
+    zs = np.maximum(zs, lo + 0.20 if np.isfinite(lo) else 0.20)
+
+    fx, fy = filled // ny, filled % ny     # flat = ix*ny + iy
+    fm = np.column_stack([x0 + (fx + 0.5) * cell,
+                           y0 + (fy + 0.5) * cell, zs])
+    n = len(fm)
+    from agentic_gts.tools.gs_io import GaussianData as _GD
+    extra = _GD(
+        means=fm.astype(np.float32),
+        log_scales=np.full((n, 3), float(np.log(scale_m)), dtype=np.float32),
+        quats=np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+                      (n, 1)),
+        raw_opacity=np.full(n, 6.0, dtype=np.float32),
+        f_dc=np.full((n, 3), (gray - 0.5) / SH_C0, dtype=np.float32),
+    )
+    return _GD(
+        means=np.vstack([gs.means, extra.means]),
+        log_scales=np.vstack([gs.log_scales, extra.log_scales]),
+        quats=np.vstack([gs.quats, extra.quats]),
+        raw_opacity=np.concatenate([gs.raw_opacity, extra.raw_opacity]),
+        f_dc=np.vstack([gs.f_dc, extra.f_dc]),
+    )
+
+
 def _try_gsplat(means, quats, scales, opac, rgb, V_cv, K, W, H):
     import torch
     from gsplat.rendering import rasterization
