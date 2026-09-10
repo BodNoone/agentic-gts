@@ -294,6 +294,31 @@ def run_pipeline(scene: Scene,
     _eval("stageA")
     _render_stage(scene, "stageA_coarse", out_dir, gt_boxes)
 
+    # --- stage A-G: VLM 2D grounding (optional) ---
+    # The initial boxes are downgraded to HINTS: the VLM outlines every
+    # device structure on a top-down view (a joined row = ONE region),
+    # geometry turns each region into a full-depth row box, and a split
+    # pass resolves how many cabinets each row contains. Replaces the
+    # per-box two-phase refine: the region IS the whole device extent,
+    # so the thin-fragment problem never arises.
+    judge = None
+    if opts.get("vlm_ground"):
+        judge = VLMJudge(backend=vlm_backend, api_base=vlm_api_base,
+                         model=vlm_model,
+                         thinking_model=vlm_thinking_model,
+                         thinking_api_base=vlm_thinking_base)
+        try:
+            judge.set_record(os.path.join(out_dir, "vlm_records.jsonl"))
+        except Exception as e:
+            print(f"[warn] record path set failed ({type(e).__name__}: {e})")
+        from agentic_gts.agent.ground import ground_stage, split_stage
+        if ground_stage(scene, judge, out_dir):
+            split_stage(scene, judge, out_dir)
+            opts["vlm_grounded"] = True
+            _diag_support(scene)
+            _eval("stageG")
+            _render_stage(scene, "stageG_ground", out_dir, gt_boxes)
+
     # --- stage B: deterministic rules ---
     _, issues = apply_rules(scene, opts)
     print(f"[stageB] rules applied -> {len(scene.boxes)} boxes, {len(issues)} issues noted")
@@ -302,10 +327,11 @@ def run_pipeline(scene: Scene,
     _render_stage(scene, "stageB_rules", out_dir, gt_boxes)
 
     # --- stage C: agent loop ---
-    judge = VLMJudge(backend=vlm_backend, api_base=vlm_api_base,
-                     model=vlm_model,
-                     thinking_model=vlm_thinking_model,
-                     thinking_api_base=vlm_thinking_base)
+    if judge is None:      # the grounding stage may have created it already
+        judge = VLMJudge(backend=vlm_backend, api_base=vlm_api_base,
+                         model=vlm_model,
+                         thinking_model=vlm_thinking_model,
+                         thinking_api_base=vlm_thinking_base)
     # record every adjudication (prompt + answer + choice + confidence) to a
     # JSONL so the user can audit why the agent decided each issue
     try:

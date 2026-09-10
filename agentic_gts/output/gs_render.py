@@ -71,6 +71,30 @@ def _bbox(pts: np.ndarray):
     return lo, hi
 
 
+def unproject_ground(cam: Cam, uvs: np.ndarray, z_plane: float) -> np.ndarray:
+    """Nx2 pixel coords -> Nx3 world points on the z=z_plane plane.
+
+    Exact inverse of Cam.project_cv (CV convention: x right, y down, z
+    forward). Used by the VLM grounding stage: the model answers in
+    image-space rectangles; the ray through each corner hits the
+    device-height plane and gives the world XY footprint. For a true
+    nadir camera the rays are parallel, so the plane height is
+    irrelevant; it only matters for a slightly tilted view.
+    """
+    uvs = np.atleast_2d(np.asarray(uvs, dtype=np.float64))
+    Kinv = np.linalg.inv(cam.K())
+    V = cam.view_cv()
+    R, t = V[:3, :3], V[:3, 3]
+    centre = -R.T @ t                       # camera centre (world)
+    homo = np.hstack([uvs, np.ones((len(uvs), 1))])
+    rays_cam = (Kinv @ homo.T).T            # ray dirs in camera frame
+    rays_world = rays_cam @ R                # row-wise R.T @ ray
+    denom = rays_world[:, 2].copy()
+    denom[np.abs(denom) < 1e-9] = 1e-9
+    s = (z_plane - centre[2]) / denom
+    return centre[None, :] + s[:, None] * rays_world
+
+
 def _footprint(points: np.ndarray, boxes, pad_frac: float = 0.03):
     """(center, half_diag, loft, lohi) framing the DEVICE LAYOUT.
 

@@ -453,28 +453,76 @@ def render_godview_png(points: np.ndarray, boxes, max_points: int = 250_000,
 def _extract_json(text: str):
     """Best-effort JSON object extraction from a VLM reply.
 
-    The fit prompt asks for reasoning sentences FIRST and the JSON on the
-    LAST line, so multiple {...} spans can appear -- prefer the last
-    well-formed one. Handles plain replies (single JSON) unchanged.
+    The prompts ask for reasoning sentences FIRST and the JSON on the LAST
+    line, so multiple {...} spans can appear -- prefer the last
+    well-formed one. Balanced-brace scanning keeps NESTED replies intact:
+    a regex like {[^{}]*} only ever matches the innermost objects (e.g.
+    one region dict instead of the {"regions": [...]} wrapper around
+    them), silently losing the answer key.
     """
-    import re
-    cands = re.findall(r"\{[^{}]*\}", text)
-    for c in reversed(cands):
-        try:
-            return json.loads(c)
-        except json.JSONDecodeError:
-            continue
-    m = re.search(r"\{.*\}", text, re.S)  # nested-JSON fallback
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return None
+    top, inner = [], []          # top-level spans vs nested ones
+    stack = []
+    for i, ch in enumerate(text):
+        if ch == "{":
+            stack.append(i)
+        elif ch == "}" and stack:
+            j = stack.pop()
+            (top if not stack else inner).append(text[j:i + 1])
+    for cands in (top, inner):
+        for c in reversed(cands):
+            try:
+                return json.loads(c)
+            except json.JSONDecodeError:
+                continue
+    return None
 
 
 def _png_to_b64(png_bytes: bytes) -> str:
     return base64.b64encode(png_bytes).decode("ascii")
+
+
+def _render_split_views(scene, box, extent: float = 1.2):
+    """Two-panel evidence image for the row-split question: the row box's
+    FRONT face (azim ~0) and BACK face (azim ~180), each best-of nearby
+    azimuths with the same quality/visibility selection as the local
+    view. Both long faces are needed because a joined row's cabinet
+    boundaries are door seams -- often clearer on one face than the
+    other. Falls back to the single top-down view where the row's
+    internal gaps are still visible.
+
+    Returns (image, quality_dict)."""
+    gs_ply = scene.meta.get("gs_ply")
+    if gs_ply:
+        try:
+            from agentic_gts.tools.gs_io import read_gaussian_ply
+            from agentic_gts.output.gs_render import (make_local_cam,
+                                                      render_slot_candidates)
+            gs = read_gaussian_ply(gs_ply)
+            cut_z = box.center[2] + box.size[2] / 2.0 - 0.08
+            iso = extent + 1.0
+            faces = {
+                "front": ((18.0, 0.0), (18.0, 12.0), (18.0, -12.0)),
+                "back": ((18.0, 180.0), (18.0, 168.0), (18.0, 192.0)),
+            }
+            views, quality = [], {}
+            for name, cands in faces.items():
+                img, q, chosen = render_slot_candidates(
+                    gs, [box],
+                    lambda e, a: make_local_cam([box], extent=extent * 2,
+                                                elev_deg=e, azim_deg=a),
+                    cands, cut_z=cut_z, overlay="wire3d", iso_margin=iso)
+                if img is None:
+                    continue
+                views.append(img)
+                quality[name] = dict(q, view=[chosen[0], chosen[1]])
+            if views:
+                return _tile_views(views, labels=list(quality)), quality
+        except Exception as e:
+            print(f"[gs][split] true render failed ({type(e).__name__}: {e}) "
+                  f"-> top-down fallback")
+    img = render_topdown_image(scene.points, [box], extent=extent,
+                               gs_ply=gs_ply)
+    return img, {}
 
 
 class VLMJudge:
@@ -918,6 +966,189 @@ class VLMJudge:
                 out.append({"index": idx,
                            "reason": str(item.get("reason", ""))[:80]})
         return out
+
+    # ---- global 2D grounding (rows as whole regions) ----
+    _GROUND_PROMPT = (
+        "You are looking at a TOP-DOWN view of a data-center room (ceiling "
+        "removed). Rows of tall server racks / cabinets appear as solid "
+        "bright bands; aisles are dark or empty; walls are thin lines at "
+        "the room boundary. Thin GRAY dashed outlines with centre crosses "
+        "mark rough initial detections -- HINTS ONLY: they are often "
+        "fragmented, shifted, or missing entirely. Ignore them wherever "
+        "they disagree with what you actually see.\n\n"
+        "Task: output ONE axis-aligned rectangle per DEVICE STRUCTURE, "
+        "covering its full footprint. A continuous row of joined cabinets "
+        "counts as ONE rectangle spanning the WHOLE row (do NOT split it "
+        "into individual cabinets). Structures separated by an aisle or a "
+        "clear gap get separate rectangles. Do NOT box walls, pillars, "
+        "columns, or floor clutter.\n\n"
+        "Work step by step:\n"
+        "1. List each device structure you see with one short sentence "
+        "(row / single cabinet, roughly where).\n"
+        "2. Then output ONE JSON object on the LAST line:\n"
+        '{"regions": [{"x0": <int>, "y0": <int>, "x1": <int>, "y1": <int>}, ...]}\n'
+        "Pixel coordinates, origin at the TOP-LEFT corner of the image, x "
+        "rightward, y downward, x0 < x1, y0 < y1."
+    )
+
+    def ground_regions(self, png: bytes, W: int, H: int,
+                       png_path: str | None = None) -> list[tuple]:
+        """2D grounding over the top-down view: outline EVERY device
+        structure (a joined row = one region).
+
+        Returns pixel rects [(x0, y0, x1, y1)] or [] on mock / failure.
+        Runs on the thinking tier when configured: one call per run, and
+        these regions BECOME the pipeline's boxes (high stakes)."""
+        if self.backend == "mock":
+            return []
+        use_thinking = bool(self.thinking_model)
+        try:
+            for thinking in ((True, False) if use_thinking else (False,)):
+                try:
+                    if self.backend == "local":
+                        text = self._local_image_call(
+                            png, self._GROUND_PROMPT,
+                            max_new_tokens=2048 if thinking else 900,
+                            thinking=thinking)
+                    else:
+                        text = self._qwen_image_call(
+                            png, self._GROUND_PROMPT,
+                            max_tokens=2048 if thinking else 900,
+                            thinking=thinking)
+                    break
+                except Exception as e:
+                    if not thinking:
+                        raise
+                    print(f"[vlm][ground][thinking] failed "
+                          f"({type(e).__name__}: {e}) -> fast model")
+        except Exception as e:
+            print(f"[vlm][ground] failed ({type(e).__name__}: {e}) "
+                  f"-> no grounding")
+            return []
+        data = _extract_json(text)
+        if not isinstance(data, dict):
+            print(f"[vlm][ground] unparseable reply -> no grounding: "
+                  f"{text[:120]!r}")
+            return []
+        rects = []
+        for item in data.get("regions", []) or []:
+            try:
+                x0, y0 = float(item["x0"]), float(item["y0"])
+                x1, y1 = float(item["x1"]), float(item["y1"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            x0, x1 = min(x0, x1), max(x0, x1)
+            y0, y1 = min(y0, y1), max(y0, y1)
+            x0, y0 = max(0.0, x0), max(0.0, y0)
+            x1, y1 = min(float(W), x1), min(float(H), y1)
+            if x1 - x0 >= 8.0 and y1 - y0 >= 8.0:
+                rects.append((x0, y0, x1, y1))
+        self._record("ground", self._GROUND_PROMPT, text or "",
+                    f"{len(rects)} regions", 0.5, "", png_path=png_path)
+        return rects
+
+    # ---- per-row split (how many cabinets in one row box) ----
+    _SPLIT_PROMPT = (
+        "You are auditing ONE row structure in a data center. The image is "
+        "a composite of up to TWO views of the SAME row, tiled side by "
+        "side, each labeled above the panel: 'front' and 'back' (the two "
+        "opposite long faces of the row; in a fallback render a single "
+        "top-down view is shown instead). The red wireframe marks the row "
+        "box -- it spans the WHOLE row by design, so do NOT flag its "
+        "ends.\n\n"
+        "The row may contain MULTIPLE separate cabinets joined side by "
+        "side, or a single wide cabinet. Judge the cabinet units by door "
+        "seams, panel boundaries, and the width rhythm; use BOTH faces "
+        "(seams are often clearer on one side).\n\n"
+        "Work step by step:\n"
+        "1. Write ONE short sentence per view about how many distinct "
+        "cabinet units you count and where the boundaries are.\n"
+        "2. Then output ONE JSON object on the LAST line:\n"
+        '{"count": <int>, "gaps": [<float>, ...]}\n'
+        "- count: how many distinct cabinet units the row contains.\n"
+        "- gaps: for count > 1, the internal boundary positions as "
+        "fractions 0.0-1.0 along the row, measured in the FRONT view "
+        "from its LEFT edge to its RIGHT edge (count-1 values, "
+        "increasing). Empty list when count is 1."
+    )
+
+    @staticmethod
+    def _parse_split_reply(text: str) -> dict | None:
+        """Parse the split reply. None = keep whole (unparseable -> no
+        split is the safe default)."""
+        data = _extract_json(text)
+        if not isinstance(data, dict):
+            return None
+        try:
+            count = int(data.get("count", 1))
+        except (TypeError, ValueError):
+            return None
+        count = max(1, min(count, 40))
+        gaps = []
+        for g in data.get("gaps", []) or []:
+            try:
+                g = float(g)
+            except (TypeError, ValueError):
+                continue
+            if 0.02 < g < 0.98:
+                gaps.append(min(max(g, 0.02), 0.98))
+        gaps = sorted(set(round(g, 4) for g in gaps))[: max(count, 1)]
+        return {"count": count, "gaps": gaps}
+
+    def adjudicate_split(self, scene, box) -> Verdict:
+        """How many cabinets does one whole-row box contain, and where
+        are the internal boundaries? Renders the row's two long faces.
+        Mock / any failure degrades to keep (no split without evidence
+        -- an over-split row is far harder to repair downstream)."""
+        if self.backend == "mock":
+            return Verdict(action="keep", params={"count": 1, "gaps": []},
+                           confidence=0.5, detail="mock: no split")
+        try:
+            img, quality = _render_split_views(scene, box)
+        except Exception as e:
+            print(f"[vlm][split] render failed ({type(e).__name__}: {e}) "
+                  f"-> keep whole")
+            return Verdict(action="keep", params={"count": 1, "gaps": []},
+                           confidence=0.3, detail=f"render failed: {e}")
+        from agentic_gts.output.gs_render import png_bytes as _pb
+        png = _pb(img)
+        png_path = self._save_evidence_png(
+            img, f"split_evidence_{box.box_id[:8]}.png")
+        use_thinking = bool(self.thinking_model)
+        text = None
+        try:
+            for thinking in ((True, False) if use_thinking else (False,)):
+                try:
+                    if self.backend == "local":
+                        text = self._local_image_call(
+                            png, self._SPLIT_PROMPT,
+                            max_new_tokens=2048 if thinking else 300,
+                            thinking=thinking)
+                    else:
+                        text = self._qwen_image_call(
+                            png, self._SPLIT_PROMPT,
+                            max_tokens=2048 if thinking else 300,
+                            thinking=thinking)
+                    break
+                except Exception as e:
+                    if not thinking:
+                        raise
+                    print(f"[vlm][split][thinking] failed "
+                          f"({type(e).__name__}: {e}) -> fast model")
+        except Exception as e:
+            print(f"[vlm][split] failed ({type(e).__name__}: {e}) -> keep")
+            return Verdict(action="keep", params={"count": 1, "gaps": []},
+                           confidence=0.3, detail=f"call failed: {e}")
+        p = self._parse_split_reply(text)
+        if p is None:
+            print(f"[vlm][split] unparseable reply -> keep: {text[:120]!r}")
+            return Verdict(action="keep", params={"count": 1, "gaps": []},
+                           confidence=0.3, detail="unparseable")
+        self._record("split", self._SPLIT_PROMPT, text or "",
+                    f"count={p['count']} gaps={p['gaps']}", 0.6,
+                    "", png_path=png_path, quality=quality or None)
+        return Verdict(action="keep" if p["count"] <= 1 else "split",
+                       params=p, confidence=0.6, detail="")
 
     # ---- fine-grained fit refinement (size + yaw around z) ----
     _FIT_PROMPT = (

@@ -420,7 +420,15 @@ class LayoutAgent:
         completed depth) trusted throughout. A hallucinated nomination
         is inert by construction: 'short' with no points beyond the edge
         re-fits to the same span, 'over' with full support keeps it.
+
+        SKIPPED under VLM grounding: the grounded row boxes already span
+        the region the VLM outlined (both faces, full depth), and the
+        split stage resolved the interior -- there is no per-box misfit
+        left for this pass to repair.
         """
+        if self.opts.get("vlm_grounded"):
+            print("[vlm][refine] skipped (VLM-grounded boxes)")
+            return
         for b in list(scene.boxes):
             cur = b
             # ---- phase 1: yaw from the oblique near-top-down view ----

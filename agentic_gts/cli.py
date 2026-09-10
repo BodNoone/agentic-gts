@@ -84,6 +84,9 @@ def cmd_run(args):
         import math as _math
         opts["yaw"] = _math.radians(args.yaw)
         print(f"[cli] yaw pinned by user: {args.yaw} deg (estimation skipped)")
+    if getattr(args, "vlm_ground", False):
+        opts["vlm_ground"] = True
+        print("[cli] VLM 2D grounding enabled (initial boxes = hints only)")
     for kv in args.stage_a_opts or []:
         if "=" not in kv:
             print(f"[cli] ignoring malformed --stage-a-opt '{kv}' (want key=value)")
@@ -221,6 +224,12 @@ def main():
     r.add_argument("--vlm-thinking-base", default=None,
                    help="API base for the thinking model if served separately "
                         "(defaults to --vlm-base, also env VLM_THINKING_API_BASE)")
+    r.add_argument("--vlm-ground", action="store_true", default=False,
+                   help="VLM 2D grounding: the initial boxes are used only as "
+                        "hints; the VLM outlines every device structure on a "
+                        "top-down view (a joined row = ONE region), geometry "
+                        "fits full-depth row boxes, and a front/back split "
+                        "pass resolves how many cabinets each row contains")
     r.add_argument("--edge-thr", type=float, default=0.05)
     r.add_argument("--yaw", type=float, default=None,
                    help="pin device row yaw in degrees (skips estimation)")
