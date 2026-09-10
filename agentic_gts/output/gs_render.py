@@ -304,8 +304,7 @@ def _subset_gs(gs: GaussianData, mask: np.ndarray) -> GaussianData:
 
 def inject_top_filler(gs: GaussianData, cut_z: float,
                       cut_z_low: float = 0.30, cell: float = 0.05,
-                      min_pts: int = 4, gray: float = 0.45,
-                      scale_m: float = 0.03) -> GaussianData:
+                      min_pts: int = 4, gray: float = 0.45) -> GaussianData:
     """Cap devices with a flat gray LID where the top surface is a blurry
     undertrained slab -- classified from each column's vertical profile
     (the cross-section), never from box geometry.
@@ -333,10 +332,13 @@ def inject_top_filler(gs: GaussianData, cut_z: float,
     plane get a lid: the trays ran overhead, so only the tallest level's
     tops were occluded -- lower structures' tops were seen from the
     aisles and are well-trained (capping them would hide real texture).
-    A lid is one coherent plane covering its region; it sits just ABOVE
-    the slab so the rasterizer (nearer to the camera = drawn over) hides
-    the blur, and is clamped below cut_z so the render's ceiling cut
-    cannot remove it.
+    A lid REPLACES the slab rather than covering it: the undertrained
+    top gaussians are BLOATED (large scales), so a thin plate floating
+    3 cm above their centers still shows their garbled texture poking
+    through. The slab gaussians under each lid are dropped from the
+    in-memory render copy, and a dense opaque gray plate (2.5 cm
+    sub-grid, overlapping ~4.5 cm splats) becomes the top surface,
+    clamped below cut_z so the render's ceiling cut cannot remove it.
 
     Everything derives from the point cloud only; the source PLY is
     untouched (points join an in-memory copy).
@@ -421,32 +423,53 @@ def inject_top_filler(gs: GaussianData, cut_z: float,
     top_plane = max(p for p, _ in regions)
     regions = [(p, k) for p, k in regions if p >= top_plane - 0.15]
 
-    filler = []
+    lid_cells = np.zeros(ncell, dtype=bool)
+    slab_floor = np.full(ncell, np.nan)
+    zlid_of = np.full(ncell, np.nan)
     for plane, keep in regions:
-        zlid = min(plane + 0.03, cut_z - 0.02)
-        px = x0 + (keep // ny + 0.5) * cell
-        py = y0 + (keep % ny + 0.5) * cell
-        filler.extend(zip(px, py, [zlid] * len(keep)))
-    if not filler:
-        return gs
+        zlid = min(plane + 0.05, cut_z - 0.02)
+        lid_cells[keep] = True
+        slab_floor[keep] = plane - 0.50
+        zlid_of[keep] = zlid
 
-    fm = np.asarray(filler, dtype=np.float64)
+    # ---- the lid REPLACES the slab, not just covers it ----
+    # The undertrained top gaussians are BLOATED (large scales): a plate
+    # floating 3 cm above their centers still shows their garbled texture
+    # poking through the gaps. Drop the slab gaussians under each lid
+    # (in-memory render copy only; the source PLY is untouched) so the
+    # dense opaque filler IS the top surface there.
+    mflat = (np.clip(((means[:, 0] - x0) / cell).astype(np.int64), 0, nx - 1)
+             * ny
+             + np.clip(((means[:, 1] - y0) / cell).astype(np.int64),
+                       0, ny - 1))
+    drop = lid_cells[mflat] & (means[:, 2] >= slab_floor[mflat])
+    base = _subset_gs(gs, ~drop) if drop.any() else gs
+
+    # ---- dense opaque filler: 2x2 sub-grid per cell, overlapping ----
+    cells = np.nonzero(lid_cells)[0]
+    zl = zlid_of[cells]
+    parts = []
+    for dx, dy in ((0.25, 0.25), (0.25, 0.75), (0.75, 0.25), (0.75, 0.75)):
+        parts.append(np.column_stack([
+            x0 + (cells // ny + dx) * cell,
+            y0 + (cells % ny + dy) * cell, zl]))
+    fm = np.vstack(parts)
     n = len(fm)
     from agentic_gts.tools.gs_io import GaussianData as _GD
     extra = _GD(
         means=fm.astype(np.float32),
-        log_scales=np.full((n, 3), float(np.log(scale_m)), dtype=np.float32),
+        log_scales=np.full((n, 3), float(np.log(0.045)), dtype=np.float32),
         quats=np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
                       (n, 1)),
-        raw_opacity=np.full(n, 6.0, dtype=np.float32),
+        raw_opacity=np.full(n, 12.0, dtype=np.float32),
         f_dc=np.full((n, 3), (gray - 0.5) / SH_C0, dtype=np.float32),
     )
     return _GD(
-        means=np.vstack([gs.means, extra.means]),
-        log_scales=np.vstack([gs.log_scales, extra.log_scales]),
-        quats=np.vstack([gs.quats, extra.quats]),
-        raw_opacity=np.concatenate([gs.raw_opacity, extra.raw_opacity]),
-        f_dc=np.vstack([gs.f_dc, extra.f_dc]),
+        means=np.vstack([base.means, extra.means]),
+        log_scales=np.vstack([base.log_scales, extra.log_scales]),
+        quats=np.vstack([base.quats, extra.quats]),
+        raw_opacity=np.concatenate([base.raw_opacity, extra.raw_opacity]),
+        f_dc=np.vstack([base.f_dc, extra.f_dc]),
     )
 
 

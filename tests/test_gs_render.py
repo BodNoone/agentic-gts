@@ -137,8 +137,9 @@ def test_inject_top_filler_lids_cross_section():
                             rng.uniform(0.0, 4.0, n)])
     gs = _gs(np.vstack([face, top_hi, top_lo, wall]))
     out = inject_top_filler(gs, cut_z=2.4)
-    fm = np.asarray(out.means)[len(gs):]
-    assert len(fm) > 20, f"expected a lid over the tall top region, got {len(fm)}"
+    m = np.asarray(out.means)
+    fm = m[out.raw_opacity == 12.0]      # filler points: raw opacity 12
+    assert len(fm) > 40, f"expected a lid over the tall top region, got {len(fm)}"
     # lid ONLY over the tall top-slab region (x in [1.1, 2.0])
     assert 1.05 <= fm[:, 0].min() and fm[:, 0].max() <= 2.05, \
         f"lid leaked outside the tall top region: x=[{fm[:, 0].min():.2f}," \
@@ -147,12 +148,26 @@ def test_inject_top_filler_lids_cross_section():
     assert np.allclose(fm[:, 2], fm[0, 2]), \
         f"lid not planar: z range [{fm[:, 2].min():.3f},{fm[:, 2].max():.3f}]"
     assert 1.94 < fm[0, 2] < 2.4, f"lid height off: {fm[0, 2]:.3f}"
-    # flat gray, small, opaque
-    assert abs(out.log_scales[len(gs):].max() - float(np.log(0.03))) < 1e-6
-    assert (out.raw_opacity[len(gs):] == 6.0).all()
+    # THE SLAB IS REPLACED, not covered: the blurry tall-top gaussians
+    # (x in [1.1,2], z in [1.5,1.93]) are dropped from the render copy --
+    # only the lid (~1.99) remains there
+    slab_left = ((m[:, 0] > 1.1) & (m[:, 0] < 2.0)
+                 & (m[:, 2] > 1.5) & (m[:, 2] < 1.93)).sum()
+    assert slab_left <= 5, \
+        f"blurry slab still under the lid ({slab_left} pts poke through)"
+    # everything else survives untouched: faces, LOW tops, walls
+    for lo_x, hi_x, lo_z, hi_z, what in ((0.0, 1.0, 0.0, 1.95, "faces"),
+                                         (2.1, 3.0, 0.90, 1.00, "low tops"),
+                                         (3.5, 4.5, 0.0, 4.0, "walls")):
+        cnt = ((m[:, 0] > lo_x) & (m[:, 0] < hi_x)
+               & (m[:, 2] > lo_z) & (m[:, 2] < hi_z)).sum()
+        assert cnt > 500, f"{what} were damaged: only {cnt} pts left"
+    # dense opaque filler: overlapping splats, near-full opacity
+    assert abs(out.log_scales[len(m) - len(fm)].max()
+               - float(np.log(0.045))) < 1e-6
     print(f"PASS top filler lids cross-section ({len(fm)} pts, "
           f"plane z={fm[0, 2]:.3f}, x=[{fm[:, 0].min():.2f},"
-          f"{fm[:, 0].max():.2f}]; faces, low tops and walls untouched)")
+          f"{fm[:, 0].max():.2f}]; slab replaced, faces/low tops/walls kept)")
 
 
 def test_gs_roundtrip_binary(tmp_path=None):
