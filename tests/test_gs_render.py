@@ -94,12 +94,14 @@ def test_colmap_views_missing_returns_none():
 
 def test_inject_top_filler_lids_cross_section():
     """The filler classifies each column from its vertical profile and
-    caps ONLY the blurry top slabs, as ONE coherent plane per region:
+    caps ONLY the blurry HIGHEST top slabs, as ONE coherent plane per
+    region:
       face columns (points floor->top: well-trained texture) -> NO cap,
       top columns (points clustered in a thin slab: blurry top)  -> cap,
-      wall columns (structure continuing above the cut)          -> NO cap.
+      wall columns (structure continuing above the cut)          -> NO cap,
+      LOWER top slabs (well-trained, seen from aisles)            -> NO cap.
     The lid must be uniform in z, sit just ABOVE the slab (so the
-    rasterizer hides the blur), and only over the top-column region."""
+    rasterizer hides the blur), and only over the HIGHEST top region."""
     from agentic_gts.output.gs_render import inject_top_filler
     from agentic_gts.tools.gs_io import GaussianData
 
@@ -120,23 +122,28 @@ def test_inject_top_filler_lids_cross_section():
     face = np.column_stack([rng.uniform(0.0, 1.0, n),
                             rng.uniform(-0.5, 0.5, n),
                             rng.uniform(0.0, 1.95, n)])
-    # top region x in [1.1, 2.0]: blurry top slab, points near z ~1.8-1.95
-    top = np.column_stack([rng.uniform(1.1, 2.0, n),
-                           rng.uniform(-0.5, 0.5, n),
-                           rng.uniform(1.80, 1.95, n)])
-    # wall region x in [3.0, 4.0]: full height 0 -> 4.0
-    wall = np.column_stack([rng.uniform(3.0, 4.0, n),
+    # tall top region x in [1.1, 2.0]: blurry top slab, z ~1.80-1.95
+    top_hi = np.column_stack([rng.uniform(1.1, 2.0, n),
+                              rng.uniform(-0.5, 0.5, n),
+                              rng.uniform(1.80, 1.95, n)])
+    # LOWER top region x in [2.1, 3.0]: top slab at z ~1.0 (short rack)
+    # -- well-trained (seen over the aisle), must NOT be capped
+    top_lo = np.column_stack([rng.uniform(2.1, 3.0, n),
+                              rng.uniform(-0.5, 0.5, n),
+                              rng.uniform(0.90, 1.00, n)])
+    # wall region x in [3.5, 4.5]: full height 0 -> 4.0
+    wall = np.column_stack([rng.uniform(3.5, 4.5, n),
                             rng.uniform(-0.5, 0.5, n),
                             rng.uniform(0.0, 4.0, n)])
-    gs = _gs(np.vstack([face, top, wall]))
+    gs = _gs(np.vstack([face, top_hi, top_lo, wall]))
     out = inject_top_filler(gs, cut_z=2.4)
     fm = np.asarray(out.means)[len(gs):]
-    assert len(fm) > 20, f"expected a lid over the top region, got {len(fm)}"
-    # lid ONLY over the top-slab region
+    assert len(fm) > 20, f"expected a lid over the tall top region, got {len(fm)}"
+    # lid ONLY over the tall top-slab region (x in [1.1, 2.0])
     assert 1.05 <= fm[:, 0].min() and fm[:, 0].max() <= 2.05, \
-        f"lid leaked outside the top region: x=[{fm[:, 0].min():.2f}," \
+        f"lid leaked outside the tall top region: x=[{fm[:, 0].min():.2f}," \
         f"{fm[:, 0].max():.2f}]"
-    # ONE uniform plane height, just above the slab (slab z95 ~1.945)
+    # ONE uniform plane height, just above the tall slab (z95 ~1.945)
     assert np.allclose(fm[:, 2], fm[0, 2]), \
         f"lid not planar: z range [{fm[:, 2].min():.3f},{fm[:, 2].max():.3f}]"
     assert 1.94 < fm[0, 2] < 2.4, f"lid height off: {fm[0, 2]:.3f}"
@@ -145,7 +152,7 @@ def test_inject_top_filler_lids_cross_section():
     assert (out.raw_opacity[len(gs):] == 6.0).all()
     print(f"PASS top filler lids cross-section ({len(fm)} pts, "
           f"plane z={fm[0, 2]:.3f}, x=[{fm[:, 0].min():.2f},"
-          f"{fm[:, 0].max():.2f}]; faces and walls untouched)")
+          f"{fm[:, 0].max():.2f}]; faces, low tops and walls untouched)")
 
 
 def test_gs_roundtrip_binary(tmp_path=None):

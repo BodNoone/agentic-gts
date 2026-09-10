@@ -329,11 +329,14 @@ def inject_top_filler(gs: GaussianData, cut_z: float,
                      occupies one band and leaves gaps): NO cap.
 
     Per REGION (connected component of top columns) the plane is the
-    median column top: one rack row gets one coherent lid, and cells
-    deviating from it are dropped (a taller neighbouring device must not
-    drag the lid up). The lid sits just ABOVE the slab so the rasterizer
-    (nearer to the camera = drawn over) hides the blur, and is clamped
-    below cut_z so the render's ceiling cut cannot remove it.
+    median column top; but ONLY the regions on the HIGHEST device-top
+    plane get a lid: the trays ran overhead, so only the tallest level's
+    tops were occluded -- lower structures' tops were seen from the
+    aisles and are well-trained (capping them would hide real texture).
+    A lid is one coherent plane covering its region; it sits just ABOVE
+    the slab so the rasterizer (nearer to the camera = drawn over) hides
+    the blur, and is clamped below cut_z so the render's ceiling cut
+    cannot remove it.
 
     Everything derives from the point cloud only; the source PLY is
     untouched (points join an in-memory copy).
@@ -388,15 +391,15 @@ def inject_top_filler(gs: GaussianData, cut_z: float,
         tall = hits >= 3
 
     # top-column candidates: occupied, not a wall, points NOT spanning
-    # down (a face does), and high enough to be a device top
-    cand = occupied & ~tall & (lowf <= 0.20) & (z95 >= 0.80)
+    # down (a face does)
+    cand = occupied & ~tall & (lowf <= 0.20)
     if not cand.any():
         return gs
 
-    # ---- one coherent lid per connected region ----
+    # ---- regions of top columns, each with its own plane height ----
     from scipy.ndimage import label
     lab, nlab = label(cand.reshape(nx, ny))
-    filler = []
+    regions = []
     for r in range(1, nlab + 1):
         cells = np.nonzero((lab == r).ravel())[0]
         if len(cells) < 6:
@@ -405,6 +408,21 @@ def inject_top_filler(gs: GaussianData, cut_z: float,
         keep = cells[np.abs(z95[cells] - plane) <= 0.20]
         if len(keep) < 6:
             continue
+        regions.append((plane, keep))
+    if not regions:
+        return gs
+
+    # ---- lid ONLY the HIGHEST device-top plane ----
+    # The trays ran overhead: only the tallest level's tops were occluded
+    # (and render blurry once the trays are cut away). Lower structures'
+    # tops were seen from the aisles and are well-trained -- capping them
+    # would only hide real texture. Keep regions whose plane sits within
+    # 0.15 m of the highest one (co-level devices in the same room).
+    top_plane = max(p for p, _ in regions)
+    regions = [(p, k) for p, k in regions if p >= top_plane - 0.15]
+
+    filler = []
+    for plane, keep in regions:
         zlid = min(plane + 0.03, cut_z - 0.02)
         px = x0 + (keep // ny + 0.5) * cell
         py = y0 + (keep % ny + 0.5) * cell
