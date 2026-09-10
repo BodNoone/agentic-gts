@@ -199,23 +199,25 @@ def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
     return np.asarray(pil, dtype=np.float32) / 255.0
 
 
-def _save_grounded_png(scene, hints, boxes, yaw, out_dir) -> None:
+def _save_grounded_png(base_img, cam, hints, boxes, out_dir) -> None:
     """The grounding RESULT audit image: magenta dashed = initial hints,
-    red solid = VLM-grounded full-depth row boxes. One glance shows
-    whether the VLM outlined the right structures and whether the
-    point-support guards altered them."""
+    red solid = VLM-grounded full-depth row boxes.
+
+    Reuses the EXACT base render and camera the VLM answered on -- the
+    two images must be pixel-identical apart from the overlays, or the
+    before/after comparison is confounded by different ceiling cuts and
+    camera framing.
+    """
     import os
     try:
         from agentic_gts.output.gs_render import png_bytes
-        img, cam, _, _ = _render_topdown(scene, list(hints) + list(boxes),
-                                         yaw)
-        img = _draw_hints(img, cam, hints)
+        img = _draw_hints(base_img, cam, hints)
         img = _draw_result_boxes(img, cam, boxes)
         path = os.path.join(out_dir, "grounded.png")
         with open(path, "wb") as f:
             f.write(png_bytes(img))
         print(f"[ground] result render -> {path} "
-              f"(magenta dashed = hints, red = grounded)")
+              f"(same base as groundview.png)")
     except Exception as e:
         print(f"[ground] result render failed ({type(e).__name__}: {e})")
 
@@ -270,8 +272,15 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     if not hints:
         return False
     yaw = float(scene.meta.get("yaw", 0.0) or 0.0)
+    # ONE base render serves both images: the input view the VLM answers
+    # on (base + magenta hints) and the result audit view (same base +
+    # hints + red grounded boxes). Rendering them separately produced
+    # different ceiling cuts (fitted over hints vs hints+boxes) and
+    # camera framing -- the before/after comparison was confounded.
     try:
-        png, cam, W, H = _render_ground_view(scene, hints, yaw)
+        from agentic_gts.output.gs_render import png_bytes
+        base_img, cam, W, H = _render_topdown(scene, hints, yaw)
+        png = png_bytes(_draw_hints(base_img, cam, hints))
     except Exception as e:
         print(f"[ground] render failed ({type(e).__name__}: {e}) -> keep hints")
         return False
@@ -320,7 +329,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
           f"full-depth row boxes")
     scene.boxes = boxes
     if out_dir:
-        _save_grounded_png(scene, hints, boxes, yaw, out_dir)
+        _save_grounded_png(base_img, cam, hints, boxes, out_dir)
     return True
 
 
