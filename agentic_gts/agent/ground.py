@@ -54,14 +54,15 @@ def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
     centre shows only the racks' TOP faces -- which a ground-level
     3DGS training set barely observed, so they render as a blurry
     smear the VLM cannot ground).
-    tilt_deg!=0: the SAME fitted nadir camera tilted IN PLACE about
-    the row-frame x-axis (positive = eye swings toward +y). Up stays
-    ~+y, so the image KEEPS the god-view's orientation -- an
-    azimuth-90 SIDE camera's screen-up flips to -y and the room then
-    reads like a 180-deg rotation of the god-view (user-reported).
-    The slight tilt reveals the racks' well-trained FACES as bright
-    strips while the layout stays map-like. Eye pulled back
-    20%/cos(t) so the tilted frustum still frames the whole footprint.
+    tilt_deg!=0: the SAME fitted nadir camera TRANSLATED sideways
+    along the row-frame y-axis (eye and target shift together;
+    positive tilt = shift toward +y). Height, viewing direction, and
+    up are untouched -- user directive after the in-place-tilt attempt
+    raised the camera and changed the view. A perspective camera
+    looking straight down from an offset sees each rack's near-side
+    edge (asymmetric projection = faces turn toward the camera), so
+    the well-trained side structure becomes visible while the layout
+    stays map-like and the framing scale is unchanged.
 
     Returns (img_float, cam, W, H).
     """
@@ -87,16 +88,24 @@ def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
     # frame; the VLM prompt tells it to ignore walls.
     cam_r = make_godview_cam(pts_rot, (), nadir=True, W=W, H=H)
     if abs(tilt_deg) > 1e-6:
-        # in-place tilt of the fitted nadir camera (see docstring)
-        t = math.radians(tilt_deg)
-        tgt = np.asarray(cam_r.target, dtype=float)
-        d = float(np.linalg.norm(np.asarray(cam_r.eye, dtype=float) - tgt))
-        k = 1.2 / math.cos(t)
-        cam_r = Cam(eye=tgt + np.array([0.0, d * k * math.sin(t),
-                                        d * k * math.cos(t)]),
-                    target=tgt, up=np.array([0.0, math.cos(t),
-                                            math.sin(t)]),
-                    fovy_deg=cam_r.fovy_deg, W=W, H=H)
+        # pure TRANSLATION of the fitted nadir camera along the
+        # row-frame y-axis (eye AND target shift together; height,
+        # viewing direction, and up stay EXACTLY the original nadir's
+        # -- user directive: never raise the camera or change the view
+        # direction). A perspective camera looking straight down from
+        # an offset still sees each rack's near side EDGE: the
+        # projection is no longer symmetric about the device centre,
+        # so faces turn toward the camera -- parallax reveals the
+        # well-trained side structure the exact-nadir centre lacks,
+        # while the layout stays map-like (no flipping, no re-framing,
+        # no height change). offset sign picks the revealed side.
+        d = float(np.linalg.norm(np.asarray(cam_r.eye, dtype=float)
+                                - np.asarray(cam_r.target, dtype=float)))
+        off = np.array([0.0, math.tan(math.radians(abs(tilt_deg))) * d,
+                        0.0]) * (1.0 if tilt_deg > 0 else -1.0)
+        cam_r = Cam(eye=np.asarray(cam_r.eye, dtype=float) + off,
+                    target=np.asarray(cam_r.target, dtype=float) + off,
+                    up=cam_r.up, fovy_deg=cam_r.fovy_deg, W=W, H=H)
     # rotate the camera back into world (rotation about z: the nadir
     # axis and the tilt direction rotate with it)
     if abs(yaw) > 1e-9:
