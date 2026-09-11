@@ -157,50 +157,11 @@ def _projected_scatter(points: np.ndarray, cam, W: int, H: int) -> np.ndarray:
     return np.clip(arr.astype(np.float32) / 255.0, 0.0, 1.0)
 
 
-def _draw_hints(img: np.ndarray, cam, hints) -> np.ndarray:
-    """Magenta dashed outlines + centre crosses over the grounding view.
-
-    VLM-visible by design: 3px saturated magenta survives the vision
-    encoder's resize/patchification where the old 1px gray could vanish
-    to sub-pixel. Authority stays with the PROMPT ("hints only, ignore
-    where they disagree"), not with faintness -- a hint the model cannot
-    see is worse than one it must be told to distrust.
-    """
-    from PIL import Image, ImageDraw
-    u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3].copy()
-    pil = Image.fromarray(u8)
-    dr = ImageDraw.Draw(pil)
-    magenta = (255, 0, 255)
-    for b in hints:
-        z = b.center[2] + b.size[2] / 2.0
-        cs = b.corners_2d()
-        uv = cam.project_cv(np.column_stack([cs, np.full(len(cs), z)]))
-        pts = np.round(uv).astype(np.int32)
-        # dashed rectangle: alternate 12-px draw / 8-px skip per edge
-        for i in range(4):
-            a, c = pts[i], pts[(i + 1) % 4]
-            n = max(int(np.linalg.norm(c - a)) // 5, 1)
-            for k in range(0, n, 2):
-                t0, t1 = k / n, min((k + 1) / n, 1.0)
-                p0 = a + (c - a) * t0
-                p1 = a + (c - a) * t1
-                dr.line((*np.round(p0).astype(int), *np.round(p1).astype(int)),
-                        fill=magenta, width=3)
-        # centre cross (the 'hint point')
-        cc = cam.project_cv(np.array([[b.center[0], b.center[1], z]]))[0]
-        ci = np.round(cc).astype(int)
-        dr.line((int(ci[0] - 10), int(ci[1]), int(ci[0] + 10), int(ci[1])),
-                fill=magenta, width=2)
-        dr.line((int(ci[0]), int(ci[1] - 10), int(ci[0]), int(ci[1] + 10)),
-                fill=magenta, width=2)
-    return np.asarray(pil, dtype=np.float32) / 255.0
-
-
 # ---------- region -> 3D box ----------
 
 def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
-    """Solid red outlines for the grounded result boxes -- the audit
-    contrast to _draw_hints' gray dashed initial hints."""
+    """Solid red outlines for the grounded result boxes (result-only
+    audit: no initial-hint overlay, grounding is independent of them)."""
     from PIL import Image, ImageDraw
     u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3].copy()
     pil = Image.fromarray(u8)
@@ -217,20 +178,19 @@ def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
     return np.asarray(pil, dtype=np.float32) / 255.0
 
 
-def _save_grounded_png(base_img, cam, hints, boxes, out_dir) -> None:
-    """The grounding RESULT audit image: magenta dashed = initial hints,
-    red solid = VLM-grounded full-depth row boxes.
+def _save_grounded_png(base_img, cam, boxes, out_dir) -> None:
+    """The grounding RESULT audit image: red solid = VLM-grounded
+    full-depth row boxes over the clean nadir base the VLM answered on.
 
-    Reuses the EXACT base render and camera the VLM answered on -- the
-    two images must be pixel-identical apart from the overlays, or the
-    before/after comparison is confounded by different ceiling cuts and
-    camera framing.
+    Initial hint boxes are deliberately NOT drawn: grounding is
+    supposed to be independent of them (clean input), and re-showing
+    them here invites reading the audit as 'initial + result' when it
+    is result-only.
     """
     import os
     try:
         from agentic_gts.output.gs_render import png_bytes
-        img = _draw_hints(base_img, cam, hints)
-        img = _draw_result_boxes(img, cam, boxes)
+        img = _draw_result_boxes(base_img, cam, boxes)
         path = os.path.join(out_dir, "grounded.png")
         with open(path, "wb") as f:
             f.write(png_bytes(img))
@@ -410,7 +370,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
           f"-> {len(merged)} merged -> {len(boxes)} full-depth row boxes")
     scene.boxes = boxes
     if out_dir and base is not None:
-        _save_grounded_png(base[0], base[1], hints, boxes, out_dir)
+        _save_grounded_png(base[0], base[1], boxes, out_dir)
     return True
 
 

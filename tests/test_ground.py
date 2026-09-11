@@ -153,8 +153,8 @@ def test_ground_stage_with_patched_vlm():
     with tempfile.TemporaryDirectory() as td:
         ok = ground.ground_stage(scene, judge, out_dir=td)
         assert ok, "grounding must succeed with a valid VLM reply"
-        # the result audit image must exist: magenta dashed hints vs red
-        # grounded boxes
+        # the result audit image must exist: red grounded boxes only
+        # (no initial-hint overlay)
         assert os.path.exists(os.path.join(td, "grounded.png")), \
             "grounded.png (result audit view) was not saved"
         assert os.path.exists(os.path.join(td, "groundview.png")), \
