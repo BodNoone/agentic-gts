@@ -410,6 +410,96 @@ def _tighten_oblique(cam, r, yaw, pts_fit, frame_rect_fn):
     return tight
 
 
+# ---------- front-view height (the 2-pass fit the user asked for) ----------
+
+def _pixel_ray_z(cam, u: float, v: float, plane_p, n) -> float:
+    """World z where the pixel (u, v)'s ray crosses the vertical plane
+    through plane_p with horizontal normal n. Exact inverse of
+    Cam.project_cv along the ray (same algebra as unproject_ground,
+    plane axis generalised)."""
+    Kinv = np.linalg.inv(cam.K())
+    V = cam.view_cv()
+    R, t = V[:3, :3], V[:3, 3]
+    centre = -R.T @ t                       # camera centre (world)
+    ray = (Kinv @ np.array([u, v, 1.0])) @ R  # world ray direction
+    denom = float(ray @ n)
+    if abs(denom) < 1e-9:
+        return float("nan")
+    s = float((np.asarray(plane_p, float) - centre) @ n) / denom
+    return float((centre + s * ray)[2])
+
+
+def _front_view_height(scene, box, judge, hint_top,
+                       out_dir: str | None = None, idx: int = 0):
+    """Region height from its FRONT elevation.
+
+    The two-pass design the user specified: the top-down 2D fit owns
+    the FOOTPRINT, the front view owns the HEIGHT -- ground-level 3DGS
+    training observed rack faces well (tops are the blurry part), so
+    the VLM boxes the row floor-to-top on a front render and the bbox's
+    vertical extent, measured through the camera-facing face plane, is
+    the height in metres. The percentile z from the fit stays as the
+    fallback when the VLM answers nothing sane. Returns float | None."""
+    import os
+    from agentic_gts.output.gs_render import (make_local_cam,
+                                              render_gs_view, png_bytes)
+    W, H = 1024, 768
+    try:
+        cam = make_local_cam([box], extent=1.5, W=W, H=H,
+                             elev_deg=10.0, azim_deg=0.0)
+    except Exception as e:
+        print(f"[ground] front cam failed ({type(e).__name__}: {e})")
+        return None
+    cut = float(hint_top) + 0.10
+    img = None
+    gs_ply = scene.meta.get("gs_ply")
+    if gs_ply:
+        try:
+            from agentic_gts.tools.gs_io import read_gaussian_ply
+            gs = read_gaussian_ply(gs_ply)
+            img = render_gs_view(gs, (), cam, cut_z=cut)
+        except Exception as e:
+            print(f"[ground] front GS render failed "
+                  f"({type(e).__name__}: {e}) -> scatter")
+    if img is None:
+        pts = np.asarray(scene.points, dtype=float)
+        # floor KEPT: the VLM needs the floor-to-rack boundary at the
+        # bottom of the image to place the bbox's lower edge
+        img = _projected_scatter(pts[pts[:, 2] < cut], cam, W, H)
+    png = png_bytes(img)
+    png_path = None
+    if out_dir:
+        png_path = os.path.join(out_dir, f"frontview_{idx:02d}.png")
+        try:
+            with open(png_path, "wb") as f:
+                f.write(png)
+        except Exception as e:
+            print(f"[ground] front png save failed ({type(e).__name__})")
+            png_path = None
+    rects = judge.ground_regions(png, W, H, png_path=png_path, front=True)
+    if not rects:
+        return None
+    # the rect over THIS region: nearest x-centre to the box centre's
+    # projection (a front view may also catch the row behind the aisle)
+    ctr = np.asarray(box.center, dtype=float)
+    uv = cam.project_cv(ctr[None, :])[0]
+    best = min(rects, key=lambda r: abs((r[0] + r[2]) / 2.0 - uv[0]))
+    u = (best[0] + best[2]) / 2.0
+    yaw = float(box.yaw)
+    d = np.array([-math.sin(yaw), math.cos(yaw), 0.0])
+    face_p = ctr + d * (box.size[1] / 2.0)   # camera-facing face plane
+    z_top = _pixel_ray_z(cam, u, best[1], face_p, d)
+    z_bot = _pixel_ray_z(cam, u, best[3], face_p, d)
+    if not (np.isfinite(z_top) and np.isfinite(z_bot)):
+        return None
+    h = z_top - z_bot
+    if not (0.5 <= h <= 4.5) or z_bot > 0.6:
+        print(f"[ground] front height rejected "
+              f"(z_top {z_top:.2f}, z_bot {z_bot:.2f}) -> percentile")
+        return None
+    return float(h)
+
+
 def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     """Replace scene.boxes with VLM-grounded full-depth row boxes.
 
@@ -513,11 +603,22 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         if bb is None:
             continue
         c = _rot_xy(np.array([[bb.center[0], bb.center[1], 0.0]]), yaw)[0]
-        boxes.append(OrientedBox(center=(float(c[0]), float(c[1]),
-                                         bb.center[2]),
-                                 size=bb.size, yaw=yaw,
-                                 device_type=DeviceType.RACK,
-                                 meta={"grounded": True}))
+        box = OrientedBox(center=(float(c[0]), float(c[1]), bb.center[2]),
+                          size=bb.size, yaw=yaw,
+                          device_type=DeviceType.RACK,
+                          meta={"grounded": True})
+        # HEIGHT from the front view (user-directed division of labour):
+        # the top-down 2D fit owns the footprint; the well-trained rack
+        # FACES on a front elevation own the height. The fit's
+        # percentile z stays as the fallback when the VLM is unusable.
+        h = _front_view_height(scene, box, judge, hint_top,
+                               out_dir=out_dir, idx=len(boxes))
+        if h is not None:
+            box = OrientedBox(center=(float(c[0]), float(c[1]), h / 2.0),
+                              size=(bb.size[0], bb.size[1], h), yaw=yaw,
+                              device_type=DeviceType.RACK,
+                              meta={"grounded": True})
+        boxes.append(box)
     if not boxes:
         print("[ground] no region survived the point-support guards "
               "-> keep hints")

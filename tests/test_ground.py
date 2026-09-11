@@ -155,6 +155,11 @@ def test_ground_stage_with_patched_vlm():
     judge = VLMJudge(backend="qwen")
 
     def _fake_call(png, prompt, *a, **k):
+        # front-elevation height queries answer with nothing here: the
+        # percentile fallback keeps the fit's own z (the front-view
+        # height path is covered by test_front_view_height)
+        if "front-facing" in prompt.lower():
+            return "[]"
         # tilted views answer with nothing extra here: the nadir view
         # alone grounds both rows (the multi-view UNION path is covered
         # by test_merge_rects)
@@ -316,6 +321,63 @@ def test_tighten_oblique_rect():
           f"true 1.10)")
 
 
+def test_front_view_height():
+    """The front elevation owns the region height: the VLM bbox's
+    vertical extent, measured through the face plane, is floor-to-top
+    in metres; no VLM answer -> None (percentile fallback)."""
+    from agentic_gts.agent import ground
+    from agentic_gts.output.gs_render import make_local_cam
+    rng = np.random.default_rng(13)
+    pts = _row_points(0.0, 6.0, rng=rng)          # true height 2.1
+    scene = Scene(points=pts)
+    scene.meta["yaw"] = 0.0
+    box = _hint(3.0, 0.0, size=(6.0, 1.1, 2.1))
+    # rebuild the SAME cam _front_view_height builds (deterministic:
+    # same box, same args) and fabricate the VLM bbox from the row's
+    # TRUE floor-to-top corners projected through it
+    cam = make_local_cam([box], extent=1.5, W=1024, H=768,
+                         elev_deg=10.0, azim_deg=0.0)
+    corners = np.column_stack([
+        [0.0, 6.0, 6.0, 0.0, 0.0, 6.0, 6.0, 0.0],
+        [-0.55, -0.55, 0.55, 0.55, -0.55, -0.55, 0.55, 0.55],
+        [0.0, 0.0, 0.0, 0.0, 2.1, 2.1, 2.1, 2.1]])
+    uv = cam.project_cv(corners)
+    rect = (float(uv[:, 0].min()), float(uv[:, 1].min()),
+            float(uv[:, 0].max()), float(uv[:, 1].max()))
+
+    class _FakeJudge:
+        def ground_regions(self, png, W, H, png_path=None,
+                           oblique=False, front=False):
+            assert front, "the height query must use the front prompt"
+            return [(*rect, "rack row")]
+
+    h = ground._front_view_height(scene, box, _FakeJudge(), hint_top=2.1)
+    assert h is not None and abs(h - 2.1) < 0.08, \
+        f"front-view height {h} (true 2.10)"
+    # guards: a nonsense reply (tray-height box floating above the
+    # floor) is rejected, not averaged in
+    class _HighJudge:
+        def ground_regions(self, *a, **k):
+            # z 1.4..3.0: bottom far above the floor -> rejected
+            c2 = np.column_stack([corners[:, 0],
+                                  corners[:, 1] + 1.4,
+                                  corners[:, 2] * 0.7619 + 1.4])
+            uv2 = cam.project_cv(c2)
+            r2 = (float(uv2[:, 0].min()), float(uv2[:, 1].min()),
+                  float(uv2[:, 0].max()), float(uv2[:, 1].max()))
+            return [(*r2, "rack row")]
+    assert ground._front_view_height(
+        scene, box, _HighJudge(), hint_top=2.1) is None
+    # no VLM answer -> None (caller keeps the percentile estimate)
+    class _NoneJudge:
+        def ground_regions(self, *a, **k):
+            return []
+    assert ground._front_view_height(
+        scene, box, _NoneJudge(), hint_top=2.1) is None
+    print(f"PASS front view height ({h:.2f} m via face-plane rays, "
+          "guards + fallback verified)")
+
+
 def test_parse_ground_regions_official_format():
     """The official Qwen3-VL grounding reply format (per the 2d_grounding
     cookbook) parses correctly: bare JSON array of {"bbox_2d": [x1,y1,
@@ -417,6 +479,7 @@ if __name__ == "__main__":
     test_split_reply_parse()
     test_merge_rects_multiview_union()
     test_tighten_oblique_rect()
+    test_front_view_height()
     test_parse_ground_regions_official_format()
     test_parse_ground_regions_salvage()
     test_ground_mock_returns_false()
