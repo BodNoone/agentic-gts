@@ -21,6 +21,7 @@ import base64
 import io
 import json
 import os
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -529,6 +530,15 @@ def _parse_ground_regions(text: str, W: int, H: int) -> list[tuple]:
     happens to use small pixel values is ambiguous; relative-first is
     the correct default since that is what was asked for). The label
     is kept (default "device") for the official-style audit plot.
+
+    SALVAGE: real replies on row-heavy rooms arrive TRUNCATED (30+
+    regions overflow the generation budget) and malformed (objects
+    wrapped in parentheses instead of a JSON array, "bbox 2d" /
+    "bbox _2d" key typos) -- the structural parse then finds nothing.
+    The salvage scanner pulls every COMPLETE bbox object straight out
+    of the raw text; a truncated tail yields no match. What survived
+    is good grounding evidence: using it beats dropping everything
+    (user report: an entire grounding run silently failed this way).
     """
     items = []
     data = _extract_json(text)
@@ -560,6 +570,39 @@ def _parse_ground_regions(text: str, W: int, H: int) -> list[tuple]:
                 x1, y1 = float(item["x1"]), float(item["y1"])
             except (KeyError, TypeError, ValueError):
                 continue
+        x0, x1 = min(x0, x1), max(x0, x1)
+        y0, y1 = min(y0, y1), max(y0, y1)
+        x0, y0 = max(0.0, x0), max(0.0, y0)
+        x1, y1 = min(float(W), x1), min(float(H), y1)
+        if x1 - x0 >= 8.0 and y1 - y0 >= 8.0:
+            rects.append((x0, y0, x1, y1, label))
+    if not rects:
+        rects = _salvage_bboxes(text, W, H)
+    return rects
+
+
+_SALV_BBOX = re.compile(
+    r'["\']?bbox[\s_]*2d["\']?\s*:\s*\[\s*(-?[\d.]+\s*,\s*-?[\d.]+\s*,'
+    r'\s*-?[\d.]+\s*,\s*-?[\d.]+)\s*\]')
+_SALV_LABEL = re.compile(r'["\']?label["\']?\s*:\s*["\']([^"\']{0,20})')
+
+
+def _salvage_bboxes(text: str, W: int, H: int) -> list[tuple]:
+    """Scan the RAW text for complete bbox objects (see the salvage
+    note in _parse_ground_regions). Tolerates paren-wrapped objects,
+    key typos ("bbox 2d", "bbox _2d"), and a truncated tail. A nearby
+    label (within 80 chars after the bbox) is picked up when present."""
+    rects = []
+    for m in _SALV_BBOX.finditer(text or ""):
+        try:
+            x0, y0, x1, y1 = (float(v) for v in m.group(1).split(","))
+        except ValueError:
+            continue
+        if max(abs(x0), abs(y0), abs(x1), abs(y1)) <= 1000.0:
+            x0, x1 = x0 / 1000.0 * W, x1 / 1000.0 * W
+            y0, y1 = y0 / 1000.0 * H, y1 / 1000.0 * H
+        lm = _SALV_LABEL.search(text, m.end(), m.end() + 80)
+        label = (lm.group(1).strip() if lm else "") or "device"
         x0, x1 = min(x0, x1), max(x0, x1)
         y0, y1 = min(y0, y1), max(y0, y1)
         x0, y0 = max(0.0, x0), max(0.0, y0)
@@ -1123,15 +1166,17 @@ class VLMJudge:
         try:
             for thinking in ((True, False) if use_thinking else (False,)):
                 try:
+                    # generous budget: row-heavy rooms return 30+
+                    # regions; the old 900/2048 caps TRUNCATED the
+                    # reply mid-item and the whole grounding silently
+                    # failed (user report)
                     if self.backend == "local":
                         text = self._local_image_call(
-                            png, prompt,
-                            max_new_tokens=2048 if thinking else 900,
+                            png, prompt, max_new_tokens=6000,
                             thinking=thinking)
                     else:
                         text = self._qwen_image_call(
-                            png, prompt,
-                            max_tokens=2048 if thinking else 900,
+                            png, prompt, max_tokens=6000,
                             thinking=thinking)
                     break
                 except Exception as e:

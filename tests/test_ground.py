@@ -275,6 +275,36 @@ def test_parse_ground_regions_official_format():
     print("PASS parse official bbox_2d (0-1000 relative, fences, legacy)")
 
 
+def test_parse_ground_regions_salvage():
+    """Truncated + malformed reply still yields every COMPLETE bbox.
+
+    Real Qwen reply shape on row-heavy rooms (user report): objects
+    wrapped in parentheses instead of a JSON array, 'bbox 2d' /
+    'bbox _2d' key typos, and the tail cut off mid-item by the token
+    budget. The salvage scanner must recover all complete boxes and
+    silently drop the truncated one."""
+    from agentic_gts.agent.judge import _parse_ground_regions
+    txt = (
+        '("bbox 2d": [328, 44, 400, 118], "label": "server rack row"),\n'
+        '("bbox_2d": [424, 50, 493, 118], "label": "server rack row"),\n'
+        "('bbox _2d': [514, 73, 643, 127], \"label\": \"row\"),\n"
+        '("bbox 2d": [645, 82, 782, 133], "label": "server rack row"),\n'
+        '("bbox 2d": [627, 870, 667, 92'      # truncated tail, no match
+    )
+    px = _parse_ground_regions(txt, 1280, 1024)
+    assert len(px) == 4, f"salvage must find 4 complete boxes, got {len(px)}"
+    # relative 0-1000 grid -> pixel scaling
+    assert abs(px[0][0] - 328 / 1000 * 1280) < 1e-6
+    assert abs(px[0][3] - 118 / 1000 * 1024) < 1e-6
+    assert px[0][4] == "server rack row"
+    assert px[2][4] == "row"
+    # >1000 value = absolute pixels, not rescaled
+    big = _parse_ground_regions(
+        '("bbox 2d": [1100, 20, 1200, 900])', 1280, 1024)
+    assert big and abs(big[0][2] - 1200.0) < 1e-6
+    print("PASS parse salvage (truncated + malformed reply recovered)")
+
+
 def test_ground_mock_returns_false():
     """Mock backend / no VLM -> grounding must fail soft, keeping hints.
 
@@ -309,5 +339,6 @@ if __name__ == "__main__":
     test_split_reply_parse()
     test_merge_rects_multiview_union()
     test_parse_ground_regions_official_format()
+    test_parse_ground_regions_salvage()
     test_ground_mock_returns_false()
     print("ALL GROUND TESTS PASSED")
