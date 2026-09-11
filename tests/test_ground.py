@@ -130,13 +130,19 @@ def test_ground_stage_with_patched_vlm():
     for (xa, xb), (ya, yb) in true_rects:
         uv = cam.project_cv(np.column_stack([
             [xa, xb, xb, xa], [ya, ya, yb, yb], np.full(4, 1.0)]))
-        regions.append({"x0": float(uv[:, 0].min()),
-                        "y0": float(uv[:, 1].min()),
-                        "x1": float(uv[:, 0].max()),
-                        "y1": float(uv[:, 1].max())})
+        # clamp to the image like a real reply: the official 0-1000
+        # relative grid cannot express coordinates beyond the frame
+        px = (np.clip(uv[:, 0].min(), 0, W), np.clip(uv[:, 1].min(), 0, H),
+              np.clip(uv[:, 0].max(), 0, W), np.clip(uv[:, 1].max(), 0, H))
+        regions.append({"bbox_2d": [
+            int(round(px[0] / W * 1000)),
+            int(round(px[1] / H * 1000)),
+            int(round(px[2] / W * 1000)),
+            int(round(px[3] / H * 1000))],
+            "label": "row"})
     reply = ("Row 1: one long joined row at the bottom.\n"
              "Row 2: one long joined row above it.\n"
-             + _json.dumps({"regions": regions}))
+             + _json.dumps(regions))
 
     judge = VLMJudge(backend="qwen")
 
@@ -145,8 +151,7 @@ def test_ground_stage_with_patched_vlm():
         # alone grounds both rows (the multi-view UNION path is covered
         # by test_merge_rects)
         if "TILTED" in prompt:
-            return "I see rows but nothing new.\n" + _json.dumps(
-                {"regions": []})
+            return "I see rows but nothing new.\n[]"
         return reply
     judge._qwen_image_call = _fake_call    # canned VLM answer
     import tempfile
@@ -233,6 +238,39 @@ def test_merge_rects_multiview_union():
     print("PASS merge rects (3-view union, disjoint rows kept)")
 
 
+def test_parse_ground_regions_official_format():
+    """The official Qwen3-VL grounding reply format (per the 2d_grounding
+    cookbook) parses correctly: bare JSON array of {"bbox_2d": [x1,y1,
+    x2,y2]} in RELATIVE 0-1000 coords, possibly behind markdown fences
+    / a thinking preamble. Legacy {"regions": [...]} pixel dicts still
+    parse (backward robustness), and pixel replies with values >1000
+    are detected as absolute."""
+    from agentic_gts.agent.judge import _parse_ground_regions
+    W, H = 1280, 1024
+    # official: relative 0-1000, fenced, after a reasoning preamble
+    text = ("Thinking... two rows visible.\n```json\n"
+            '[{"bbox_2d": [100, 200, 900, 400], "label": "row 1"},\n'
+            ' {"bbox_2d": [100, 500, 900, 700], "label": "row 2"}]\n'
+            "```")
+    rects = _parse_ground_regions(text, W, H)
+    assert len(rects) == 2, f"want 2 rects, got {len(rects)}"
+    r = rects[0]
+    assert abs(r[0] - 128.0) < 1e-6 and abs(r[1] - 204.8) < 1e-6, \
+        "0-1000 relative coords must rescale by W/1000, H/1000"
+    assert abs(r[2] - 1152.0) < 1e-6 and abs(r[3] - 409.6) < 1e-6
+    # absolute pixels (values > 1000 -> treated as pixels, no scaling)
+    px = _parse_ground_regions(
+        '[{"bbox_2d": [110, 120, 1150, 900]}]', W, H)
+    assert abs(px[0][2] - 1150.0) < 1e-6, "pixel replies must not rescale"
+    # legacy dict format still honoured
+    lg = _parse_ground_regions(
+        '{"regions": [{"x0": 10, "y0": 20, "x1": 30, "y1": 40}]}', W, H)
+    assert lg == [(10.0, 20.0, 30.0, 40.0)]
+    # noise / no JSON -> nothing
+    assert _parse_ground_regions("just prose, no json", W, H) == []
+    print("PASS parse official bbox_2d (0-1000 relative, fences, legacy)")
+
+
 def test_ground_mock_returns_false():
     """Mock backend / no VLM -> grounding must fail soft, keeping hints."""
     from agentic_gts.agent import ground
@@ -257,5 +295,6 @@ if __name__ == "__main__":
     test_ground_stage_with_patched_vlm()
     test_split_reply_parse()
     test_merge_rects_multiview_union()
+    test_parse_ground_regions_official_format()
     test_ground_mock_returns_false()
     print("ALL GROUND TESTS PASSED")

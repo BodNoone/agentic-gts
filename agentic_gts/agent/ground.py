@@ -78,14 +78,14 @@ def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
     if len(band) < 100:
         band = points
     pts_rot = _rot_xy(band, -yaw)
-    # rotate the box footprints too so the camera frames the layout
-    boxes_rot = []
-    for b in frame_boxes:
-        c = _rot_xy(np.array([[b.center[0], b.center[1], 0.0]]), -yaw)[0]
-        boxes_rot.append(OrientedBox(center=(float(c[0]), float(c[1]),
-                                             b.center[2]),
-                                     size=b.size, yaw=0.0))
-    cam_r = make_godview_cam(pts_rot, boxes_rot, nadir=True, W=W, H=H)
+    # frame over the CLOUD band, NOT the hint boxes: grounding must not
+    # depend on the initial detections (user directive) -- a device the
+    # detector missed sits OUTSIDE the hint footprint, and a camera
+    # fitted over the hints would crop it out of the view entirely,
+    # making it invisible to the VLM (guaranteed miss). The device band
+    # (walls included) spans the whole room, so every structure is in
+    # frame; the VLM prompt tells it to ignore walls.
+    cam_r = make_godview_cam(pts_rot, (), nadir=True, W=W, H=H)
     if abs(tilt_deg) > 1e-6:
         # in-place tilt of the fitted nadir camera (see docstring)
         t = math.radians(tilt_deg)

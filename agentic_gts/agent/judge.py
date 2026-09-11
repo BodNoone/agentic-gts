@@ -477,6 +477,96 @@ def _extract_json(text: str):
     return None
 
 
+def _extract_json_array(text: str):
+    """Last balanced top-level JSON ARRAY in a reply, or None.
+
+    The official Qwen3-VL grounding format is a bare array of
+    {"bbox_2d": ...} items, which _extract_json (brace-scanner) cannot
+    return -- hence this bracket-scanning twin.
+    """
+    depth, start = 0, -1
+    spans = []
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "[":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                spans.append(text[start:i + 1])
+    for c in reversed(spans):
+        try:
+            arr = json.loads(c)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(arr, list):
+            return arr
+    return None
+
+
+def _parse_ground_regions(text: str, W: int, H: int) -> list[tuple]:
+    """Parse a grounding reply into pixel rects [(x0, y0, x1, y1)].
+
+    Accepts the OFFICIAL Qwen3-VL grounding format (per the 2d_grounding
+    cookbook): a JSON array of {"bbox_2d": [x1, y1, x2, y2], ...} in
+    RELATIVE 0-1000 coordinates -- the model's trained output
+    distribution, which is why the prompt asks for it verbatim. The
+    legacy {"regions": [{"x0", "y0", "x1", "y1"}]} dict with absolute
+    pixels is still honoured (a reply that ignores the format and
+    happens to use small pixel values is ambiguous; relative-first is
+    the correct default since that is what was asked for).
+    """
+    items = []
+    data = _extract_json(text)
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        items = data.get("regions") or data.get("boxes") or []
+    if not items:
+        items = _extract_json_array(text) or []
+    rects = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        bbox = item.get("bbox_2d")
+        if bbox is not None:
+            try:
+                x0, y0, x1, y1 = (float(v) for v in bbox[:4])
+            except (TypeError, ValueError):
+                continue
+            if max(x0, y0, x1, y1) > 1000.0:
+                pass          # absolute pixels despite the format spec
+            else:             # official relative 0-1000 grid -> pixels
+                x0, x1 = x0 / 1000.0 * W, x1 / 1000.0 * W
+                y0, y1 = y0 / 1000.0 * H, y1 / 1000.0 * H
+        else:
+            try:
+                x0, y0 = float(item["x0"]), float(item["y0"])
+                x1, y1 = float(item["x1"]), float(item["y1"])
+            except (KeyError, TypeError, ValueError):
+                continue
+        x0, x1 = min(x0, x1), max(x0, x1)
+        y0, y1 = min(y0, y1), max(y0, y1)
+        x0, y0 = max(0.0, x0), max(0.0, y0)
+        x1, y1 = min(float(W), x1), min(float(H), y1)
+        if x1 - x0 >= 8.0 and y1 - y0 >= 8.0:
+            rects.append((x0, y0, x1, y1))
+    return rects
+
+
 def _png_to_b64(png_bytes: bytes) -> str:
     return base64.b64encode(png_bytes).decode("ascii")
 
@@ -968,45 +1058,51 @@ class VLMJudge:
         return out
 
     # ---- global 2D grounding (rows as whole regions) ----
+    # Output contract follows the OFFICIAL Qwen3-VL grounding cookbook
+    # (2d_grounding.ipynb): a JSON array of {"bbox_2d": [x1,y1,x2,y2]}
+    # in RELATIVE 0-1000 coordinates. Multi-target grounding is a
+    # trained capability of the model -- asking for any other coordinate
+    # format (e.g. absolute pixels) pushes the reply off-distribution
+    # and measurably degrades the boxes.
     _GROUND_PROMPT = (
-        "You are looking at a TOP-DOWN view of a data-center room (ceiling "
+        "This is a TOP-DOWN view of a data-center room (ceiling "
         "removed). Rows of tall server racks / cabinets appear as solid "
-        "bright bands; aisles are dark or empty; walls are thin lines at "
-        "the room boundary.\n\n"
-        "Task: output ONE axis-aligned rectangle per DEVICE STRUCTURE, "
-        "covering its full footprint. A continuous row of joined cabinets "
-        "counts as ONE rectangle spanning the WHOLE row (do NOT split it "
-        "into individual cabinets). Structures separated by an aisle or a "
-        "clear gap get separate rectangles. Do NOT box walls, pillars, "
-        "columns, or floor clutter.\n\n"
-        "Work step by step:\n"
-        "1. List each device structure you see with one short sentence "
-        "(row / single cabinet, roughly where).\n"
-        "2. Then output ONE JSON object on the LAST line:\n"
-        '{"regions": [{"x0": <int>, "y0": <int>, "x1": <int>, "y1": <int>}, ...]}\n'
-        "Pixel coordinates, origin at the TOP-LEFT corner of the image, x "
-        "rightward, y downward, x0 < x1, y0 < y1."
+        "bright bands; aisles are dark or empty; walls are thin lines "
+        "at the room boundary.\n\n"
+        "Locate every DEVICE STRUCTURE in the image and output the "
+        "corresponding 2D bounding boxes. A continuous row of joined "
+        "cabinets counts as ONE structure whose box covers the WHOLE "
+        "row (do NOT split it into individual cabinets); structures "
+        "separated by an aisle or a clear gap get separate boxes. Do "
+        "not include walls, pillars, columns, or floor clutter.\n\n"
+        "Output format:\n"
+        '[{"bbox_2d": [x1, y1, x2, y2], "label": "<short name>"}]\n'
+        "bbox_2d uses RELATIVE coordinates normalized to 0-1000 on "
+        "both axes: the image top-left corner is [0, 0], the "
+        "bottom-right corner is [1000, 1000]. You may briefly list the "
+        "structures first; the JSON array must be the LAST line."
     )
 
     _GROUND_PROMPT_TILT = (
-        "You are looking at a SLIGHTLY TILTED top-down view of a "
-        "data-center room (camera just above the room, offset to one "
-        "side, ceiling removed). The layout matches a straight "
-        "top-down map: device rows run horizontally. The tilt makes "
-        "the cabinets' vertical FACES visible as bright strips on one "
+        "This is a SLIGHTLY TILTED top-down view of a data-center "
+        "room (camera just above the room, offset to one side, "
+        "ceiling removed). The layout matches a straight top-down "
+        "map: device rows run horizontally. The tilt makes the "
+        "cabinets' vertical FACES visible as bright strips on one "
         "side of each row, while the tops stay visible too.\n\n"
-        "Task: output ONE axis-aligned rectangle per DEVICE STRUCTURE, "
-        "covering its full footprint (a row band TOGETHER with its "
-        "visible face strip). A continuous row of joined cabinets "
-        "counts as ONE rectangle spanning the WHOLE row. Structures "
-        "separated by an aisle or a clear gap get separate rectangles. "
-        "Do NOT box walls, pillars, columns, or floor clutter.\n\n"
-        "Work step by step:\n"
-        "1. List each device structure you see with one short sentence.\n"
-        "2. Then output ONE JSON object on the LAST line:\n"
-        '{"regions": [{"x0": <int>, "y0": <int>, "x1": <int>, "y1": <int>}, ...]}\n'
-        "Pixel coordinates, origin at the TOP-LEFT corner of the image, x "
-        "rightward, y downward, x0 < x1, y0 < y1."
+        "Locate every DEVICE STRUCTURE in the image and output the "
+        "corresponding 2D bounding boxes, each covering the row band "
+        "TOGETHER with its visible face strip. A continuous row of "
+        "joined cabinets counts as ONE structure whose box covers "
+        "the WHOLE row; structures separated by an aisle or a clear "
+        "gap get separate boxes. Do not include walls, pillars, "
+        "columns, or floor clutter.\n\n"
+        "Output format:\n"
+        '[{"bbox_2d": [x1, y1, x2, y2], "label": "<short name>"}]\n'
+        "bbox_2d uses RELATIVE coordinates normalized to 0-1000 on "
+        "both axes: the image top-left corner is [0, 0], the "
+        "bottom-right corner is [1000, 1000]. You may briefly list the "
+        "structures first; the JSON array must be the LAST line."
     )
 
     def ground_regions(self, png: bytes, W: int, H: int,
@@ -1052,24 +1148,10 @@ class VLMJudge:
             print(f"[vlm][ground] failed ({type(e).__name__}: {e}) "
                   f"-> no grounding")
             return []
-        data = _extract_json(text)
-        if not isinstance(data, dict):
+        rects = _parse_ground_regions(text or "", W, H)
+        if not rects:
             print(f"[vlm][ground] unparseable reply -> no grounding: "
-                  f"{text[:120]!r}")
-            return []
-        rects = []
-        for item in data.get("regions", []) or []:
-            try:
-                x0, y0 = float(item["x0"]), float(item["y0"])
-                x1, y1 = float(item["x1"]), float(item["y1"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            x0, x1 = min(x0, x1), max(x0, x1)
-            y0, y1 = min(y0, y1), max(y0, y1)
-            x0, y0 = max(0.0, x0), max(0.0, y0)
-            x1, y1 = min(float(W), x1), min(float(H), y1)
-            if x1 - x0 >= 8.0 and y1 - y0 >= 8.0:
-                rects.append((x0, y0, x1, y1))
+                  f"{(text or '')[:120]!r}")
         self._record("ground", prompt, text or "",
                     f"{len(rects)} regions", 0.5, "", png_path=png_path)
         return rects
