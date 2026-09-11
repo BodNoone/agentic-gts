@@ -399,6 +399,35 @@ def _merge_rects(rects: list[tuple], iou_thr: float = 0.25,
     return [tuple(r) for r in rs]
 
 
+def _primary_merge(prim_rects: list[tuple], obl_rects: list[tuple],
+                   pts: np.ndarray | None = None) -> list[tuple]:
+    """PRIMARY-VIEW merge policy (user-directed).
+
+    The nadir view owns the footprint: its rects merge among
+    themselves (fragment rules) and form the BASE set. A tilted view's
+    rect can only ADD: when it overlaps any accepted rect it is simply
+    DROPPED -- the nadir capture is the exact footprint (vertical rays,
+    no perspective dilation), and union-ing the tilted view's
+    perspective slop into it was what inflated the fitted boxes. Only a
+    rect covering something the nadir MISSED (the blurry-top centre
+    rows) survives and is fitted as its own structure.
+    """
+    def _ovf(a, b):
+        ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+        iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+        inter = ix * iy
+        sm = min((a[2] - a[0]) * (a[3] - a[1]),
+                 (b[2] - b[0]) * (b[3] - b[1]))
+        return inter / sm if sm > 0 else 0.0
+
+    accepted = list(_merge_rects(prim_rects, pts=pts))
+    for r in obl_rects:
+        if any(_ovf(r, m) > 0.15 for m in accepted):
+            continue          # the primary view owns this structure
+        accepted.append(r)
+    return accepted
+
+
 def _tighten_oblique(cam, r, yaw, pts_fit, frame_rect_fn):
     """Tighten a tilted view's rect via two-plane back-projection.
 
@@ -612,13 +641,16 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         return (float(corners_r[:, 0].min()), float(corners_r[:, 1].min()),
                 float(corners_r[:, 0].max()), float(corners_r[:, 1].max()))
 
-    frame_rects = []
+    prim_rects: list[tuple] = []   # nadir: the exact footprint capture
+    obl_rects: list[tuple] = []   # tilted views: perspective-sloped captures
     for cam, r, oblique in cam_rects:
         rect = _frame_rect(cam, r, 1.0)
         if oblique:
             rect = _tighten_oblique(cam, r, yaw, pts_fit, _frame_rect)
-        frame_rects.append(rect)
-    merged = _merge_rects(frame_rects, pts=pts_fit)
+            obl_rects.append(rect)
+        else:
+            prim_rects.append(rect)
+    merged = _primary_merge(prim_rects, obl_rects, pts_fit)
     boxes = []
     for rect_r in merged:
         bb = _fit_region_box(pts_fit, rect_r)

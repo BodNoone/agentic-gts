@@ -234,21 +234,39 @@ def test_split_reply_parse():
     print("PASS split reply parse (incl. think-block + range clamps)")
 
 
-def test_merge_rects_multiview_union():
-    """The same row outlined in three views (nadir tight, obliques
-    shifted/stretched by perspective) must union into ONE rect; a
-    disjoint row must never fuse into it."""
+def test_primary_merge_policy():
+    """PRIMARY-VIEW merge policy (user-directed): the nadir view owns
+    the footprint. Oblique rects that overlap a nadir rect are DROPPED
+    (their perspective slop must never dilate the exact vertical-ray
+    capture); only rects covering something the nadir MISSED survive
+    as additions. A disjoint row must never fuse into the primary."""
+    from agentic_gts.agent.ground import _primary_merge
+    # nadir's capture of row 1 (tight, exact) + its two tilted captures
+    # (shifted/stretched by perspective) + a parallel row 2
+    nadir = [(-0.2, -0.6, 6.1, 0.7), (-1.0, 2.4, 5.2, 3.6)]
+    obliques = [(0.3, -0.8, 6.4, 0.5), (-0.4, -0.5, 5.9, 0.9)]
+    out = _primary_merge(nadir, obliques)
+    assert len(out) == 2, f"want 2 rects (both rows), got {len(out)}"
+    row1 = min(out, key=lambda r: r[1])
+    # the oblique slop must NOT have widened the nadir capture: the
+    # result IS the nadir rect (no union with 6.4 / -0.8)
+    assert abs(row1[0] - (-0.2)) < 1e-9 and abs(row1[2] - 6.1) < 1e-9, \
+        "primary rect must stay as the nadir drew it"
+    assert abs(row1[1] - (-0.6)) < 1e-9 and abs(row1[3] - 0.7) < 1e-9
+    # an oblique rect over a nadir BLIND SPOT (a centre row the nadir
+    # missed) survives as its own addition
+    blind = (1.0, 5.0, 5.0, 6.1)
+    out = _primary_merge(nadir, [blind])
+    assert len(out) == 3, f"blind-spot addition must survive, got {len(out)}"
+    assert any(abs(r[1] - 5.0) < 1e-9 for r in out)
+    print("PASS primary merge (nadir owns overlap, obliques only add)")
+
+
+def test_merge_rects_fragments():
+    """_merge_rects fragment rules (within ONE view's rects):
+    overlap fusion, along-row adjacency gated by point support, depth
+    complement, and parallel rows that never fuse."""
     from agentic_gts.agent.ground import _merge_rects
-    # row 1 as seen by nadir / az90 / az270 (loose, shifted)
-    r1 = [(-0.2, -0.6, 6.1, 0.7), (0.3, -0.8, 6.4, 0.5), (-0.4, -0.5, 5.9, 0.9)]
-    # row 2: parallel, 3m away -- must stay separate
-    r2 = [(-1.0, 2.4, 5.2, 3.6)]
-    out = _merge_rects(r1 + r2)
-    assert len(out) == 2, f"expected 2 merged rects, got {len(out)}"
-    big = max(out, key=lambda r: (r[2] - r[0]) * (r[3] - r[1]))
-    assert abs(big[0] - (-0.4)) < 1e-9 and abs(big[2] - 6.4) < 1e-9, \
-        "union rect must span all three captures"
-    assert abs(big[1] - (-0.8)) < 1e-9 and abs(big[3] - 0.9) < 1e-9
     # neighbouring rows 1.2m apart with slight VLM slop still stay split
     a = (0.0, 0.0, 6.0, 1.1)
     b = (0.0, 1.35, 6.0, 2.45)      # overlap of 0 -> never merges
@@ -276,7 +294,7 @@ def test_merge_rects_multiview_union():
     out = _merge_rects(faces)
     assert len(out) == 1, f"depth-complement faces must fuse, got {len(out)}"
     assert abs(out[0][1]) < 1e-9 and abs(out[0][3] - 1.1) < 1e-9
-    print("PASS merge rects (3-view union, adjacency, disjoint rows kept)")
+    print("PASS merge rects (adjacency, depth complement, disjoint kept)")
 
 
 def test_tighten_oblique_rect():
@@ -490,7 +508,8 @@ if __name__ == "__main__":
     test_split_row_snaps_to_profile_gaps()
     test_ground_stage_with_patched_vlm()
     test_split_reply_parse()
-    test_merge_rects_multiview_union()
+    test_primary_merge_policy()
+    test_merge_rects_fragments()
     test_tighten_oblique_rect()
     test_front_view_height()
     test_parse_ground_regions_official_format()
