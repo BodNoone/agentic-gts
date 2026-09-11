@@ -150,7 +150,7 @@ def test_ground_stage_with_patched_vlm():
         # tilted views answer with nothing extra here: the nadir view
         # alone grounds both rows (the multi-view UNION path is covered
         # by test_merge_rects)
-        if "TILTED" in prompt:
+        if "tilted" in prompt.lower():
             return "I see rows but nothing new.\n[]"
         return reply
     judge._qwen_image_call = _fake_call    # canned VLM answer

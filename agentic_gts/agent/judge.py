@@ -1058,51 +1058,44 @@ class VLMJudge:
         return out
 
     # ---- global 2D grounding (rows as whole regions) ----
-    # Output contract follows the OFFICIAL Qwen3-VL grounding cookbook
-    # (2d_grounding.ipynb): a JSON array of {"bbox_2d": [x1,y1,x2,y2]}
-    # in RELATIVE 0-1000 coordinates. Multi-target grounding is a
-    # trained capability of the model -- asking for any other coordinate
-    # format (e.g. absolute pixels) pushes the reply off-distribution
-    # and measurably degrades the boxes.
+    # Prompt style follows the OFFICIAL 2d_grounding cookbook verbatim:
+    # "Locate every instance that belongs to the following categories:
+    # ... Report bbox coordinates in JSON format like this:
+    # {\"bbox_2d\": [x1, y1, x2, y2], \"label\": ...}". Multi-target
+    # grounding in relative 0-1000 coords is a TRAINED capability -- the
+    # model needs the categories and the JSON template ONLY. Explaining
+    # the coordinate system or dictating reply structure (as earlier
+    # drafts did) is off-distribution instruction the model must
+    # second-guess.
     _GROUND_PROMPT = (
-        "This is a TOP-DOWN view of a data-center room (ceiling "
-        "removed). Rows of tall server racks / cabinets appear as solid "
-        "bright bands; aisles are dark or empty; walls are thin lines "
-        "at the room boundary.\n\n"
-        "Locate every DEVICE STRUCTURE in the image and output the "
-        "corresponding 2D bounding boxes. A continuous row of joined "
-        "cabinets counts as ONE structure whose box covers the WHOLE "
-        "row (do NOT split it into individual cabinets); structures "
-        "separated by an aisle or a clear gap get separate boxes. Do "
-        "not include walls, pillars, columns, or floor clutter.\n\n"
-        "Output format:\n"
-        '[{"bbox_2d": [x1, y1, x2, y2], "label": "<short name>"}]\n'
-        "bbox_2d uses RELATIVE coordinates normalized to 0-1000 on "
-        "both axes: the image top-left corner is [0, 0], the "
-        "bottom-right corner is [1000, 1000]. You may briefly list the "
-        "structures first; the JSON array must be the LAST line."
+        "This is a top-down view of a data-center room with the ceiling "
+        "removed: rows of tall server racks appear as solid bright "
+        "bands, aisles are dark, walls are thin lines at the room "
+        "boundary.\n"
+        "Locate every instance that belongs to the following categories: "
+        '"server rack row, single cabinet". A continuous row of joined '
+        "cabinets is ONE instance whose box covers the WHOLE row (do "
+        "not split it into individual cabinets); structures separated "
+        "by an aisle or a clear gap are separate instances. Do not "
+        "include walls, pillars, columns, or floor clutter.\n"
+        "Report bbox coordinates in JSON format like this: "
+        '{"bbox_2d": [x1, y1, x2, y2], "label": "rack row"}'
     )
 
     _GROUND_PROMPT_TILT = (
-        "This is a SLIGHTLY TILTED top-down view of a data-center "
-        "room (camera just above the room, offset to one side, "
-        "ceiling removed). The layout matches a straight top-down "
-        "map: device rows run horizontally. The tilt makes the "
-        "cabinets' vertical FACES visible as bright strips on one "
-        "side of each row, while the tops stay visible too.\n\n"
-        "Locate every DEVICE STRUCTURE in the image and output the "
-        "corresponding 2D bounding boxes, each covering the row band "
-        "TOGETHER with its visible face strip. A continuous row of "
-        "joined cabinets counts as ONE structure whose box covers "
-        "the WHOLE row; structures separated by an aisle or a clear "
-        "gap get separate boxes. Do not include walls, pillars, "
-        "columns, or floor clutter.\n\n"
-        "Output format:\n"
-        '[{"bbox_2d": [x1, y1, x2, y2], "label": "<short name>"}]\n'
-        "bbox_2d uses RELATIVE coordinates normalized to 0-1000 on "
-        "both axes: the image top-left corner is [0, 0], the "
-        "bottom-right corner is [1000, 1000]. You may briefly list the "
-        "structures first; the JSON array must be the LAST line."
+        "This is a slightly tilted top-down view of a data-center room "
+        "(camera just above the room, offset to one side, ceiling "
+        "removed): device rows run horizontally, and the tilt makes "
+        "the cabinets' vertical faces visible as bright strips on one "
+        "side of each row.\n"
+        "Locate every instance that belongs to the following categories: "
+        '"server rack row, single cabinet". A continuous row of joined '
+        "cabinets is ONE instance whose box covers the WHOLE row "
+        "together with its visible face strip; structures separated by "
+        "an aisle or a clear gap are separate instances. Do not include "
+        "walls, pillars, columns, or floor clutter.\n"
+        "Report bbox coordinates in JSON format like this: "
+        '{"bbox_2d": [x1, y1, x2, y2], "label": "rack row"}'
     )
 
     def ground_regions(self, png: bytes, W: int, H: int,
