@@ -1146,7 +1146,20 @@ class VLMJudge:
         rects = _parse_ground_regions(text or "", W, H)
         if not rects:
             print(f"[vlm][ground] unparseable reply -> no grounding: "
-                  f"{(text or '')[:120]!r}")
+                  f"{(text or '')[:200]!r}")
+            # persist the FULL reply next to the evidence png: 200 chars
+            # on the console is not enough to debug why the model's
+            # grounding output does not parse (user needs the raw text)
+            if png_path:
+                try:
+                    import os as _os
+                    rp = _os.path.splitext(png_path)[0] + "_reply.txt"
+                    with open(rp, "w", encoding="utf-8") as rf:
+                        rf.write(text or "")
+                    print(f"[vlm][ground] full raw reply -> {rp}")
+                except Exception as _e:
+                    print(f"[vlm][ground] reply dump failed "
+                          f"({type(_e).__name__})")
         self._record("ground", prompt, text or "",
                     f"{len(rects)} regions", 0.5, "", png_path=png_path)
         return rects

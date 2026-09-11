@@ -276,7 +276,12 @@ def test_parse_ground_regions_official_format():
 
 
 def test_ground_mock_returns_false():
-    """Mock backend / no VLM -> grounding must fail soft, keeping hints."""
+    """Mock backend / no VLM -> grounding must fail soft, keeping hints.
+
+    The failure must also be VISIBLE: grounded.png is written with a
+    red GROUNDING FAILED banner (previously it only appeared on
+    success, so a failed run left nothing but raw renders)."""
+    import tempfile
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
     rng = np.random.default_rng(3)
@@ -286,7 +291,11 @@ def test_ground_mock_returns_false():
     hints = [_hint(3.0, 0.0)]
     scene.boxes = list(hints)
     judge = VLMJudge(backend="mock")
-    assert ground.ground_stage(scene, judge) is False
+    with tempfile.TemporaryDirectory() as td:
+        assert ground.ground_stage(scene, judge, out_dir=td) is False
+        gpng = os.path.join(td, "grounded.png")
+        assert os.path.isfile(gpng) and os.path.getsize(gpng) > 500, \
+            "failure audit grounded.png (banner) must be written"
     assert len(scene.boxes) == 1 and scene.boxes[0] is hints[0], \
         "hints must be kept untouched on grounding failure"
     print("PASS grounding fails soft (mock keeps hints)")

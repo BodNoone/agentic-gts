@@ -245,6 +245,38 @@ def _save_grounded_png(base_img, cam, boxes, raw_rects, out_dir) -> None:
         print(f"[ground] result render failed ({type(e).__name__}: {e})")
 
 
+def _save_grounded_fail_png(base_img, out_dir: str, why: str) -> None:
+    """Failure is an audit result too: a loud banner instead of silence.
+
+    grounded.png used to be written ONLY on success, so a failed
+    grounding left nothing but the raw groundview_*.png renders --
+    indistinguishable from 'grounding never ran' (user report: 'all I
+    see are the raw renders'). Now the same filename always carries the
+    outcome: regions + fitted wireframes when it worked, a red banner
+    with the reason when it did not.
+    """
+    import os
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        from agentic_gts.output.gs_render import png_bytes
+        u8 = (np.clip(base_img, 0, 1) * 255).astype(np.uint8)[..., :3].copy()
+        pil = Image.fromarray(u8)
+        dr = ImageDraw.Draw(pil)
+        try:
+            font = ImageFont.truetype("arialbd.ttf", 28)
+        except OSError:
+            font = ImageFont.load_default()
+        dr.rectangle(((0, 0), (pil.width, 46)), fill=(180, 0, 0))
+        dr.text((10, 9), f"GROUNDING FAILED - kept hints: {why}"[:110],
+                fill=(255, 255, 255), font=font)
+        path = os.path.join(out_dir, "grounded.png")
+        with open(path, "wb") as f:
+            f.write(png_bytes(np.asarray(pil, dtype=np.float32) / 255.0))
+        print(f"[ground] FAILURE audit render -> {path} ({why})")
+    except Exception as e:
+        print(f"[ground] failure render failed ({type(e).__name__}: {e})")
+
+
 def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     """Fit a full-depth OBB (yaw=0; points already in the row-aligned
     frame) to the points inside a grounded 2D rect.
@@ -377,6 +409,9 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         cam_rects += [(cam, r) for r in rects]
     if not cam_rects:
         print("[ground] VLM returned no usable regions -> keep hints")
+        if out_dir and base is not None:
+            _save_grounded_fail_png(base[0], out_dir,
+                                    "VLM returned no usable regions")
         return False
     pts_rot = _rot_xy(np.asarray(scene.points, dtype=np.float64), -yaw)
     z_plane = 1.0      # oblique rays hit the device mid-height plane;
@@ -412,6 +447,9 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     if not boxes:
         print("[ground] no region survived the point-support guards "
               "-> keep hints")
+        if out_dir and base is not None:
+            _save_grounded_fail_png(base[0], out_dir,
+                                    "no region survived point-support guards")
         return False
     print(f"[ground] {len(cam_rects)} VLM regions in {len(views)} views "
           f"-> {len(merged)} merged -> {len(boxes)} full-depth row boxes")
