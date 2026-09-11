@@ -42,27 +42,27 @@ def _rot_xy(pts: np.ndarray, yaw: float) -> np.ndarray:
 # ---------- grounding evidence render ----------
 
 def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
-                    H: int = 1024, tilt_deg: float = 0.0):
+                    H: int = 1024, pan_deg: float = 0.0):
     """Base top-down render, no overlays. Camera fitted over the
     yaw-rotated cloud (rows parallel to the image axes), then rotated
     back into world so the GS render and the pixel back-projection
     share one consistent camera. Shared by the grounding input views
     and the grounded-result audit view.
 
-    tilt_deg=0: true nadir (rows axis-aligned in the image; an
+    pan_deg=0: true nadir (rows axis-aligned in the image; an
     axis-aligned image rectangle captures a row exactly, but the room
     centre shows only the racks' TOP faces -- which a ground-level
     3DGS training set barely observed, so they render as a blurry
     smear the VLM cannot ground).
-    tilt_deg!=0: the SAME fitted nadir camera TRANSLATED sideways
-    along the row-frame y-axis (eye and target shift together;
-    positive tilt = shift toward +y). Height, viewing direction, and
-    up are untouched -- user directive after the in-place-tilt attempt
-    raised the camera and changed the view. A perspective camera
-    looking straight down from an offset sees each rack's near-side
-    edge (asymmetric projection = faces turn toward the camera), so
-    the well-trained side structure becomes visible while the layout
-    stays map-like and the framing scale is unchanged.
+    pan_deg!=0: the SAME fitted nadir camera translated a LITTLE
+    sideways along the row-frame y-axis (eye and target shift
+    together; positive = toward +y). Height, viewing direction, and
+    up are untouched, and the offset is capped at 12% of the frustum's
+    half-width so the framing stays essentially complete (user
+    directive after a large pan cropped the room). Even this slight
+    offset makes the projection asymmetric about each rack centre, so
+    faces turn toward the camera and the well-trained side structure
+    becomes visible while the layout stays map-like.
 
     Returns (img_float, cam, W, H).
     """
@@ -87,22 +87,20 @@ def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
     # (walls included) spans the whole room, so every structure is in
     # frame; the VLM prompt tells it to ignore walls.
     cam_r = make_godview_cam(pts_rot, (), nadir=True, W=W, H=H)
-    if abs(tilt_deg) > 1e-6:
-        # pure TRANSLATION of the fitted nadir camera along the
-        # row-frame y-axis (eye AND target shift together; height,
-        # viewing direction, and up stay EXACTLY the original nadir's
-        # -- user directive: never raise the camera or change the view
-        # direction). A perspective camera looking straight down from
-        # an offset still sees each rack's near side EDGE: the
-        # projection is no longer symmetric about the device centre,
-        # so faces turn toward the camera -- parallax reveals the
-        # well-trained side structure the exact-nadir centre lacks,
-        # while the layout stays map-like (no flipping, no re-framing,
-        # no height change). offset sign picks the revealed side.
+    if abs(pan_deg) > 1e-6:
+        # SLIGHT sideways translation of the fitted nadir camera (eye
+        # and target shift together; height, direction, up unchanged).
+        # The offset is capped at 12% of the frustum half-width so the
+        # framing stays essentially complete -- the first version
+        # panned by tan(25deg)*d and cropped the room (user report).
+        # Even a small offset makes the projection asymmetric about
+        # each rack, revealing side structure the exact nadir lacks.
         d = float(np.linalg.norm(np.asarray(cam_r.eye, dtype=float)
-                                - np.asarray(cam_r.target, dtype=float)))
-        off = np.array([0.0, math.tan(math.radians(abs(tilt_deg))) * d,
-                        0.0]) * (1.0 if tilt_deg > 0 else -1.0)
+                                 - np.asarray(cam_r.target, dtype=float)))
+        half_w = d * math.tan(math.radians(cam_r.fovy_deg / 2.0)) * (W / H)
+        off_m = min(math.tan(math.radians(abs(pan_deg))) * d,
+                    0.12 * half_w)
+        off = np.array([0.0, off_m, 0.0]) * (1.0 if pan_deg > 0 else -1.0)
         cam_r = Cam(eye=np.asarray(cam_r.eye, dtype=float) + off,
                     target=np.asarray(cam_r.target, dtype=float) + off,
                     up=cam_r.up, fovy_deg=cam_r.fovy_deg, W=W, H=H)
@@ -343,7 +341,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     for name, tilt in views:
         try:
             img, cam, W, H = _render_topdown(scene, hints, yaw,
-                                             tilt_deg=tilt)
+                                             pan_deg=tilt)
             png = png_bytes(img)       # CLEAN view: no hint overlays
         except Exception as e:
             print(f"[ground] view {name} render failed "
