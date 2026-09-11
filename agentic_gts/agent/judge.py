@@ -518,16 +518,17 @@ def _extract_json_array(text: str):
 
 
 def _parse_ground_regions(text: str, W: int, H: int) -> list[tuple]:
-    """Parse a grounding reply into pixel rects [(x0, y0, x1, y1)].
+    """Parse a grounding reply into pixel rects [(x0, y0, x1, y1, label)].
 
     Accepts the OFFICIAL Qwen3-VL grounding format (per the 2d_grounding
-    cookbook): a JSON array of {"bbox_2d": [x1, y1, x2, y2], ...} in
-    RELATIVE 0-1000 coordinates -- the model's trained output
+    cookbook): a JSON array of {"bbox_2d": [x1, y1, x2, y2], "label":
+    ...} in RELATIVE 0-1000 coordinates -- the model's trained output
     distribution, which is why the prompt asks for it verbatim. The
     legacy {"regions": [{"x0", "y0", "x1", "y1"}]} dict with absolute
     pixels is still honoured (a reply that ignores the format and
     happens to use small pixel values is ambiguous; relative-first is
-    the correct default since that is what was asked for).
+    the correct default since that is what was asked for). The label
+    is kept (default "device") for the official-style audit plot.
     """
     items = []
     data = _extract_json(text)
@@ -541,6 +542,7 @@ def _parse_ground_regions(text: str, W: int, H: int) -> list[tuple]:
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
             continue
+        label = str(item.get("label", "device"))[:20] or "device"
         bbox = item.get("bbox_2d")
         if bbox is not None:
             try:
@@ -563,7 +565,7 @@ def _parse_ground_regions(text: str, W: int, H: int) -> list[tuple]:
         x0, y0 = max(0.0, x0), max(0.0, y0)
         x1, y1 = min(float(W), x1), min(float(H), y1)
         if x1 - x0 >= 8.0 and y1 - y0 >= 8.0:
-            rects.append((x0, y0, x1, y1))
+            rects.append((x0, y0, x1, y1, label))
     return rects
 
 

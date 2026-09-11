@@ -201,7 +201,8 @@ def build_report(run_dir: str, out_path: str | None = None,
                       ("groundview.png", "grounding 输入（干净俯视图，无标注）"),
                       ("groundview_az90.png", "grounding 输入（对向斜俯视 A）"),
                       ("groundview_az270.png", "grounding 输入（对向斜俯视 B）"),
-                      ("grounded.png", "grounding 结果（红实线 = 全深度行框）"),
+                      ("grounded.png", "grounding 审计（彩色框+标签 = VLM 原始"
+                                      " rects，红线框 = 几何拟合结果）"),
                       ("godview_final.png", "终审 god-view")):
         b64 = _b64_file(os.path.join(run_dir, name))
         if b64:

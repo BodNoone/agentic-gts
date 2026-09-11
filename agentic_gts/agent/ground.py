@@ -149,7 +149,39 @@ def _projected_scatter(points: np.ndarray, cam, W: int, H: int) -> np.ndarray:
     return np.clip(arr.astype(np.float32) / 255.0, 0.0, 1.0)
 
 
-# ---------- region -> 3D box ----------
+# ---------- official-style audit plot (cookbook plot_bounding_boxes) ----------
+
+# the cookbook's per-box color cycle (plot_bounding_boxes), minus
+# near-black colors that vanish on a dark data-center render
+_AUDIT_COLORS = [
+    (220, 20, 60), (34, 139, 34), (0, 0, 255), (255, 215, 0),
+    (255, 140, 0), (255, 105, 180), (138, 43, 226), (165, 42, 42),
+    (128, 128, 128), (0, 206, 209), (0, 255, 255), (255, 0, 255),
+    (0, 255, 0), (25, 25, 112), (0, 128, 128), (240, 128, 128),
+]
+
+
+def _draw_raw_regions(img: np.ndarray, raw_rects: list) -> np.ndarray:
+    """Draw the VLM's RAW pixel rects the way the official cookbook's
+    plot_bounding_boxes does: one DISTINCT color per region, 3-px
+    rectangle outline, and the label text at the box's top-left.
+    raw_rects: [(x0, y0, x1, y1, label)] in THIS image's pixel space."""
+    from PIL import Image, ImageDraw, ImageFont
+    u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3].copy()
+    pil = Image.fromarray(u8)
+    dr = ImageDraw.Draw(pil)
+    try:
+        font = ImageFont.truetype("arial.ttf", 16)
+    except OSError:
+        font = ImageFont.load_default()
+    for i, (x0, y0, x1, y1, label) in enumerate(raw_rects):
+        color = _AUDIT_COLORS[i % len(_AUDIT_COLORS)]
+        dr.rectangle(((int(x0), int(y0)), (int(x1), int(y1))),
+                     outline=color, width=3)
+        dr.text((int(x0) + 4, max(int(y0) - 18, 0)), label,
+                fill=color, font=font)
+    return np.asarray(pil, dtype=np.float32) / 255.0
+
 
 def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
     """Solid red outlines for the grounded result boxes (result-only
@@ -170,19 +202,24 @@ def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
     return np.asarray(pil, dtype=np.float32) / 255.0
 
 
-def _save_grounded_png(base_img, cam, boxes, out_dir) -> None:
-    """The grounding RESULT audit image: red solid = VLM-grounded
-    full-depth row boxes over the clean nadir base the VLM answered on.
+def _save_grounded_png(base_img, cam, boxes, raw_rects, out_dir) -> None:
+    """The grounding audit image, drawn the way the official 2d_grounding
+    cookbook plots its answers.
 
-    Initial hint boxes are deliberately NOT drawn: grounding is
-    supposed to be independent of them (clean input), and re-showing
-    them here invites reading the audit as 'initial + result' when it
-    is result-only.
+    Two layers over the clean nadir base the VLM answered on:
+      - COLORED 3-px rectangles with labels = the VLM's RAW regions
+        for this view (one distinct color per region, official
+        plot_bounding_boxes style)
+      - RED 2-px wireframes = the geometry-fitted final row boxes
+    This separates WHAT the VLM said from what the point-support fit
+    made of it -- when the result is wrong, the audit shows whether
+    the VLM mis-boxed or the fit mangled it.
     """
     import os
     try:
         from agentic_gts.output.gs_render import png_bytes
-        img = _draw_result_boxes(base_img, cam, boxes)
+        img = _draw_result_boxes(_draw_raw_regions(base_img, raw_rects),
+                                 cam, boxes)
         path = os.path.join(out_dir, "grounded.png")
         with open(path, "wb") as f:
             f.write(png_bytes(img))
@@ -293,6 +330,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
              ("az270", -25.0))        # tilt toward -y: -y-facing FACES
     cam_rects: list[tuple] = []       # (cam, pixel_rect)
     base = None                       # (img, cam) of the nadir render
+    raw_nadir: list = []              # nadir raw rects for the audit plot
     for name, tilt in views:
         try:
             img, cam, W, H = _render_topdown(scene, hints, yaw,
@@ -318,6 +356,8 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         rects = judge.ground_regions(png, W, H, png_path=png_path,
                                      oblique=tilt != 0.0)
         print(f"[ground] view {name}: {len(rects)} regions")
+        if name == "nadir":
+            raw_nadir = rects         # same pixel space as the audit base
         cam_rects += [(cam, r) for r in rects]
     if not cam_rects:
         print("[ground] VLM returned no usable regions -> keep hints")
@@ -361,7 +401,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
           f"-> {len(merged)} merged -> {len(boxes)} full-depth row boxes")
     scene.boxes = boxes
     if out_dir and base is not None:
-        _save_grounded_png(base[0], base[1], boxes, out_dir)
+        _save_grounded_png(base[0], base[1], boxes, raw_nadir, out_dir)
     return True
 
 

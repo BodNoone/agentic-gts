@@ -262,10 +262,14 @@ def test_parse_ground_regions_official_format():
     px = _parse_ground_regions(
         '[{"bbox_2d": [110, 120, 1150, 900]}]', W, H)
     assert abs(px[0][2] - 1150.0) < 1e-6, "pixel replies must not rescale"
-    # legacy dict format still honoured
+    # legacy dict format still honoured (label defaults to "device")
     lg = _parse_ground_regions(
         '{"regions": [{"x0": 10, "y0": 20, "x1": 30, "y1": 40}]}', W, H)
-    assert lg == [(10.0, 20.0, 30.0, 40.0)]
+    assert lg[0][:4] == (10.0, 20.0, 30.0, 40.0)
+    assert lg[0][4] == "device", "missing label defaults to 'device'"
+    assert _parse_ground_regions(
+        '[{"bbox_2d": [100, 200, 900, 400], "label": "rack row"}]',
+        W, H)[0][4] == "rack row"
     # noise / no JSON -> nothing
     assert _parse_ground_regions("just prose, no json", W, H) == []
     print("PASS parse official bbox_2d (0-1000 relative, fences, legacy)")
