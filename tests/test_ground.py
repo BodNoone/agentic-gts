@@ -235,7 +235,20 @@ def test_merge_rects_multiview_union():
     a = (0.0, 0.0, 6.0, 1.1)
     b = (0.0, 1.35, 6.0, 2.45)      # overlap of 0 -> never merges
     assert len(_merge_rects([a, b])) == 2
-    print("PASS merge rects (3-view union, disjoint rows kept)")
+    # ALONG-ROW adjacency: one long row outlined in touching pieces
+    # (0.2m apart on x, y-aligned) -> ONE rect; the split stage divides
+    # it later
+    pieces = [(0.0, 0.0, 3.0, 1.1), (3.2, 0.05, 6.0, 1.05)]
+    out = _merge_rects(pieces)
+    assert len(out) == 1, f"along-row pieces must fuse, got {len(out)}"
+    assert abs(out[0][0]) < 1e-9 and abs(out[0][2] - 6.0) < 1e-9
+    # DEPTH complement: front/back face fragments of ONE rack (thin
+    # bands, 0.3m apart on y, combined depth 1.1 <= 1.6) -> ONE rect
+    faces = [(0.0, 0.0, 6.0, 0.4), (0.0, 0.7, 6.0, 1.1)]
+    out = _merge_rects(faces)
+    assert len(out) == 1, f"depth-complement faces must fuse, got {len(out)}"
+    assert abs(out[0][1]) < 1e-9 and abs(out[0][3] - 1.1) < 1e-9
+    print("PASS merge rects (3-view union, adjacency, disjoint rows kept)")
 
 
 def test_parse_ground_regions_official_format():

@@ -315,15 +315,26 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
                        device_type=DeviceType.RACK)
 
 
-def _merge_rects(rects: list[tuple], iou_thr: float = 0.25) -> list[tuple]:
-    """Greedy union of overlapping grounded rects (row frame).
+def _merge_rects(rects: list[tuple], iou_thr: float = 0.25,
+                 along_gap: float = 0.5, cross_gap: float = 0.35,
+                 cross_union: float = 1.6) -> list[tuple]:
+    """Greedy union merge of grounded rects (row frame: x = along the
+    row, y = depth).
 
     The same row is typically outlined in SEVERAL views (nadir + the
     two obliques); each capture is coarse in its own way (nadir: blurry
     tops; oblique: perspective stretch). Union + a fresh point-support
-    fit keeps the most inclusive footprint per structure. Only rects
-    whose overlap is a decent fraction of the SMALLER one merge --
-    disjoint structures (different rows) never fuse.
+    fit keeps the most inclusive footprint per structure. Three ways the
+    same structure's rects fuse:
+      1. OVERLAP: intersection > iou_thr of the smaller rect.
+      2. ALONG-ROW adjacency: one long row outlined in pieces -- gap
+         <= along_gap on x with substantial y alignment. The split
+         stage divides rows LATER; grounding must capture them whole.
+      3. DEPTH complement: front- and back-face fragments of one rack
+         (small y gap, strong x overlap, combined depth <= cross_union
+         -- two full parallel rows stacked in y always exceed it).
+    Parallel rows never fuse: their y gap is aisle-scale, and two full
+    rows stacked in y exceed cross_union.
     """
     rs = [list(map(float, r)) for r in rects]
 
@@ -340,7 +351,21 @@ def _merge_rects(rects: list[tuple], iou_thr: float = 0.25) -> list[tuple]:
                 iy = min(a[3], b[3]) - max(a[1], b[1])
                 inter = max(0.0, ix) * max(0.0, iy)
                 smaller = min(_area(a), _area(b))
-                if smaller > 0 and inter > iou_thr * smaller:
+                merge = smaller > 0 and inter > iou_thr * smaller
+                if not merge and iy > 0 and ix >= -along_gap:
+                    # along-row pieces: touching (or a hair apart) on x,
+                    # aligned on y
+                    ha, hb = a[3] - a[1], b[3] - b[1]
+                    if min(ha, hb) > 0 and iy >= 0.5 * min(ha, hb):
+                        merge = True
+                if not merge and ix > 0 and iy >= -cross_gap:
+                    # depth complement: front/back face fragments
+                    wa, wb = a[2] - a[0], b[2] - b[0]
+                    y_union = max(a[3], b[3]) - min(a[1], b[1])
+                    if (min(wa, wb) > 0 and ix >= 0.8 * min(wa, wb)
+                            and y_union <= cross_union):
+                        merge = True
+                if merge:
                     rs[i] = [min(a[0], b[0]), min(a[1], b[1]),
                              max(a[2], b[2]), max(a[3], b[3])]
                     rs.pop(j)
