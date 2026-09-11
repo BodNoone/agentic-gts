@@ -116,6 +116,14 @@ def test_ground_stage_with_patched_vlm():
     # two parallel rows, the classic thin-fragment setup
     pts = np.vstack([_row_points(0.0, 6.0, y=0.0, rng=rng),
                      _row_points(-1.0, 5.0, y=3.0, rng=rng)])
+    # CEILING slab spanning the whole room at z~2.95: the raw cloud
+    # carries it (only the RENDER band cuts it); the FIT must cut it
+    # too, or every fitted box spans the loose rect at tray height
+    # (user report: red boxes all too large and wrong)
+    ceil = np.column_stack([rng.uniform(-2.0, 7.0, 3000),
+                            rng.uniform(-2.0, 5.0, 3000),
+                            rng.uniform(2.9, 3.0, 3000)])
+    pts = np.vstack([pts, ceil])
     scene = Scene(points=pts)
     scene.meta["yaw"] = 0.0
     # hints: fragmented thin boxes (what the detector would give)
@@ -187,6 +195,8 @@ def test_ground_stage_with_patched_vlm():
     b = rows[0]
     assert 5.5 < b.size[0] < 6.5, f"row1 length {b.size[0]:.2f}"
     assert 0.85 < b.size[1] < 1.35, f"row1 depth {b.size[1]:.2f} (FULL, not thin)"
+    assert 1.9 < b.size[2] < 2.35, \
+        f"row1 height {b.size[2]:.2f} (ceiling must not be fitted!)"
     assert abs(b.center[1]) < 0.2, f"row1 y {b.center[1]:.2f}"
     # row 2
     b2 = rows[1]
@@ -249,6 +259,61 @@ def test_merge_rects_multiview_union():
     assert len(out) == 1, f"depth-complement faces must fuse, got {len(out)}"
     assert abs(out[0][1]) < 1e-9 and abs(out[0][3] - 1.1) < 1e-9
     print("PASS merge rects (3-view union, adjacency, disjoint rows kept)")
+
+
+def test_tighten_oblique_rect():
+    """A tilted view's rect is the footprint DILATED by the view angle;
+    the two-plane intersection recovers it.
+
+    The VLM outlines the rack's full image height (floor-to-top). On a
+    10-deg tilted view that image back-projects to z=1.0 as the true
+    footprint inflated ~0.37m in y -- enough to swallow a neighbouring
+    row 0.2m away. Intersecting the z=0 and z=0.8*H back-projections
+    must recover the true footprint (no clipping, <0.2m slack)."""
+    from agentic_gts.agent import ground
+    from agentic_gts.output.gs_render import unproject_ground
+    rng = np.random.default_rng(9)
+    pts = _row_points(0.0, 6.0, rng=rng)      # row y in [-0.55, 0.55], H=2.1
+    scene = Scene(points=pts)
+    scene.meta["yaw"] = 0.0
+    _, cam, W, H = ground._render_topdown(scene, [_hint(3.0, 0.0)], 0.0,
+                                          pan_deg=10.0)
+
+    def _frame_rect(c, r, z_plane):
+        uv = np.array([[r[0], r[1]], [r[2], r[1]],
+                       [r[2], r[3]], [r[0], r[3]]], dtype=float)
+        cw = unproject_ground(c, uv, z_plane)[:, :2]
+        return (float(cw[:, 0].min()), float(cw[:, 1].min()),
+                float(cw[:, 0].max()), float(cw[:, 1].max()))
+
+    # VLM-style rect: the rack's full IMAGE extent (all 8 corners of the
+    # solid projected through the tilted camera), clamped to the frame
+    # like a real reply
+    uv = cam.project_cv(np.column_stack([
+        [0.0, 6.0, 6.0, 0.0, 0.0, 6.0, 6.0, 0.0],
+        [-0.55, -0.55, 0.55, 0.55, -0.55, -0.55, 0.55, 0.55],
+        [0.0, 0.0, 0.0, 0.0, 2.1, 2.1, 2.1, 2.1]]))
+    r = (float(np.clip(uv[:, 0].min(), 0, W)),
+         float(np.clip(uv[:, 1].min(), 0, H)),
+         float(np.clip(uv[:, 0].max(), 0, W)),
+         float(np.clip(uv[:, 1].max(), 0, H)))
+
+    coarse = _frame_rect(cam, r, 1.0)
+    tight = ground._tighten_oblique(cam, r, 0.0, pts, _frame_rect)
+    # coarse: dilated well beyond the true 1.1m depth...
+    assert coarse[3] - coarse[1] > 1.35, \
+        f"coarse rect y-width {coarse[3] - coarse[1]:.2f} (must be dilated)"
+    # ...tight: within the true footprint +- 0.2m slack, both directions
+    assert -0.75 < tight[1] and tight[3] < 0.75, \
+        f"tight y range [{tight[1]:.2f}, {tight[3]:.2f}] must hug [-0.55, 0.55]"
+    assert tight[3] - tight[1] < coarse[3] - coarse[1], \
+        "tightened rect must be narrower than the coarse one"
+    # x survives (length direction is barely affected by the y-tilt)
+    assert -0.3 < tight[0] and tight[2] < 6.3, \
+        f"tight x range [{tight[0]:.2f}, {tight[2]:.2f}] must hug [0, 6]"
+    print(f"PASS tighten oblique "
+          f"(y: coarse {coarse[3]-coarse[1]:.2f} -> tight {tight[3]-tight[1]:.2f}, "
+          f"true 1.10)")
 
 
 def test_parse_ground_regions_official_format():
@@ -351,6 +416,7 @@ if __name__ == "__main__":
     test_ground_stage_with_patched_vlm()
     test_split_reply_parse()
     test_merge_rects_multiview_union()
+    test_tighten_oblique_rect()
     test_parse_ground_regions_official_format()
     test_parse_ground_regions_salvage()
     test_ground_mock_returns_false()

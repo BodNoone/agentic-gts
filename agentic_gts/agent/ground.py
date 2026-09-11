@@ -376,6 +376,40 @@ def _merge_rects(rects: list[tuple], iou_thr: float = 0.25,
     return [tuple(r) for r in rs]
 
 
+def _tighten_oblique(cam, r, yaw, pts_fit, frame_rect_fn):
+    """Tighten a tilted view's rect via two-plane back-projection.
+
+    A rect the VLM draws on a TILTED view covers the structure's full
+    image height; back-projected onto one z plane it is the footprint
+    DILATED by (H - z)*tan(tilt) on the y sides (~0.4m total at 10 deg
+    for a 2.2m rack) -- enough to swallow a neighbouring row 0.2m away
+    and to union-inflate the correct nadir capture (user report: red
+    fitted boxes all too large while the raw rects were right).
+
+    The footprint is contained in the back-projection at EVERY plane
+    z in [0, H], and the rect's frustum cross-section shifts
+    monotonically with z, so INTERSECTING the z=0 and z=z_c
+    back-projections (any z_c <= H) never clips the true footprint
+    while removing nearly all of the dilation. z_c is estimated as
+    0.8x the structure height under the coarse rect (strictly below
+    the true height, keeping the no-clip guarantee even when the
+    estimate runs hot).
+    """
+    coarse = frame_rect_fn(cam, r, 1.0)
+    m = ((pts_fit[:, 0] >= coarse[0]) & (pts_fit[:, 0] <= coarse[2]) &
+         (pts_fit[:, 1] >= coarse[1]) & (pts_fit[:, 1] <= coarse[3]))
+    inner = pts_fit[m]
+    h_est = float(np.percentile(inner[:, 2], 99.5)) if len(inner) else 2.0
+    z_c = min(max(0.8 * h_est, 0.8), 2.2)
+    lo = frame_rect_fn(cam, r, 0.0)
+    hi = frame_rect_fn(cam, r, z_c)
+    tight = (max(lo[0], hi[0]), max(lo[1], hi[1]),
+             min(lo[2], hi[2]), min(lo[3], hi[3]))
+    if tight[2] <= tight[0] or tight[3] <= tight[1]:
+        return coarse            # degenerate: keep the coarse rect
+    return tight
+
+
 def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     """Replace scene.boxes with VLM-grounded full-depth row boxes.
 
@@ -431,7 +465,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         print(f"[ground] view {name}: {len(rects)} regions")
         if name == "nadir":
             raw_nadir = rects         # same pixel space as the audit base
-        cam_rects += [(cam, r) for r in rects]
+        cam_rects += [(cam, r, tilt != 0.0) for r in rects]
     if not cam_rects:
         print("[ground] VLM returned no usable regions -> keep hints")
         if out_dir and base is not None:
@@ -439,12 +473,22 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                                     "VLM returned no usable regions")
         return False
     pts_rot = _rot_xy(np.asarray(scene.points, dtype=np.float64), -yaw)
-    z_plane = 1.0      # oblique rays hit the device mid-height plane;
-    # the resulting rect is coarse by design -- the point-support fit
-    # tightens it. (For the nadir view the rays are parallel and the
-    # plane height is irrelevant.)
-    frame_rects = []
-    for cam, r in cam_rects:
+    # FIT points: the device band only. The render band cuts at
+    # hint_top - 0.45, but the FIT must keep the rack top, so cut at
+    # hint_top + 0.1: everything above (ceiling / cable trays -- the
+    # raw cloud still carries them) is excluded. Ceiling points span
+    # the WHOLE room in XY, so even a correct rect whose fit included
+    # them produced a tray-height box hugging the loose rect edges
+    # (user report: red boxes all too large and wrong while the raw
+    # colored rects were right).
+    hint_top = max((b.center[2] + b.size[2] / 2.0 for b in hints),
+                   default=2.5)
+    pts_fit = pts_rot[(pts_rot[:, 2] > 0.30) &
+                      (pts_rot[:, 2] <= hint_top + 0.10)]
+    if len(pts_fit) < 100:
+        pts_fit = pts_rot[pts_rot[:, 2] > 0.30]
+
+    def _frame_rect(cam, r, z_plane):
         uv = np.array([[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]],
                       dtype=float)
         corners_w = unproject_ground(cam, uv, z_plane)[:, :2]
@@ -453,14 +497,19 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         corners_r = _rot_xy(np.column_stack([corners_w,
                                              np.zeros(len(corners_w))]),
                             -yaw)[:, :2]
-        frame_rects.append((float(corners_r[:, 0].min()),
-                            float(corners_r[:, 1].min()),
-                            float(corners_r[:, 0].max()),
-                            float(corners_r[:, 1].max())))
+        return (float(corners_r[:, 0].min()), float(corners_r[:, 1].min()),
+                float(corners_r[:, 0].max()), float(corners_r[:, 1].max()))
+
+    frame_rects = []
+    for cam, r, oblique in cam_rects:
+        rect = _frame_rect(cam, r, 1.0)
+        if oblique:
+            rect = _tighten_oblique(cam, r, yaw, pts_fit, _frame_rect)
+        frame_rects.append(rect)
     merged = _merge_rects(frame_rects)
     boxes = []
     for rect_r in merged:
-        bb = _fit_region_box(pts_rot, rect_r)
+        bb = _fit_region_box(pts_fit, rect_r)
         if bb is None:
             continue
         c = _rot_xy(np.array([[bb.center[0], bb.center[1], 0.0]]), yaw)[0]
