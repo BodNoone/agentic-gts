@@ -171,10 +171,13 @@ def test_ground_stage_with_patched_vlm():
     with tempfile.TemporaryDirectory() as td:
         ok = ground.ground_stage(scene, judge, out_dir=td)
         assert ok, "grounding must succeed with a valid VLM reply"
-        # the result audit image must exist: red grounded boxes only
-        # (no initial-hint overlay)
-        assert os.path.exists(os.path.join(td, "grounded.png")), \
-            "grounded.png (result audit view) was not saved"
+        # result audit images on EVERY view (user request): each shows
+        # that view's own raw rects + the final boxes projected through
+        # the same camera
+        for fn in ("grounded.png", "grounded_az90.png",
+                   "grounded_az270.png"):
+            assert os.path.exists(os.path.join(td, fn)), \
+                f"{fn} (per-view result audit) was not saved"
         assert os.path.exists(os.path.join(td, "groundview.png")), \
             "groundview.png (input view) was not saved"
         # oblique complement views are saved too (the nadir blind-spot
@@ -250,13 +253,23 @@ def test_merge_rects_multiview_union():
     a = (0.0, 0.0, 6.0, 1.1)
     b = (0.0, 1.35, 6.0, 2.45)      # overlap of 0 -> never merges
     assert len(_merge_rects([a, b])) == 2
-    # ALONG-ROW adjacency: one long row outlined in touching pieces
-    # (0.2m apart on x, y-aligned) -> ONE rect; the split stage divides
-    # it later
+    # ALONG-ROW adjacency: one long row outlined in pieces. Without
+    # points given the rule stays permissive (legacy callers); WITH the
+    # device band the gap strip decides: a continuous row (points in
+    # the gap) fuses, colinear-but-separate rows (empty cross aisle in
+    # the gap) never do -- the over-merge the user reported
     pieces = [(0.0, 0.0, 3.0, 1.1), (3.2, 0.05, 6.0, 1.05)]
-    out = _merge_rects(pieces)
-    assert len(out) == 1, f"along-row pieces must fuse, got {len(out)}"
+    assert len(_merge_rects(pieces)) == 1, "pts=None keeps legacy behaviour"
+    rng2 = np.random.default_rng(4)
+    cont = _row_points(0.0, 6.0, rng=rng2)      # continuous: gap filled
+    out = _merge_rects(pieces, pts=cont)
+    assert len(out) == 1, "continuous row pieces must fuse with point support"
     assert abs(out[0][0]) < 1e-9 and abs(out[0][2] - 6.0) < 1e-9
+    sep = np.vstack([_row_points(0.0, 3.0, rng=rng2),
+                     _row_points(3.2, 6.0, rng=rng2)])   # empty x-gap
+    out = _merge_rects(pieces, pts=sep)
+    assert len(out) == 2, \
+        "colinear separate rows (empty cross aisle) must NOT fuse"
     # DEPTH complement: front/back face fragments of ONE rack (thin
     # bands, 0.3m apart on y, combined depth 1.1 <= 1.6) -> ONE rect
     faces = [(0.0, 0.0, 6.0, 0.4), (0.0, 0.7, 6.0, 1.1)]

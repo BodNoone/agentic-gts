@@ -218,29 +218,30 @@ def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
     return np.asarray(pil, dtype=np.float32) / 255.0
 
 
-def _save_grounded_png(base_img, cam, boxes, raw_rects, out_dir) -> None:
+def _save_grounded_png(base_img, cam, boxes, raw_rects, out_dir,
+                       fname: str = "grounded.png") -> None:
     """The grounding audit image, drawn the way the official 2d_grounding
     cookbook plots its answers.
 
-    Two layers over the clean nadir base the VLM answered on:
+    Two layers over the clean view base the VLM answered on:
       - COLORED 3-px rectangles with labels = the VLM's RAW regions
         for this view (one distinct color per region, official
         plot_bounding_boxes style)
       - RED 2-px wireframes = the geometry-fitted final row boxes
     This separates WHAT the VLM said from what the point-support fit
     made of it -- when the result is wrong, the audit shows whether
-    the VLM mis-boxed or the fit mangled it.
+    the VLM mis-boxed or the fit mangled it. One image per view
+    (grounded.png / grounded_az90.png / grounded_az270.png).
     """
     import os
     try:
         from agentic_gts.output.gs_render import png_bytes
         img = _draw_result_boxes(_draw_raw_regions(base_img, raw_rects),
                                  cam, boxes)
-        path = os.path.join(out_dir, "grounded.png")
+        path = os.path.join(out_dir, fname)
         with open(path, "wb") as f:
             f.write(png_bytes(img))
-        print(f"[ground] result render -> {path} "
-              f"(same base as groundview.png)")
+        print(f"[ground] result render -> {path}")
     except Exception as e:
         print(f"[ground] result render failed ({type(e).__name__}: {e})")
 
@@ -317,7 +318,8 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
 
 def _merge_rects(rects: list[tuple], iou_thr: float = 0.25,
                  along_gap: float = 0.5, cross_gap: float = 0.35,
-                 cross_union: float = 1.6) -> list[tuple]:
+                 cross_union: float = 1.6,
+                 pts: np.ndarray | None = None) -> list[tuple]:
     """Greedy union merge of grounded rects (row frame: x = along the
     row, y = depth).
 
@@ -328,8 +330,13 @@ def _merge_rects(rects: list[tuple], iou_thr: float = 0.25,
     same structure's rects fuse:
       1. OVERLAP: intersection > iou_thr of the smaller rect.
       2. ALONG-ROW adjacency: one long row outlined in pieces -- gap
-         <= along_gap on x with substantial y alignment. The split
-         stage divides rows LATER; grounding must capture them whole.
+         <= along_gap on x with substantial y alignment. Requires
+         POINT SUPPORT in the gap strip when pts is given: a row
+         outlined in pieces is physically continuous (device points
+         between the pieces), while colinear-but-SEPARATE rows have an
+         empty cross aisle in the gap -- chaining those together was
+         the over-merge the user reported. The split stage divides
+         rows LATER; grounding must capture them whole.
       3. DEPTH complement: front- and back-face fragments of one rack
          (small y gap, strong x overlap, combined depth <= cross_union
          -- two full parallel rows stacked in y always exceed it).
@@ -340,6 +347,20 @@ def _merge_rects(rects: list[tuple], iou_thr: float = 0.25,
 
     def _area(r):
         return max(0.0, r[2] - r[0]) * max(0.0, r[3] - r[1])
+
+    def _gap_supported(a, b):
+        """Device points present in the x-gap strip between two pieces
+        (row frame, pts pre-filtered to the device band). Touching
+        pieces are always supported."""
+        gx0, gx1 = min(a[2], b[2]), max(a[0], b[0])
+        if gx1 - gx0 <= 0.05:
+            return True
+        if pts is None or not len(pts):
+            return True
+        m = ((pts[:, 0] >= gx0) & (pts[:, 0] <= gx1) &
+             (pts[:, 1] >= max(a[1], b[1])) &
+             (pts[:, 1] <= min(a[3], b[3])))
+        return int(m.sum()) >= 5
 
     changed = True
     while changed:
@@ -354,9 +375,11 @@ def _merge_rects(rects: list[tuple], iou_thr: float = 0.25,
                 merge = smaller > 0 and inter > iou_thr * smaller
                 if not merge and iy > 0 and ix >= -along_gap:
                     # along-row pieces: touching (or a hair apart) on x,
-                    # aligned on y
+                    # aligned on y, and the structure continues through
+                    # the gap
                     ha, hb = a[3] - a[1], b[3] - b[1]
-                    if min(ha, hb) > 0 and iy >= 0.5 * min(ha, hb):
+                    if (min(ha, hb) > 0 and iy >= 0.5 * min(ha, hb)
+                            and _gap_supported(a, b)):
                         merge = True
                 if not merge and ix > 0 and iy >= -cross_gap:
                     # depth complement: front/back face fragments
@@ -525,9 +548,9 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     views = (("nadir", 0.0),           # exact footprint capture
              ("az90", 10.0),          # pan+tilt toward +y: +y faces
              ("az270", -10.0))        # pan+tilt toward -y: -y faces
-    cam_rects: list[tuple] = []       # (cam, pixel_rect)
+    cam_rects: list[tuple] = []       # (cam, pixel_rect, oblique)
     base = None                       # (img, cam) of the nadir render
-    raw_nadir: list = []              # nadir raw rects for the audit plot
+    view_audit: list = []              # (name, img, cam, rects) per view
     for name, tilt in views:
         try:
             img, cam, W, H = _render_topdown(scene, hints, yaw,
@@ -548,13 +571,12 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                 with open(png_path, "wb") as f:
                     f.write(png)
             except Exception as e:
-                print(f"[ground] png save failed ({type(e).__name__}: {e})")
+                print(f"[ground] png save failed ({type(e).__name__})")
                 png_path = None
         rects = judge.ground_regions(png, W, H, png_path=png_path,
                                      oblique=tilt != 0.0)
         print(f"[ground] view {name}: {len(rects)} regions")
-        if name == "nadir":
-            raw_nadir = rects         # same pixel space as the audit base
+        view_audit.append((name, img, cam, rects))
         cam_rects += [(cam, r, tilt != 0.0) for r in rects]
     if not cam_rects:
         print("[ground] VLM returned no usable regions -> keep hints")
@@ -596,7 +618,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         if oblique:
             rect = _tighten_oblique(cam, r, yaw, pts_fit, _frame_rect)
         frame_rects.append(rect)
-    merged = _merge_rects(frame_rects)
+    merged = _merge_rects(frame_rects, pts=pts_fit)
     boxes = []
     for rect_r in merged:
         bb = _fit_region_box(pts_fit, rect_r)
@@ -629,8 +651,15 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     print(f"[ground] {len(cam_rects)} VLM regions in {len(views)} views "
           f"-> {len(merged)} merged -> {len(boxes)} full-depth row boxes")
     scene.boxes = boxes
-    if out_dir and base is not None:
-        _save_grounded_png(base[0], base[1], boxes, raw_nadir, out_dir)
+    # result audit on EVERY view (user request): each grounded_*.png
+    # shows that view's own raw VLM rects (colored) plus the final
+    # fitted boxes (red) projected through the same camera -- the nadir
+    # one alone could not show what the oblique views contributed
+    if out_dir:
+        for name, img, cam, vrects in view_audit:
+            _save_grounded_png(img, cam, boxes, vrects, out_dir,
+                               fname=("grounded.png" if name == "nadir"
+                                      else f"grounded_{name}.png"))
     return True
 
 
