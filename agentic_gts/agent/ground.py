@@ -41,41 +41,27 @@ def _rot_xy(pts: np.ndarray, yaw: float) -> np.ndarray:
 
 # ---------- grounding evidence render ----------
 
-def _render_ground_view(scene, hints, yaw: float, W: int = 1280, H: int = 1024):
-    """Top-down evidence image for grounding, rows AXIS-ALIGNED in the image.
-
-    Hints are drawn as magenta dashed outlines + centre crosses --
-    anchors for the VLM's own grounding, visually distinct from the red
-    adjudication frames.
-
-    Returns (png_bytes, cam, W, H).
-    """
-    from agentic_gts.output.gs_render import png_bytes
-    img, cam, W, H = _render_topdown(scene, hints, yaw, W, H)
-    img = _draw_hints(img, cam, hints)
-    return png_bytes(img), cam, W, H
-
-
 def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
-                    H: int = 1024, elev_deg: float | None = None,
-                    azim_deg: float = 90.0):
+                    H: int = 1024, tilt_deg: float = 0.0):
     """Base top-down render, no overlays. Camera fitted over the
     yaw-rotated cloud (rows parallel to the image axes), then rotated
     back into world so the GS render and the pixel back-projection
     share one consistent camera. Shared by the grounding input views
     and the grounded-result audit view.
 
-    elev_deg=None: true nadir (rows axis-aligned in the image; an
+    tilt_deg=0: true nadir (rows axis-aligned in the image; an
     axis-aligned image rectangle captures a row exactly, but the room
     centre shows only the racks' TOP faces -- which a ground-level
     3DGS training set barely observed, so they render as a blurry
     smear the VLM cannot ground).
-    elev_deg given: OBLIQUE top-down from that elevation (azim_deg is
-    the horizontal viewing azimuth in the ROW frame; 90/270 look along
-    the cross-axis, i.e. straight down the aisles, so every row shows
-    a well-trained FACE). Rows appear as horizontal bands, slightly
-    trapezoidal under perspective -- coarse for capture, but the faces
-    are sharp and the point-support fit tightens the edges anyway.
+    tilt_deg!=0: the SAME fitted nadir camera tilted IN PLACE about
+    the row-frame x-axis (positive = eye swings toward +y). Up stays
+    ~+y, so the image KEEPS the god-view's orientation -- an
+    azimuth-90 SIDE camera's screen-up flips to -y and the room then
+    reads like a 180-deg rotation of the god-view (user-reported).
+    The slight tilt reveals the racks' well-trained FACES as bright
+    strips while the layout stays map-like. Eye pulled back
+    20%/cos(t) so the tilted frustum still frames the whole footprint.
 
     Returns (img_float, cam, W, H).
     """
@@ -99,14 +85,20 @@ def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
         boxes_rot.append(OrientedBox(center=(float(c[0]), float(c[1]),
                                              b.center[2]),
                                      size=b.size, yaw=0.0))
-    if elev_deg is None:
-        cam_r = make_godview_cam(pts_rot, boxes_rot, nadir=True, W=W, H=H)
-    else:
-        cam_r = make_godview_cam(pts_rot, boxes_rot, nadir=False,
-                                 elev_deg=elev_deg, azim_deg=azim_deg,
-                                 W=W, H=H)
-    # rotate the camera back into world (rotation about z: nadir stays
-    # nadir, oblique keeps its elevation and swings the azimuth)
+    cam_r = make_godview_cam(pts_rot, boxes_rot, nadir=True, W=W, H=H)
+    if abs(tilt_deg) > 1e-6:
+        # in-place tilt of the fitted nadir camera (see docstring)
+        t = math.radians(tilt_deg)
+        tgt = np.asarray(cam_r.target, dtype=float)
+        d = float(np.linalg.norm(np.asarray(cam_r.eye, dtype=float) - tgt))
+        k = 1.2 / math.cos(t)
+        cam_r = Cam(eye=tgt + np.array([0.0, d * k * math.sin(t),
+                                        d * k * math.cos(t)]),
+                    target=tgt, up=np.array([0.0, math.cos(t),
+                                            math.sin(t)]),
+                    fovy_deg=cam_r.fovy_deg, W=W, H=H)
+    # rotate the camera back into world (rotation about z: the nadir
+    # axis and the tilt direction rotate with it)
     if abs(yaw) > 1e-9:
         c_, s_ = math.cos(yaw), math.sin(yaw)
         rz = lambda v: np.array([c_ * v[0] - s_ * v[1],
@@ -296,16 +288,15 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     if not hints:
         return False
     yaw = float(scene.meta.get("yaw", 0.0) or 0.0)
-    views = (("nadir", None),
-             ("az90", (58.0, 90.0)),      # cross-axis face pair
-             ("az270", (58.0, 270.0)))
+    views = (("nadir", 0.0),           # exact footprint capture
+             ("az90", 25.0),          # tilt toward +y: +y-facing FACES
+             ("az270", -25.0))        # tilt toward -y: -y-facing FACES
     cam_rects: list[tuple] = []       # (cam, pixel_rect)
     base = None                       # (img, cam) of the nadir render
-    for name, obq in views:
+    for name, tilt in views:
         try:
-            kw = {} if obq is None else dict(elev_deg=obq[0],
-                                             azim_deg=obq[1])
-            img, cam, W, H = _render_topdown(scene, hints, yaw, **kw)
+            img, cam, W, H = _render_topdown(scene, hints, yaw,
+                                             tilt_deg=tilt)
             png = png_bytes(img)       # CLEAN view: no hint overlays
         except Exception as e:
             print(f"[ground] view {name} render failed "
@@ -325,7 +316,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                 print(f"[ground] png save failed ({type(e).__name__}: {e})")
                 png_path = None
         rects = judge.ground_regions(png, W, H, png_path=png_path,
-                                     oblique=obq is not None)
+                                     oblique=tilt != 0.0)
         print(f"[ground] view {name}: {len(rects)} regions")
         cam_rects += [(cam, r) for r in rects]
     if not cam_rects:

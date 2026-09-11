@@ -141,10 +141,10 @@ def test_ground_stage_with_patched_vlm():
     judge = VLMJudge(backend="qwen")
 
     def _fake_call(png, prompt, *a, **k):
-        # oblique views answer with nothing extra here: the nadir view
+        # tilted views answer with nothing extra here: the nadir view
         # alone grounds both rows (the multi-view UNION path is covered
         # by test_merge_rects)
-        if "OBLIQUE" in prompt:
+        if "TILTED" in prompt:
             return "I see rows but nothing new.\n" + _json.dumps(
                 {"regions": []})
         return reply

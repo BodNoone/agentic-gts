@@ -988,20 +988,19 @@ class VLMJudge:
         "rightward, y downward, x0 < x1, y0 < y1."
     )
 
-    _GROUND_PROMPT_OBLIQUE = (
-        "You are looking at an OBLIQUE top-down view of a data-center "
-        "room (camera tilted ~58 deg, looking down the aisles, ceiling "
-        "removed). Rows of server racks / cabinets appear as long "
-        "HORIZONTAL bands; you see each row's front or back FACE plus "
-        "its top. Perspective makes a band slightly trapezoidal "
-        "(the nearer end looks a bit larger) -- that is expected.\n\n"
+    _GROUND_PROMPT_TILT = (
+        "You are looking at a SLIGHTLY TILTED top-down view of a "
+        "data-center room (camera just above the room, offset to one "
+        "side, ceiling removed). The layout matches a straight "
+        "top-down map: device rows run horizontally. The tilt makes "
+        "the cabinets' vertical FACES visible as bright strips on one "
+        "side of each row, while the tops stay visible too.\n\n"
         "Task: output ONE axis-aligned rectangle per DEVICE STRUCTURE, "
-        "covering the structure's full visible extent (the whole band, "
-        "including the perspective-widened near end). A continuous row "
-        "of joined cabinets counts as ONE rectangle spanning the WHOLE "
-        "row. Structures separated by an aisle or a clear gap get "
-        "separate rectangles. Do NOT box walls, pillars, columns, or "
-        "floor clutter.\n\n"
+        "covering its full footprint (a row band TOGETHER with its "
+        "visible face strip). A continuous row of joined cabinets "
+        "counts as ONE rectangle spanning the WHOLE row. Structures "
+        "separated by an aisle or a clear gap get separate rectangles. "
+        "Do NOT box walls, pillars, columns, or floor clutter.\n\n"
         "Work step by step:\n"
         "1. List each device structure you see with one short sentence.\n"
         "2. Then output ONE JSON object on the LAST line:\n"
@@ -1016,16 +1015,16 @@ class VLMJudge:
         """2D grounding over a top-down view: outline EVERY device
         structure (a joined row = one region).
 
-        oblique: the view is the tilted aisle-looking complement to the
-        nadir view -- rows are horizontal bands with faces visible. The
-        nadir centre shows only rack TOPS, which a ground-level 3DGS
-        training set barely observed (blurry smear); the oblique views
-        recover the faces.
+        oblique: the view is a slightly-tilted variant of the nadir
+        map (camera offset to one side) -- the tilt reveals the rack
+        FACES, which a ground-level 3DGS training set observed well
+        (the nadir centre shows only the barely-trained TOPS: a blurry
+        smear).
 
         Returns pixel rects [(x0, y0, x1, y1)] or [] on mock / failure.
         Runs on the thinking tier when configured: one call per view,
         and these regions BECOME the pipeline's boxes (high stakes)."""
-        prompt = self._GROUND_PROMPT_OBLIQUE if oblique \
+        prompt = self._GROUND_PROMPT_TILT if oblique \
             else self._GROUND_PROMPT
         if self.backend == "mock":
             return []
