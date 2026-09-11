@@ -54,15 +54,17 @@ def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
     centre shows only the racks' TOP faces -- which a ground-level
     3DGS training set barely observed, so they render as a blurry
     smear the VLM cannot ground).
-    pan_deg!=0: the SAME fitted nadir camera translated a LITTLE
-    sideways along the row-frame y-axis (eye and target shift
-    together; positive = toward +y). Height, viewing direction, and
-    up are untouched, and the offset is capped at 12% of the frustum's
-    half-width so the framing stays essentially complete (user
-    directive after a large pan cropped the room). Even this slight
-    offset makes the projection asymmetric about each rack centre, so
-    faces turn toward the camera and the well-trained side structure
-    becomes visible while the layout stays map-like.
+    pan_deg!=0: the fitted nadir camera ROTATED about the framing
+    centre by a small angle (positive = view swings toward +y). One
+    operation gives BOTH the slight sideways pan AND the slight tilt
+    the user asked for: the camera height only drops by
+    1-cos(a) (1.5% at 10 deg), but the view direction is now a
+    degrees off vertical, so the racks directly under the ORIGINAL
+    godview centre show their camera-facing FACES -- the parallax-only
+    pan was too subtle to be useful (user report). up tilts with the
+    camera so the layout stays map-like. NOT the old large tilt: the
+    camera distance to the framing centre is strictly unchanged (no
+    pull-back, no raising).
 
     Returns (img_float, cam, W, H).
     """
@@ -92,22 +94,25 @@ def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
                                      size=b.size, yaw=0.0))
     cam_r = make_godview_cam(pts_rot, boxes_rot, nadir=True, W=W, H=H)
     if abs(pan_deg) > 1e-6:
-        # SLIGHT sideways translation of the fitted nadir camera (eye
-        # and target shift together; height, direction, up unchanged).
-        # The offset is capped at 12% of the frustum half-width so the
-        # framing stays essentially complete -- the first version
-        # panned by tan(25deg)*d and cropped the room (user report).
-        # Even a small offset makes the projection asymmetric about
-        # each rack, revealing side structure the exact nadir lacks.
-        d = float(np.linalg.norm(np.asarray(cam_r.eye, dtype=float)
-                                 - np.asarray(cam_r.target, dtype=float)))
-        half_w = d * math.tan(math.radians(cam_r.fovy_deg / 2.0)) * (W / H)
-        off_m = min(math.tan(math.radians(abs(pan_deg))) * d,
-                    0.12 * half_w)
-        off = np.array([0.0, off_m, 0.0]) * (1.0 if pan_deg > 0 else -1.0)
-        cam_r = Cam(eye=np.asarray(cam_r.eye, dtype=float) + off,
-                    target=np.asarray(cam_r.target, dtype=float) + off,
-                    up=cam_r.up, fovy_deg=cam_r.fovy_deg, W=W, H=H)
+        # small ROTATION of the fitted nadir camera about the framing
+        # centre (row-frame x-axis): sideways pan + slight tilt in ONE
+        # operation, camera-target distance strictly unchanged (no
+        # pull-back -- that was the flaw of the old large tilt). Height
+        # drops only by 1-cos(a); the off-vertical view direction is
+        # what reveals the faces of the racks under the original
+        # godview centre. 10 deg: strong enough to show faces, gentle
+        # enough to keep the framing essentially complete.
+        a = math.radians(-pan_deg)   # sign: positive pan -> eye at +y
+        tgt = np.asarray(cam_r.target, dtype=float)
+        eye0 = np.asarray(cam_r.eye, dtype=float)
+        d = eye0 - tgt                       # nadir: ~[0, 0, +h]
+        rx = np.array([[1.0, 0.0, 0.0],
+                       [0.0, math.cos(a), -math.sin(a)],
+                       [0.0, math.sin(a), math.cos(a)]])
+        cam_r = Cam(eye=tgt + rx @ d,
+                    target=tgt,
+                    up=rx @ np.asarray(cam_r.up, dtype=float),
+                    fovy_deg=cam_r.fovy_deg, W=W, H=H)
     # rotate the camera back into world (rotation about z: the nadir
     # axis and the tilt direction rotate with it)
     if abs(yaw) > 1e-9:
@@ -337,8 +342,8 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         return False
     yaw = float(scene.meta.get("yaw", 0.0) or 0.0)
     views = (("nadir", 0.0),           # exact footprint capture
-             ("az90", 25.0),          # tilt toward +y: +y-facing FACES
-             ("az270", -25.0))        # tilt toward -y: -y-facing FACES
+             ("az90", 10.0),          # pan+tilt toward +y: +y faces
+             ("az270", -10.0))        # pan+tilt toward -y: -y faces
     cam_rects: list[tuple] = []       # (cam, pixel_rect)
     base = None                       # (img, cam) of the nadir render
     raw_nadir: list = []              # nadir raw rects for the audit plot
