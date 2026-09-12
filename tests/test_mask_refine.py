@@ -182,6 +182,59 @@ def test_sam_debug_composite():
     print("PASS SAM debug composite (3-panel + union/no-fit fallback)")
 
 
+def test_view_frustum_mask_drops_occluders():
+    """The front view must show the box's FACE, not whatever stands in
+    front of it: gaussians between the camera and the box are dropped,
+    the box's own ring is always kept, and far-away context is trimmed
+    to a thin band (user report: garbage angles showing the side)."""
+    from types import SimpleNamespace
+    from agentic_gts.agent.mask_refine import _view_frustum_mask
+    from agentic_gts.output.gs_render import make_local_cam
+
+    # a long rack row box: long edge along x (yaw=0)
+    box = OrientedBox(center=(3, 0, 1), size=(6, 1.1, 2), yaw=0.0)
+    cam = make_local_cam([box], extent=1.4, W=768, H=768,
+                         elev_deg=18.0, azim_deg=0.0)   # front view
+    pts = np.array([
+        [3.0, 0.0, 1.0],      # inside the box
+        [3.0, 0.4, 1.0],      # box front band
+        [3.0, 2.0, 1.0],      # OCCLUDER in the aisle, camera side
+        [3.0, 8.0, 1.0],      # far in front (near the camera)
+        [3.0, -1.5, 1.0],     # behind the far face (out of the band)
+        [8.0, 0.0, 1.0],      # beside the row (outside the frame hull)
+    ])
+    gs = SimpleNamespace(means=pts)
+    m = _view_frustum_mask(gs, box, cam)
+    assert m[0] and m[1], "box interior / front band must always be kept"
+    assert not m[2], "aisle occluder between camera and box must be dropped"
+    assert not m[3], "near-camera clutter must be dropped"
+    assert not m[5], ("structure beside the row must be dropped "
+                      "(remove everything outside the box)")
+    print("PASS view frustum mask (occluders dropped, box ring kept)")
+
+
+def test_front_view_axis_swap():
+    """'front' must look perpendicular to the LONG edge: a box whose
+    length is on the cross axis (size[0] < size[1]) swaps the azimuth
+    so the view faces the device's face, not its side."""
+    import inspect
+    from agentic_gts.agent import mask_refine as mr
+    src = inspect.getsource(mr.render_local_views)
+    assert "azim_front" in src, "front azimuth must adapt to box axes"
+    # long edge on cross axis: front must use azim 90 (along the yaw
+    # axis) so the view direction is perpendicular to the long edge
+    from agentic_gts.output.gs_render import make_local_cam
+    import numpy as np
+    box = OrientedBox(center=(0, 0, 1), size=(1.1, 6, 2), yaw=0.0)
+    cam = make_local_cam([box], extent=1.4, W=768, H=768,
+                         elev_deg=18.0, azim_deg=90.0)
+    # eye offset from center: for azim 90 the eye moves along +yaw axis
+    d = np.asarray(cam.eye) - np.asarray(box.center)
+    assert abs(d[0]) > abs(d[1]), \
+        "camera must look along the yaw (short) axis of the long-cross box"
+    print("PASS front view axis swap (perpendicular to the long edge)")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed = 0

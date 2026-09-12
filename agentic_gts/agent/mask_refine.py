@@ -183,6 +183,90 @@ class SamPredictorAdapter:
         return np.asarray(masks, dtype=bool), np.asarray(scores, dtype=float)
 
 
+def _subset_or_none(gs, keep: np.ndarray):
+    """gs restricted to the keep mask, or None when nothing survives."""
+    if keep is None or not keep.any():
+        return None
+    from agentic_gts.output.gs_render import _subset_gs
+    return _subset_gs(gs, keep)
+
+
+def _view_frustum_mask(gs, box: OrientedBox, cam, near_margin: float = 0.5,
+                       ring_margin: float = 0.25,
+                       behind_slack: float = 0.4) -> np.ndarray:
+    """Occlusion-free isolation for the front/side local views.
+
+    The box OBB ring (near_margin) is ALWAYS kept -- that is the device
+    plus its own noisy gaussians bleeding past the faces. Everything
+    else must EARN its way into the render by being INSIDE the camera's
+    view frustum of the box: project the box's 3D corners, take the
+    pixel-space hull of the box, and keep only gaussians whose
+    projection falls inside it (inflated by ring_margin in world
+    terms). This drops whatever stands between the camera and the box
+    (a facing row across the aisle, a near wall) -- the 'garbage
+    angles' the user reported: the rack rendered as its visible SIDE
+    because the front was occluded -- while keeping a thin ring of
+    context (the user asked for a little surrounding environment).
+
+    behind_slack: gaussians up to this far BEHIND the box's far face
+    are kept even when the frustum test rejects them (their projections
+    fall inside the box hull anyway; the slack covers the row's own
+    back band and splat radii).
+    """
+    pts = np.asarray(gs.means, dtype=float)
+    m = np.zeros(len(pts), dtype=bool)
+
+    # 1. the always-keep ring: box OBB + near_margin
+    corners3 = np.asarray(box.corners_2d())
+    c = np.asarray(box.center, dtype=float)
+    yaw = float(box.yaw)
+    ca, sa = math.cos(yaw), math.sin(yaw)
+    d = pts[:, :2] - c[:2]
+    along = d @ np.array([ca, sa])
+    cross = d @ np.array([-sa, ca])
+    size = np.asarray(box.size, dtype=float)
+    m |= ((np.abs(along) < size[0] / 2.0 + near_margin) &
+          (np.abs(cross) < size[1] / 2.0 + near_margin) &
+          (pts[:, 2] > c[2] - size[2] / 2.0 - 0.3) &
+          (pts[:, 2] < c[2] + size[2] / 2.0 + 0.3))
+
+    # 2. frustum-of-the-box test for everything else
+    uv = cam.project_cv(pts)
+    H, W = cam.H, cam.W
+    in_img = ((uv[:, 0] >= -0.02 * W) & (uv[:, 0] <= 1.02 * W) &
+              (uv[:, 1] >= -0.02 * H) & (uv[:, 1] <= 1.02 * H))
+    # the box's 8 real 3D corners (4 footprint corners at both z faces)
+    z_lo, z_hi = c[2] - size[2] / 2.0, c[2] + size[2] / 2.0
+    box_pts = np.vstack([np.column_stack([corners3, np.full(4, z_lo)]),
+                         np.column_stack([corners3, np.full(4, z_hi)])])
+    box_uv = cam.project_cv(box_pts)
+    # pixel hull bounds (conservative AABB of the box's own corners),
+    # inflated by ring_margin expressed in pixels (~size[1] maps to the
+    # box's face height in the frame; scale the margin the same way)
+    face_px = max(float(np.ptp(box_uv[:, 0])), float(np.ptp(box_uv[:, 1])),
+                  1.0)
+    pad_px = ring_margin / max(size[1], 0.1) * face_px
+    u0 = float(box_uv[:, 0].min()) - pad_px
+    u1 = float(box_uv[:, 0].max()) + pad_px
+    v0 = float(box_uv[:, 1].min()) - pad_px
+    v1 = float(box_uv[:, 1].max()) + pad_px
+    in_box_hull = ((uv[:, 0] >= u0) & (uv[:, 0] <= u1) &
+                   (uv[:, 1] >= v0) & (uv[:, 1] <= v1))
+    # depth: keep a bit behind the box (its back band + splat radius),
+    # but anything CLOSER to the camera than the box's near face minus
+    # slack is an occluder candidate -- only frustum survivors pass
+    V = cam.view_cv()
+    pc = np.hstack([pts, np.ones((len(pts), 1))]) @ V.T
+    depth = pc[:, 2]
+    bpc = np.hstack([box_pts, np.ones((8, 1))]) @ V.T
+    box_near = float(bpc[:, 2].min()) - behind_slack
+    box_far = float(bpc[:, 2].max()) + behind_slack
+    near_ok = (depth >= box_near) | (m & (depth > 0.0))
+    far_ok = depth <= box_far + 0.3
+    m |= (in_img & in_box_hull & near_ok & far_ok & (depth > 0.0))
+    return m
+
+
 def render_local_views(scene: Scene, box: OrientedBox,
                        out_dir: str | None = None) -> list[dict]:
     """Render front + side local views, isolated to the box neighborhood."""
@@ -190,27 +274,47 @@ def render_local_views(scene: Scene, box: OrientedBox,
     if not gs_ply:
         return []
     from agentic_gts.tools.gs_io import read_gaussian_ply
-    from agentic_gts.output.gs_render import (make_local_cam, render_gs_view,
-                                              png_bytes)
+    from agentic_gts.output.gs_render import (make_local_cam, rasterize_gs,
+                                              render_gs_view, png_bytes)
     gs = read_gaussian_ply(gs_ply)
     cut_hi = box.center[2] + box.size[2] / 2.0 + 0.10
     cut_lo = box.center[2] - box.size[2] / 2.0 + 0.05
-    slots = (("front", 18.0, 0.0), ("side", 18.0, 90.0))
+    # FRONT must face the device's front face: the camera direction is
+    # the box's cross (short) axis. When the fitted box has its length
+    # on the cross axis (size[0] < size[1] -- a yaw that runs along the
+    # row, or a 90-deg flip from PCA), the view at azim=0 looks along
+    # the LONG edge instead: swap the two so 'front' is always
+    # perpendicular to the long edge, i.e. facing the device's face
+    # (user report: many front views were the visible SIDE).
+    azim_front = 0.0 if box.size[0] >= box.size[1] else 90.0
+    azim_side = 90.0 if azim_front == 0.0 else 0.0
+    slots = (("front", 18.0, azim_front), ("side", 18.0, azim_side))
     out = []
     for name, elev, azim in slots:
         cam = make_local_cam([box], extent=1.4, W=768, H=768,
                              elev_deg=elev, azim_deg=azim)
-        raw = render_gs_view(gs, [box], cam, cut_z=cut_hi, cut_z_low=cut_lo,
-                             overlay=None, isolate_boxes=True,
-                             isolate_margin=0.8)
+        # occlusion-free isolation (user report: the box's front was
+        # occluded by structure between the camera and the box, so the
+        # view degenerated to a visible side / garbage angle). The
+        # frustum mask keeps the box's ring plus a thin context band,
+        # and drops every gaussian standing in front of the box.
+        keep = _view_frustum_mask(gs, box, cam)
+        sub = _subset_or_none(gs, keep)
+        raw = rasterize_gs(sub, cam, cut_z=cut_hi, cut_z_low=cut_lo) \
+            if sub is not None else None
         if raw is None:
-            continue
-        # The VLM needs a visual reference for which object to prompt, while
-        # SAM must receive a clean image (wireframes would become false mask
-        # evidence). Keep both explicitly separate.
-        prompt_img = render_gs_view(
-            gs, [box], cam, cut_z=cut_hi, cut_z_low=cut_lo,
-            overlay="wire3d", isolate_boxes=True, isolate_margin=0.8)
+            raw = render_gs_view(gs, [box], cam, cut_z=cut_hi,
+                                 cut_z_low=cut_lo, overlay=None,
+                                 isolate_boxes=True, isolate_margin=0.8)
+            if raw is None:
+                continue
+            prompt_img = render_gs_view(
+                gs, [box], cam, cut_z=cut_hi, cut_z_low=cut_lo,
+                overlay="wire3d", isolate_boxes=True, isolate_margin=0.8)
+        else:
+            prompt_img = render_gs_view(
+                sub, [box], cam, cut_z=cut_hi, cut_z_low=cut_lo,
+                overlay="wire3d")
         path = None
         prompt_path = None
         if out_dir:
