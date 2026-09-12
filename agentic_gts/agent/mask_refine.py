@@ -233,71 +233,41 @@ def _open_side(gs, box: OrientedBox, reach: float = 3.0):
     return best_vec, min(best_corridor, reach)
 
 
-def _view_occlusion_mask(gs, box: OrientedBox, cam,
-                         pad_px: float = 12.0,
-                         front_slack: float = 0.12) -> np.ndarray:
-    """Keep the whole scene EXCEPT gaussians that occlude the box.
+def _box_only_mask(gs, box: OrientedBox, pad: float = 0.15) -> np.ndarray:
+    """Boolean mask over gs: True only for gaussians INSIDE the box's OBB
+    (plus `pad` metres of slack, since the fitted OBB clips a few cm off
+    the device's own face gaussians).
 
-    A normal aisle photo shows the device, the floor under it, the
-    background behind the row and the neighbouring racks beside it;
-    deleting any of that (the old screen-hull + depth-slab isolation)
-    leaves see-through holes where the deleted structure used to be, a
-    sliced band of floor and black void -- the 'messy' views the user
-    reported. The ONE thing that must go is structure BETWEEN the
-    camera and the box whose projection lands inside the box's screen
-    silhouette: it covers the very device the view is about (a pillar in
-    the aisle; the facing row when the camera ended up past the aisle's
-    middle).
-
-    front_slack: the box's own face gaussians bleed a few cm past the
-    fitted OBB; anything closer to the camera than the near face minus
-    this slack counts as an occluder.
+    The local views exist to show the VLM and SAM exactly ONE device.
+    Keeping the rest of the scene (the earlier 'normal aisle photo'
+    attempt) re-introduced haze whenever the camera stood inside
+    structure: big low-opacity training floaters fog the whole frame
+    from any position. Hiding everything outside the box removes both
+    the occluders AND the fog source in one rule -- what renders is
+    exactly the device under adjudication, on a clean background.
     """
-    pts = np.asarray(gs.means, dtype=float)
-    # box silhouette in pixels (footprint corners at both z faces)
-    corners3 = np.asarray(box.corners_2d())
-    c = np.asarray(box.center, dtype=float)
-    size = np.asarray(box.size, dtype=float)
-    z_lo, z_hi = c[2] - size[2] / 2.0, c[2] + size[2] / 2.0
-    box_pts = np.vstack([np.column_stack([corners3, np.full(4, z_lo)]),
-                         np.column_stack([corners3, np.full(4, z_hi)])])
-    bpc = np.hstack([box_pts, np.ones((8, 1))]) @ cam.view_cv().T
-    box_near = float(bpc[:, 2].min()) - front_slack
-    buv = cam.project_cv(box_pts)
-    u0 = float(buv[:, 0].min()) - pad_px
-    u1 = float(buv[:, 0].max()) + pad_px
-    v0 = float(buv[:, 1].min()) - pad_px
-    v1 = float(buv[:, 1].max()) + pad_px
-    uv = cam.project_cv(pts)
-    pc = np.hstack([pts, np.ones((len(pts), 1))]) @ cam.view_cv().T
-    depth = pc[:, 2]
-    in_sil = ((uv[:, 0] >= u0) & (uv[:, 0] <= u1) &
-              (uv[:, 1] >= v0) & (uv[:, 1] <= v1))
-    occluder = in_sil & (depth < box_near) & (depth > 0.0)
-    return ~occluder
+    return box.contains(np.asarray(gs.means, dtype=float), margin=pad)
 
 
 def render_local_views(scene: Scene, box: OrientedBox,
                        out_dir: str | None = None) -> list[dict]:
-    """Render front + diagonal local views: a NORMAL aisle photo.
+    """Render front + diagonal local views: ONE device, isolated.
 
-    The view must look like a photo taken standing in the aisle: the
-    device front-on, the floor below it, the background behind the row,
-    neighbouring racks at the frame edges. Three placement rules
-    produce it:
+    The views feed the VLM and SAM, which only need the target box --
+    everything else in the scene (the facing row the camera may stand
+    inside, floor floaters, training haze) is noise to them. Two
+    placement rules produce the clean pair:
       * the camera stands on the box's OPEN side (the aisle), picked by
         comparing free corridor width on either side -- the alternative
-        (whichever way local +y happens to point) photographs the rack's
-        back against the wall half the time;
-      * the eye stays INSIDE that corridor (standoff mode): backing off
-        to frame a 2m rack through a 60-deg lens puts the eye past the
-        aisle's middle, inside the facing row, and the render then needs
-        x-ray isolation and degenerates into a sliced collage;
-      * only ACTUAL occluders (between camera and box, projecting
-        inside the box's screen silhouette) are removed -- the floor,
-        the background behind the row and the facing row at the frame
-        edges all stay. Removing them is what made earlier views
-        'messy': see-through holes, a band of sliced floor, black void.
+        (whichever way local +y happens to point) photographs the
+        rack's back against the wall half the time;
+      * the eye stays INSIDE that corridor (standoff mode) and widens
+        its lens to frame the box instead of backing off;
+      * every gaussian OUTSIDE the box's OBB (plus a small slack) is
+        hidden from the render: no occluders, and no fog from structure
+        the camera happened to end up inside (the earlier 'keep the
+        environment' attempt still hazed out whenever the eye stood in
+        a big low-opacity floater).
     """
     gs_ply = scene.meta.get("gs_ply")
     if not gs_ply:
@@ -306,10 +276,6 @@ def render_local_views(scene: Scene, box: OrientedBox,
     from agentic_gts.output.gs_render import (make_local_cam, rasterize_gs,
                                               render_gs_view, png_bytes)
     gs = read_gaussian_ply(gs_ply)
-    # generous z window: keep the FLOOR (a normal photo shows it) and the
-    # headroom above the rack; only far ceiling / below-ground junk go
-    cut_hi = box.center[2] + box.size[2] / 2.0 + 2.0
-    cut_lo = box.center[2] - box.size[2] / 2.0 - 0.5
     # camera side: the open corridor (aisle), not whichever way local +y
     # points. FRONT must additionally face the big face: perpendicular to
     # the long edge (a yaw running along the row, or a 90-deg flip from
@@ -342,24 +308,21 @@ def render_local_views(scene: Scene, box: OrientedBox,
     for name, elev, azim in slots:
         cam = make_local_cam([box], W=768, H=768, elev_deg=elev,
                              azim_deg=azim, standoff=standoff)
-        # drop only what actually covers the box from this camera
-        keep = _view_occlusion_mask(gs, box, cam)
-        sub = _subset_or_none(gs, keep)
-        raw = rasterize_gs(sub, cam, cut_z=cut_hi, cut_z_low=cut_lo) \
-            if sub is not None else None
+        # render ONLY the device: every gaussian outside the box's OBB
+        # (plus slack) is hidden -- occluders and fog sources alike
+        sub = _subset_or_none(gs, _box_only_mask(gs, box))
+        raw = rasterize_gs(sub, cam) if sub is not None else None
         if raw is None:
-            raw = render_gs_view(gs, [box], cam, cut_z=cut_hi,
-                                 cut_z_low=cut_lo, overlay=None,
+            raw = render_gs_view(gs, [box], cam, overlay=None,
                                  isolate_boxes=True, isolate_margin=0.8)
             if raw is None:
                 continue
             prompt_img = render_gs_view(
-                gs, [box], cam, cut_z=cut_hi, cut_z_low=cut_lo,
-                overlay="wire3d", isolate_boxes=True, isolate_margin=0.8)
+                gs, [box], cam, overlay="wire3d", isolate_boxes=True,
+                isolate_margin=0.8)
         else:
             prompt_img = render_gs_view(
-                sub, [box], cam, cut_z=cut_hi, cut_z_low=cut_lo,
-                overlay="wire3d")
+                sub, [box], cam, overlay="wire3d")
         path = None
         prompt_path = None
         if out_dir:

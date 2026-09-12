@@ -198,37 +198,43 @@ def test_sam_debug_composite():
     print("PASS SAM debug composite (3-panel + union/no-fit fallback)")
 
 
-def test_view_occlusion_mask_drops_only_occluders():
-    """The front view must show the box's FACE, not whatever stands in
-    front of it -- and everything else must SURVIVE. The old screen-hull +
-    depth-slab isolation deleted the background, the floor band and the
-    neighbours (sliced x-ray views); the occlusion mask only drops
-    gaussians BETWEEN the camera and the box that project inside the
-    box's screen silhouette."""
+def test_box_only_mask_hides_everything_outside():
+    """The local views must render ONLY the device: every gaussian
+    outside the box's OBB (plus slack) is hidden -- occluders in the
+    aisle, the facing row, the floor, background floaters. This is what
+    kills the fog: haze came from structure the camera stood inside,
+    and it lives OUTSIDE the box."""
     from types import SimpleNamespace
-    from agentic_gts.agent.mask_refine import _view_occlusion_mask
-    from agentic_gts.output.gs_render import make_local_cam
+    from agentic_gts.agent.mask_refine import _box_only_mask
 
-    # a long rack row box: long edge along x (yaw=0)
     box = OrientedBox(center=(3, 0, 1), size=(6, 1.1, 2), yaw=0.0)
-    cam = make_local_cam([box], W=768, H=768,
-                         elev_deg=18.0, azim_deg=0.0, standoff=1.0)
     pts = np.array([
         [3.0, 0.0, 1.0],      # inside the box
-        [3.0, 0.4, 1.0],      # box front band (own face bleed)
-        [3.0, 1.2, 1.0],      # OCCLUDER in the aisle, over the box
+        [3.0, 0.4, 1.0],      # box front band (own face bleed, < pad)
+        [3.0, 0.8, 1.0],      # just outside the padded face -> hidden
+        [3.0, 1.2, 1.0],      # occluder / facing row in the aisle
         [3.0, -1.5, 1.0],     # background behind the far face
         [8.5, 0.0, 1.0],      # neighbour beside the row
         [3.0, 1.2, 0.02],     # floor in front of the aisle
     ])
     gs = SimpleNamespace(means=pts)
-    m = _view_occlusion_mask(gs, box, cam)
+    m = _box_only_mask(gs, box)
     assert m[0] and m[1], "box interior / own face band must be kept"
-    assert not m[2], "aisle occluder covering the box must be dropped"
-    assert m[3], "background behind the row must STAY (normal photo)"
-    assert m[4], "neighbour beside the row must STAY (context)"
-    assert m[5], "floor in front of the aisle must STAY (normal photo)"
-    print("PASS view occlusion mask (occluders dropped, scene kept)")
+    assert not m[2], "outside the padded OBB must be hidden"
+    assert not m[3], "aisle occluder must be hidden"
+    assert not m[4], "background must be hidden (device-only view)"
+    assert not m[5], "neighbour must be hidden"
+    assert not m[6], "floor must be hidden"
+    # rotated box: the mask follows the OBB axes, not the world axes
+    yaw = math.radians(30.0)
+    box2 = OrientedBox(center=(0, 0, 1), size=(2, 0.6, 2), yaw=yaw)
+    along = np.array([math.cos(yaw), math.sin(yaw)])
+    inside = np.array([[along[0] * 0.9, along[1] * 0.9, 1.0]])   # local |x|<1
+    outside = np.array([[along[0] * 1.5, along[1] * 1.5, 1.0]])   # local |x|>1
+    gs2 = SimpleNamespace(means=np.vstack([inside, outside]))
+    m2 = _box_only_mask(gs2, box2)
+    assert m2[0] and not m2[1], "mask must follow the OBB's rotated axes"
+    print("PASS box-only mask (everything outside the OBB hidden)")
 
 
 def test_open_side_picks_aisle():
