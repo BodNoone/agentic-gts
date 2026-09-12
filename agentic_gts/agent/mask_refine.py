@@ -191,85 +191,114 @@ def _subset_or_none(gs, keep: np.ndarray):
     return _subset_gs(gs, keep)
 
 
-def _view_frustum_mask(gs, box: OrientedBox, cam, near_margin: float = 0.5,
-                       ring_margin: float = 0.25,
-                       behind_slack: float = 0.4) -> np.ndarray:
-    """Occlusion-free isolation for the front/side local views.
+def _open_side(gs, box: OrientedBox, reach: float = 3.0):
+    """The box's open side (the aisle) and the clear corridor width.
 
-    The box OBB ring (near_margin) is ALWAYS kept -- that is the device
-    plus its own noisy gaussians bleeding past the faces. Everything
-    else must EARN its way into the render by being INSIDE the camera's
-    view frustum of the box: project the box's 3D corners, take the
-    pixel-space hull of the box, and keep only gaussians whose
-    projection falls inside it (inflated by ring_margin in world
-    terms). This drops whatever stands between the camera and the box
-    (a facing row across the aisle, a near wall) -- the 'garbage
-    angles' the user reported: the rack rendered as its visible SIDE
-    because the front was occluded -- while keeping a thin ring of
-    context (the user asked for a little surrounding environment).
-
-    behind_slack: gaussians up to this far BEHIND the box's far face
-    are kept even when the frustum test rejects them (their projections
-    fall inside the box hull anyway; the slack covers the row's own
-    back band and splat radii).
+    A rack in a row has an aisle on one face and the back gap (wall /
+    the next row's back, typically 0.3-0.8m) on the other; a camera on
+    the closed side photographs the rack's back squeezed against
+    structure. Compare the free corridor on each side of the box -- in
+    the device-height band and the row strip -- and return the open
+    direction (unit world 2D vector) plus the corridor width in metres
+    (capped at `reach`).
     """
     pts = np.asarray(gs.means, dtype=float)
-    m = np.zeros(len(pts), dtype=bool)
-
-    # 1. the always-keep ring: box OBB + near_margin
-    corners3 = np.asarray(box.corners_2d())
     c = np.asarray(box.center, dtype=float)
     yaw = float(box.yaw)
-    ca, sa = math.cos(yaw), math.sin(yaw)
-    d = pts[:, :2] - c[:2]
-    along = d @ np.array([ca, sa])
-    cross = d @ np.array([-sa, ca])
+    axis = np.array([math.cos(yaw), math.sin(yaw)])       # local x
+    cross = np.array([-math.sin(yaw), math.cos(yaw)])     # local y
     size = np.asarray(box.size, dtype=float)
-    m |= ((np.abs(along) < size[0] / 2.0 + near_margin) &
-          (np.abs(cross) < size[1] / 2.0 + near_margin) &
-          (pts[:, 2] > c[2] - size[2] / 2.0 - 0.3) &
-          (pts[:, 2] < c[2] + size[2] / 2.0 + 0.3))
+    # the FACE axis is perpendicular to the long edge (same convention as
+    # the azim_front swap in render_local_views)
+    if size[0] >= size[1]:
+        face_axis, face_half, long_half = cross, size[1] / 2.0, size[0] / 2.0
+        u, v = cross, axis          # u: face axis, v: row axis
+    else:
+        face_axis, face_half, long_half = axis, size[0] / 2.0, size[1] / 2.0
+        u, v = axis, cross
+    d = pts[:, :2] - c[:2]
+    du = d @ u
+    dv = d @ v
+    z = pts[:, 2]
+    z_top = c[2] + size[2] / 2.0
+    band = (z > 0.25) & (z < max(min(z_top - 0.2, 2.0), 0.5))
+    best_vec, best_corridor = face_axis.copy(), -1.0
+    for s in (1.0, -1.0):
+        beyond = du * s - face_half        # distance past the s-side face
+        m = (np.abs(dv) < long_half + 1.0) & (beyond > 0.10) & \
+            (beyond < reach) & band
+        corridor = float(beyond[m].min()) if m.any() else reach
+        if corridor > best_corridor:
+            best_corridor, best_vec = corridor, s * face_axis
+    return best_vec, min(best_corridor, reach)
 
-    # 2. frustum-of-the-box test for everything else
-    uv = cam.project_cv(pts)
-    H, W = cam.H, cam.W
-    in_img = ((uv[:, 0] >= -0.02 * W) & (uv[:, 0] <= 1.02 * W) &
-              (uv[:, 1] >= -0.02 * H) & (uv[:, 1] <= 1.02 * H))
-    # the box's 8 real 3D corners (4 footprint corners at both z faces)
+
+def _view_occlusion_mask(gs, box: OrientedBox, cam,
+                         pad_px: float = 12.0,
+                         front_slack: float = 0.12) -> np.ndarray:
+    """Keep the whole scene EXCEPT gaussians that occlude the box.
+
+    A normal aisle photo shows the device, the floor under it, the
+    background behind the row and the neighbouring racks beside it;
+    deleting any of that (the old screen-hull + depth-slab isolation)
+    leaves see-through holes where the deleted structure used to be, a
+    sliced band of floor and black void -- the 'messy' views the user
+    reported. The ONE thing that must go is structure BETWEEN the
+    camera and the box whose projection lands inside the box's screen
+    silhouette: it covers the very device the view is about (a pillar in
+    the aisle; the facing row when the camera ended up past the aisle's
+    middle).
+
+    front_slack: the box's own face gaussians bleed a few cm past the
+    fitted OBB; anything closer to the camera than the near face minus
+    this slack counts as an occluder.
+    """
+    pts = np.asarray(gs.means, dtype=float)
+    # box silhouette in pixels (footprint corners at both z faces)
+    corners3 = np.asarray(box.corners_2d())
+    c = np.asarray(box.center, dtype=float)
+    size = np.asarray(box.size, dtype=float)
     z_lo, z_hi = c[2] - size[2] / 2.0, c[2] + size[2] / 2.0
     box_pts = np.vstack([np.column_stack([corners3, np.full(4, z_lo)]),
                          np.column_stack([corners3, np.full(4, z_hi)])])
-    box_uv = cam.project_cv(box_pts)
-    # pixel hull bounds (conservative AABB of the box's own corners),
-    # inflated by ring_margin expressed in pixels (~size[1] maps to the
-    # box's face height in the frame; scale the margin the same way)
-    face_px = max(float(np.ptp(box_uv[:, 0])), float(np.ptp(box_uv[:, 1])),
-                  1.0)
-    pad_px = ring_margin / max(size[1], 0.1) * face_px
-    u0 = float(box_uv[:, 0].min()) - pad_px
-    u1 = float(box_uv[:, 0].max()) + pad_px
-    v0 = float(box_uv[:, 1].min()) - pad_px
-    v1 = float(box_uv[:, 1].max()) + pad_px
-    in_box_hull = ((uv[:, 0] >= u0) & (uv[:, 0] <= u1) &
-                   (uv[:, 1] >= v0) & (uv[:, 1] <= v1))
-    # depth: keep a bit behind the box (its back band + splat radius),
-    # but anything CLOSER to the camera than the box's near face minus
-    # slack is an occluder candidate -- only frustum survivors pass
-    V = cam.view_cv()
-    pc = np.hstack([pts, np.ones((len(pts), 1))]) @ V.T
+    bpc = np.hstack([box_pts, np.ones((8, 1))]) @ cam.view_cv().T
+    box_near = float(bpc[:, 2].min()) - front_slack
+    buv = cam.project_cv(box_pts)
+    u0 = float(buv[:, 0].min()) - pad_px
+    u1 = float(buv[:, 0].max()) + pad_px
+    v0 = float(buv[:, 1].min()) - pad_px
+    v1 = float(buv[:, 1].max()) + pad_px
+    uv = cam.project_cv(pts)
+    pc = np.hstack([pts, np.ones((len(pts), 1))]) @ cam.view_cv().T
     depth = pc[:, 2]
-    bpc = np.hstack([box_pts, np.ones((8, 1))]) @ V.T
-    box_near = float(bpc[:, 2].min()) - behind_slack
-    box_far = float(bpc[:, 2].max()) + behind_slack
-    near_ok = (depth >= box_near) | (m & (depth > 0.0))
-    far_ok = depth <= box_far + 0.3
-    m |= (in_img & in_box_hull & near_ok & far_ok & (depth > 0.0))
-    return m
+    in_sil = ((uv[:, 0] >= u0) & (uv[:, 0] <= u1) &
+              (uv[:, 1] >= v0) & (uv[:, 1] <= v1))
+    occluder = in_sil & (depth < box_near) & (depth > 0.0)
+    return ~occluder
 
 
 def render_local_views(scene: Scene, box: OrientedBox,
                        out_dir: str | None = None) -> list[dict]:
-    """Render front + side local views, isolated to the box neighborhood."""
+    """Render front + diagonal local views: a NORMAL aisle photo.
+
+    The view must look like a photo taken standing in the aisle: the
+    device front-on, the floor below it, the background behind the row,
+    neighbouring racks at the frame edges. Three placement rules
+    produce it:
+      * the camera stands on the box's OPEN side (the aisle), picked by
+        comparing free corridor width on either side -- the alternative
+        (whichever way local +y happens to point) photographs the rack's
+        back against the wall half the time;
+      * the eye stays INSIDE that corridor (standoff mode): backing off
+        to frame a 2m rack through a 60-deg lens puts the eye past the
+        aisle's middle, inside the facing row, and the render then needs
+        x-ray isolation and degenerates into a sliced collage;
+      * only ACTUAL occluders (between camera and box, projecting
+        inside the box's screen silhouette) are removed -- the floor,
+        the background behind the row and the facing row at the frame
+        edges all stay. Removing them is what made earlier views
+        'messy': see-through holes, a band of sliced floor, black void.
+    """
     gs_ply = scene.meta.get("gs_ply")
     if not gs_ply:
         return []
@@ -277,36 +306,44 @@ def render_local_views(scene: Scene, box: OrientedBox,
     from agentic_gts.output.gs_render import (make_local_cam, rasterize_gs,
                                               render_gs_view, png_bytes)
     gs = read_gaussian_ply(gs_ply)
-    cut_hi = box.center[2] + box.size[2] / 2.0 + 0.10
-    cut_lo = box.center[2] - box.size[2] / 2.0 + 0.05
-    # FRONT must face the device's front face: the camera direction is
-    # the box's cross (short) axis. When the fitted box has its length
-    # on the cross axis (size[0] < size[1] -- a yaw that runs along the
-    # row, or a 90-deg flip from PCA), the view at azim=0 looks along
-    # the LONG edge instead: swap the two so 'front' is always
-    # perpendicular to the long edge, i.e. facing the device's face
-    # (user report: many front views were the visible SIDE).
-    azim_front = 0.0 if box.size[0] >= box.size[1] else 90.0
-    # user-directed view pair, both at GROUND level (elev 18 deg, rack
-    # height -- no top-down component: the local views must show the
-    # device's vertical surfaces, which the ground-level 3DGS training
-    # observed well): FRONT (the face: doors, panels) + the DIAGONAL
-    # halfway between front and side (front+45 deg: corner view showing
-    # two adjacent faces at once -- the device's 3D extent along BOTH
-    # axes is measurable, which neither the face-on nor the pure side
-    # view alone can give).
+    # generous z window: keep the FLOOR (a normal photo shows it) and the
+    # headroom above the rack; only far ceiling / below-ground junk go
+    cut_hi = box.center[2] + box.size[2] / 2.0 + 2.0
+    cut_lo = box.center[2] - box.size[2] / 2.0 - 0.5
+    # camera side: the open corridor (aisle), not whichever way local +y
+    # points. FRONT must additionally face the big face: perpendicular to
+    # the long edge (a yaw running along the row, or a 90-deg flip from
+    # PCA, otherwise makes azim=0 look along the LONG edge -- the visible
+    # SIDE, an earlier user report).
+    open_vec, corridor = _open_side(gs, box)
+    yaw = float(box.yaw)
+    cross_dir = np.array([-math.sin(yaw), math.cos(yaw)])  # local +y
+    axis_dir = np.array([math.cos(yaw), math.sin(yaw)])    # local +x
+    if box.size[0] >= box.size[1]:
+        azim_front, face_dir = 0.0, cross_dir
+    else:
+        azim_front, face_dir = 90.0, axis_dir
+    if float(open_vec @ face_dir) < 0.0:
+        azim_front += 180.0            # the aisle is on the other side
+    # view pair, both at GROUND level (elev 18 deg, rack height -- no
+    # top-down component: the local views must show the device's
+    # vertical surfaces, which the ground-level 3DGS training observed
+    # well): FRONT (the face: doors, panels) + the DIAGONAL halfway
+    # between front and side (front+45 deg: corner view showing two
+    # adjacent faces at once -- the device's 3D extent along BOTH axes
+    # is measurable, which neither the face-on nor the pure side view
+    # alone can give).
     slots = (("front", 18.0, azim_front),
              ("oblique", 18.0, azim_front + 45.0))
+    # standoff: ~80% into the corridor, never further than 2.2m; the
+    # camera widens its lens to frame, it does not back off
+    standoff = float(np.clip(0.8 * corridor, 0.6, 2.2))
     out = []
     for name, elev, azim in slots:
-        cam = make_local_cam([box], extent=1.4, W=768, H=768,
-                             elev_deg=elev, azim_deg=azim)
-        # occlusion-free isolation (user report: the box's front was
-        # occluded by structure between the camera and the box, so the
-        # view degenerated to a visible side / garbage angle). The
-        # frustum mask keeps the box's ring plus a thin context band,
-        # and drops every gaussian standing in front of the box.
-        keep = _view_frustum_mask(gs, box, cam)
+        cam = make_local_cam([box], W=768, H=768, elev_deg=elev,
+                             azim_deg=azim, standoff=standoff)
+        # drop only what actually covers the box from this camera
+        keep = _view_occlusion_mask(gs, box, cam)
         sub = _subset_or_none(gs, keep)
         raw = rasterize_gs(sub, cam, cut_z=cut_hi, cut_z_low=cut_lo) \
             if sub is not None else None

@@ -421,6 +421,37 @@ def test_local_cam_frames_pair():
     print("PASS local cam frames both boxes of a pair")
 
 
+def test_local_cam_standoff_widens_lens():
+    """Standoff mode: the eye stays AT the given distance from the box's
+    camera-facing silhouette and the camera WIDENS ITS LENS to frame the
+    box instead of backing off. Backing off to frame a 2m rack through a
+    60-deg lens puts the eye ~1.9m out -- past the middle of a 1.2-1.5m
+    aisle, inside the facing row -- which forced x-ray isolation and the
+    sliced 'messy' views."""
+    import math as _m
+    from agentic_gts.output.gs_render import make_local_cam, _box_corners_3d
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(1.2, 0.6, 2.0), yaw=0.0)
+    cam = make_local_cam([box], W=768, H=768, elev_deg=18.0, azim_deg=0.0,
+                         standoff=0.9)
+    # the near face is at y=+0.3: the eye must stay ~0.9m from it
+    assert abs(cam.eye[1] - 1.2) < 0.05, \
+        f"eye must stand off in the aisle, eye_y={cam.eye[1]:.2f}"
+    assert cam.fovy_deg > 60.0, \
+        f"lens must widen instead of backing off, fovy={cam.fovy_deg}"
+    cs = _box_corners_3d(box)
+    uv = cam.project_cv(cs)
+    assert (uv[:, 0].min() > 0 and uv[:, 0].max() < cam.W and
+            uv[:, 1].min() > 0 and uv[:, 1].max() < cam.H), \
+        f"box off-frame at standoff: {uv}"
+    # eye at human height looking slightly down (ground-level aisle view)
+    assert 1.0 < cam.eye[2] < 1.8, f"eye height {cam.eye[2]:.2f} not human"
+    look = cam.target - cam.eye
+    tilt = _m.degrees(_m.asin(np.clip(-look[2] / np.linalg.norm(look), -1, 1)))
+    assert 0 < tilt < 35, f"tilt {tilt:.1f} deg not a ground-level view"
+    print(f"PASS local cam standoff (eye 0.9m from face, "
+          f"fovy {cam.fovy_deg:.0f} deg, box framed)")
+
+
 def test_near_boxes_mask_isolates():
     """The local render keeps only gaussians inside the (inflated) box
     OBBs: everything else -- e.g. an occluding rack 2m in front -- must be
@@ -851,6 +882,7 @@ if __name__ == "__main__":
     test_local_cam_front_face()
     test_local_cam_steep_oblique_measures_thickness()
     test_local_cam_frames_pair()
+    test_local_cam_standoff_widens_lens()
     test_near_boxes_mask_isolates()
     test_local_cam_azim_rotates_view()
     test_tile_views_composite()

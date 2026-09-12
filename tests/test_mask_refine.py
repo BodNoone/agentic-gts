@@ -198,35 +198,70 @@ def test_sam_debug_composite():
     print("PASS SAM debug composite (3-panel + union/no-fit fallback)")
 
 
-def test_view_frustum_mask_drops_occluders():
+def test_view_occlusion_mask_drops_only_occluders():
     """The front view must show the box's FACE, not whatever stands in
-    front of it: gaussians between the camera and the box are dropped,
-    the box's own ring is always kept, and far-away context is trimmed
-    to a thin band (user report: garbage angles showing the side)."""
+    front of it -- and everything else must SURVIVE. The old screen-hull +
+    depth-slab isolation deleted the background, the floor band and the
+    neighbours (sliced x-ray views); the occlusion mask only drops
+    gaussians BETWEEN the camera and the box that project inside the
+    box's screen silhouette."""
     from types import SimpleNamespace
-    from agentic_gts.agent.mask_refine import _view_frustum_mask
+    from agentic_gts.agent.mask_refine import _view_occlusion_mask
     from agentic_gts.output.gs_render import make_local_cam
 
     # a long rack row box: long edge along x (yaw=0)
     box = OrientedBox(center=(3, 0, 1), size=(6, 1.1, 2), yaw=0.0)
-    cam = make_local_cam([box], extent=1.4, W=768, H=768,
-                         elev_deg=18.0, azim_deg=0.0)   # front view
+    cam = make_local_cam([box], W=768, H=768,
+                         elev_deg=18.0, azim_deg=0.0, standoff=1.0)
     pts = np.array([
         [3.0, 0.0, 1.0],      # inside the box
-        [3.0, 0.4, 1.0],      # box front band
-        [3.0, 2.0, 1.0],      # OCCLUDER in the aisle, camera side
-        [3.0, 8.0, 1.0],      # far in front (near the camera)
-        [3.0, -1.5, 1.0],     # behind the far face (out of the band)
-        [8.0, 0.0, 1.0],      # beside the row (outside the frame hull)
+        [3.0, 0.4, 1.0],      # box front band (own face bleed)
+        [3.0, 1.2, 1.0],      # OCCLUDER in the aisle, over the box
+        [3.0, -1.5, 1.0],     # background behind the far face
+        [8.5, 0.0, 1.0],      # neighbour beside the row
+        [3.0, 1.2, 0.02],     # floor in front of the aisle
     ])
     gs = SimpleNamespace(means=pts)
-    m = _view_frustum_mask(gs, box, cam)
-    assert m[0] and m[1], "box interior / front band must always be kept"
-    assert not m[2], "aisle occluder between camera and box must be dropped"
-    assert not m[3], "near-camera clutter must be dropped"
-    assert not m[5], ("structure beside the row must be dropped "
-                      "(remove everything outside the box)")
-    print("PASS view frustum mask (occluders dropped, box ring kept)")
+    m = _view_occlusion_mask(gs, box, cam)
+    assert m[0] and m[1], "box interior / own face band must be kept"
+    assert not m[2], "aisle occluder covering the box must be dropped"
+    assert m[3], "background behind the row must STAY (normal photo)"
+    assert m[4], "neighbour beside the row must STAY (context)"
+    assert m[5], "floor in front of the aisle must STAY (normal photo)"
+    print("PASS view occlusion mask (occluders dropped, scene kept)")
+
+
+def test_open_side_picks_aisle():
+    """_open_side must find the aisle side: the rack's front faces a
+    1.7m corridor, its back a 0.7m gap to the wall -> the open direction
+    is +y (front) with the corridor width of the facing structure."""
+    from types import SimpleNamespace
+    from agentic_gts.agent.mask_refine import _open_side
+
+    box = OrientedBox(center=(0, 0, 1), size=(1.2, 0.6, 2.0), yaw=0.0)
+    rng = np.random.default_rng(0)
+    row = np.column_stack([rng.uniform(-0.6, 0.6, 500),
+                           rng.uniform(-0.3, 0.3, 500),
+                           rng.uniform(0.3, 1.7, 500)])
+    # wall 0.7m behind the back face (y = -0.3 - 0.7 = -1.0)
+    wall = np.column_stack([rng.uniform(-3, 3, 300),
+                            np.full(300, -1.0),
+                            rng.uniform(0.3, 1.7, 300)])
+    # facing row across a 1.7m aisle (front face y = 0.3 + 1.7 = 2.0)
+    facing = np.column_stack([rng.uniform(-3, 3, 300),
+                              np.full(300, 2.0),
+                              rng.uniform(0.3, 1.7, 300)])
+    gs = SimpleNamespace(means=np.vstack([row, wall, facing]))
+    vec, corridor = _open_side(gs, box)
+    assert vec[1] > 0.9, f"open side must be +y (aisle), got {vec}"
+    assert 1.3 < corridor < 1.9, f"corridor ~1.7m expected, got {corridor}"
+    # mirrored scene: the aisle on -y must flip the pick
+    gs2 = SimpleNamespace(
+        means=np.vstack([row, wall[:, [0, 1, 2]] * np.array([1, -1, 1]),
+                         facing * np.array([1, -1, 1])]))
+    vec2, _ = _open_side(gs2, box)
+    assert vec2[1] < -0.9, f"mirrored scene must pick -y, got {vec2}"
+    print("PASS open side picks the aisle (and flips on mirror)")
 
 
 def test_front_view_axis_swap():

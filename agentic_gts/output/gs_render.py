@@ -214,13 +214,14 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
 
 
 def make_local_cam(boxes, extent: float = 1.2, W: int = 768, H: int = 768,
-                   elev_deg: float = 18.0, azim_deg: float = 0.0) -> Cam:
+                   elev_deg: float = 18.0, azim_deg: float = 0.0,
+                   standoff: float | None = None) -> Cam:
     """Camera for one box (or a pair): the fine-detail counterpart to the
     god-view's coarse positioning.
 
     Accepts a single OrientedBox or a LIST of boxes (e.g. the two faces of
-    a merge-pair adjudication) and frames the UNION of all their 3D corners
-    -- with a verify-and-back-off loop so nothing clips out of view.
+    a merge-pair adjudication) and frames the UNION of all their 3D
+    corners -- with a verify-and-back-off loop so nothing clips out of view.
 
     The camera looks at the box from its FRONT (perpendicular to the row
     direction), rotated around the box by `azim_deg` (0 = front face, 90 =
@@ -229,6 +230,14 @@ def make_local_cam(boxes, extent: float = 1.2, W: int = 768, H: int = 768,
     with little foreshortening -- the row-direction thickness stays
     measurable in continuous rows. `up` stays world-vertical so the rack
     renders upright.
+
+    standoff (metres, from the box's camera-facing silhouette): keep the
+    eye AT that distance and WIDEN THE LENS (60 -> 95 deg) to frame the
+    box. Backing off instead pushes the eye past the middle of the aisle
+    into the facing row -- the render then needs x-ray isolation (delete
+    the row around the camera) and degenerates into a sliced, see-through
+    collage. Only when even 95 deg cannot frame the box does the camera
+    fall back to backing off.
 
     W/H default 768: each tile of the three-view composite the VLM
     adjudicates on carries ~5cm-scale misfits (wireframe overhang); at
@@ -251,21 +260,47 @@ def make_local_cam(boxes, extent: float = 1.2, W: int = 768, H: int = 768,
     fy = math.tan(math.radians(60.0 / 2.0))
     fx = fy * (W / H)
     spans = corners.max(axis=0) - corners.min(axis=0)
-    # first-guess distance from the union's extent (plus margin), then
-    # verify by projection and back off until every corner is in frame
-    dist0 = max(spans[2] / 2.0 / fy, (spans[0] + extent) / 2.0 / fx)
+
+    def _framed(cam):
+        pc = np.hstack([corners, np.ones((len(corners), 1))]) @ cam.view_cv().T
+        if not np.all(pc[:, 2] > 0.1):       # some corner behind the camera
+            return False
+        uv = cam.project_cv(corners)
+        return (uv[:, 0].min() > 0.02 * W and uv[:, 0].max() < 0.98 * W and
+                uv[:, 1].min() > 0.02 * H and uv[:, 1].max() < 0.98 * H)
+
+    if standoff is not None:
+        # how far the box's silhouette bulges toward the camera
+        ext = float(np.max((corners[:, :2] - c[:2]) @ horiz))
+        dist = standoff + ext
+        cam = None
+        # lens ladder: a 2m rack framed from a ~1m aisle needs ~100+ deg
+        # (the near-top corner sits >50 deg above a downward-tilted axis);
+        # narrow aisles are exactly where wide-angle is the honest view
+        for fovy in (60.0, 66.0, 72.0, 78.0, 84.0, 90.0, 96.0, 102.0,
+                     110.0):
+            eye = c + np.array([horiz[0] * dist, horiz[1] * dist,
+                                dist * math.tan(math.radians(elev_deg))])
+            cand = Cam(eye=eye, target=c, up=np.array([0.0, 0.0, 1.0]),
+                       fovy_deg=fovy, W=W, H=H)
+            if _framed(cand):
+                return cand
+            cam = cand
+        # even 95 deg could not frame it (very long box): back off from
+        # the standoff distance instead (old behaviour)
+        dist0 = dist
+    else:
+        # first-guess distance from the union's extent (plus margin), then
+        # verify by projection and back off until every corner is in frame
+        dist0 = max(spans[2] / 2.0 / fy, (spans[0] + extent) / 2.0 / fx)
+        cam = None
     for f in (1.0, 1.1, 1.25, 1.4, 1.6, 1.9, 2.2, 2.6, 3.0, 3.5):
         dist = dist0 * f
         eye = c + np.array([horiz[0] * dist, horiz[1] * dist,
                             dist * math.tan(math.radians(elev_deg))])
         cam = Cam(eye=eye, target=c, up=np.array([0.0, 0.0, 1.0]),
                   fovy_deg=60.0, W=W, H=H)
-        pc = np.hstack([corners, np.ones((len(corners), 1))]) @ cam.view_cv().T
-        if not np.all(pc[:, 2] > 0.1):       # some corner behind the camera
-            continue
-        uv = cam.project_cv(corners)
-        if (uv[:, 0].min() > 0.02 * W and uv[:, 0].max() < 0.98 * W and
-                uv[:, 1].min() > 0.02 * H and uv[:, 1].max() < 0.98 * H):
+        if _framed(cam):
             return cam
     return cam
 
