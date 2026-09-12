@@ -316,101 +316,22 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
                        device_type=DeviceType.RACK)
 
 
-def _merge_rects(rects: list[tuple], iou_thr: float = 0.25,
-                 along_gap: float = 0.5, cross_gap: float = 0.35,
-                 cross_union: float = 1.6,
-                 pts: np.ndarray | None = None) -> list[tuple]:
-    """Greedy union merge of grounded rects (row frame: x = along the
-    row, y = depth).
+def _dedup_views(prim_rects: list[tuple],
+                 obl_rects: list[tuple]) -> list[tuple]:
+    """View-level DEDUP only -- no merging (user-directed).
 
-    The same row is typically outlined in SEVERAL views (nadir + the
-    two obliques); each capture is coarse in its own way (nadir: blurry
-    tops; oblique: perspective stretch). Union + a fresh point-support
-    fit keeps the most inclusive footprint per structure. Three ways the
-    same structure's rects fuse:
-      1. OVERLAP: intersection > iou_thr of the smaller rect.
-      2. ALONG-ROW adjacency: one long row outlined in pieces -- gap
-         <= along_gap on x with substantial y alignment. Requires
-         POINT SUPPORT in the gap strip when pts is given: a row
-         outlined in pieces is physically continuous (device points
-         between the pieces), while colinear-but-SEPARATE rows have an
-         empty cross aisle in the gap -- chaining those together was
-         the over-merge the user reported. The split stage divides
-         rows LATER; grounding must capture them whole.
-      3. DEPTH complement: front- and back-face fragments of one rack
-         (small y gap, strong x overlap, combined depth <= cross_union
-         -- two full parallel rows stacked in y always exceed it).
-    Parallel rows never fuse: their y gap is aisle-scale, and two full
-    rows stacked in y exceed cross_union.
-    """
-    rs = [list(map(float, r)) for r in rects]
+    The nadir view owns the footprint: every nadir rect becomes its
+    own candidate, exactly as drawn (vertical rays, no perspective
+    dilation). An oblique rect can only ADD a structure the nadir
+    MISSED (the blurry-top centre rows): when it overlaps any nadir
+    rect it is simply DROPPED -- union-ing the tilted view's
+    perspective slop into the nadir capture was what inflated the
+    fitted boxes.
 
-    def _area(r):
-        return max(0.0, r[2] - r[0]) * max(0.0, r[3] - r[1])
-
-    def _gap_supported(a, b):
-        """Device points present in the x-gap strip between two pieces
-        (row frame, pts pre-filtered to the device band). Touching
-        pieces are always supported."""
-        gx0, gx1 = min(a[2], b[2]), max(a[0], b[0])
-        if gx1 - gx0 <= 0.05:
-            return True
-        if pts is None or not len(pts):
-            return True
-        m = ((pts[:, 0] >= gx0) & (pts[:, 0] <= gx1) &
-             (pts[:, 1] >= max(a[1], b[1])) &
-             (pts[:, 1] <= min(a[3], b[3])))
-        return int(m.sum()) >= 5
-
-    changed = True
-    while changed:
-        changed = False
-        for i in range(len(rs)):
-            for j in range(i + 1, len(rs)):
-                a, b = rs[i], rs[j]
-                ix = min(a[2], b[2]) - max(a[0], b[0])
-                iy = min(a[3], b[3]) - max(a[1], b[1])
-                inter = max(0.0, ix) * max(0.0, iy)
-                smaller = min(_area(a), _area(b))
-                merge = smaller > 0 and inter > iou_thr * smaller
-                if not merge and iy > 0 and ix >= -along_gap:
-                    # along-row pieces: touching (or a hair apart) on x,
-                    # aligned on y, and the structure continues through
-                    # the gap
-                    ha, hb = a[3] - a[1], b[3] - b[1]
-                    if (min(ha, hb) > 0 and iy >= 0.5 * min(ha, hb)
-                            and _gap_supported(a, b)):
-                        merge = True
-                if not merge and ix > 0 and iy >= -cross_gap:
-                    # depth complement: front/back face fragments
-                    wa, wb = a[2] - a[0], b[2] - b[0]
-                    y_union = max(a[3], b[3]) - min(a[1], b[1])
-                    if (min(wa, wb) > 0 and ix >= 0.8 * min(wa, wb)
-                            and y_union <= cross_union):
-                        merge = True
-                if merge:
-                    rs[i] = [min(a[0], b[0]), min(a[1], b[1]),
-                             max(a[2], b[2]), max(a[3], b[3])]
-                    rs.pop(j)
-                    changed = True
-                    break
-            if changed:
-                break
-    return [tuple(r) for r in rs]
-
-
-def _primary_merge(prim_rects: list[tuple], obl_rects: list[tuple],
-                   pts: np.ndarray | None = None) -> list[tuple]:
-    """PRIMARY-VIEW merge policy (user-directed).
-
-    The nadir view owns the footprint: its rects merge among
-    themselves (fragment rules) and form the BASE set. A tilted view's
-    rect can only ADD: when it overlaps any accepted rect it is simply
-    DROPPED -- the nadir capture is the exact footprint (vertical rays,
-    no perspective dilation), and union-ing the tilted view's
-    perspective slop into it was what inflated the fitted boxes. Only a
-    rect covering something the nadir MISSED (the blurry-top centre
-    rows) survives and is fitted as its own structure.
+    Fragments are NOT fused here anymore: the grounding result goes to
+    the per-box local refinement (SAM) FIRST and the joined rows are
+    split LATER. Pre-merging pieces here decided structure membership
+    before the evidence ever got a vote.
     """
     def _ovf(a, b):
         ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
@@ -420,12 +341,12 @@ def _primary_merge(prim_rects: list[tuple], obl_rects: list[tuple],
                  (b[2] - b[0]) * (b[3] - b[1]))
         return inter / sm if sm > 0 else 0.0
 
-    accepted = list(_merge_rects(prim_rects, pts=pts))
+    out = list(prim_rects)
     for r in obl_rects:
-        if any(_ovf(r, m) > 0.15 for m in accepted):
+        if any(_ovf(r, m) > 0.15 for m in out):
             continue          # the primary view owns this structure
-        accepted.append(r)
-    return accepted
+        out.append(r)
+    return out
 
 
 def _tighten_oblique(cam, r, yaw, pts_fit, frame_rect_fn):
@@ -553,15 +474,17 @@ def _front_view_height(scene, box, judge, hint_top,
 
 
 def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
-    """Replace scene.boxes with VLM-grounded full-depth row boxes.
+    """Replace scene.boxes with VLM-grounded per-region boxes.
 
     Two-view capture: the true NADIR view (rows axis-aligned, exact
     footprint) plus ONE OBLIQUE view whose well-trained rack FACES compensate the nadir's
     blind spot -- a ground-level 3DGS training set barely observed rack
     tops, so the nadir room centre renders as an ungroundable smear
     while the image edges (perspective showing faces) ground fine.
-    Regions from all views are back-projected, union-merged, and
-    point-support fitted into full-depth row boxes.
+    Regions are back-projected, view-DEDUPED (nadir owns the footprint,
+    obliques only add what it missed) and point-support fitted -- each
+    region its OWN box, unmerged (the local refinement and the row
+    split run downstream).
 
     False = grounding unavailable (mock backend / VLM failure / no
     region survived the point-support guards) and the caller keeps the
@@ -648,7 +571,11 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
             obl_rects.append(rect)
         else:
             prim_rects.append(rect)
-    merged = _primary_merge(prim_rects, obl_rects, pts_fit)
+    # NO merging: each grounded rect is fitted as its OWN box (user
+    # directive). The per-box local refinement (SAM) runs next and the
+    # joined rows are split after it -- pre-merging decided structure
+    # membership before the refinement evidence got a vote.
+    merged = _dedup_views(prim_rects, obl_rects)
     boxes = []
     for rect_r in merged:
         bb = _fit_region_box(pts_fit, rect_r)
@@ -679,7 +606,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                                     "no region survived point-support guards")
         return False
     print(f"[ground] {len(cam_rects)} VLM regions in {len(views)} views "
-          f"-> {len(merged)} merged -> {len(boxes)} full-depth row boxes")
+          f"-> {len(merged)} unmerged -> {len(boxes)} fitted boxes")
     scene.boxes = boxes
     # result audit on EVERY view (user request): each grounded_*.png
     # shows that view's own raw VLM rects (colored) plus the final

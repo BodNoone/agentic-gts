@@ -170,6 +170,14 @@ class LayoutAgent:
         # centers fit the metric OBB. Runs for BOTH externally supplied and
         # VLM-grounded boxes; grounding finds where, local masks refine edges.
         self._local_mask_refine(scene, report)
+        # 1b. row split AFTER the local refinement (user-directed order):
+        # each grounded region is refined on its own evidence FIRST, then
+        # the joined rows are divided into cabinets. Pre-merging / splitting
+        # before the refinement decided structure membership before the SAM
+        # masks had a vote.
+        if self.opts.get("vlm_grounded"):
+            from agentic_gts.agent.ground import split_stage
+            split_stage(scene, self.judge, self.out_dir)
         # 2. row-depth completion: thin single-face fragments (rows
         # scanned only from their facades) are expanded to the full row
         # thickness from the cross-axis surface-band profile BEFORE the

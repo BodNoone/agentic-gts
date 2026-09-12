@@ -311,10 +311,14 @@ def run_pipeline(scene: Scene,
             judge.set_record(os.path.join(out_dir, "vlm_records.jsonl"))
         except Exception as e:
             print(f"[warn] record path set failed ({type(e).__name__}: {e})")
-        from agentic_gts.agent.ground import ground_stage, split_stage
+        from agentic_gts.agent.ground import ground_stage
         if ground_stage(scene, judge, out_dir):
-            split_stage(scene, judge, out_dir)
             opts["vlm_grounded"] = True
+            # NOTE: the row SPLIT no longer runs here -- it moved into
+            # the agent loop, AFTER the per-box local refinement (SAM).
+            # User-directed order: grounding -> refine each region ->
+            # split the joined rows. Pre-splitting decided structure
+            # membership before the refinement evidence had a vote.
             _diag_support(scene)
             _eval("stageG")
             _render_stage(scene, "stageG_ground", out_dir, gt_boxes)

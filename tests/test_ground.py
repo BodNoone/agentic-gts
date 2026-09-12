@@ -161,8 +161,8 @@ def test_ground_stage_with_patched_vlm():
         if "front-facing" in prompt.lower():
             return "[]"
         # tilted views answer with nothing extra here: the nadir view
-        # alone grounds both rows (the multi-view UNION path is covered
-        # by test_merge_rects)
+        # alone grounds both rows (the multi-view DEDUP path is covered
+        # by test_dedup_views_policy)
         if "tilted" in prompt.lower():
             return "I see rows but nothing new.\n[]"
         return reply
@@ -231,18 +231,18 @@ def test_split_reply_parse():
     print("PASS split reply parse (incl. think-block + range clamps)")
 
 
-def test_primary_merge_policy():
-    """PRIMARY-VIEW merge policy (user-directed): the nadir view owns
-    the footprint. Oblique rects that overlap a nadir rect are DROPPED
-    (their perspective slop must never dilate the exact vertical-ray
-    capture); only rects covering something the nadir MISSED survive
-    as additions. A disjoint row must never fuse into the primary."""
-    from agentic_gts.agent.ground import _primary_merge
+def test_dedup_views_policy():
+    """View-level DEDUP (no merging): the nadir view owns the
+    footprint. Every nadir rect stays AS DRAWN (fragments are NOT
+    fused -- the local refinement handles them downstream); an oblique
+    rect that overlaps a nadir rect is DROPPED, one over a nadir BLIND
+    SPOT survives as its own addition."""
+    from agentic_gts.agent.ground import _dedup_views
     # nadir's capture of row 1 (tight, exact) + its two tilted captures
     # (shifted/stretched by perspective) + a parallel row 2
     nadir = [(-0.2, -0.6, 6.1, 0.7), (-1.0, 2.4, 5.2, 3.6)]
     obliques = [(0.3, -0.8, 6.4, 0.5), (-0.4, -0.5, 5.9, 0.9)]
-    out = _primary_merge(nadir, obliques)
+    out = _dedup_views(nadir, obliques)
     assert len(out) == 2, f"want 2 rects (both rows), got {len(out)}"
     row1 = min(out, key=lambda r: r[1])
     # the oblique slop must NOT have widened the nadir capture: the
@@ -253,45 +253,16 @@ def test_primary_merge_policy():
     # an oblique rect over a nadir BLIND SPOT (a centre row the nadir
     # missed) survives as its own addition
     blind = (1.0, 5.0, 5.0, 6.1)
-    out = _primary_merge(nadir, [blind])
+    out = _dedup_views(nadir, [blind])
     assert len(out) == 3, f"blind-spot addition must survive, got {len(out)}"
     assert any(abs(r[1] - 5.0) < 1e-9 for r in out)
-    print("PASS primary merge (nadir owns overlap, obliques only add)")
-
-
-def test_merge_rects_fragments():
-    """_merge_rects fragment rules (within ONE view's rects):
-    overlap fusion, along-row adjacency gated by point support, depth
-    complement, and parallel rows that never fuse."""
-    from agentic_gts.agent.ground import _merge_rects
-    # neighbouring rows 1.2m apart with slight VLM slop still stay split
-    a = (0.0, 0.0, 6.0, 1.1)
-    b = (0.0, 1.35, 6.0, 2.45)      # overlap of 0 -> never merges
-    assert len(_merge_rects([a, b])) == 2
-    # ALONG-ROW adjacency: one long row outlined in pieces. Without
-    # points given the rule stays permissive (legacy callers); WITH the
-    # device band the gap strip decides: a continuous row (points in
-    # the gap) fuses, colinear-but-separate rows (empty cross aisle in
-    # the gap) never do -- the over-merge the user reported
-    pieces = [(0.0, 0.0, 3.0, 1.1), (3.2, 0.05, 6.0, 1.05)]
-    assert len(_merge_rects(pieces)) == 1, "pts=None keeps legacy behaviour"
-    rng2 = np.random.default_rng(4)
-    cont = _row_points(0.0, 6.0, rng=rng2)      # continuous: gap filled
-    out = _merge_rects(pieces, pts=cont)
-    assert len(out) == 1, "continuous row pieces must fuse with point support"
-    assert abs(out[0][0]) < 1e-9 and abs(out[0][2] - 6.0) < 1e-9
-    sep = np.vstack([_row_points(0.0, 3.0, rng=rng2),
-                     _row_points(3.2, 6.0, rng=rng2)])   # empty x-gap
-    out = _merge_rects(pieces, pts=sep)
-    assert len(out) == 2, \
-        "colinear separate rows (empty cross aisle) must NOT fuse"
-    # DEPTH complement: front/back face fragments of ONE rack (thin
-    # bands, 0.3m apart on y, combined depth 1.1 <= 1.6) -> ONE rect
-    faces = [(0.0, 0.0, 6.0, 0.4), (0.0, 0.7, 6.0, 1.1)]
-    out = _merge_rects(faces)
-    assert len(out) == 1, f"depth-complement faces must fuse, got {len(out)}"
-    assert abs(out[0][1]) < 1e-9 and abs(out[0][3] - 1.1) < 1e-9
-    print("PASS merge rects (adjacency, depth complement, disjoint kept)")
+    # FRAGMENTS ARE NOT MERGED anymore: overlapping nadir pieces stay
+    # separate structures (the local refinement + split decide later)
+    frags = [(-0.2, -0.6, 3.0, 0.7), (2.9, -0.6, 6.1, 0.7)]
+    assert len(_dedup_views(frags, [])) == 2, \
+        "fragments must NOT fuse at grounding anymore"
+    print("PASS dedup views (nadir owns overlap, obliques only add, "
+          "fragments unmerged)")
 
 
 def test_tighten_oblique_rect():
@@ -505,8 +476,7 @@ if __name__ == "__main__":
     test_split_row_snaps_to_profile_gaps()
     test_ground_stage_with_patched_vlm()
     test_split_reply_parse()
-    test_primary_merge_policy()
-    test_merge_rects_fragments()
+    test_dedup_views_policy()
     test_tighten_oblique_rect()
     test_front_view_height()
     test_parse_ground_regions_official_format()
