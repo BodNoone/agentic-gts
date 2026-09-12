@@ -67,6 +67,79 @@ def test_sam_unconfigured_is_conservative():
     print("PASS SAM-unconfigured path keeps boxes unchanged")
 
 
+def test_parse_rack_confirm():
+    from agentic_gts.agent.judge import VLMJudge
+    p = VLMJudge._parse_rack_confirm(
+        'The image shows a rack row.\n{"is_rack": true, "confidence": 0.9}')
+    assert p == {"is_rack": True, "confidence": 0.9}
+    # string booleans + missing confidence
+    p = VLMJudge._parse_rack_confirm('{"is_rack": "false"}')
+    assert p == {"is_rack": False, "confidence": 0.5}
+    # think-block prefix, clamped confidence
+    p = VLMJudge._parse_rack_confirm(
+        'reasoning... {"is_rack": true, "confidence": 5}')
+    assert p == {"is_rack": True, "confidence": 1.0}
+    # no verdict -> None (keep, never guess)
+    assert VLMJudge._parse_rack_confirm("cannot tell") is None
+    assert VLMJudge._parse_rack_confirm('{"confidence": 0.9}') is None
+    print("PASS rack confirm parse (string bools, clamp, None on no verdict)")
+
+
+def test_type_confirm_marks_low_not_deleted():
+    """A VLM 'not a rack' verdict must mark LOW + unresolved and NEVER
+    delete the box -- false-positive deletion is the dangerous
+    direction. Runs the full _local_mask_refine path with SAM
+    unconfigured (type confirmation must work without SAM)."""
+    from agentic_gts.agent import loop as loop_mod
+    from agentic_gts.agent import mask_refine as mr
+    from agentic_gts.agent.judge import Verdict, VLMJudge
+    from agentic_gts.core.models import Confidence
+
+    scene = Scene(points=np.zeros((50, 3)))
+    scene.meta["yaw"] = 0.0
+    suspect = OrientedBox(center=(1, 1, 1), size=(0.6, 1.1, 2.0), yaw=0.0)
+    good = OrientedBox(center=(4, 1, 1), size=(0.6, 1.1, 2.0), yaw=0.0)
+    scene.boxes = [suspect, good]
+
+    judge = VLMJudge(backend="qwen")
+
+    def _fake_confirm(image, box, png_path=None):
+        if box is suspect:
+            return Verdict(action="keep",
+                           params={"is_rack": False, "confidence": 0.85})
+        return Verdict(action="keep",
+                      params={"is_rack": True, "confidence": 0.95})
+    judge.adjudicate_rack_confirm = _fake_confirm
+
+    fake_view = {"name": "front", "image": np.zeros((4, 4, 3)),
+                 "prompt_image": np.zeros((4, 4, 3)), "cam": None,
+                 "path": None, "prompt_path": None}
+    orig_rlv = mr.render_local_views
+    mr.render_local_views = lambda *a, **k: [fake_view]
+    try:
+        agent = loop_mod.LayoutAgent(judge=judge)
+        report = loop_mod.AgentReport()
+        agent._local_mask_refine(scene, report)
+    finally:
+        mr.render_local_views = orig_rlv
+
+    # suspect: kept in the scene, but LOW + flagged for human review
+    ids = [b.box_id for b in scene.boxes]
+    assert suspect.box_id in ids, "a 'no' verdict must NOT delete the box"
+    assert suspect.confidence == Confidence.LOW
+    assert suspect.meta.get("type_suspect") is True
+    assert any(u["issue"]["type"] == "not_a_rack"
+               and u["issue"]["box_id"] == suspect.box_id
+               for u in report.unresolved), "must surface for human review"
+    # good box untouched
+    assert good.confidence != Confidence.LOW
+    assert not good.meta.get("type_suspect")
+    # no VLM answer, no marking: mock judge returns None -> box stays
+    mock_ids = len(scene.boxes)
+    assert mock_ids == 2
+    print("PASS type confirm marks LOW + unresolved, never deletes")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed = 0

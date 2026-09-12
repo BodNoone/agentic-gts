@@ -1385,6 +1385,78 @@ class VLMJudge:
                        detail=f"{len(groups)} prompt groups", raw=text,
                        png_path=png_path)
 
+    _RACK_CONFIRM_PROMPT = (
+        "You are verifying ONE detected object in a data-center scene.\n"
+        "The image shows the local neighborhood of one detected 3D box; "
+        "the RED wireframe marks the box. Question: is the object the "
+        "wireframe wraps really a SERVER RACK / IT cabinet (or a joined "
+        "row of them)? A pillar, wall segment, cable tray, UPS unit, "
+        "AC unit, pipe, floor patch or clutter is NOT a server rack "
+        "even when the box fits it well. Judge the object, not the "
+        "box fit.\n"
+        "Output ONLY JSON on the last line:\n"
+        '{"is_rack": true|false, "confidence": 0.0-1.0}'
+    )
+
+    def adjudicate_rack_confirm(self, image: np.ndarray, box,
+                                png_path: str | None = None) -> Verdict:
+        """Type-level guard: is the boxed object actually a server rack?
+
+        The grounding guards only reject hallucinated EMPTY regions
+        (no point support / floor patches); a real structure mislabelled
+        a rack (pillar, UPS, AC, wall) passes them all. One yes/no
+        question on the local view. The caller NEVER deletes on a 'no'
+        -- it marks LOW confidence and surfaces the box for human
+        review (false-positive deletion is the dangerous direction).
+        """
+        if self.backend == "mock":
+            return Verdict(action="keep", params=None, confidence=0.0,
+                           detail="mock: no type signal")
+        png = self._array_png_bytes(image)
+        if png_path is None:
+            png_path = self._save_evidence_png(
+                image, f"rack_confirm_{box.box_id}.png")
+        try:
+            if self.backend == "local":
+                text = self._local_image_call(png, self._RACK_CONFIRM_PROMPT,
+                                              max_new_tokens=200)
+            else:
+                text = self._qwen_image_call(png, self._RACK_CONFIRM_PROMPT,
+                                             max_tokens=200)
+        except Exception as e:
+            self._record("rack_confirm", self._RACK_CONFIRM_PROMPT, "", "",
+                         0.0, f"call failed: {e}", png_path=png_path)
+            return Verdict(action="keep", params=None, confidence=0.0,
+                           detail=f"call failed: {e}")
+        p = self._parse_rack_confirm(self._strip_think(text))
+        self._record("rack_confirm", self._RACK_CONFIRM_PROMPT, text,
+                     str(p), p["confidence"] if p else 0.0,
+                     "no deletion on a 'no' -- LOW + human review",
+                     png_path=png_path)
+        if p is None:
+            return Verdict(action="keep", params=None, confidence=0.0,
+                           detail="unparseable", raw=text, png_path=png_path)
+        return Verdict(action="keep", params=p, confidence=p["confidence"],
+                       raw=text, png_path=png_path)
+
+    @staticmethod
+    def _parse_rack_confirm(text: str) -> dict | None:
+        """Parse the rack yes/no JSON. Tolerates string booleans and
+        missing confidence; None when no verdict can be extracted."""
+        data = _extract_json(text)
+        if not isinstance(data, dict) or "is_rack" not in data:
+            return None
+        v = data["is_rack"]
+        if isinstance(v, bool):
+            is_rack = v
+        else:
+            is_rack = str(v).strip().lower() in ("true", "yes", "1")
+        try:
+            conf = min(max(float(data.get("confidence", 0.5)), 0.0), 1.0)
+        except (TypeError, ValueError):
+            conf = 0.5
+        return {"is_rack": is_rack, "confidence": conf}
+
     @staticmethod
     def _array_png_bytes(arr: np.ndarray) -> bytes:
         import matplotlib

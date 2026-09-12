@@ -316,10 +316,44 @@ def score_candidate(mask_score: float, points: np.ndarray,
     return 0.45 * float(mask_score) + 0.25 * support + 0.20 * iou + 0.10 * yaw_score
 
 
+def confirm_device_type(judge, box: OrientedBox, views: list,
+                        ) -> dict | None:
+    """Type-level guard for ONE box: is the wrapped object a server rack?
+
+    The grounding guards only reject hallucinated EMPTY regions; a real
+    structure mislabelled a rack (pillar / UPS / AC / wall) passes them
+    all. This asks the VLM one yes/no question on the front local view
+    (wireframe overlay shows which object is meant). `views` comes from
+    the caller's render_local_views call (shared with refine_box --
+    one render, two questions).
+
+    Returns None when there is no signal (no views, or the judge is mock
+    -- never penalise for missing evidence); else {"is_rack": bool,
+    "confidence": float}. The CALLER decides policy; the standing
+    contract is mark-LOW + human review, never deletion.
+    """
+    if getattr(judge, "backend", "mock") == "mock":
+        return None
+    front = next((v for v in views if v["name"] == "front"), None)
+    if front is None:
+        return None
+    verdict = judge.adjudicate_rack_confirm(
+        front["prompt_image"], box,
+        png_path=front["prompt_path"] or front["path"])
+    p = verdict.params or {}
+    if "is_rack" not in p:
+        return None
+    return {"is_rack": bool(p["is_rack"]),
+            "confidence": float(p.get("confidence",
+                                      verdict.confidence or 0.5))}
+
+
 def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
-               out_dir: str | None = None) -> tuple[OrientedBox | None, dict]:
+               out_dir: str | None = None,
+               views: list | None = None) -> tuple[OrientedBox | None, dict]:
     """Run Qwen point grounding + SAM + 3D fitting for one box."""
-    views = render_local_views(scene, box, out_dir)
+    if views is None:
+        views = render_local_views(scene, box, out_dir)
     audit = {"box_id": box.box_id, "views": [], "accepted": False}
     if not views or not sam.available:
         audit["reason"] = "no local GS views or SAM checkpoint"

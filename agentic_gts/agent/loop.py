@@ -359,8 +359,16 @@ class LayoutAgent:
                   f"{e}) -> skipped")
 
     def _local_mask_refine(self, scene: Scene, report: AgentReport) -> None:
-        """Qwen point prompts -> SAM masks -> projected 3D OBB refinement."""
-        from agentic_gts.agent.mask_refine import SamPredictorAdapter, refine_box
+        """Local per-box VLM pass: SAM mask refinement + type confirmation.
+
+        Both questions share ONE render_local_views call per box (front
+        + side views). The type confirmation runs even when SAM is not
+        configured -- it only needs the local view and the VLM.
+        """
+        from agentic_gts.agent.mask_refine import (SamPredictorAdapter,
+                                                    confirm_device_type,
+                                                    refine_box,
+                                                    render_local_views)
         import json as _json
         import os as _os
 
@@ -370,14 +378,46 @@ class LayoutAgent:
         if not sam.available:
             print("[mask-refine] SAM disabled: set --sam-checkpoint or "
                   "SAM_CHECKPOINT; existing boxes kept")
-            return
-        audits = []
+        audits, conf_audits = [], []
         for old in list(scene.boxes):
             if scene.get_box(old.box_id) is None:
                 continue
+            # one render per box, shared by both questions
+            views = (render_local_views(scene, old, self.out_dir)
+                     if (sam.available
+                         or self.judge.backend != "mock") else [])
+            # ---- type-level guard (no SAM needed) ----
+            # Grounding guards reject hallucinated EMPTY regions, but a
+            # real structure mislabelled a rack (pillar / UPS / AC / wall
+            # segment) passes them all: it has points, height and a good
+            # SAM mask. One VLM yes/no on the front view closes that
+            # gap. A 'no' NEVER deletes -- it marks LOW confidence and
+            # surfaces the box for human review (false-positive deletion
+            # is the dangerous direction).
+            try:
+                r = confirm_device_type(self.judge, old, views)
+            except Exception as e:
+                print(f"[type-confirm] {old.box_id[:6]} failed "
+                      f"({type(e).__name__}: {e})")
+                r = None
+            if r is not None:
+                conf_audits.append({"box_id": old.box_id, **r})
+                if not r["is_rack"]:
+                    old.confidence = Confidence.LOW
+                    old.meta["type_suspect"] = True
+                    report.unresolved.append(
+                        {"issue": {"type": "not_a_rack",
+                                   "box_id": old.box_id,
+                                   "confidence": r["confidence"]},
+                         "ok": False})
+                    print(f"[type-confirm] {old.box_id[:6]} NOT a rack "
+                          f"(conf {r['confidence']:.2f}) -> LOW + review")
+            # ---- SAM mask refinement ----
+            if not sam.available:
+                continue
             try:
                 new, audit = refine_box(scene, old, self.judge, sam,
-                                        self.out_dir)
+                                        self.out_dir, views=views)
             except Exception as e:
                 print(f"[mask-refine] {old.box_id[:6]} failed "
                       f"({type(e).__name__}: {e}) -> keep")
@@ -403,9 +443,16 @@ class LayoutAgent:
                   f"{audit.get('view')} score={audit.get('score')}")
         if self.out_dir:
             try:
-                with open(_os.path.join(self.out_dir, "mask_refine.json"),
-                          "w", encoding="utf-8") as f:
-                    _json.dump(audits, f, ensure_ascii=False, indent=2)
+                if audits:
+                    with open(_os.path.join(self.out_dir, "mask_refine.json"),
+                              "w", encoding="utf-8") as f:
+                        _json.dump(audits, f, ensure_ascii=False, indent=2)
+                if conf_audits:
+                    with open(_os.path.join(self.out_dir,
+                                            "type_confirm.json"),
+                              "w", encoding="utf-8") as f:
+                        _json.dump(conf_audits, f, ensure_ascii=False,
+                                   indent=2)
             except Exception as e:
                 print(f"[mask-refine] audit save failed ({type(e).__name__})")
 
