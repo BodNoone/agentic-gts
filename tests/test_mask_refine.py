@@ -40,6 +40,22 @@ def test_point_groups_accept_fractional_normalized():
     print("PASS fractional [0,1] points normalized to Qwen 0-1000")
 
 
+def test_sam_point_prompt_construction():
+    """The real-VLM prompt must survive construction: the JSON example's
+    literal braces ({\"candidate_groups\": ...}) used to be parsed by
+    str.format as a replacement field -> KeyError on every call (the
+    mock backend never formats, so only a real run caught it)."""
+    from agentic_gts.agent.judge import VLMJudge
+    j = VLMJudge(backend="qwen")
+    prompt = j._SAM_POINT_PROMPT.replace("{view_name}", "front")
+    assert "{view_name}" not in prompt and "front" in prompt
+    assert '{"candidate_groups"' in prompt, \
+        "the JSON example braces must stay literal"
+    # regression: .format would raise KeyError '"candidate_groups"'
+    # (field name includes the quotes) -- nothing may raise now
+    print("PASS SAM point prompt construction (literal JSON braces)")
+
+
 def test_fit_mask_points_preserves_length_axis():
     rng = np.random.default_rng(2)
     yaw = math.radians(25)

@@ -1308,7 +1308,12 @@ class VLMJudge:
                               png_path: str | None = None) -> Verdict:
         """Qwen3-VL point grounding for SAM (native 0..1000 coordinates)."""
         from agentic_gts.agent.mask_refine import parse_point_groups
-        prompt = self._SAM_POINT_PROMPT.format(view_name=view_name)
+        # .replace, NOT .format: the prompt's JSON example carries
+        # literal braces ({"candidate_groups": ...}) that str.format
+        # parses as a replacement field named '"candidate_groups"'
+        # (quotes included) -> KeyError on EVERY real-VLM call (mock
+        # never formats, so the tests could not catch it)
+        prompt = self._SAM_POINT_PROMPT.replace("{view_name}", view_name)
         if self.backend == "mock":
             return Verdict(action="keep", params={"groups": []},
                            confidence=0.0, detail="mock: no SAM points")
