@@ -348,6 +348,112 @@ def confirm_device_type(judge, box: OrientedBox, views: list,
                                       verdict.confidence or 0.5))}
 
 
+def _save_sam_debug(view: dict | None, coords, labels, mask, pts3,
+                    box, fitted, out_dir: str, tag: str) -> None:
+    """Composite debug render for ONE SAM candidate (user request):
+      panel 1: the view image with the VLM's prompt points drawn
+               (green = positive, red = negative)
+      panel 2: the same image with the SAM mask overlaid (cyan tint +
+               solid edge)
+      panel 3: the back-projected 3D points top-down (z colored), the
+               OLD box (dashed blue) and the FITTED box (solid red)
+    view=None renders panel 3 only (the multi-view union candidate has
+    no single owning view). Never raises: debug output must not break
+    the refinement."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from PIL import Image, ImageDraw
+
+        # ---- panel 3 (always available): back-projected points ----
+        fig = plt.figure(figsize=(4.8, 4.8), dpi=160)
+        ax = fig.add_axes([0.04, 0.04, 0.92, 0.92])
+        if pts3 is not None and len(pts3):
+            ax.scatter(pts3[:, 0], pts3[:, 1], s=2, c=pts3[:, 2],
+                       cmap="viridis", vmin=0.0)
+        for b, style, color, label in ((box, "--", "deepskyblue", "old"),
+                                       (fitted, "-", "red", "fitted")):
+            if b is None:
+                continue
+            cs = np.asarray(b.corners_2d())
+            ax.plot(np.append(cs[:, 0], cs[0, 0]),
+                    np.append(cs[:, 1], cs[0, 1]), style, color=color,
+                    lw=2, label=label)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        if fitted is not None or box is not None:
+            ax.legend(loc="upper right", fontsize=6)
+        fig.canvas.draw()
+        p3 = Image.fromarray(
+            np.asarray(fig.canvas.buffer_rgba())[..., :3])
+        plt.close(fig)
+
+        panels = [p3]
+        titles = ["3. back-projected pts (top-down)"]
+
+        if view is not None and view.get("image") is not None:
+            img = np.asarray(view["image"], dtype=np.float32)
+            img = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3]
+            H, W = img.shape[:2]
+            # ---- panel 1: prompt points on the clean view ----
+            p1 = Image.fromarray(img.copy())
+            d1 = ImageDraw.Draw(p1)
+            for (x, y), lab in zip(coords or [], labels or []):
+                r = max(6, W // 128)
+                color = (0, 255, 0) if lab > 0 else (255, 40, 40)
+                d1.ellipse((x - r, y - r, x + r, y + r),
+                           fill=color, outline=(255, 255, 255), width=2)
+            # ---- panel 2: mask overlay on the same view ----
+            p2 = Image.fromarray(img.copy())
+            if mask is not None:
+                m = np.asarray(mask, dtype=bool)
+                if m.shape == (H, W):
+                    # semi-transparent cyan fill
+                    alpha = (m.astype(np.uint8) * 90)
+                    tint = np.zeros((H, W, 3), dtype=np.uint8)
+                    tint[..., 0] = 0
+                    tint[..., 1] = 220
+                    tint[..., 2] = 255
+                    a3 = alpha[..., None]
+                    p2 = Image.fromarray(
+                        (np.asarray(p2) * (255 - a3) // 255
+                         + tint * a3 // 255).astype(np.uint8))
+                    # solid edge: mask minus its erosion (no scipy needed)
+                    er = m.copy()
+                    er[1:] &= m[:-1]
+                    er[:-1] &= m[1:]
+                    er[:, 1:] &= m[:, :-1]
+                    er[:, :-1] &= m[:, 1:]
+                    edge = m & ~er
+                    d2 = ImageDraw.Draw(p2)
+                    ys, xs = np.nonzero(edge)
+                    for xx, yy in zip(xs.tolist(), ys.tolist()):
+                        d2.point((xx, yy), fill=(0, 220, 255))
+            panels = [p1, p2, p3]
+            titles = ["1. VLM prompt pts (+=green -=red)",
+                      "2. SAM mask", "3. back-projected pts (top-down)"]
+
+        # ---- tile horizontally with label strips ----
+        lab_h = 20
+        pad = 6
+        Wt = sum(p.width for p in panels) + pad * (len(panels) + 1)
+        Ht = max(p.height for p in panels) + lab_h + pad
+        comp = Image.new("RGB", (Wt, Ht), (0, 0, 0))
+        dd = ImageDraw.Draw(comp)
+        x = pad
+        for p, t in zip(panels, titles):
+            comp.paste(p, (x, lab_h + pad))
+            dd.text((x + 4, 4), t, fill=(255, 255, 255))
+            x += p.width + pad
+        os.makedirs(out_dir, exist_ok=True)
+        comp.save(os.path.join(out_dir, f"sam_debug_{tag}.png"))
+    except Exception as e:
+        print(f"[mask-refine] debug render {tag} failed "
+              f"({type(e).__name__}: {e})")
+
+
 def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                out_dir: str | None = None,
                views: list | None = None) -> tuple[OrientedBox | None, dict]:
@@ -380,16 +486,16 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
             for mi, (mask, ms) in enumerate(zip(masks, scores)):
                 pts3 = _mask_to_points(scene, box, mask, view["cam"])
                 fitted = fit_mask_points(pts3, box)
+                if out_dir:
+                    # debug composite: prompt points + mask + lifted pts
+                    _save_sam_debug(view, coords, labels, mask, pts3, box,
+                                    fitted, out_dir,
+                                    f"{box.box_id}_{view['name']}_g{gi}_m{mi}")
                 if fitted is None:
                     continue
                 s = score_candidate(float(ms), pts3, fitted, box)
                 candidates.append((s, fitted, view["name"], len(pts3), float(ms)))
                 view_candidates.append((s, pts3, float(ms), gi, mi))
-                if out_dir:
-                    from PIL import Image
-                    mp = os.path.join(out_dir,
-                                      f"mask_{box.box_id}_{view['name']}_{mi}.png")
-                    Image.fromarray((mask.astype(np.uint8) * 255)).save(mp)
         if view_candidates:
             view_candidates.sort(key=lambda x: x[0], reverse=True)
             best_points_per_view.append(view_candidates[0])
@@ -407,6 +513,10 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     if len(best_points_per_view) >= 2:
         union_pts = np.vstack([x[1] for x in best_points_per_view])
         fitted = fit_mask_points(union_pts, box)
+        if out_dir:
+            # union debug: panel 3 only (no single owning view)
+            _save_sam_debug(None, None, None, None, union_pts, box, fitted,
+                            out_dir, f"{box.box_id}_union")
         if fitted is not None:
             ms = float(np.mean([x[2] for x in best_points_per_view]))
             s = score_candidate(ms, union_pts, fitted, box) + 0.08

@@ -140,6 +140,48 @@ def test_type_confirm_marks_low_not_deleted():
     print("PASS type confirm marks LOW + unresolved, never deletes")
 
 
+def test_sam_debug_composite():
+    """The debug composite (user request): prompt points + mask overlay +
+    back-projected points, one PNG per SAM candidate. Must produce a
+    readable image even with empty points / no fitted box."""
+    import tempfile
+    from agentic_gts.agent.mask_refine import _save_sam_debug
+
+    rng = np.random.default_rng(9)
+    H = W = 96
+    view = {"name": "front", "image": rng.uniform(0, 1, (H, W, 3)),
+            "cam": None, "path": None, "prompt_path": None}
+    # prompt points: 2 positive, 1 negative; mask: a filled ellipse
+    yy, xx = np.mgrid[0:H, 0:W]
+    mask = ((xx - 50) ** 2 / 30 ** 2 + (yy - 50) ** 2 / 20 ** 2) <= 1.0
+    # back-projected points: scattered inside the same ellipse footprint
+    n = 400
+    pts3 = np.column_stack([rng.uniform(30, 70, n),
+                           rng.uniform(30, 70, n),
+                           rng.uniform(0.0, 2.0, n)])
+    with tempfile.TemporaryDirectory() as td:
+        _save_sam_debug(view, [(50, 50), (60, 45), (20, 20)],
+                        [1, 1, 0], mask, pts3,
+                        OrientedBox(center=(50, 50, 1), size=(40, 40, 2),
+                                    yaw=0.0),
+                        OrientedBox(center=(50, 50, 1), size=(36, 36, 1.9),
+                                    yaw=0.1),
+                        td, "box1_front_g0_m0")
+        p = os.path.join(td, "sam_debug_box1_front_g0_m0.png")
+        assert os.path.isfile(p) and os.path.getsize(p) > 5000, \
+            "3-panel composite (points + mask + lifted pts) must be written"
+        # union path: view=None renders the top-down panel only, and a
+        # failed fit (None) must still render
+        _save_sam_debug(None, None, None, None, pts3[:5],
+                        OrientedBox(center=(50, 50, 1), size=(40, 40, 2),
+                                   yaw=0.0),
+                        None, td, "box1_union")
+        p2 = os.path.join(td, "sam_debug_box1_union.png")
+        assert os.path.isfile(p2) and os.path.getsize(p2) > 3000, \
+            "union / no-fit panel must still be written"
+    print("PASS SAM debug composite (3-panel + union/no-fit fallback)")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed = 0
