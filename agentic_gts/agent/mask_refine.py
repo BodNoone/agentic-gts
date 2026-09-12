@@ -1,0 +1,390 @@
+"""Local VLM point prompts -> SAM mask -> 3D OBB refinement.
+
+Contract:
+  * Qwen3-VL returns point prompts in its native relative 0..1000 grid.
+  * This module converts them ONCE to image pixels for SAM. They are not
+    normalized again.
+  * SAM creates pixel-accurate candidate masks.
+  * The mask is lifted to the local 3DGS geometry by projecting Gaussian
+    centers through the exact render camera. Geometry, not the VLM, measures
+    the final metric OBB.
+
+SAM is optional. The implementation supports Meta SAM2 and legacy Segment
+Anything when installed. If no SAM backend/checkpoint is configured, local
+mask refinement is skipped conservatively; it never damages existing boxes.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+from dataclasses import dataclass
+
+import numpy as np
+
+from agentic_gts.core.models import BoxSource, Confidence, OrientedBox, Scene
+
+
+@dataclass
+class PointGroup:
+    positive_norm: list[tuple[float, float]]
+    negative_norm: list[tuple[float, float]]
+    hypothesis: str = "rack"
+    confidence: float = 0.5
+
+    def pixel_prompts(self, W: int, H: int) -> tuple[np.ndarray, np.ndarray]:
+        pts = self.positive_norm + self.negative_norm
+        labels = [1] * len(self.positive_norm) + [0] * len(self.negative_norm)
+        if not pts:
+            return np.empty((0, 2), dtype=np.float32), np.empty(0, dtype=np.int32)
+        xy = np.asarray([[x / 1000.0 * (W - 1), y / 1000.0 * (H - 1)]
+                         for x, y in pts], dtype=np.float32)
+        return xy, np.asarray(labels, dtype=np.int32)
+
+
+def parse_point_groups(text: str) -> list[PointGroup]:
+    """Parse Qwen point-grounding JSON (relative 0..1000 coordinates).
+
+    Accepted shapes:
+      {"candidate_groups": [{"positive": [[x,y]], "negative": ...}]}
+      [{"positive_points": ..., "negative_points": ...}]
+      {"positive": ..., "negative": ...}
+    Points may be [x,y] or {"x": x, "y": y}. Values in 0..1 are accepted
+    as normalized fractions and converted to 0..1000 for robustness.
+    """
+    if not text:
+        return []
+    data = None
+    # Qwen may prepend reasoning. Scan every object/array opener with the
+    # standard JSON decoder and keep the LAST complete value (the final answer).
+    dec = json.JSONDecoder()
+    values = []
+    for m in re.finditer(r"[\[{]", text):
+        try:
+            value, _ = dec.raw_decode(text[m.start():])
+            values.append(value)
+        except json.JSONDecodeError:
+            continue
+    if values:
+        # Prefer a complete top-level structure carrying prompt-group keys;
+        # later values may just be nested [x,y] arrays encountered by the scan.
+        for value in reversed(values):
+            if (isinstance(value, dict) and
+                    any(k in value for k in ("candidate_groups", "groups",
+                                              "positive", "positive_points"))):
+                data = value
+                break
+            if (isinstance(value, list) and value and
+                    all(isinstance(x, dict) for x in value)):
+                data = value
+                break
+    if data is None:
+        return []
+    if isinstance(data, dict):
+        items = data.get("candidate_groups") or data.get("groups") or [data]
+    elif isinstance(data, list):
+        items = data
+    else:
+        return []
+
+    def _points(raw):
+        out = []
+        for p in raw or []:
+            try:
+                if isinstance(p, dict):
+                    x, y = float(p["x"]), float(p["y"])
+                else:
+                    x, y = float(p[0]), float(p[1])
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+            if max(abs(x), abs(y)) <= 1.0:
+                x, y = x * 1000.0, y * 1000.0
+            if 0 <= x <= 1000 and 0 <= y <= 1000:
+                out.append((x, y))
+        return out
+
+    groups = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        pos = _points(item.get("positive") or item.get("positive_points"))
+        neg = _points(item.get("negative") or item.get("negative_points"))
+        if not pos:
+            continue
+        try:
+            conf = float(item.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            conf = 0.5
+        groups.append(PointGroup(pos, neg, str(item.get("hypothesis", "rack")),
+                                 min(max(conf, 0.0), 1.0)))
+    return groups
+
+
+class SamPredictorAdapter:
+    """Lazy SAM2/SAM1 predictor with a uniform point-prompt interface."""
+
+    def __init__(self, checkpoint: str | None = None,
+                 model_cfg: str | None = None):
+        self.checkpoint = checkpoint or os.environ.get("SAM_CHECKPOINT")
+        self.model_cfg = model_cfg or os.environ.get("SAM_MODEL_CFG")
+        self._predictor = None
+
+    @property
+    def available(self) -> bool:
+        return bool(self.checkpoint)
+
+    def _load(self):
+        if self._predictor is not None:
+            return
+        if not self.checkpoint:
+            raise RuntimeError("SAM_CHECKPOINT not configured")
+        # SAM2 first (recommended). SAM_MODEL_CFG is required by build_sam2.
+        try:
+            from sam2.build_sam import build_sam2
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+            if not self.model_cfg:
+                raise RuntimeError("SAM_MODEL_CFG is required for SAM2")
+            model = build_sam2(self.model_cfg, self.checkpoint)
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    model = model.to("cuda")
+            except Exception:
+                pass
+            self._predictor = SAM2ImagePredictor(model)
+            return
+        except ImportError:
+            pass
+        # Legacy SAM fallback.
+        try:
+            from segment_anything import sam_model_registry, SamPredictor
+            model_type = os.environ.get("SAM_MODEL_TYPE", "vit_h")
+            model = sam_model_registry[model_type](checkpoint=self.checkpoint)
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    model = model.to("cuda")
+            except Exception:
+                pass
+            self._predictor = SamPredictor(model)
+            return
+        except ImportError as e:
+            raise RuntimeError("install SAM2 or segment-anything") from e
+
+    def predict(self, image: np.ndarray, point_coords: np.ndarray,
+                point_labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        self._load()
+        u8 = (np.clip(image[..., :3], 0, 1) * 255).astype(np.uint8)
+        self._predictor.set_image(u8)
+        masks, scores, _ = self._predictor.predict(
+            point_coords=point_coords, point_labels=point_labels,
+            multimask_output=True)
+        return np.asarray(masks, dtype=bool), np.asarray(scores, dtype=float)
+
+
+def render_local_views(scene: Scene, box: OrientedBox,
+                       out_dir: str | None = None) -> list[dict]:
+    """Render front + side local views, isolated to the box neighborhood."""
+    gs_ply = scene.meta.get("gs_ply")
+    if not gs_ply:
+        return []
+    from agentic_gts.tools.gs_io import read_gaussian_ply
+    from agentic_gts.output.gs_render import (make_local_cam, render_gs_view,
+                                              png_bytes)
+    gs = read_gaussian_ply(gs_ply)
+    cut_hi = box.center[2] + box.size[2] / 2.0 + 0.10
+    cut_lo = box.center[2] - box.size[2] / 2.0 + 0.05
+    slots = (("front", 18.0, 0.0), ("side", 18.0, 90.0))
+    out = []
+    for name, elev, azim in slots:
+        cam = make_local_cam([box], extent=1.4, W=768, H=768,
+                             elev_deg=elev, azim_deg=azim)
+        raw = render_gs_view(gs, [box], cam, cut_z=cut_hi, cut_z_low=cut_lo,
+                             overlay=None, isolate_boxes=True,
+                             isolate_margin=0.8)
+        if raw is None:
+            continue
+        # The VLM needs a visual reference for which object to prompt, while
+        # SAM must receive a clean image (wireframes would become false mask
+        # evidence). Keep both explicitly separate.
+        prompt_img = render_gs_view(
+            gs, [box], cam, cut_z=cut_hi, cut_z_low=cut_lo,
+            overlay="wire3d", isolate_boxes=True, isolate_margin=0.8)
+        path = None
+        prompt_path = None
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(out_dir, f"mask_{box.box_id}_{name}.png")
+            with open(path, "wb") as f:
+                f.write(png_bytes(raw))
+            if prompt_img is not None:
+                prompt_path = os.path.join(
+                    out_dir, f"mask_prompt_{box.box_id}_{name}.png")
+                with open(prompt_path, "wb") as f:
+                    f.write(png_bytes(prompt_img))
+        out.append({"name": name, "image": raw,
+                    "prompt_image": prompt_img if prompt_img is not None else raw,
+                    "cam": cam, "path": path, "prompt_path": prompt_path})
+    return out
+
+
+def _mask_to_points(scene: Scene, box: OrientedBox, mask: np.ndarray, cam,
+                    margin: float = 0.8) -> np.ndarray:
+    """Lift mask to visible local 3DGS centers with a small z-buffer.
+
+    Selecting every center whose projection lands in the mask also selects
+    surfaces hidden behind the visible rack, inflating the fitted OBB. Keep
+    only points close to the nearest projected depth in each pixel.
+    """
+    pts = np.asarray(scene.points, dtype=float)
+    region = box.contains(pts, margin=margin)
+    pts = pts[region]
+    if not len(pts):
+        return pts
+    uv = cam.project_cv(pts)
+    x = np.rint(uv[:, 0]).astype(int)
+    y = np.rint(uv[:, 1]).astype(int)
+    h = np.hstack([pts, np.ones((len(pts), 1))])
+    pc = h @ cam.view_cv().T
+    depth = pc[:, 2]
+    valid = ((x >= 0) & (x < mask.shape[1]) &
+             (y >= 0) & (y < mask.shape[0]) & (depth > 0.05))
+    keep = np.zeros(len(pts), dtype=bool)
+    ids = np.where(valid)[0]
+    if not len(ids):
+        return pts[:0]
+    pix = y[ids] * mask.shape[1] + x[ids]
+    zbuf = np.full(mask.shape[0] * mask.shape[1], np.inf, dtype=float)
+    np.minimum.at(zbuf, pix, depth[ids])
+    visible = depth[ids] <= zbuf[pix] + 0.12
+    selected = ids[visible & mask[y[ids], x[ids]]]
+    keep[selected] = True
+    return pts[keep]
+
+
+def fit_mask_points(points: np.ndarray, old: OrientedBox) -> OrientedBox | None:
+    """Fit yaw + footprint + height from SAM-selected 3D points."""
+    if len(points) < 40:
+        return None
+    xy = points[:, :2]
+    cxy = np.median(xy, axis=0)
+    xc = xy - cxy
+    cov = xc.T @ xc / max(len(xc) - 1, 1)
+    vals, vecs = np.linalg.eigh(cov)
+    v = vecs[:, int(np.argmax(vals))]
+    pca_yaw = math.atan2(float(v[1]), float(v[0]))
+    # A side-view mask often has more depth than rack width, so raw PCA may
+    # pick local y and rotate the rack by 90 degrees. The existing rough box
+    # reliably tells us which eigen-axis is the row/length axis. Choose
+    # between the PCA axis and its perpendicular by nearest angular distance.
+    choices = [pca_yaw + k * math.pi / 2 for k in range(4)]
+    yaw = min(choices, key=lambda a: abs(math.atan2(
+        math.sin(a - old.yaw), math.cos(a - old.yaw))))
+    # resolve 180-degree symmetry to the representation nearest old.yaw
+    while yaw - old.yaw > math.pi / 2:
+        yaw -= math.pi
+    while yaw - old.yaw < -math.pi / 2:
+        yaw += math.pi
+    axis = np.array([math.cos(yaw), math.sin(yaw)])
+    cross = np.array([-math.sin(yaw), math.cos(yaw)])
+    a, d = xy @ axis, xy @ cross
+    a0, a1 = np.percentile(a, [1.0, 99.0])
+    d0, d1 = np.percentile(d, [1.0, 99.0])
+    z0, z1 = np.percentile(points[:, 2], [1.0, 99.0])
+    L, W, H = float(a1 - a0), float(d1 - d0), float(z1 - z0)
+    if L < 0.15 or W < 0.10 or H < 0.30:
+        return None
+    centre2 = axis * ((a0 + a1) / 2.0) + cross * ((d0 + d1) / 2.0)
+    return OrientedBox(center=(float(centre2[0]), float(centre2[1]),
+                               float((z0 + z1) / 2.0)),
+                       size=(L, W, H), yaw=yaw,
+                       box_id=old.box_id, device_type=old.device_type,
+                       source=BoxSource.AGENT_FIX,
+                       confidence=Confidence.MID, row_id=old.row_id,
+                       meta={**old.meta, "sam_refined": True})
+
+
+def score_candidate(mask_score: float, points: np.ndarray,
+                    new: OrientedBox, old: OrientedBox) -> float:
+    """SAM quality + 3D support + conservative change score."""
+    support = min(len(points) / 300.0, 1.0)
+    iou = old.iou_2d(new)
+    yaw_delta = abs(math.atan2(math.sin(new.yaw - old.yaw),
+                               math.cos(new.yaw - old.yaw)))
+    yaw_score = max(0.0, 1.0 - yaw_delta / math.radians(45))
+    return 0.45 * float(mask_score) + 0.25 * support + 0.20 * iou + 0.10 * yaw_score
+
+
+def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
+               out_dir: str | None = None) -> tuple[OrientedBox | None, dict]:
+    """Run Qwen point grounding + SAM + 3D fitting for one box."""
+    views = render_local_views(scene, box, out_dir)
+    audit = {"box_id": box.box_id, "views": [], "accepted": False}
+    if not views or not sam.available:
+        audit["reason"] = "no local GS views or SAM checkpoint"
+        return None, audit
+    candidates = []
+    best_points_per_view = []
+    for view in views:
+        verdict = judge.adjudicate_sam_points(
+            view["prompt_image"], box, view["name"],
+            png_path=view["prompt_path"] or view["path"])
+        groups = verdict.params.get("groups", []) if verdict.params else []
+        va = {"view": view["name"], "image": view["path"],
+              "answer": verdict.raw or verdict.detail, "groups": groups}
+        view_candidates = []
+        for gi, g in enumerate(groups):
+            group = PointGroup(g["positive"], g.get("negative", []),
+                               g.get("hypothesis", "rack"),
+                               float(g.get("confidence", 0.5)))
+            coords, labels = group.pixel_prompts(view["image"].shape[1],
+                                                  view["image"].shape[0])
+            if not len(coords):
+                continue
+            masks, scores = sam.predict(view["image"], coords, labels)
+            for mi, (mask, ms) in enumerate(zip(masks, scores)):
+                pts3 = _mask_to_points(scene, box, mask, view["cam"])
+                fitted = fit_mask_points(pts3, box)
+                if fitted is None:
+                    continue
+                s = score_candidate(float(ms), pts3, fitted, box)
+                candidates.append((s, fitted, view["name"], len(pts3), float(ms)))
+                view_candidates.append((s, pts3, float(ms), gi, mi))
+                if out_dir:
+                    from PIL import Image
+                    mp = os.path.join(out_dir,
+                                      f"mask_{box.box_id}_{view['name']}_{mi}.png")
+                    Image.fromarray((mask.astype(np.uint8) * 255)).save(mp)
+        if view_candidates:
+            view_candidates.sort(key=lambda x: x[0], reverse=True)
+            best_points_per_view.append(view_candidates[0])
+        if out_dir:
+            try:
+                with open(os.path.join(
+                        out_dir, f"sam_points_{box.box_id}_{view['name']}.json"),
+                          "w", encoding="utf-8") as f:
+                    json.dump(va, f, ensure_ascii=False, indent=2)
+            except OSError:
+                pass
+        audit["views"].append(va)
+    # Multi-view union candidate: front provides width/height, side provides
+    # depth. It is usually more complete than either visible surface alone.
+    if len(best_points_per_view) >= 2:
+        union_pts = np.vstack([x[1] for x in best_points_per_view])
+        fitted = fit_mask_points(union_pts, box)
+        if fitted is not None:
+            ms = float(np.mean([x[2] for x in best_points_per_view]))
+            s = score_candidate(ms, union_pts, fitted, box) + 0.08
+            candidates.append((min(s, 1.0), fitted, "front+side",
+                               len(union_pts), ms))
+    if not candidates:
+        audit["reason"] = "no SAM mask yielded a valid 3D box"
+        return None, audit
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    score, best, view_name, npts, mask_score = candidates[0]
+    audit.update({"accepted": score >= 0.45, "score": round(score, 4),
+                  "view": view_name, "points": npts,
+                  "sam_score": round(mask_score, 4),
+                  "box": best.to_dict()})
+    return (best if score >= 0.45 else None), audit

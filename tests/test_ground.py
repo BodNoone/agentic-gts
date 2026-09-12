@@ -174,18 +174,15 @@ def test_ground_stage_with_patched_vlm():
         # result audit images on EVERY view (user request): each shows
         # that view's own raw rects + the final boxes projected through
         # the same camera
-        for fn in ("grounded.png", "grounded_az90.png",
-                   "grounded_az270.png"):
+        for fn in ("grounded.png", "grounded_oblique.png"):
             assert os.path.exists(os.path.join(td, fn)), \
                 f"{fn} (per-view result audit) was not saved"
         assert os.path.exists(os.path.join(td, "groundview.png")), \
             "groundview.png (input view) was not saved"
         # oblique complement views are saved too (the nadir blind-spot
         # fix -- centre rows with untrained tops)
-        assert os.path.exists(os.path.join(td, "groundview_az90.png")), \
-            "groundview_az90.png (oblique view) was not saved"
-        assert os.path.exists(os.path.join(td, "groundview_az270.png")), \
-            "groundview_az270.png (oblique view) was not saved"
+        assert os.path.exists(os.path.join(td, "groundview_oblique.png")), \
+            "groundview_oblique.png (oblique view) was not saved"
         # same-base contract: the two images must be pixel-identical
         # apart from the red result overlays -- different ceiling cuts /
         # camera framing would confound the before/after comparison

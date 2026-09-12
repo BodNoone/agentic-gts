@@ -555,7 +555,7 @@ def render_gs_view(gs: GaussianData, boxes, cam: Cam,
                        keep_mask=keep)
     if img is None:
         return None
-    if boxes:
+    if boxes and overlay:
         img = overlay_boxes(img, boxes, cam, mode=overlay)
     return img
 

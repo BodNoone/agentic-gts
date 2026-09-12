@@ -555,9 +555,8 @@ def _front_view_height(scene, box, judge, hint_top,
 def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     """Replace scene.boxes with VLM-grounded full-depth row boxes.
 
-    Multi-view capture: the true NADIR view (rows axis-aligned, exact
-    footprint) plus TWO opposite OBLIQUE views (~58 deg, looking down
-    the aisles) whose well-trained rack FACES compensate the nadir's
+    Two-view capture: the true NADIR view (rows axis-aligned, exact
+    footprint) plus ONE OBLIQUE view whose well-trained rack FACES compensate the nadir's
     blind spot -- a ground-level 3DGS training set barely observed rack
     tops, so the nadir room centre renders as an ungroundable smear
     while the image edges (perspective showing faces) ground fine.
@@ -575,8 +574,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         return False
     yaw = float(scene.meta.get("yaw", 0.0) or 0.0)
     views = (("nadir", 0.0),           # exact footprint capture
-             ("az90", 10.0),          # pan+tilt toward +y: +y faces
-             ("az270", -10.0))        # pan+tilt toward -y: -y faces
+             ("oblique", 10.0))        # one face-visible view for missed rows
     cam_rects: list[tuple] = []       # (cam, pixel_rect, oblique)
     base = None                       # (img, cam) of the nadir render
     view_audit: list = []              # (name, img, cam, rects) per view

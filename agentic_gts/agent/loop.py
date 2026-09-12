@@ -165,19 +165,12 @@ class LayoutAgent:
     # ---------------- repair loop ----------------
     def run(self, scene: Scene) -> AgentReport:
         report = AgentReport()
-        # 1. fine-grained per-box pose refinement FIRST: the VLM proposes
-        # quantized size/yaw corrections (z-rotation only) from the
-        # axes-annotated local view; geometry tools re-fit the box to
-        # point support. Doing this BEFORE merging is the whole point:
-        # fragments of one rack become co-axial (same corrected yaw), so
-        # the geometric merge below can pair them reliably.
-        self._vlm_refine(scene, report)
-        # 2. geometric merge of the now co-axial fragments: with a common
-        # yaw, same-device fragments satisfy the deterministic front/back
-        # + side complement rules, and the VLM merge adjudication is no
-        # longer needed (the old MERGED_NEIGHBORS VLM pass is retired).
-        self._geometric_merge(scene, report)
-        # 2.5 row-depth completion: thin single-face fragments (rows
+        # 1. local mask refinement: Qwen3-VL proposes normalized positive /
+        # negative SAM prompts, SAM produces pixel masks, and projected 3DGS
+        # centers fit the metric OBB. Runs for BOTH externally supplied and
+        # VLM-grounded boxes; grounding finds where, local masks refine edges.
+        self._local_mask_refine(scene, report)
+        # 2. row-depth completion: thin single-face fragments (rows
         # scanned only from their facades) are expanded to the full row
         # thickness from the cross-axis surface-band profile BEFORE the
         # repair loop audits anything -- no VLM stage can grow a depth
@@ -265,33 +258,6 @@ class LayoutAgent:
                           self._region(b),
                           detail=f"final godview: {f['reason']}", severity=0.7)
             report.unresolved.append({"issue": issue.to_dict(), "ok": False})
-
-    def _geometric_merge(self, scene: Scene, report: AgentReport) -> None:
-        """Deterministic fragment merge AFTER the per-box pose refinement.
-
-        The VLM merge adjudication (old MERGED_NEIGHBORS pass) is retired:
-        once refine has corrected each fragment's yaw/size to the device,
-        fragments of ONE rack are co-axial, and the B0 geometry rules
-        (front/back + side complement) pair them reliably -- no reasoning
-        needed. Reuses rules.fuse_fragments verbatim.
-        """
-        try:
-            from agentic_gts.rules.rules import fuse_fragments
-            yaw = float(scene.meta.get("yaw", 0.0))
-            trusted = bool(self.opts.get("trust_input_boxes"))
-            before = len(scene.boxes)
-            boxes, n_absorbed = fuse_fragments(scene, yaw=yaw,
-                                               trusted=trusted)
-            if n_absorbed > 0:
-                scene.boxes = boxes
-                report.actions_taken.append(
-                    {"issue_id": "geometric_merge", "action": "merge",
-                     "params": {"absorbed": n_absorbed}})
-                print(f"[diag][C] geometric merge absorbed {n_absorbed} "
-                      f"fragments ({before} -> {len(scene.boxes)} boxes)")
-        except Exception as e:
-            print(f"[diag][C] geometric merge failed ({type(e).__name__}: "
-                  f"{e}) -> skipped")
 
     @staticmethod
     def _row_mates(scene: Scene, box: OrientedBox) -> list:
@@ -392,116 +358,56 @@ class LayoutAgent:
             print(f"[diag][C] depth completion failed ({type(e).__name__}: "
                   f"{e}) -> skipped")
 
-    def _vlm_refine(self, scene: Scene, report: AgentReport) -> None:
-        """Two-phase per-box refinement, SEQUENTIAL by dependency:
+    def _local_mask_refine(self, scene: Scene, report: AgentReport) -> None:
+        """Qwen point prompts -> SAM masks -> projected 3D OBB refinement."""
+        from agentic_gts.agent.mask_refine import SamPredictorAdapter, refine_box
+        import json as _json
+        import os as _os
 
-          phase 1 -- ORIENTATION from the oblique near-top-down view:
-          the row direction reads best with little perspective
-          foreshortening, and a skewed box makes every horizontal-view
-          extent judgment unreliable (its wireframe edges no longer run
-          parallel to the device faces);
-          phase 2 -- LENGTH ends from the front/side views, RE-RENDERED
-          on the corrected box so the extent question sees honest
-          geometry.
-
-        The VLM nominates DIRECTIONS only, geometry measures magnitudes
-        (metres/degrees from an image are pseudo-precision):
-          - phase 1: sweep the nominated direction (opposite direction
-            as fallback -- point evidence overrules a wrong nomination)
-            to the support peak (geo.sweep_yaw);
-          - phase 2: 'short' end -> growth re-fit -- the seed's x is
-            enlarged (max 0.25m: edge-level misalignment; a full
-            grid-unit shortfall is WIDTH_MISFIT's split/merge domain,
-            not fine refine) so the density span can extend to the
-            device's true edge, stopping at the gap to the neighbour;
-            'over' end -> plain re-fit -- the shrink-only span snaps
-            back to the point support.
-        Guards: IoU < 0.3 with the original rolls back; height (and
-        completed depth) trusted throughout. A hallucinated nomination
-        is inert by construction: 'short' with no points beyond the edge
-        re-fits to the same span, 'over' with full support keeps it.
-
-        SKIPPED under VLM grounding: the grounded row boxes already span
-        the region the VLM outlined (both faces, full depth), and the
-        split stage resolved the interior -- there is no per-box misfit
-        left for this pass to repair.
-        """
-        if self.opts.get("vlm_grounded"):
-            print("[vlm][refine] skipped (VLM-grounded boxes)")
+        sam = SamPredictorAdapter(
+            checkpoint=self.opts.get("sam_checkpoint"),
+            model_cfg=self.opts.get("sam_model_cfg"))
+        if not sam.available:
+            print("[mask-refine] SAM disabled: set --sam-checkpoint or "
+                  "SAM_CHECKPOINT; existing boxes kept")
             return
-        for b in list(scene.boxes):
-            cur = b
-            # ---- phase 1: yaw from the oblique near-top-down view ----
-            try:
-                v1 = self.judge.adjudicate_yaw(scene, cur)
-            except Exception as e:
-                print(f"[diag][C] yaw refine error on {b.box_id[:6]} "
-                      f"({type(e).__name__}) -> skipped")
-                v1 = None
-            if (v1 is not None and v1.action == "refine"
-                    and v1.params.get("yaw_dir") in ("cw", "ccw")):
-                direction = 1.0 if v1.params["yaw_dir"] == "ccw" else -1.0
-                swept = None
-                try:
-                    swept = geo.sweep_yaw(scene, cur, direction=direction)
-                except Exception as e:
-                    print(f"[diag][C] yaw sweep error on {b.box_id[:6]} "
-                          f"({type(e).__name__}: {e})")
-                if swept is not None:
-                    yaw, refit = swept
-                    if refit.iou_2d(b) >= 0.3:
-                        print(f"[diag][C] refine {b.box_id[:6]}: yaw "
-                              f"sweep -> {math.degrees(yaw - b.yaw):+.1f}deg "
-                              f"(nominated {v1.params['yaw_dir']})")
-                        cur = self._adopt_refit(scene, cur, refit)
-                        report.actions_taken.append(
-                            {"issue_id": "vlm_refine", "action": "refine",
-                             "params": {"yaw_dir": v1.params["yaw_dir"],
-                                        "applied_deg":
-                                        round(math.degrees(yaw - b.yaw), 1)}})
-            # ---- phase 2: x-ends on the CORRECTED box ----
-            try:
-                verdict = self.judge.adjudicate_extent(scene, cur)
-            except Exception as e:
-                print(f"[diag][C] extent refine error on {b.box_id[:6]} "
-                      f"({type(e).__name__}) -> skipped")
+        audits = []
+        for old in list(scene.boxes):
+            if scene.get_box(old.box_id) is None:
                 continue
-            if verdict.action != "refine" or not verdict.params:
+            try:
+                new, audit = refine_box(scene, old, self.judge, sam,
+                                        self.out_dir)
+            except Exception as e:
+                print(f"[mask-refine] {old.box_id[:6]} failed "
+                      f"({type(e).__name__}: {e}) -> keep")
+                audits.append({"box_id": old.box_id, "accepted": False,
+                               "reason": f"{type(e).__name__}: {e}"})
                 continue
-            p = verdict.params
-            ends = (p.get("x_minus"), p.get("x_plus"))
-            if "short" in ends or "over" in ends:
-                keep_depth = bool(cur.meta.get("depth_completed"))
-                # one-sided 'short': shift the seed centre toward the
-                # nominated end -- a symmetric growth alone cannot reach
-                # an edge further than half(growth) from the centre, and
-                # fit_box_to_points re-centres on the trimmed point span
-                fwdx = np.array([math.cos(cur.yaw), math.sin(cur.yaw)])
-                cx, cy = cur.center[:2]
-                if p.get("x_plus") == "short" and p.get("x_minus") != "short":
-                    cx, cy = (cx + fwdx[0] * 0.125, cy + fwdx[1] * 0.125)
-                elif p.get("x_minus") == "short" and p.get("x_plus") != "short":
-                    cx, cy = (cx - fwdx[0] * 0.125, cy - fwdx[1] * 0.125)
-                seed = (cur.size[0] + 0.25 if "short" in ends else cur.size[0],
-                        cur.size[1], cur.size[2])
-                refit = geo.fit_box_to_points(scene, (cx, cy), seed,
-                                              cur.yaw, keep_height=True,
-                                              keep_depth=keep_depth)
-                if refit is not None and refit.iou_2d(b) >= 0.3:
-                    if abs(refit.size[0] - cur.size[0]) > 0.02:
-                        print(f"[diag][C] refine {b.box_id[:6]}: x re-fit "
-                              f"{cur.size[0]:.2f} -> {refit.size[0]:.2f} "
-                              f"({'+'.join(e for e in ends if e != 'ok')})")
-                        cur = self._adopt_refit(scene, cur, refit)
-                        report.actions_taken.append(
-                            {"issue_id": "vlm_refine", "action": "refine",
-                             "params": {"ends": {"x_minus": p.get("x_minus"),
-                                                 "x_plus": p.get("x_plus")},
-                                        "length":
-                                        round(float(refit.size[0]), 2)}})
-                else:
-                    print(f"[diag][C] refine {b.box_id[:6]}: x nomination "
-                          f"inert (no support change) -> keep")
+            audits.append(audit)
+            if new is None:
+                print(f"[mask-refine] {old.box_id[:6]} no valid mask -> keep")
+                continue
+            # conservative guard: a local mask may not jump to a neighbour
+            if new.iou_2d(old) < 0.2:
+                print(f"[mask-refine] {old.box_id[:6]} rejected: IoU<0.2")
+                continue
+            self._adopt_refit(scene, old, new)
+            report.actions_taken.append({
+                "issue_id": "sam_refine", "action": "mask_refine",
+                "params": {"box_id": old.box_id,
+                           "score": audit.get("score"),
+                           "view": audit.get("view"),
+                           "points": audit.get("points")}})
+            print(f"[mask-refine] {old.box_id[:6]} accepted from "
+                  f"{audit.get('view')} score={audit.get('score')}")
+        if self.out_dir:
+            try:
+                with open(_os.path.join(self.out_dir, "mask_refine.json"),
+                          "w", encoding="utf-8") as f:
+                    _json.dump(audits, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"[mask-refine] audit save failed ({type(e).__name__})")
 
     @staticmethod
     def _adopt_refit(scene: Scene, old: OrientedBox,

@@ -1546,6 +1546,60 @@ class VLMJudge:
                                       ("front", "side"),
                                       self._parse_extent_reply)
 
+    _SAM_POINT_PROMPT = (
+        "You are preparing point prompts for SAM to segment ONE server rack "
+        "in a local {view_name} view. The image contains only the current "
+        "box neighborhood. Return 1-3 candidate prompt groups. For each "
+        "group, place 2-4 POSITIVE points safely inside the target rack "
+        "surface (door/panel/body), and 2-5 NEGATIVE points on adjacent "
+        "racks, aisle, wall, cables, or background. Do not put points on "
+        "boundaries. Coordinates MUST use Qwen's official relative 0-1000 "
+        "image grid (x=0 left, x=1000 right, y=0 top, y=1000 bottom), not "
+        "pixels and not metres. Output ONLY JSON:\n"
+        '{"candidate_groups": [{"positive": [[x,y], ...], '
+        '"negative": [[x,y], ...], "hypothesis": "rack", '
+        '"confidence": 0.0}]}'
+    )
+
+    def adjudicate_sam_points(self, image: np.ndarray, box,
+                              view_name: str,
+                              png_path: str | None = None) -> Verdict:
+        """Qwen3-VL point grounding for SAM (native 0..1000 coordinates)."""
+        from agentic_gts.agent.mask_refine import parse_point_groups
+        prompt = self._SAM_POINT_PROMPT.format(view_name=view_name)
+        if self.backend == "mock":
+            return Verdict(action="keep", params={"groups": []},
+                           confidence=0.0, detail="mock: no SAM points")
+        png = self._array_png_bytes(image)
+        if png_path is None:
+            png_path = self._save_evidence_png(
+                image, f"sam_points_{box.box_id}_{view_name}.png")
+        try:
+            if self.backend == "local":
+                text = self._local_image_call(png, prompt,
+                                              max_new_tokens=800)
+            else:
+                text = self._qwen_image_call(png, prompt, max_tokens=800)
+        except Exception as e:
+            self._record("sam_points", prompt, "", "", 0.0,
+                         f"call failed: {e}", png_path=png_path)
+            return Verdict(action="keep", params={"groups": []},
+                           confidence=0.0, detail=f"call failed: {e}")
+        parsed = parse_point_groups(self._strip_think(text))
+        groups = [{"positive": g.positive_norm,
+                   "negative": g.negative_norm,
+                   "hypothesis": g.hypothesis,
+                   "confidence": g.confidence} for g in parsed]
+        conf = max((g.confidence for g in parsed), default=0.0)
+        self._record("sam_points", prompt, text,
+                     f"{len(groups)} groups", conf,
+                     "normalized 0-1000; converted once to pixels for SAM",
+                     png_path=png_path)
+        return Verdict(action="segment" if groups else "keep",
+                       params={"groups": groups}, confidence=conf,
+                       detail=f"{len(groups)} prompt groups", raw=text,
+                       png_path=png_path)
+
     @staticmethod
     def _parse_fit_reply(text: str, keep_allok: bool = False) -> dict | None:
         """Parse the VLM's categorical fit nomination. None if no change.

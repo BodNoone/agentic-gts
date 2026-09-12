@@ -87,6 +87,11 @@ def cmd_run(args):
     if getattr(args, "vlm_ground", False):
         opts["vlm_ground"] = True
         print("[cli] VLM 2D grounding enabled (initial boxes = hints only)")
+    if getattr(args, "sam_checkpoint", None):
+        opts["sam_checkpoint"] = args.sam_checkpoint
+        if getattr(args, "sam_model_cfg", None):
+            opts["sam_model_cfg"] = args.sam_model_cfg
+        print(f"[cli] local SAM mask refinement enabled: {args.sam_checkpoint}")
     for kv in args.stage_a_opts or []:
         if "=" not in kv:
             print(f"[cli] ignoring malformed --stage-a-opt '{kv}' (want key=value)")
@@ -229,7 +234,13 @@ def main():
                         "hints; the VLM outlines every device structure on a "
                         "top-down view (a joined row = ONE region), geometry "
                         "fits full-depth row boxes, and a front/back split "
-                        "pass resolves how many cabinets each row contains")
+                         "pass resolves how many cabinets each row contains")
+    r.add_argument("--sam-checkpoint", default=None,
+                   help="SAM2/SAM checkpoint for local VLM-point + SAM mask "
+                        "refinement (also env SAM_CHECKPOINT)")
+    r.add_argument("--sam-model-cfg", default=None,
+                   help="SAM2 model config (also env SAM_MODEL_CFG); omitted "
+                        "for legacy segment-anything")
     r.add_argument("--edge-thr", type=float, default=0.05)
     r.add_argument("--yaw", type=float, default=None,
                    help="pin device row yaw in degrees (skips estimation)")

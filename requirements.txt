@@ -6,3 +6,7 @@ pillow>=10.0
 requests>=2.31
 pyyaml>=6.0
 open3d>=0.18
+# Local mask refinement (install one backend explicitly):
+#   pip install git+https://github.com/facebookresearch/sam2.git
+# or legacy:
+#   pip install git+https://github.com/facebookresearch/segment-anything.git

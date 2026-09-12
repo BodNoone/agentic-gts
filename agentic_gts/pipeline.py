@@ -319,9 +319,18 @@ def run_pipeline(scene: Scene,
             _eval("stageG")
             _render_stage(scene, "stageG_ground", out_dir, gt_boxes)
 
-    # --- stage B: deterministic rules ---
-    _, issues = apply_rules(scene, opts)
-    print(f"[stageB] rules applied -> {len(scene.boxes)} boxes, {len(issues)} issues noted")
+    # --- stage B: deterministic cleanup (geometry-only path only) ---
+    # Trusted external boxes and VLM-grounded boxes go directly to the local
+    # mask-refine agent. The old B0 pre-merge can destroy separate surface
+    # hypotheses before Qwen+SAM sees them, so it is intentionally bypassed.
+    if opts.get("trust_input_boxes") or opts.get("vlm_grounded"):
+        issues = []
+        print(f"[stageB] skipped for trusted/VLM-grounded boxes -> "
+              f"{len(scene.boxes)} boxes handed directly to agent")
+    else:
+        _, issues = apply_rules(scene, opts)
+        print(f"[stageB] geometry cleanup -> {len(scene.boxes)} boxes, "
+              f"{len(issues)} issues noted")
     _diag_support(scene)
     _eval("stageB")
     _render_stage(scene, "stageB_rules", out_dir, gt_boxes)
