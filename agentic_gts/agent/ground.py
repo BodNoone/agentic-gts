@@ -42,29 +42,16 @@ def _rot_xy(pts: np.ndarray, yaw: float) -> np.ndarray:
 # ---------- grounding evidence render ----------
 
 def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
-                    H: int = 1024, pan_deg: float = 0.0):
+                    H: int = 1024):
     """Base top-down render, no overlays. Camera fitted over the
     yaw-rotated cloud (rows parallel to the image axes), then rotated
     back into world so the GS render and the pixel back-projection
-    share one consistent camera. Shared by the grounding input views
+    share one consistent camera. Shared by the grounding input view
     and the grounded-result audit view.
 
-    pan_deg=0: true nadir (rows axis-aligned in the image; an
-    axis-aligned image rectangle captures a row exactly, but the room
-    centre shows only the racks' TOP faces -- which a ground-level
-    3DGS training set barely observed, so they render as a blurry
-    smear the VLM cannot ground).
-    pan_deg!=0: the fitted nadir camera ROTATED about the framing
-    centre by a small angle (positive = view swings toward +y). One
-    operation gives BOTH the slight sideways pan AND the slight tilt
-    the user asked for: the camera height only drops by
-    1-cos(a) (1.5% at 10 deg), but the view direction is now a
-    degrees off vertical, so the racks directly under the ORIGINAL
-    godview centre show their camera-facing FACES -- the parallax-only
-    pan was too subtle to be useful (user report). up tilts with the
-    camera so the layout stays map-like. NOT the old large tilt: the
-    camera distance to the framing centre is strictly unchanged (no
-    pull-back, no raising).
+    True nadir: rows axis-aligned in the image (an axis-aligned image
+    rectangle captures a row exactly, vertical rays carry no
+    perspective dilation).
 
     Returns (img_float, cam, W, H).
     """
@@ -93,28 +80,8 @@ def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
                                              b.center[2]),
                                      size=b.size, yaw=0.0))
     cam_r = make_godview_cam(pts_rot, boxes_rot, nadir=True, W=W, H=H)
-    if abs(pan_deg) > 1e-6:
-        # small ROTATION of the fitted nadir camera about the framing
-        # centre (row-frame x-axis): sideways pan + slight tilt in ONE
-        # operation, camera-target distance strictly unchanged (no
-        # pull-back -- that was the flaw of the old large tilt). Height
-        # drops only by 1-cos(a); the off-vertical view direction is
-        # what reveals the faces of the racks under the original
-        # godview centre. 10 deg: strong enough to show faces, gentle
-        # enough to keep the framing essentially complete.
-        a = math.radians(-pan_deg)   # sign: positive pan -> eye at +y
-        tgt = np.asarray(cam_r.target, dtype=float)
-        eye0 = np.asarray(cam_r.eye, dtype=float)
-        d = eye0 - tgt                       # nadir: ~[0, 0, +h]
-        rx = np.array([[1.0, 0.0, 0.0],
-                       [0.0, math.cos(a), -math.sin(a)],
-                       [0.0, math.sin(a), math.cos(a)]])
-        cam_r = Cam(eye=tgt + rx @ d,
-                    target=tgt,
-                    up=rx @ np.asarray(cam_r.up, dtype=float),
-                    fovy_deg=cam_r.fovy_deg, W=W, H=H)
     # rotate the camera back into world (rotation about z: the nadir
-    # axis and the tilt direction rotate with it)
+    # axis rotates with it)
     if abs(yaw) > 1e-9:
         c_, s_ = math.cos(yaw), math.sin(yaw)
         rz = lambda v: np.array([c_ * v[0] - s_ * v[1],
@@ -316,175 +283,18 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
                        device_type=DeviceType.RACK)
 
 
-def _dedup_views(prim_rects: list[tuple],
-                 obl_rects: list[tuple]) -> list[tuple]:
-    """View-level DEDUP only -- no merging (user-directed).
-
-    The nadir view owns the footprint: every nadir rect becomes its
-    own candidate, exactly as drawn (vertical rays, no perspective
-    dilation). An oblique rect can only ADD a structure the nadir
-    MISSED (the blurry-top centre rows): when it overlaps any nadir
-    rect it is simply DROPPED -- union-ing the tilted view's
-    perspective slop into the nadir capture was what inflated the
-    fitted boxes.
-
-    Fragments are NOT fused here anymore: the grounding result goes to
-    the per-box local refinement (SAM) FIRST and the joined rows are
-    split LATER. Pre-merging pieces here decided structure membership
-    before the evidence ever got a vote.
-    """
-    def _ovf(a, b):
-        ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
-        iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
-        inter = ix * iy
-        sm = min((a[2] - a[0]) * (a[3] - a[1]),
-                 (b[2] - b[0]) * (b[3] - b[1]))
-        return inter / sm if sm > 0 else 0.0
-
-    out = list(prim_rects)
-    for r in obl_rects:
-        if any(_ovf(r, m) > 0.15 for m in out):
-            continue          # the primary view owns this structure
-        out.append(r)
-    return out
-
-
-def _tighten_oblique(cam, r, yaw, pts_fit, frame_rect_fn):
-    """Tighten a tilted view's rect via two-plane back-projection.
-
-    A rect the VLM draws on a TILTED view covers the structure's full
-    image height; back-projected onto one z plane it is the footprint
-    DILATED by (H - z)*tan(tilt) on the y sides (~0.4m total at 10 deg
-    for a 2.2m rack) -- enough to swallow a neighbouring row 0.2m away
-    and to union-inflate the correct nadir capture (user report: red
-    fitted boxes all too large while the raw rects were right).
-
-    The footprint is contained in the back-projection at EVERY plane
-    z in [0, H], and the rect's frustum cross-section shifts
-    monotonically with z, so INTERSECTING the z=0 and z=z_c
-    back-projections (any z_c <= H) never clips the true footprint
-    while removing nearly all of the dilation. z_c is estimated as
-    0.8x the structure height under the coarse rect (strictly below
-    the true height, keeping the no-clip guarantee even when the
-    estimate runs hot).
-    """
-    coarse = frame_rect_fn(cam, r, 1.0)
-    m = ((pts_fit[:, 0] >= coarse[0]) & (pts_fit[:, 0] <= coarse[2]) &
-         (pts_fit[:, 1] >= coarse[1]) & (pts_fit[:, 1] <= coarse[3]))
-    inner = pts_fit[m]
-    h_est = float(np.percentile(inner[:, 2], 99.5)) if len(inner) else 2.0
-    z_c = min(max(0.8 * h_est, 0.8), 2.2)
-    lo = frame_rect_fn(cam, r, 0.0)
-    hi = frame_rect_fn(cam, r, z_c)
-    tight = (max(lo[0], hi[0]), max(lo[1], hi[1]),
-             min(lo[2], hi[2]), min(lo[3], hi[3]))
-    if tight[2] <= tight[0] or tight[3] <= tight[1]:
-        return coarse            # degenerate: keep the coarse rect
-    return tight
-
-
-# ---------- front-view height (the 2-pass fit the user asked for) ----------
-
-def _pixel_ray_z(cam, u: float, v: float, plane_p, n) -> float:
-    """World z where the pixel (u, v)'s ray crosses the vertical plane
-    through plane_p with horizontal normal n. Exact inverse of
-    Cam.project_cv along the ray (same algebra as unproject_ground,
-    plane axis generalised)."""
-    Kinv = np.linalg.inv(cam.K())
-    V = cam.view_cv()
-    R, t = V[:3, :3], V[:3, 3]
-    centre = -R.T @ t                       # camera centre (world)
-    ray = (Kinv @ np.array([u, v, 1.0])) @ R  # world ray direction
-    denom = float(ray @ n)
-    if abs(denom) < 1e-9:
-        return float("nan")
-    s = float((np.asarray(plane_p, float) - centre) @ n) / denom
-    return float((centre + s * ray)[2])
-
-
-def _front_view_height(scene, box, judge, hint_top,
-                       out_dir: str | None = None, idx: int = 0):
-    """Region height from its FRONT elevation.
-
-    The two-pass design the user specified: the top-down 2D fit owns
-    the FOOTPRINT, the front view owns the HEIGHT -- ground-level 3DGS
-    training observed rack faces well (tops are the blurry part), so
-    the VLM boxes the row floor-to-top on a front render and the bbox's
-    vertical extent, measured through the camera-facing face plane, is
-    the height in metres. The percentile z from the fit stays as the
-    fallback when the VLM answers nothing sane. Returns float | None."""
-    import os
-    from agentic_gts.output.gs_render import (make_local_cam,
-                                              render_gs_view, png_bytes)
-    W, H = 1024, 768
-    try:
-        cam = make_local_cam([box], extent=1.5, W=W, H=H,
-                             elev_deg=10.0, azim_deg=0.0)
-    except Exception as e:
-        print(f"[ground] front cam failed ({type(e).__name__}: {e})")
-        return None
-    cut = float(hint_top) + 0.10
-    img = None
-    gs_ply = scene.meta.get("gs_ply")
-    if gs_ply:
-        try:
-            from agentic_gts.tools.gs_io import read_gaussian_ply
-            gs = read_gaussian_ply(gs_ply)
-            img = render_gs_view(gs, (), cam, cut_z=cut)
-        except Exception as e:
-            print(f"[ground] front GS render failed "
-                  f"({type(e).__name__}: {e}) -> scatter")
-    if img is None:
-        pts = np.asarray(scene.points, dtype=float)
-        # floor KEPT: the VLM needs the floor-to-rack boundary at the
-        # bottom of the image to place the bbox's lower edge
-        img = _projected_scatter(pts[pts[:, 2] < cut], cam, W, H)
-    png = png_bytes(img)
-    png_path = None
-    if out_dir:
-        png_path = os.path.join(out_dir, f"frontview_{idx:02d}.png")
-        try:
-            with open(png_path, "wb") as f:
-                f.write(png)
-        except Exception as e:
-            print(f"[ground] front png save failed ({type(e).__name__})")
-            png_path = None
-    rects = judge.ground_regions(png, W, H, png_path=png_path, front=True)
-    if not rects:
-        return None
-    # the rect over THIS region: nearest x-centre to the box centre's
-    # projection (a front view may also catch the row behind the aisle)
-    ctr = np.asarray(box.center, dtype=float)
-    uv = cam.project_cv(ctr[None, :])[0]
-    best = min(rects, key=lambda r: abs((r[0] + r[2]) / 2.0 - uv[0]))
-    u = (best[0] + best[2]) / 2.0
-    yaw = float(box.yaw)
-    d = np.array([-math.sin(yaw), math.cos(yaw), 0.0])
-    face_p = ctr + d * (box.size[1] / 2.0)   # camera-facing face plane
-    z_top = _pixel_ray_z(cam, u, best[1], face_p, d)
-    z_bot = _pixel_ray_z(cam, u, best[3], face_p, d)
-    if not (np.isfinite(z_top) and np.isfinite(z_bot)):
-        return None
-    h = z_top - z_bot
-    if not (0.5 <= h <= 4.5) or z_bot > 0.6:
-        print(f"[ground] front height rejected "
-              f"(z_top {z_top:.2f}, z_bot {z_bot:.2f}) -> percentile")
-        return None
-    return float(h)
+# ---------- grounding stage ----------
 
 
 def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     """Replace scene.boxes with VLM-grounded per-region boxes.
 
-    Two-view capture: the true NADIR view (rows axis-aligned, exact
-    footprint) plus ONE OBLIQUE view whose well-trained rack FACES compensate the nadir's
-    blind spot -- a ground-level 3DGS training set barely observed rack
-    tops, so the nadir room centre renders as an ungroundable smear
-    while the image edges (perspective showing faces) ground fine.
-    Regions are back-projected, view-DEDUPED (nadir owns the footprint,
-    obliques only add what it missed) and point-support fitted -- each
-    region its OWN box, unmerged (the local refinement and the row
-    split run downstream).
+    ONE global NADIR view (rows axis-aligned, exact footprint capture,
+    vertical rays carry no perspective dilation). Regions are
+    back-projected and point-support fitted -- each region its OWN
+    box, unmerged. The per-box local refinement (front + oblique
+    renders -> VLM SAM points -> mask -> back-projected points ->
+    precise OBB) and the row split run downstream.
 
     False = grounding unavailable (mock backend / VLM failure / no
     region survived the point-support guards) and the caller keeps the
@@ -496,42 +306,28 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     if not hints:
         return False
     yaw = float(scene.meta.get("yaw", 0.0) or 0.0)
-    views = (("nadir", 0.0),           # exact footprint capture
-             ("oblique", 10.0))        # one face-visible view for missed rows
-    cam_rects: list[tuple] = []       # (cam, pixel_rect, oblique)
-    base = None                       # (img, cam) of the nadir render
-    view_audit: list = []              # (name, img, cam, rects) per view
-    for name, tilt in views:
+    try:
+        img, cam, W, H = _render_topdown(scene, hints, yaw)
+        png = png_bytes(img)           # CLEAN view: no hint overlays
+    except Exception as e:
+        print(f"[ground] nadir render failed ({type(e).__name__}: {e}) "
+              f"-> keep hints")
+        return False
+    png_path = None
+    if out_dir:
+        png_path = os.path.join(out_dir, "groundview.png")
         try:
-            img, cam, W, H = _render_topdown(scene, hints, yaw,
-                                             pan_deg=tilt)
-            png = png_bytes(img)       # CLEAN view: no hint overlays
+            with open(png_path, "wb") as f:
+                f.write(png)
         except Exception as e:
-            print(f"[ground] view {name} render failed "
-                  f"({type(e).__name__}: {e}) -> view skipped")
-            continue
-        if name == "nadir":
-            base = (img, cam)
-        png_path = None
-        if out_dir:
-            fname = "groundview.png" if name == "nadir" \
-                else f"groundview_{name}.png"
-            png_path = os.path.join(out_dir, fname)
-            try:
-                with open(png_path, "wb") as f:
-                    f.write(png)
-            except Exception as e:
-                print(f"[ground] png save failed ({type(e).__name__})")
-                png_path = None
-        rects = judge.ground_regions(png, W, H, png_path=png_path,
-                                     oblique=tilt != 0.0)
-        print(f"[ground] view {name}: {len(rects)} regions")
-        view_audit.append((name, img, cam, rects))
-        cam_rects += [(cam, r, tilt != 0.0) for r in rects]
-    if not cam_rects:
+            print(f"[ground] png save failed ({type(e).__name__})")
+            png_path = None
+    rects = judge.ground_regions(png, W, H, png_path=png_path)
+    print(f"[ground] nadir view: {len(rects)} regions")
+    if not rects:
         print("[ground] VLM returned no usable regions -> keep hints")
-        if out_dir and base is not None:
-            _save_grounded_fail_png(base[0], out_dir,
+        if out_dir:
+            _save_grounded_fail_png(img, out_dir,
                                     "VLM returned no usable regions")
         return False
     pts_rot = _rot_xy(np.asarray(scene.points, dtype=np.float64), -yaw)
@@ -562,22 +358,13 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         return (float(corners_r[:, 0].min()), float(corners_r[:, 1].min()),
                 float(corners_r[:, 0].max()), float(corners_r[:, 1].max()))
 
-    prim_rects: list[tuple] = []   # nadir: the exact footprint capture
-    obl_rects: list[tuple] = []   # tilted views: perspective-sloped captures
-    for cam, r, oblique in cam_rects:
-        rect = _frame_rect(cam, r, 1.0)
-        if oblique:
-            rect = _tighten_oblique(cam, r, yaw, pts_fit, _frame_rect)
-            obl_rects.append(rect)
-        else:
-            prim_rects.append(rect)
     # NO merging: each grounded rect is fitted as its OWN box (user
     # directive). The per-box local refinement (SAM) runs next and the
     # joined rows are split after it -- pre-merging decided structure
     # membership before the refinement evidence got a vote.
-    merged = _dedup_views(prim_rects, obl_rects)
     boxes = []
-    for rect_r in merged:
+    for r in rects:
+        rect_r = _frame_rect(cam, r, 1.0)
         bb = _fit_region_box(pts_fit, rect_r)
         if bb is None:
             continue
@@ -586,37 +373,22 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                           size=bb.size, yaw=yaw,
                           device_type=DeviceType.RACK,
                           meta={"grounded": True})
-        # HEIGHT from the front view (user-directed division of labour):
-        # the top-down 2D fit owns the footprint; the well-trained rack
-        # FACES on a front elevation own the height. The fit's
-        # percentile z stays as the fallback when the VLM is unusable.
-        h = _front_view_height(scene, box, judge, hint_top,
-                               out_dir=out_dir, idx=len(boxes))
-        if h is not None:
-            box = OrientedBox(center=(float(c[0]), float(c[1]), h / 2.0),
-                              size=(bb.size[0], bb.size[1], h), yaw=yaw,
-                              device_type=DeviceType.RACK,
-                              meta={"grounded": True})
         boxes.append(box)
     if not boxes:
         print("[ground] no region survived the point-support guards "
               "-> keep hints")
-        if out_dir and base is not None:
-            _save_grounded_fail_png(base[0], out_dir,
+        if out_dir:
+            _save_grounded_fail_png(img, out_dir,
                                     "no region survived point-support guards")
         return False
-    print(f"[ground] {len(cam_rects)} VLM regions in {len(views)} views "
-          f"-> {len(merged)} unmerged -> {len(boxes)} fitted boxes")
+    print(f"[ground] {len(rects)} VLM regions -> {len(boxes)} fitted boxes")
     scene.boxes = boxes
-    # result audit on EVERY view (user request): each grounded_*.png
-    # shows that view's own raw VLM rects (colored) plus the final
-    # fitted boxes (red) projected through the same camera -- the nadir
-    # one alone could not show what the oblique views contributed
+    # result audit: the grounded.png shows the view's own raw VLM rects
+    # (colored) plus the final fitted boxes (red) projected through the
+    # same camera
     if out_dir:
-        for name, img, cam, vrects in view_audit:
-            _save_grounded_png(img, cam, boxes, vrects, out_dir,
-                               fname=("grounded.png" if name == "nadir"
-                                      else f"grounded_{name}.png"))
+        _save_grounded_png(img, cam, boxes, rects, out_dir,
+                           fname="grounded.png")
     return True
 
 

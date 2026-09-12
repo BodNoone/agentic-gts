@@ -155,34 +155,18 @@ def test_ground_stage_with_patched_vlm():
     judge = VLMJudge(backend="qwen")
 
     def _fake_call(png, prompt, *a, **k):
-        # front-elevation height queries answer with nothing here: the
-        # percentile fallback keeps the fit's own z (the front-view
-        # height path is covered by test_front_view_height)
-        if "front-facing" in prompt.lower():
-            return "[]"
-        # tilted views answer with nothing extra here: the nadir view
-        # alone grounds both rows (the multi-view DEDUP path is covered
-        # by test_dedup_views_policy)
-        if "tilted" in prompt.lower():
-            return "I see rows but nothing new.\n[]"
         return reply
     judge._qwen_image_call = _fake_call    # canned VLM answer
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         ok = ground.ground_stage(scene, judge, out_dir=td)
         assert ok, "grounding must succeed with a valid VLM reply"
-        # result audit images on EVERY view (user request): each shows
-        # that view's own raw rects + the final boxes projected through
-        # the same camera
-        for fn in ("grounded.png", "grounded_oblique.png"):
-            assert os.path.exists(os.path.join(td, fn)), \
-                f"{fn} (per-view result audit) was not saved"
+        # result audit image: the view's own raw rects + the final
+        # boxes projected through the same camera
+        assert os.path.exists(os.path.join(td, "grounded.png")), \
+            "grounded.png (result audit view) was not saved"
         assert os.path.exists(os.path.join(td, "groundview.png")), \
             "groundview.png (input view) was not saved"
-        # oblique complement views are saved too (the nadir blind-spot
-        # fix -- centre rows with untrained tops)
-        assert os.path.exists(os.path.join(td, "groundview_oblique.png")), \
-            "groundview_oblique.png (oblique view) was not saved"
         # same-base contract: the two images must be pixel-identical
         # apart from the red result overlays -- different ceiling cuts /
         # camera framing would confound the before/after comparison
@@ -229,152 +213,6 @@ def test_split_reply_parse():
         '{"count": 2, "gaps": [0.5]}')
     assert p == {"count": 2, "gaps": [0.5]}
     print("PASS split reply parse (incl. think-block + range clamps)")
-
-
-def test_dedup_views_policy():
-    """View-level DEDUP (no merging): the nadir view owns the
-    footprint. Every nadir rect stays AS DRAWN (fragments are NOT
-    fused -- the local refinement handles them downstream); an oblique
-    rect that overlaps a nadir rect is DROPPED, one over a nadir BLIND
-    SPOT survives as its own addition."""
-    from agentic_gts.agent.ground import _dedup_views
-    # nadir's capture of row 1 (tight, exact) + its two tilted captures
-    # (shifted/stretched by perspective) + a parallel row 2
-    nadir = [(-0.2, -0.6, 6.1, 0.7), (-1.0, 2.4, 5.2, 3.6)]
-    obliques = [(0.3, -0.8, 6.4, 0.5), (-0.4, -0.5, 5.9, 0.9)]
-    out = _dedup_views(nadir, obliques)
-    assert len(out) == 2, f"want 2 rects (both rows), got {len(out)}"
-    row1 = min(out, key=lambda r: r[1])
-    # the oblique slop must NOT have widened the nadir capture: the
-    # result IS the nadir rect (no union with 6.4 / -0.8)
-    assert abs(row1[0] - (-0.2)) < 1e-9 and abs(row1[2] - 6.1) < 1e-9, \
-        "primary rect must stay as the nadir drew it"
-    assert abs(row1[1] - (-0.6)) < 1e-9 and abs(row1[3] - 0.7) < 1e-9
-    # an oblique rect over a nadir BLIND SPOT (a centre row the nadir
-    # missed) survives as its own addition
-    blind = (1.0, 5.0, 5.0, 6.1)
-    out = _dedup_views(nadir, [blind])
-    assert len(out) == 3, f"blind-spot addition must survive, got {len(out)}"
-    assert any(abs(r[1] - 5.0) < 1e-9 for r in out)
-    # FRAGMENTS ARE NOT MERGED anymore: overlapping nadir pieces stay
-    # separate structures (the local refinement + split decide later)
-    frags = [(-0.2, -0.6, 3.0, 0.7), (2.9, -0.6, 6.1, 0.7)]
-    assert len(_dedup_views(frags, [])) == 2, \
-        "fragments must NOT fuse at grounding anymore"
-    print("PASS dedup views (nadir owns overlap, obliques only add, "
-          "fragments unmerged)")
-
-
-def test_tighten_oblique_rect():
-    """A tilted view's rect is the footprint DILATED by the view angle;
-    the two-plane intersection recovers it.
-
-    The VLM outlines the rack's full image height (floor-to-top). On a
-    10-deg tilted view that image back-projects to z=1.0 as the true
-    footprint inflated ~0.37m in y -- enough to swallow a neighbouring
-    row 0.2m away. Intersecting the z=0 and z=0.8*H back-projections
-    must recover the true footprint (no clipping, <0.2m slack)."""
-    from agentic_gts.agent import ground
-    from agentic_gts.output.gs_render import unproject_ground
-    rng = np.random.default_rng(9)
-    pts = _row_points(0.0, 6.0, rng=rng)      # row y in [-0.55, 0.55], H=2.1
-    scene = Scene(points=pts)
-    scene.meta["yaw"] = 0.0
-    _, cam, W, H = ground._render_topdown(scene, [_hint(3.0, 0.0)], 0.0,
-                                          pan_deg=10.0)
-
-    def _frame_rect(c, r, z_plane):
-        uv = np.array([[r[0], r[1]], [r[2], r[1]],
-                       [r[2], r[3]], [r[0], r[3]]], dtype=float)
-        cw = unproject_ground(c, uv, z_plane)[:, :2]
-        return (float(cw[:, 0].min()), float(cw[:, 1].min()),
-                float(cw[:, 0].max()), float(cw[:, 1].max()))
-
-    # VLM-style rect: the rack's full IMAGE extent (all 8 corners of the
-    # solid projected through the tilted camera), clamped to the frame
-    # like a real reply
-    uv = cam.project_cv(np.column_stack([
-        [0.0, 6.0, 6.0, 0.0, 0.0, 6.0, 6.0, 0.0],
-        [-0.55, -0.55, 0.55, 0.55, -0.55, -0.55, 0.55, 0.55],
-        [0.0, 0.0, 0.0, 0.0, 2.1, 2.1, 2.1, 2.1]]))
-    r = (float(np.clip(uv[:, 0].min(), 0, W)),
-         float(np.clip(uv[:, 1].min(), 0, H)),
-         float(np.clip(uv[:, 0].max(), 0, W)),
-         float(np.clip(uv[:, 1].max(), 0, H)))
-
-    coarse = _frame_rect(cam, r, 1.0)
-    tight = ground._tighten_oblique(cam, r, 0.0, pts, _frame_rect)
-    # coarse: dilated well beyond the true 1.1m depth...
-    assert coarse[3] - coarse[1] > 1.35, \
-        f"coarse rect y-width {coarse[3] - coarse[1]:.2f} (must be dilated)"
-    # ...tight: within the true footprint +- 0.2m slack, both directions
-    assert -0.75 < tight[1] and tight[3] < 0.75, \
-        f"tight y range [{tight[1]:.2f}, {tight[3]:.2f}] must hug [-0.55, 0.55]"
-    assert tight[3] - tight[1] < coarse[3] - coarse[1], \
-        "tightened rect must be narrower than the coarse one"
-    # x survives (length direction is barely affected by the y-tilt)
-    assert -0.3 < tight[0] and tight[2] < 6.3, \
-        f"tight x range [{tight[0]:.2f}, {tight[2]:.2f}] must hug [0, 6]"
-    print(f"PASS tighten oblique "
-          f"(y: coarse {coarse[3]-coarse[1]:.2f} -> tight {tight[3]-tight[1]:.2f}, "
-          f"true 1.10)")
-
-
-def test_front_view_height():
-    """The front elevation owns the region height: the VLM bbox's
-    vertical extent, measured through the face plane, is floor-to-top
-    in metres; no VLM answer -> None (percentile fallback)."""
-    from agentic_gts.agent import ground
-    from agentic_gts.output.gs_render import make_local_cam
-    rng = np.random.default_rng(13)
-    pts = _row_points(0.0, 6.0, rng=rng)          # true height 2.1
-    scene = Scene(points=pts)
-    scene.meta["yaw"] = 0.0
-    box = _hint(3.0, 0.0, size=(6.0, 1.1, 2.1))
-    # rebuild the SAME cam _front_view_height builds (deterministic:
-    # same box, same args) and fabricate the VLM bbox from the row's
-    # TRUE floor-to-top corners projected through it
-    cam = make_local_cam([box], extent=1.5, W=1024, H=768,
-                         elev_deg=10.0, azim_deg=0.0)
-    corners = np.column_stack([
-        [0.0, 6.0, 6.0, 0.0, 0.0, 6.0, 6.0, 0.0],
-        [-0.55, -0.55, 0.55, 0.55, -0.55, -0.55, 0.55, 0.55],
-        [0.0, 0.0, 0.0, 0.0, 2.1, 2.1, 2.1, 2.1]])
-    uv = cam.project_cv(corners)
-    rect = (float(uv[:, 0].min()), float(uv[:, 1].min()),
-            float(uv[:, 0].max()), float(uv[:, 1].max()))
-
-    class _FakeJudge:
-        def ground_regions(self, png, W, H, png_path=None,
-                           oblique=False, front=False):
-            assert front, "the height query must use the front prompt"
-            return [(*rect, "rack row")]
-
-    h = ground._front_view_height(scene, box, _FakeJudge(), hint_top=2.1)
-    assert h is not None and abs(h - 2.1) < 0.08, \
-        f"front-view height {h} (true 2.10)"
-    # guards: a nonsense reply (tray-height box floating above the
-    # floor) is rejected, not averaged in
-    class _HighJudge:
-        def ground_regions(self, *a, **k):
-            # z 1.4..3.0: bottom far above the floor -> rejected
-            c2 = np.column_stack([corners[:, 0],
-                                  corners[:, 1] + 1.4,
-                                  corners[:, 2] * 0.7619 + 1.4])
-            uv2 = cam.project_cv(c2)
-            r2 = (float(uv2[:, 0].min()), float(uv2[:, 1].min()),
-                  float(uv2[:, 0].max()), float(uv2[:, 1].max()))
-            return [(*r2, "rack row")]
-    assert ground._front_view_height(
-        scene, box, _HighJudge(), hint_top=2.1) is None
-    # no VLM answer -> None (caller keeps the percentile estimate)
-    class _NoneJudge:
-        def ground_regions(self, *a, **k):
-            return []
-    assert ground._front_view_height(
-        scene, box, _NoneJudge(), hint_top=2.1) is None
-    print(f"PASS front view height ({h:.2f} m via face-plane rays, "
-          "guards + fallback verified)")
 
 
 def test_parse_ground_regions_official_format():
@@ -476,9 +314,6 @@ if __name__ == "__main__":
     test_split_row_snaps_to_profile_gaps()
     test_ground_stage_with_patched_vlm()
     test_split_reply_parse()
-    test_dedup_views_policy()
-    test_tighten_oblique_rect()
-    test_front_view_height()
     test_parse_ground_regions_official_format()
     test_parse_ground_regions_salvage()
     test_ground_mock_returns_false()

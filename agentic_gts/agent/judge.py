@@ -1127,58 +1127,15 @@ class VLMJudge:
         '{"bbox_2d": [x1, y1, x2, y2], "label": "rack row"}'
     )
 
-    _GROUND_PROMPT_TILT = (
-        "This is a slightly tilted top-down view of a data-center room "
-        "(camera just above the room, offset to one side, ceiling "
-        "removed): device rows run horizontally, and the tilt makes "
-        "the cabinets' vertical faces visible as bright strips on one "
-        "side of each row.\n"
-        "Locate every instance that belongs to the following categories: "
-        '"server rack row, single cabinet". A continuous row of joined '
-        "cabinets is ONE instance whose box covers the WHOLE row "
-        "together with its visible face strip; structures separated by "
-        "an aisle or a clear gap are separate instances. Do not include "
-        "walls, pillars, columns, or floor clutter.\n"
-        "Report bbox coordinates in JSON format like this: "
-        '{"bbox_2d": [x1, y1, x2, y2], "label": "rack row"}'
-    )
-
-    _GROUND_PROMPT_FRONT = (
-        "This is a front-facing view of one server-rack region in a "
-        "data-center room (camera in the aisle at rack height, looking "
-        "straight at the row's face; the cabinets run horizontally "
-        "across the image and the floor is visible at the bottom).\n"
-        "Locate every instance that belongs to the following categories: "
-        '"server rack row, single cabinet". A continuous row of joined '
-        "cabinets is ONE instance whose box spans the WHOLE row from the "
-        "floor to the TOP of the cabinets. Do not include the floor, the "
-        "aisle, cable trays or ducts ABOVE the racks, or the ceiling.\n"
-        "Report bbox coordinates in JSON format like this: "
-        '{"bbox_2d": [x1, y1, x2, y2], "label": "rack row"}'
-    )
-
     def ground_regions(self, png: bytes, W: int, H: int,
-                       png_path: str | None = None,
-                       oblique: bool = False,
-                       front: bool = False) -> list[tuple]:
-        """2D grounding over a top-down view: outline EVERY device
-        structure (a joined row = one region).
-
-        oblique: the view is a slightly-tilted variant of the nadir
-        map (camera offset to one side) -- the tilt reveals the rack
-        FACES, which a ground-level 3DGS training set observed well
-        (the nadir centre shows only the barely-trained TOPS: a blurry
-        smear).
-        front: the view is a FRONT elevation of one region (camera in
-        the aisle, rack faces across the image) -- the reply's vertical
-        extent is the region's floor-to-top height.
+                       png_path: str | None = None) -> list[tuple]:
+        """2D grounding over the global top-down view: outline EVERY
+        device structure (a joined row = one region).
 
         Returns pixel rects [(x0, y0, x1, y1)] or [] on mock / failure.
         Runs on the thinking tier when configured: one call per view,
         and these regions BECOME the pipeline's boxes (high stakes)."""
-        prompt = (self._GROUND_PROMPT_FRONT if front else
-                  self._GROUND_PROMPT_TILT if oblique
-                  else self._GROUND_PROMPT)
+        prompt = self._GROUND_PROMPT
         if self.backend == "mock":
             return []
         use_thinking = bool(self.thinking_model)

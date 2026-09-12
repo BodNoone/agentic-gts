@@ -287,8 +287,13 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # perpendicular to the long edge, i.e. facing the device's face
     # (user report: many front views were the visible SIDE).
     azim_front = 0.0 if box.size[0] >= box.size[1] else 90.0
-    azim_side = 90.0 if azim_front == 0.0 else 0.0
-    slots = (("front", 18.0, azim_front), ("side", 18.0, azim_side))
+    # user-directed view pair: FRONT (the face: doors, panels) +
+    # OBLIQUE (elevated ~58 deg off vertical, 30 deg around the box:
+    # top face + two faces + context -- the footprint and the device
+    # outline are both measurable, which a pure side view along the
+    # row cannot show).
+    slots = (("front", 18.0, azim_front),
+             ("oblique", 58.0, azim_front + 30.0))
     out = []
     for name, elev, azim in slots:
         cam = make_local_cam([box], extent=1.4, W=768, H=768,
