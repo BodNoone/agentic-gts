@@ -458,59 +458,6 @@ def _target_band_center(runs, span, own):
     return (span[0] + span[1]) / 2.0
 
 
-def sweep_yaw(scene: Scene, box: OrientedBox, direction: float | None = None,
-              max_deg: float = 15.0, step_deg: float = 2.5,
-              min_gain: float = 0.01):
-    """Search the box's best yaw around its current one by point support.
-
-    The VLM nominates the rotation DIRECTION only (cw/ccw); the exact
-    angle is a geometric quantity this sweep measures: re-fit the box at
-    each candidate yaw and keep the support peak. The opposite direction
-    is searched as a FALLBACK -- the nomination gates the search but the
-    point evidence overrules a wrong direction (a wrong cw/ccw from the
-    VLM must not leave the box stuck at a bad yaw).
-
-    Scoring is interior occupancy + best face coverage (SUMMED: a max()
-    saturates at face coverage 1.0 and masks the occupancy gain that a
-    yaw correction produces; the sum keeps both terms monotone in fit
-    quality and stays meaningful for surface-only fragments).
-
-    Returns (best_yaw, best_box) or None when no candidate beats the
-    current yaw's support by min_gain.
-    """
-    keep_depth = bool(box.meta.get("depth_completed"))
-
-    def _score(b):
-        return support_fraction(scene, b) + face_support_fraction(scene, b)
-
-    base = fit_box_to_points(scene, box.center[:2], box.size, box.yaw,
-                              keep_height=True, keep_depth=keep_depth)
-    # the baseline is the CURRENT box (refit if it succeeds, else the box
-    # as-is): a yaw-0 refit failing its coverage floor must not abort the
-    # sweep -- the whole point is that rotated candidates fit better.
-    base_sup = _score(base if base is not None else box)
-    signs = []
-    if direction is not None:
-        signs.extend((direction, -direction))
-    else:
-        signs.extend((1.0, -1.0))
-    n_steps = max(1, int(round(max_deg / step_deg)))
-    best, best_sup = None, base_sup
-    for sgn in signs:
-        for k in range(1, n_steps + 1):
-            yaw = float(box.yaw) + sgn * math.radians(k * step_deg)
-            refit = fit_box_to_points(scene, box.center[:2], box.size, yaw,
-                                      keep_height=True, keep_depth=keep_depth)
-            if refit is None:
-                continue
-            sup = _score(refit)
-            if sup > best_sup:
-                best, best_sup = (yaw, refit), sup
-    if best is None or best_sup < base_sup + min_gain:
-        return None
-    return best
-
-
 def split_box(scene: Scene, box: OrientedBox, n: int,
               width_unit: float | None = None,
               cuts: list[float] | None = None) -> list[OrientedBox]:
