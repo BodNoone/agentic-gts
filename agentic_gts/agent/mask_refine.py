@@ -784,9 +784,16 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     candidates = []
     best_points_per_view = []
     for view in views:
+        # CLEAN image to the VLM: the wireframe overlay (prompt_image)
+        # is the Stage-A box, which is often oversized/misplaced -- the
+        # VLM anchors its points on the frame and lands them off the
+        # device (user report: mostly off-device points). Same principle
+        # as global grounding: no box prompts in the input image. The
+        # rack TYPE-CONFIRM call keeps the wireframe (it judges the box
+        # fit); point generation judges the DEVICE.
         verdict = judge.adjudicate_sam_points(
-            view["prompt_image"], box, view["name"],
-            png_path=view["prompt_path"] or view["path"])
+            view["image"], box, view["name"],
+            png_path=view["path"])
         groups = verdict.params.get("groups", []) if verdict.params else []
         va = {"view": view["name"], "image": view["path"],
               "answer": verdict.raw or verdict.detail, "groups": groups}
