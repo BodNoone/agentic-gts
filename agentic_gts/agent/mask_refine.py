@@ -456,10 +456,11 @@ def score_candidate(mask_score: float, points: np.ndarray,
 
 def confirm_device_type(judge, box: OrientedBox, views: list,
                         ) -> dict | None:
-    """Type-level guard for ONE box: is the wrapped object a server rack?
+    """Type-level guard for ONE box: is the wrapped object DC equipment
+    (server rack / IT cabinet / air-conditioning unit)?
 
     The grounding guards only reject hallucinated EMPTY regions; a real
-    structure mislabelled a rack (pillar / UPS / AC / wall) passes them
+    structure mislabelled equipment (pillar / UPS / wall) passes them
     all. This asks the VLM one yes/no question on the front local view
     (wireframe overlay shows which object is meant). `views` comes from
     the caller's render_local_views call (shared with refine_box --

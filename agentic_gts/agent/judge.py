@@ -1289,15 +1289,16 @@ class VLMJudge:
                        params=p, confidence=0.6, detail="")
 
     _SAM_POINT_PROMPT = (
-        "You are preparing point prompts for SAM to segment ONE server rack "
+        "You are preparing point prompts for SAM to segment ONE target "
+        "device (a server rack / IT cabinet, or an air-conditioning unit) "
         "in a local {view_name} view. The image contains only the current "
         "box neighborhood. Return 1-3 candidate prompt groups. For each "
-        "group, place 5-8 POSITIVE points safely inside the target rack "
+        "group, place 5-8 POSITIVE points safely inside the target device "
         "surface (door/panel/body), SPREAD ACROSS THE WHOLE target: put "
         "points near its top, middle and bottom, and near its left, centre "
         "and right -- clustered points make SAM segment only a local part "
-        "(one door, one panel) instead of the entire rack. Also place 3-6 "
-        "NEGATIVE points on adjacent racks, aisle, wall, cables, or "
+        "(one door, one panel) instead of the entire device. Also place "
+        "3-6 NEGATIVE points on adjacent devices, aisle, wall, cables, or "
         "background, spread around the target. Do not put points on "
         "boundaries. Coordinates MUST use Qwen's official relative 0-1000 "
         "image grid (x=0 left, x=1000 right, y=0 top, y=1000 bottom), not "
@@ -1355,22 +1356,23 @@ class VLMJudge:
         "You are verifying ONE detected object in a data-center scene.\n"
         "The image shows the local neighborhood of one detected 3D box; "
         "the RED wireframe marks the box. Question: is the object the "
-        "wireframe wraps really a SERVER RACK / IT cabinet (or a joined "
-        "row of them)? A pillar, wall segment, cable tray, UPS unit, "
-        "AC unit, pipe, floor patch or clutter is NOT a server rack "
-        "even when the box fits it well. Judge the object, not the "
-        "box fit.\n"
+        "wireframe wraps really a piece of DC EQUIPMENT -- a SERVER RACK "
+        "/ IT cabinet (or a joined row of them) OR an air-conditioning "
+        "unit (CRAC / precision cooling)? A pillar, wall segment, cable "
+        "tray, UPS unit, pipe, floor patch or any other clutter is NOT "
+        "equipment even when the box fits it well. Judge the object, "
+        "not the box fit.\n"
         "Output ONLY JSON on the last line:\n"
         '{"is_rack": true|false, "confidence": 0.0-1.0}'
     )
 
     def adjudicate_rack_confirm(self, image: np.ndarray, box,
                                 png_path: str | None = None) -> Verdict:
-        """Type-level guard: is the boxed object actually a server rack?
+        """Type-level guard: is the boxed object DC equipment (rack or AC)?
 
         The grounding guards only reject hallucinated EMPTY regions
         (no point support / floor patches); a real structure mislabelled
-        a rack (pillar, UPS, AC, wall) passes them all. One yes/no
+        equipment (pillar, UPS, wall) passes them all. One yes/no
         question on the local view. The caller NEVER deletes on a 'no'
         -- it marks LOW confidence and surfaces the box for human
         review (false-positive deletion is the dangerous direction).

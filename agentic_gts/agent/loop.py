@@ -396,12 +396,13 @@ class LayoutAgent:
                          or self.judge.backend != "mock") else [])
             # ---- type-level guard (no SAM needed) ----
             # Grounding guards reject hallucinated EMPTY regions, but a
-            # real structure mislabelled a rack (pillar / UPS / AC / wall
+            # real structure mislabelled equipment (pillar / UPS / wall
             # segment) passes them all: it has points, height and a good
-            # SAM mask. One VLM yes/no on the front view closes that
-            # gap. A 'no' NEVER deletes -- it marks LOW confidence and
-            # surfaces the box for human review (false-positive deletion
-            # is the dangerous direction).
+            # SAM mask. One VLM yes/no on the front view (rack / IT
+            # cabinet / AC unit = equipment; the rest = clutter) closes
+            # that gap. A 'no' NEVER deletes -- it marks LOW confidence
+            # and surfaces the box for human review (false-positive
+            # deletion is the dangerous direction).
             try:
                 r = confirm_device_type(self.judge, old, views)
             except Exception as e:
