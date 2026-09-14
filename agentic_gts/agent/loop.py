@@ -31,6 +31,16 @@ from agentic_gts.core.models import (
 from agentic_gts.agent.judge import VLMJudge
 from agentic_gts.tools import geometry as geo
 
+# grounding labels that already answer the type-confirm question: the
+# local-grounding categories are exactly the equipment classes the
+# type guard accepts
+_EQUIP_TOKENS = ("rack", "cabinet", "air-con", "air con", "aircon",
+                 "air conditioning", "ac unit", "crac", "pdu")
+
+
+def _is_equipment_label(label) -> bool:
+    return any(t in str(label or "").lower() for t in _EQUIP_TOKENS)
+
 
 @dataclass
 class AgentReport:
@@ -84,8 +94,13 @@ class LayoutAgent:
         """Local per-box VLM pass: SAM mask refinement + type confirmation.
 
         Both questions share ONE render_local_views call per box (front
-        + side views). The type confirmation runs even when SAM is not
-        configured -- it only needs the local view and the VLM.
+        + diagonal views). Per box the VLM cost is 2 local-grounding
+        calls + 1 type-confirm; the type-confirm is SKIPPED when the
+        local grounding already labelled every accepted instance as
+        equipment with a strong score (the redundant third call is the
+        common case for clean racks). The type confirmation runs even
+        when SAM is not configured -- it only needs the local view and
+        the VLM.
         """
         from agentic_gts.agent.mask_refine import (SamPredictorAdapter,
                                                     confirm_device_type,
@@ -109,6 +124,25 @@ class LayoutAgent:
             views = (render_local_views(scene, old, self.out_dir)
                      if (sam.available
                          or self.judge.backend != "mock") else [])
+            # ---- SAM mask refinement (multi-instance), runs FIRST: its
+            # grounding result also decides whether the type-confirm
+            # question is worth asking ----
+            instances = []
+            if sam.available:
+                try:
+                    instances, audit = refine_box(scene, old, self.judge,
+                                                 sam, self.out_dir,
+                                                 views=views)
+                except Exception as e:
+                    print(f"[mask-refine] {old.box_id[:6]} failed "
+                          f"({type(e).__name__}: {e}) -> keep")
+                    audits.append({"box_id": old.box_id, "accepted": False,
+                                   "reason": f"{type(e).__name__}: {e}"})
+                else:
+                    audits.append(audit)
+                    if not instances:
+                        print(f"[mask-refine] {old.box_id[:6]} no valid "
+                              f"mask -> keep")
             # ---- type-level guard (no SAM needed) ----
             # Grounding guards reject hallucinated EMPTY regions, but a
             # real structure mislabelled equipment (pillar / UPS / wall
@@ -118,43 +152,46 @@ class LayoutAgent:
             # that gap. A 'no' NEVER deletes -- it marks LOW confidence
             # and surfaces the box for human review (false-positive
             # deletion is the dangerous direction).
-            try:
-                r = confirm_device_type(self.judge, old, views)
-            except Exception as e:
-                print(f"[type-confirm] {old.box_id[:6]} failed "
-                      f"({type(e).__name__}: {e})")
-                r = None
-            if r is not None:
-                conf_audits.append({"box_id": old.box_id, **r})
-                if not r["is_rack"]:
-                    old.confidence = Confidence.LOW
-                    old.meta["type_suspect"] = True
-                    report.unresolved.append(
-                        {"issue": {"type": "not_a_rack",
-                                   "box_id": old.box_id,
-                                   "confidence": r["confidence"]},
-                         "ok": False})
-                    print(f"[type-confirm] {old.box_id[:6]} NOT a rack "
-                          f"(conf {r['confidence']:.2f}) -> LOW + review")
-            # ---- SAM mask refinement (multi-instance) ----
-            if not sam.available:
-                continue
-            try:
-                instances, audit = refine_box(scene, old, self.judge, sam,
-                                             self.out_dir, views=views)
-            except Exception as e:
-                print(f"[mask-refine] {old.box_id[:6]} failed "
-                      f"({type(e).__name__}: {e}) -> keep")
-                audits.append({"box_id": old.box_id, "accepted": False,
-                               "reason": f"{type(e).__name__}: {e}"})
-                continue
-            audits.append(audit)
+            # SKIP when the local grounding already answered it: every
+            # accepted instance is equipment-labelled with a strong
+            # score (>= 0.6) -- asking again would be a redundant third
+            # VLM call per box. Runs BEFORE the adoption below so the
+            # LOW mark propagates into the refit through meta copy.
+            skip_confirm = bool(instances) and all(
+                _is_equipment_label(e["label"]) and e["score"] >= 0.6
+                for e in instances)
+            if skip_confirm:
+                conf_audits.append({
+                    "box_id": old.box_id, "is_rack": True,
+                    "skipped": "local grounding labelled every instance "
+                               "as equipment with score >= 0.6"})
+            else:
+                try:
+                    r = confirm_device_type(self.judge, old, views)
+                except Exception as e:
+                    print(f"[type-confirm] {old.box_id[:6]} failed "
+                          f"({type(e).__name__}: {e})")
+                    r = None
+                if r is not None:
+                    conf_audits.append({"box_id": old.box_id, **r})
+                    if not r["is_rack"]:
+                        old.confidence = Confidence.LOW
+                        old.meta["type_suspect"] = True
+                        report.unresolved.append(
+                            {"issue": {"type": "not_a_rack",
+                                       "box_id": old.box_id,
+                                       "confidence": r["confidence"]},
+                             "ok": False})
+                        print(f"[type-confirm] {old.box_id[:6]} NOT a rack "
+                              f"(conf {r['confidence']:.2f}) -> LOW + review")
+            # ---- adoption: the primary keeps the old identity, extra
+            # split instances enter as new boxes ----
             if not instances:
-                print(f"[mask-refine] {old.box_id[:6]} no valid mask -> keep")
                 continue
             # conservative guard: every instance must stay near the old
             # box (a local mask may not jump to a neighbour)
-            valid = [b for b in instances if b.iou_2d(old) >= 0.2]
+            valid = [e["fitted"] for e in instances
+                     if e["fitted"].iou_2d(old) >= 0.2]
             if not valid:
                 print(f"[mask-refine] {old.box_id[:6]} rejected: IoU<0.2")
                 continue

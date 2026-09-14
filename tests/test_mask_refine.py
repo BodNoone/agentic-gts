@@ -149,6 +149,52 @@ def test_sam_unconfigured_is_conservative():
     print("PASS SAM-unconfigured path keeps boxes unchanged")
 
 
+def test_sam_predict_encodes_image_once_per_object():
+    """predict() must call set_image only ONCE per distinct image OBJECT:
+    a multi-group view (joined row split into G cabinets) runs G box
+    prompts over the SAME rendering, and the Hiera encoder -- not the
+    lightweight mask head -- is SAM's dominant cost. A different image
+    must always re-encode (correctness never depends on the cache)."""
+    class _FakePred:
+        n_set = 0
+
+        def set_image(self, u8):
+            self.n_set += 1
+
+        def predict(self, box, multimask_output):
+            return [np.ones((8, 8), bool)], [0.9], None
+
+    sam = SamPredictorAdapter(checkpoint=None)
+    sam._predictor = _FakePred()
+    sam._last_img = None
+    img = np.zeros((8, 8, 3), np.float32)
+    sam.predict(img, np.array([1, 1, 5, 5]))
+    sam.predict(img, np.array([2, 2, 6, 6]))     # same object, new box
+    assert sam._predictor.n_set == 1, \
+        f"same-image prompts must not re-encode, got {sam._predictor.n_set}"
+    sam.predict(np.zeros((8, 8, 3), np.float32), np.array([1, 1, 5, 5]))
+    assert sam._predictor.n_set == 2, \
+        f"a new image must re-encode, got {sam._predictor.n_set}"
+    print("PASS SAM adapter encodes once per image object")
+
+
+def test_equipment_label_gate():
+    """The type-confirm skip gate: grounding labels naming the equipment
+    classes pass; anything else (pillar / wall / ups / unknown) fails and
+    keeps the confirm question alive."""
+    from agentic_gts.agent.loop import _is_equipment_label
+    assert _is_equipment_label("rack")
+    assert _is_equipment_label("server rack")
+    assert _is_equipment_label("IT cabinet")
+    assert _is_equipment_label("air-conditioning unit")
+    assert _is_equipment_label("AC unit")
+    assert _is_equipment_label(None) is False
+    assert not _is_equipment_label("pillar")
+    assert not _is_equipment_label("wall segment")
+    assert not _is_equipment_label("ups battery")
+    print("PASS equipment-label gate for the type-confirm skip")
+
+
 def test_parse_rack_confirm():
     from agentic_gts.agent.judge import VLMJudge
     p = VLMJudge._parse_rack_confirm(

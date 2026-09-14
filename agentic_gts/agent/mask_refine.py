@@ -146,6 +146,7 @@ class SamPredictorAdapter:
         self.checkpoint = checkpoint or os.environ.get("SAM_CHECKPOINT")
         self.model_cfg = model_cfg or os.environ.get("SAM_MODEL_CFG")
         self._predictor = None
+        self._last_img = None
 
     @property
     def available(self) -> bool:
@@ -222,10 +223,21 @@ class SamPredictorAdapter:
         The box prompt is SAM's canonical interaction: coarse anchoring
         from the VLM, fine boundaries from the mask. multimask_output
         keeps the 3 granularity candidates (object / part / supart)
-        competing downstream."""
+        competing downstream.
+
+        Efficiency: the image is encoded ONCE per distinct array OBJECT
+        (identity check, not content). A multi-group view -- a joined
+        row the local grounding split into G cabinets -- runs G box
+        prompts over the SAME rendering, and the Hiera encoder (not the
+        lightweight mask head) is SAM's dominant cost: re-encoding per
+        prompt multiplied that cost by G. A different image always
+        re-encodes, so correctness never depends on the cache.
+        """
         self._load()
-        u8 = (np.clip(image[..., :3], 0, 1) * 255).astype(np.uint8)
-        self._predictor.set_image(u8)
+        if self._last_img is not image:
+            u8 = (np.clip(image[..., :3], 0, 1) * 255).astype(np.uint8)
+            self._predictor.set_image(u8)
+            self._last_img = image
         masks, scores, _ = self._predictor.predict(
             box=np.asarray(box, dtype=np.float32),
             multimask_output=True)
@@ -709,7 +721,7 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                 if best is None or s > best[0]:
                     best = (s, pts3, fitted, float(ms))
             if best is not None:
-                grounded.append((view["name"], *best))
+                grounded.append((view["name"], *best, group.hypothesis))
         if out_dir:
             try:
                 with open(os.path.join(
@@ -728,35 +740,44 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     # matching by 2D IoU is view-independent; greedy first-match is fine
     # (groups from one view never overlap much).
     instances = []
-    for name, s, pts, fitted, ms in grounded:
+    for entry in grounded:
         for inst in instances:
-            if inst["fitted"].iou_2d(fitted) >= 0.3:
-                inst["views"].append((name, s, pts, ms))
+            if inst["fitted"].iou_2d(entry[3]) >= 0.3:
+                inst["views"].append(entry)
                 break
         else:
-            instances.append({"fitted": fitted,
-                              "views": [(name, s, pts, ms)]})
+            instances.append({"fitted": entry[3], "views": [entry],
+                             "label": entry[5]})
     # ---- per-instance verdict: union the matched views (more complete
-    # than either surface alone), score, keep the accepted ones
+    # than either surface alone), score, keep the accepted ones.
+    # Entries are DICTS ({"score", "fitted", "view", "points",
+    # "mask_score", "label"}): the caller adopts e["fitted"] and gates
+    # the type-confirm pass on e["label"]/e["score"].
     accepted = []
     for inst in instances:
         vs = inst["views"]
         if len(vs) >= 2:
             union_pts = np.vstack([v[2] for v in vs])
             fitted = fit_mask_points(union_pts, box) or inst["fitted"]
-            ms = float(np.mean([v[3] for v in vs]))
+            ms = float(np.mean([v[4] for v in vs]))
             s = min(score_candidate(ms, union_pts, fitted, box) + 0.08, 1.0)
-            entry = (s, fitted, "+".join(v[0] for v in vs),
-                     len(union_pts), ms)
+            entry = {"score": s, "fitted": fitted,
+                     "view": "+".join(v[0] for v in vs),
+                     "points": len(union_pts), "mask_score": ms,
+                     "label": inst["label"]}
         else:
-            name, s, pts, fitted, ms = vs[0]
-            entry = (s, fitted, name, len(pts), ms)
-        if s >= 0.45:
+            name, s, pts, fitted, ms, _ = vs[0]
+            entry = {"score": s, "fitted": fitted, "view": name,
+                     "points": len(pts), "mask_score": ms,
+                     "label": inst["label"]}
+        if entry["score"] >= 0.45:
             accepted.append(entry)
-    accepted.sort(key=lambda x: x[0], reverse=True)
+    accepted.sort(key=lambda e: e["score"], reverse=True)
     audit.update({"accepted": bool(accepted),
                   "instances": [
-                      {"score": round(s, 4), "view": vn, "points": n,
-                       "sam_score": round(ms, 4), "box": b.to_dict()}
-                      for s, b, vn, n, ms in accepted]})
+                      {"score": round(e["score"], 4), "view": e["view"],
+                       "points": e["points"],
+                       "sam_score": round(e["mask_score"], 4),
+                       "label": e["label"], "box": e["fitted"].to_dict()}
+                      for e in accepted]})
     return accepted, audit
