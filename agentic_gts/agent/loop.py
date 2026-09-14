@@ -1,14 +1,12 @@
 """Stage C: per-box local refinement agent.
 
 New-flow contract (user-directed architecture):
-  global nadir 2D grounding (ground.py) -> per-box local refine
-  (VLM box grounding -> SAM2 mask -> 3DGS backprojection -> metric OBB,
-  plus the rack type-confirm guard).
-
-The row split is NOT a separate stage anymore: the local-grounding
-prompt separates a joined row into one instance per visually distinct
-cabinet (different height / color), and refine_box returns ALL of
-them -- the split comes from the same SAM evidence as the refinement.
+  global nadir 2D grounding (ground.py) -> per-box local refine, where
+  the FRONT view's mask surface guides how the seed box SPLITS (each
+  visually distinct cabinet its own along-row span; the seed's yaw /
+  height / depth are trusted), and the SIDE view (the profile along the
+  row, where an open door sticks out beyond the body) corrects each
+  piece's thickness; plus the rack type-confirm guard.
 
 There is NO issue/repair loop anymore: the old rule-detected
 (MERGED_ROW / FALSE_POSITIVE / OVERLAP / WIDTH_MISFIT) repair rounds,
@@ -91,16 +89,19 @@ class LayoutAgent:
         return report
 
     def _local_mask_refine(self, scene: Scene, report: AgentReport) -> None:
-        """Local per-box VLM pass: SAM mask refinement + type confirmation.
+        """Local per-box VLM pass: SAM split-correction + type confirmation.
 
         Both questions share ONE render_local_views call per box (front
-        + oblique views). Per box the VLM cost is 2 local-grounding calls
-        + 1 type-confirm: the FRONT view alone votes on instance
-        division; the oblique view grounds independently but contributes
-        ONLY the depth dimension. The type-confirm is SKIPPED when the
-        grounding already labelled every accepted instance as equipment
-        with a strong score. The type confirmation runs even when SAM is
-        not configured -- it only needs the local view and the VLM.
+        + side views). The FRONT view alone votes on how the seed box
+        SPLITS (its mask surface's along-row spans; yaw / height /
+        depth stay seed-trusted), and the SIDE view (the profile along
+        the row, where an open door sticks out beyond the body) corrects
+        each piece's THICKNESS. Per box the VLM cost is 2
+        local-grounding calls + 1 type-confirm; the type-confirm is
+        SKIPPED when the grounding already labelled every accepted
+        instance as equipment with a strong score. The type
+        confirmation runs even when SAM is not configured -- it only
+        needs the local view and the VLM.
         """
         from agentic_gts.agent.mask_refine import (SamPredictorAdapter,
                                                     confirm_device_type,
@@ -188,12 +189,18 @@ class LayoutAgent:
             # split instances enter as new boxes ----
             if not instances:
                 continue
-            # conservative guard: every instance must stay near the old
-            # box (a local mask may not jump to a neighbour)
+            # conservative guard: every piece must stay ON the old box
+            # (its centre within the seed, padded). Pieces are SPLITS
+            # of the seed -- each carries ~1/N of its area -- so an IoU
+            # threshold would wrongly reject all but the biggest piece.
             valid = [e["fitted"] for e in instances
-                     if e["fitted"].iou_2d(old) >= 0.2]
+                     if old.contains(
+                         np.asarray(e["fitted"].center,
+                                    dtype=float).reshape(1, 3),
+                         margin=0.30)[0]]
             if not valid:
-                print(f"[mask-refine] {old.box_id[:6]} rejected: IoU<0.2")
+                print(f"[mask-refine] {old.box_id[:6]} rejected: "
+                      f"piece centre outside the seed")
                 continue
             if len(valid) == 1:
                 self._adopt_refit(scene, old, valid[0])

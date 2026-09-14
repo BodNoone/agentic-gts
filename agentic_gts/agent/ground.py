@@ -292,9 +292,9 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     ONE global NADIR view (rows axis-aligned, exact footprint capture,
     vertical rays carry no perspective dilation). Regions are
     back-projected and point-support fitted -- each region its OWN
-    box, unmerged. The per-box local refinement (front + oblique
-    renders -> VLM SAM points -> mask -> back-projected points ->
-    precise OBB) and the row split run downstream.
+    box, unmerged. The per-box local refinement (front + side
+    renders -> VLM SAM boxes -> mask -> back-projected points ->
+    split-corrected seed) runs downstream.
 
     False = grounding unavailable (mock backend / VLM failure / no
     region survived the point-support guards) and the caller keeps the

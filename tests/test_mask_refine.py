@@ -12,7 +12,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agentic_gts.agent.mask_refine import (
-    BoxGroup, SamPredictorAdapter, fit_mask_points, parse_box_groups,
+    BoxGroup, SamPredictorAdapter, parse_box_groups,
     refine_box,
 )
 from agentic_gts.core.models import OrientedBox, Scene
@@ -122,20 +122,56 @@ def test_box_groups_official_cookbook_array():
     print("PASS box groups (official cookbook array, no truncation)")
 
 
-def test_fit_mask_points_preserves_length_axis():
-    rng = np.random.default_rng(2)
+def test_merge_spans_dedupes_but_keeps_seams():
+    """Overlapping spans (VLM double-boxing one cabinet) merge; truly
+    adjacent cabinets keep their seam."""
+    from agentic_gts.agent.mask_refine import _merge_spans
+    spans = [
+        {"lo": 0.00, "hi": 0.60, "pts": np.zeros((50, 3)),
+         "ms": 0.8, "label": "rack"},
+        {"lo": 0.05, "hi": 0.58, "pts": np.zeros((30, 3)),
+         "ms": 0.7, "label": "rack"},     # duplicate of the first
+        {"lo": 0.62, "hi": 1.20, "pts": np.zeros((50, 3)),
+         "ms": 0.8, "label": "rack"},     # adjacent: seam must survive
+    ]
+    out = _merge_spans(spans)
+    assert len(out) == 2, f"expected 2 spans, got {len(out)}"
+    assert abs(out[0]["lo"]) < 1e-6 and abs(out[0]["hi"] - 0.60) < 1e-6
+    assert abs(out[1]["lo"] - 0.62) < 1e-6 and abs(out[1]["hi"] - 1.20) < 1e-6
+    assert len(out[0]["pts"]) == 80      # points merged
+    print("PASS span merging (duplicates union, seams survive)")
+
+
+def test_build_split_pieces_trusts_seed_dims():
+    """Pieces are SPLITS OF THE SEED: only the along extent/position come
+    from the measured spans; yaw / height / depth / cross centre stay
+    seed-trusted (user decision: corrections on the initial box only)."""
+    from agentic_gts.agent.mask_refine import _build_split_pieces
     yaw = math.radians(25)
-    old = OrientedBox(center=(2, 3, 1), size=(0.6, 1.1, 2.0), yaw=yaw)
-    local = np.column_stack([rng.uniform(-0.3, 0.3, 2000),
-                             rng.uniform(-0.55, 0.55, 2000),
-                             rng.uniform(-1.0, 1.0, 2000)])
-    pts = old.local_to_world(local)
-    new = fit_mask_points(pts, old)
-    assert new is not None
-    dyaw = abs(math.atan2(math.sin(new.yaw-yaw), math.cos(new.yaw-yaw)))
-    assert dyaw < math.radians(5), f"yaw changed {math.degrees(dyaw):.1f}deg"
-    assert 0.5 < new.size[0] < 0.7 and 0.9 < new.size[1] < 1.2
-    print("PASS mask points fit metric OBB without 90deg axis flip")
+    seed = OrientedBox(center=(2, 3, 1.05), size=(3.6, 1.1, 2.1), yaw=yaw)
+    spans = [
+        {"lo": -1.8, "hi": -0.6, "pts": np.zeros((100, 3)),
+         "ms": 0.8, "label": "rack"},
+        {"lo": -0.55, "hi": 1.75, "pts": np.zeros((100, 3)),
+         "ms": 0.8, "label": "rack"},
+    ]
+    out = _build_split_pieces(spans, seed)
+    assert len(out) == 2
+    axis = np.array([math.cos(yaw), math.sin(yaw)])
+    for e in out:
+        p = e["fitted"]
+        assert abs(math.atan2(math.sin(p.yaw - yaw),
+                              math.cos(p.yaw - yaw))) < 1e-9
+        assert abs(p.size[1] - 1.1) < 1e-9, "depth must stay seed-trusted"
+        assert abs(p.size[2] - 2.1) < 1e-9, "height must stay seed-trusted"
+        assert abs(p.center[2] - 1.05) < 1e-9
+        # cross centre unchanged: only the along position moved
+        assert abs(np.asarray(p.center)[:2] @ np.array(
+            [-math.sin(yaw), math.cos(yaw)]) - np.asarray(seed.center)[:2]
+            @ np.array([-math.sin(yaw), math.cos(yaw)])) < 1e-9
+    assert abs(out[0]["fitted"].size[0] - 1.2) < 1e-9
+    assert abs(out[1]["fitted"].size[0] - 2.3) < 1e-9
+    print("PASS split pieces keep seed dims, spans give along extent")
 
 
 def test_sam_unconfigured_is_conservative():
@@ -347,15 +383,16 @@ def test_mask_to_points_clips_far_outside_seed():
     print("PASS mask backprojection clips points far outside the seed")
 
 
-def test_apply_depth_from_oblique_single_merged_pool():
-    """The oblique depth rule: front instances keep along/height; the
-    oblique pool (typically ONE merged mask covering the whole row --
-    that is why its instance division is never adopted) is sliced per
-    instance by along span and measures ONLY each cabinet's depth."""
-    from agentic_gts.agent.mask_refine import _apply_depth_from_oblique
+def test_apply_depth_from_side_excludes_open_door():
+    """The side-view thickness rule: pieces keep along/height (seed-
+    trusted); the side pool -- ONE merged cloud over the whole row,
+    lifted without the z-buffer -- is sliced per piece by along span
+    and measures ONLY that cabinet's depth. The strong-bin estimator
+    must drop an open door's spread-out tail beyond the cabinet body,
+    which a P2-P98 percentile cut kept inflating the thickness."""
+    from agentic_gts.agent.mask_refine import _apply_depth_from_side
     seed = OrientedBox(center=(0.0, 0.0, 1.05), size=(2.0, 1.0, 2.1),
                        yaw=0.0)
-    # two front-split instances: along [-0.55,-0.05] and [0.05,0.55]
     inst_a = {"fitted": OrientedBox(center=(-0.3, 0.1, 1.0),
                                     size=(0.5, 0.15, 2.0), yaw=0.0),
               "pts": np.zeros((30, 3)), "view": "front",
@@ -364,41 +401,43 @@ def test_apply_depth_from_oblique_single_merged_pool():
                                     size=(0.5, 0.15, 2.0), yaw=0.0),
               "pts": np.zeros((30, 3)), "view": "front",
               "mask_score": 0.8, "score": 0.6, "label": "rack"}
-    # oblique pool: ONE merged cloud over both cabinets, y in [-0.4,0.4]
-    # (true depth 0.8m), split per along range
     rng = np.random.default_rng(3)
-    def slab(along_c):
+
+    def slab(along_c, y_lo, y_hi, n):
         return np.column_stack([
-            rng.uniform(along_c - 0.22, along_c + 0.22, 200),
-            rng.uniform(-0.4, 0.4, 200),
-            rng.uniform(0.1, 1.9, 200)])
-    pool = np.vstack([slab(-0.3), slab(0.3)])
-    recs = _apply_depth_from_oblique([inst_a, inst_b], pool, seed)
+            rng.uniform(along_c - 0.22, along_c + 0.22, n),
+            rng.uniform(y_lo, y_hi, n),
+            rng.uniform(0.1, 1.9, n)])
+
+    # body shells: dense, y within [-0.4, 0.4] (true depth 0.8 m)
+    pool = np.vstack([slab(-0.3, -0.4, 0.4, 300), slab(0.3, -0.4, 0.4, 300)])
+    # open door on cabinet A: a SPREAD-OUT tail beyond the front face
+    # (y in [0.4, 1.1], sparse compared to the shells)
+    pool = np.vstack([pool, slab(-0.3, 0.42, 1.1, 60)])
+    recs = _apply_depth_from_side([inst_a, inst_b], pool, seed)
     assert len(recs) == 2 and all(r.get("accepted") for r in recs), recs
     for inst in (inst_a, inst_b):
         fb = inst["fitted"]
-        # along span and height untouched (front-measured)
+        # along span and height untouched (seed-trusted)
         assert abs(fb.size[0] - 0.5) < 1e-9
         assert abs(fb.size[2] - 2.0) < 1e-9
         assert abs(fb.center[0] - (0.3 if inst is inst_b else -0.3)) < 1e-9
-        # depth now measured from the oblique pool, centred on it
-        assert 0.6 < fb.size[1] < 1.0, fb.size[1]
+        # thickness measured from the body shells, door tail EXCLUDED:
+        # a percentile cut would have stretched cabinet A to ~1.05m
+        assert 0.6 < fb.size[1] < 0.95, fb.size[1]
         assert abs(fb.center[1]) < 0.1, fb.center[1]
-        # the pool points were folded in
-        assert len(inst["pts"]) == 30 + 200
     # rejection: a pool with an implausible depth (thin sliver) leaves
-    # the front fit untouched
+    # the seed-trusted depth untouched
     thin = np.column_stack([rng.uniform(-1, 1, 50), np.full(50, 0.05),
-                             rng.uniform(0.1, 1.9, 50)])
+                            rng.uniform(0.1, 1.9, 50)])
     inst_c = {"fitted": OrientedBox(center=(0.0, 0.1, 1.0),
                                     size=(0.5, 0.15, 2.0), yaw=0.0),
               "pts": np.zeros((30, 3)), "view": "front",
               "mask_score": 0.8, "score": 0.6, "label": "rack"}
-    recs = _apply_depth_from_oblique([inst_c], thin, seed)
+    recs = _apply_depth_from_side([inst_c], thin, seed)
     assert not recs[0].get("accepted"), recs
     assert abs(inst_c["fitted"].size[1] - 0.15) < 1e-9
-    assert len(inst_c["pts"]) == 30
-    print("PASS oblique depth-only application (merged pool + rejection)")
+    print("PASS side depth application (merged pool, door tail dropped)")
 
 
 def test_parse_rack_confirm():
@@ -612,6 +651,25 @@ def test_front_view_axis_swap():
     assert abs(d[0]) > abs(d[1]), \
         "camera must look along the yaw (short) axis of the long-cross box"
     print("PASS front view axis swap (perpendicular to the long edge)")
+
+
+def test_side_view_looks_along_row_axis():
+    """The SIDE slot (front azimuth + 90 deg) must look ALONG the row
+    axis: the (depth, height) PROFILE is what corrects thickness and
+    exposes open doors sticking out beyond the cabinet body -- the front
+    view cannot separate them (user report)."""
+    from agentic_gts.output.gs_render import make_local_cam
+    box = OrientedBox(center=(0, 0, 1), size=(6, 1.1, 2), yaw=0.0)
+    # front azim 0 (long edge along x); side = front + 90
+    cam = make_local_cam([box], W=768, H=768, elev_deg=18.0,
+                         azim_deg=90.0, standoff=0.6)
+    d = np.asarray(cam.eye) - np.asarray(box.center)
+    assert abs(d[0]) > 3 * abs(d[1]), (
+        f"side camera must stand along the ROW axis, got offset {d}")
+    look = np.asarray(cam.target) - np.asarray(cam.eye)
+    assert abs(look[0]) > 3 * abs(look[1]), (
+        f"side view must look along the row, got direction {look}")
+    print("PASS side view looks along the row axis (thickness profile)")
 
 
 def test_sam2_model_cfg_file_path_registers_hydra_dir():

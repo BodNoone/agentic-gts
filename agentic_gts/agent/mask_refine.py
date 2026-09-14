@@ -1,13 +1,16 @@
-"""Local VLM point prompts -> SAM mask -> 3D OBB refinement.
+"""Local VLM box grounding -> SAM mask -> split-correction of one seed box.
 
-Contract:
-  * Qwen3-VL returns point prompts in its native relative 0..1000 grid.
-  * This module converts them ONCE to image pixels for SAM. They are not
-    normalized again.
-  * SAM creates pixel-accurate candidate masks.
-  * The mask is lifted to the local 3DGS geometry by projecting Gaussian
-    centers through the exact render camera. Geometry, not the VLM, measures
-    the final metric OBB.
+Contract (user-directed):
+  * The FRONT local view's VLM boxes feed SAM as pure box prompts; the
+    back-projected mask SURFACE guides HOW the seed box splits along the
+    row (each visually distinct cabinet its own span). The seed's yaw /
+    height / depth are trusted -- pieces are splits OF the seed, never
+    free re-fits.
+  * The SIDE view (profile along the row axis) corrects each piece's
+    THICKNESS: an open cabinet door sticks out horizontally beyond the
+    body there, separable only from the side (the front view cannot).
+    The VLM prompt excludes doors and the strong-bin estimator drops
+    whatever door tail still leaks through.
 
 SAM is optional. The implementation supports Meta SAM2 and legacy Segment
 Anything when installed. If no SAM backend/checkpoint is configured, local
@@ -394,7 +397,7 @@ def _front_azim(box: OrientedBox, open_vec) -> float:
 
 def render_local_views(scene: Scene, box: OrientedBox,
                        out_dir: str | None = None) -> list[dict]:
-    """Render front + diagonal local views: ONE device, isolated.
+    """Render front + side local views: ONE device, isolated.
 
     The views feed the VLM and SAM, which only need the target box --
     everything else in the scene (the facing row the camera may stand
@@ -430,14 +433,14 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # view pair, both at GROUND level (elev 18 deg, rack height -- no
     # top-down component: the local views must show the device's
     # vertical surfaces, which the ground-level 3DGS training observed
-    # well): FRONT (the face: doors, panels) + the DIAGONAL halfway
-    # between front and side. The roles are DECOUPLED (refine_box):
-    # front is the sole voter on instance division (door seams / height
-    # / color are legible face-on); the diagonal's foreshortening makes
-    # adjacent cabinets visually merge, so it NEVER grounds -- it only
-    # completes DEPTH via SAM prompts projected from the front fit.
+    # well): FRONT (the face: doors, panels -- the sole voter on
+    # instance division, door seams / height / color are legible
+    # face-on) + SIDE (along the row axis: the depth/height PROFILE,
+    # where an open door sticks out horizontally beyond the cabinet body
+    # and the true thickness is measurable -- the front view cannot
+    # separate a door, user report).
     slots = (("front", 18.0, azim_front),
-             ("oblique", 18.0, azim_front + 45.0))
+             ("side", 18.0, azim_front + 90.0))
     # standoff: ~80% into the corridor, never further than 2.2m; the
     # camera widens its lens to frame, it does not back off
     standoff = float(np.clip(0.8 * corridor, 0.6, 2.2))
@@ -479,17 +482,23 @@ def render_local_views(scene: Scene, box: OrientedBox,
 
 
 def _mask_to_points(scene: Scene, box: OrientedBox, mask: np.ndarray, cam,
-                    margin: float = 0.25) -> np.ndarray:
-    """Lift mask to visible local 3DGS centers with a small z-buffer.
+                    margin: float = 0.25, z_buffer: bool = True) -> np.ndarray:
+    """Lift mask to local 3DGS centers.
 
-    Selecting every center whose projection lands in the mask also selects
-    surfaces hidden behind the visible rack, inflating the fitted OBB. Keep
-    only points close to the nearest projected depth in each pixel.
+    z_buffer=True (front view): only points close to the nearest
+    projected depth in each pixel -- the visible SURFACE. Selecting every
+    center whose projection lands in the mask also selects surfaces
+    hidden behind the visible rack, inflating the fitted box.
+
+    z_buffer=False (side view): every region point projecting into the
+    mask, at ANY depth. The side camera looks ALONG the row, so all
+    cabinets of the seed overlap in projection; keeping only the nearest
+    surface would starve the inner cabinets of depth-measurement points.
 
     margin: the candidate region is the seed OBB grown by this much.
     Backprojected points far outside the seed are NOISE -- a mask edge
     bleeding onto the floor / neighbouring structure picks up their
-    pixels, and the P1-P99 fit balloons toward them (user report:
+    pixels, and the fitted box balloons toward them (user report:
     backprojected points well past the initial box). 0.25 m allows the
     legitimate case (a slightly conservative grounding box growing to
     the true surface, which the nadir point-fit places within ~0.2 m)
@@ -503,11 +512,17 @@ def _mask_to_points(scene: Scene, box: OrientedBox, mask: np.ndarray, cam,
     uv = cam.project_cv(pts)
     x = np.rint(uv[:, 0]).astype(int)
     y = np.rint(uv[:, 1]).astype(int)
+    valid = ((x >= 0) & (x < mask.shape[1]) &
+             (y >= 0) & (y < mask.shape[0]))
+    if not z_buffer:
+        selected = np.where(valid)[0]
+        keep = np.zeros(len(pts), dtype=bool)
+        keep[selected[mask[y[selected], x[selected]]]] = True
+        return pts[keep]
     h = np.hstack([pts, np.ones((len(pts), 1))])
     pc = h @ cam.view_cv().T
     depth = pc[:, 2]
-    valid = ((x >= 0) & (x < mask.shape[1]) &
-             (y >= 0) & (y < mask.shape[0]) & (depth > 0.05))
+    valid &= (depth > 0.05)
     keep = np.zeros(len(pts), dtype=bool)
     ids = np.where(valid)[0]
     if not len(ids):
@@ -521,57 +536,51 @@ def _mask_to_points(scene: Scene, box: OrientedBox, mask: np.ndarray, cam,
     return pts[keep]
 
 
-def fit_mask_points(points: np.ndarray, old: OrientedBox) -> OrientedBox | None:
-    """Fit yaw + footprint + height from SAM-selected 3D points."""
-    if len(points) < 40:
-        return None
-    xy = points[:, :2]
-    cxy = np.median(xy, axis=0)
-    xc = xy - cxy
-    cov = xc.T @ xc / max(len(xc) - 1, 1)
-    vals, vecs = np.linalg.eigh(cov)
-    v = vecs[:, int(np.argmax(vals))]
-    pca_yaw = math.atan2(float(v[1]), float(v[0]))
-    # A side-view mask often has more depth than rack width, so raw PCA may
-    # pick local y and rotate the rack by 90 degrees. The existing rough box
-    # reliably tells us which eigen-axis is the row/length axis. Choose
-    # between the PCA axis and its perpendicular by nearest angular distance.
-    choices = [pca_yaw + k * math.pi / 2 for k in range(4)]
-    yaw = min(choices, key=lambda a: abs(math.atan2(
-        math.sin(a - old.yaw), math.cos(a - old.yaw))))
-    # resolve 180-degree symmetry to the representation nearest old.yaw
-    while yaw - old.yaw > math.pi / 2:
-        yaw -= math.pi
-    while yaw - old.yaw < -math.pi / 2:
-        yaw += math.pi
-    axis = np.array([math.cos(yaw), math.sin(yaw)])
-    cross = np.array([-math.sin(yaw), math.cos(yaw)])
-    a, d = xy @ axis, xy @ cross
-    a0, a1 = np.percentile(a, [1.0, 99.0])
-    d0, d1 = np.percentile(d, [1.0, 99.0])
-    z0, z1 = np.percentile(points[:, 2], [1.0, 99.0])
-    L, W, H = float(a1 - a0), float(d1 - d0), float(z1 - z0)
-    if L < 0.15 or W < 0.10 or H < 0.30:
-        return None
-    centre2 = axis * ((a0 + a1) / 2.0) + cross * ((d0 + d1) / 2.0)
-    return OrientedBox(center=(float(centre2[0]), float(centre2[1]),
-                               float((z0 + z1) / 2.0)),
-                       size=(L, W, H), yaw=yaw,
-                       box_id=old.box_id, device_type=old.device_type,
-                       source=BoxSource.AGENT_FIX,
-                       confidence=Confidence.MID, row_id=old.row_id,
-                       meta={**old.meta, "sam_refined": True})
+def _merge_spans(spans: list) -> list:
+    """Merge overlapping along-row spans (VLM occasionally double-boxes
+    the same cabinet): sorted by lo, unioned when they overlap by more
+    than 0.10 m. Truly adjacent cabinets touch but do not overlap -- a
+    real seam between different instances survives."""
+    out = []
+    for s in sorted(spans, key=lambda t: t["lo"]):
+        if out and s["lo"] < out[-1]["hi"] - 0.10:
+            p = out[-1]
+            if len(s["pts"]) > len(p["pts"]):
+                p["label"] = s["label"]
+            p["hi"] = max(p["hi"], s["hi"])
+            p["pts"] = np.vstack([p["pts"], s["pts"]])
+            p["ms"] = max(p["ms"], s["ms"])
+        else:
+            out.append(dict(s))
+    return out
 
 
-def score_candidate(mask_score: float, points: np.ndarray,
-                    new: OrientedBox, old: OrientedBox) -> float:
-    """SAM quality + 3D support + conservative change score."""
-    support = min(len(points) / 300.0, 1.0)
-    iou = old.iou_2d(new)
-    yaw_delta = abs(math.atan2(math.sin(new.yaw - old.yaw),
-                               math.cos(new.yaw - old.yaw)))
-    yaw_score = max(0.0, 1.0 - yaw_delta / math.radians(45))
-    return 0.45 * float(mask_score) + 0.25 * support + 0.20 * iou + 0.10 * yaw_score
+def _robust_span(v: np.ndarray, cell: float = 0.05,
+                 strong_frac: float = 0.4, floor: int = 3):
+    """Strong-bin span of a 1D sample: the extent covered by histogram
+    bins holding at least `strong_frac` of the PEAK bin's count.
+
+    Why not percentiles: an open cabinet door contributes a SPREAD-OUT
+    tail of points beyond the body (the door panel stands roughly
+    perpendicular to the front face, so its points smear over the door's
+    full swing range) -- often more than the 2% a P2-P98 cut trims. The
+    body's front/back shells concentrate into tall narrow bins while a
+    door tail smears into a low plateau, so a peak-relative threshold
+    keeps the body and drops the door. Returns None when no bin reaches
+    the floor (too few points)."""
+    v = np.asarray(v, dtype=float)
+    if len(v) < floor:
+        return None
+    lo, hi = float(v.min()), float(v.max())
+    edges = np.arange(lo, hi + cell / 2, cell)
+    if len(edges) < 3:
+        return None
+    hist, _ = np.histogram(v, bins=edges)
+    peak = int(hist.max())
+    strong = np.where(hist >= max(strong_frac * peak, floor))[0]
+    if not len(strong):
+        return None
+    return float(edges[strong[0]]), float(edges[strong[-1] + 1])
 
 
 def confirm_device_type(judge, box: OrientedBox, views: list,
@@ -721,21 +730,27 @@ def _save_sam_debug(view: dict | None, box_prompt, mask, pts3,
               f"({type(e).__name__}: {e})")
 
 
-def _apply_depth_from_oblique(instances: list, pts: np.ndarray,
-                              seed: "OrientedBox",
-                              min_pts: int = 20) -> list[dict]:
-    """Update each front instance's DEPTH dimension from oblique-view
-    back-projected points (the ONLY thing the oblique view contributes).
+def _apply_depth_from_side(instances: list, pts: np.ndarray,
+                           seed: "OrientedBox",
+                           min_pts: int = 20) -> list[dict]:
+    """Correct each split piece's THICKNESS (cross-axis extent) from
+    side-view back-projected points.
 
-    The oblique grounding may see a joined row as ONE instance -- its
-    foreshortening merges adjacent cabinets -- so its instance division
-    is NEVER adopted. Only the points matter, sliced per instance: an
-    oblique mask's points whose ALONG coordinate falls inside a front
-    instance's along span belong to that cabinet, and their cross-axis
-    (depth) extent measures it (the 45-deg view sees front AND side
-    faces). Along/height stay front-measured: oblique perspective
-    distorts along-row spans, which is exactly why the front view alone
-    votes on division.
+    The side camera looks ALONG the row axis, so the (depth, height)
+    profile of every cabinet projects into the same image region; the
+    pool contains ALL pieces' points (lifted WITHOUT the z-buffer) and
+    is sliced per piece by along-row span. Two things differ from the
+    old oblique-view rule:
+
+    * the view is a true PROFILE (90 deg off the front), where an open
+      door sticks out horizontally beyond the cabinet body -- the front
+      view cannot separate it (user report), the side view can;
+    * the depth estimator is the strong-bin span (_robust_span), which
+      drops the door's spread-out tail that a P2-P98 percentile cut
+      kept inflating the thickness.
+
+    Along/height stay seed-measured: the side view corrects ONLY the
+    thickness and the cross-axis centre of each piece.
     """
     recs = []
     yaw = float(seed.yaw)
@@ -753,14 +768,15 @@ def _apply_depth_from_oblique(instances: list, pts: np.ndarray,
         fc = np.asarray(f.center, dtype=float)
         along_c = float(fc[:2] @ axis)
         half = float(f.size[0]) / 2.0
-        m = np.abs(along_all - along_c) <= half + 0.10
+        m = np.abs(along_all - along_c) <= half + 0.05
         sel = pts[m]
         rec = {"points": int(len(sel))}
         recs.append(rec)
-        if len(sel) < min_pts:
-            rec["reason"] = "too few oblique points in along span"
+        span = _robust_span(cross_all[m])
+        if span is None or len(sel) < min_pts:
+            rec["reason"] = "too few side points in along span"
             continue
-        c_lo, c_hi = np.percentile(cross_all[m], [2.0, 98.0])
+        c_lo, c_hi = span
         depth = float(c_hi - c_lo)
         if not (0.3 <= depth <= 2.5):
             rec["reason"] = f"implausible depth {depth:.2f}m"
@@ -771,48 +787,78 @@ def _apply_depth_from_oblique(instances: list, pts: np.ndarray,
         if abs(mid - seed_cross_c) > seed_half_d + 0.30:
             rec["reason"] = "depth centre too far from seed"
             continue
-        # rebuild: front's along/height/centre-height, oblique-measured
-        # depth and cross centre
+        # rebuild: seed's along/height, side-measured thickness + centre
         cxy = axis * along_c + cross * mid
         inst["fitted"] = OrientedBox(
             center=(float(cxy[0]), float(cxy[1]), float(fc[2])),
             size=(float(f.size[0]), depth, float(f.size[2])),
             yaw=yaw)
-        inst["pts"] = np.vstack([inst["pts"], sel])
+        inst["pts"] = sel
         rec["accepted"] = True
         rec["depth"] = round(depth, 3)
     return recs
 
 
+def _build_split_pieces(spans: list, seed: "OrientedBox") -> list:
+    """Turn along-row spans into SPLIT PIECES of the seed box.
+
+    Each piece keeps the seed's yaw, height, depth and cross/z centres
+    -- the front view only guides HOW the seed splits; only the
+    along-row extent and position come from the measured span. Piece
+    identity/meta copy the seed (the caller's adoption assigns ids).
+    """
+    yaw = float(seed.yaw)
+    axis = np.array([math.cos(yaw), math.sin(yaw)])
+    sc = np.asarray(seed.center, dtype=float)
+    out = []
+    for s in spans:
+        length = float(s["hi"] - s["lo"])
+        along_mid = 0.5 * (s["lo"] + s["hi"])
+        c2 = sc[:2] + axis * along_mid
+        piece = OrientedBox(
+            center=(float(c2[0]), float(c2[1]), float(sc[2])),
+            size=(length, float(seed.size[1]), float(seed.size[2])),
+            yaw=yaw, box_id=seed.box_id, device_type=seed.device_type,
+            source=BoxSource.AGENT_FIX, confidence=seed.confidence,
+            row_id=seed.row_id, meta={**seed.meta, "sam_refined": True})
+        if s["pts"] is not None:
+            score = 0.55 * float(s["ms"]) + 0.45 * min(len(s["pts"]) / 200.0,
+                                                       1.0)
+        else:
+            score = 0.5      # fallback piece: neutral, never skips the
+                            # type-confirm (label unknown, score < 0.6)
+        out.append({"score": score, "pts": s["pts"], "fitted": piece,
+                    "mask_score": float(s["ms"]), "label": s["label"],
+                    "view": "front"})
+    return out
+
+
 def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                out_dir: str | None = None,
                views: list | None = None) -> tuple[list, dict]:
-    """Run VLM box grounding + SAM + 3D fitting for one box.
+    """Split-correct one seed box from local VLM grounding + SAM masks.
 
     Box-only prompting (no points): point placement is a WEAK Qwen3-VL
     skill (user report: prompts mostly off the device despite a clean
     input image), while box grounding is the model's NATIVE task -- and
     the box prompt is SAM's canonical interaction, forgiving of prompt
-    error where points are brittle. The VLM draws the coarse box; SAM
-    snaps the mask to the device inside it; the 3D fit comes from the
-    mask's back-projected gaussians.
+    error where points are brittle.
 
-    DECOUPLED views (user decision): instance division is voted on by
-    the FRONT view ONLY -- door seams / height / color differences are
-    legible face-on, and letting a second view vote too produced
-    count inconsistencies (oblique's foreshortening merges adjacent
-    cabinets). The oblique view DOES run its own local grounding (same
-    prompt), but its groups are never adopted as instances -- all its
-    back-projected points form a pool, sliced per front instance by
-    along-row span, from which ONLY the depth dimension is measured
-    (_apply_depth_from_oblique): whether oblique grounds 1 merged box
-    or N boxes, each front instance takes just its cabinet's depth.
+    Corrections are applied ON the seed box, never as a free re-fit
+    (user decision): the front view's back-projected mask surface only
+    guides HOW the seed splits (each visually distinct cabinet its own
+    along-row span; the seed's yaw / height / depth / cross centre are
+    TRUSTED), and the SIDE view -- the profile along the row axis --
+    corrects each piece's THICKNESS. The side view is where an open
+    door is separable: it sticks out horizontally beyond the cabinet
+    body, which the front view cannot resolve (user report) -- the
+    depth estimator (_robust_span) additionally drops the door's
+    spread-out tail as a safety net behind the VLM's door-excluding
+    prompt.
 
-    MULTI-instance: the front grounding separates a joined row into one
-    group per visually distinct cabinet (different height / color).
-    Returns the list of accepted instances (score >= 0.45) -- more than
-    one means the grounding split the row, and the caller replaces the
-    old box with all of them.
+    Returns the list of pieces -- more than one means the front
+    grounding split the row, and the caller replaces the old box with
+    all of them.
     """
     if views is None:
         views = render_local_views(scene, box, out_dir)
@@ -820,15 +866,16 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     if not views or not sam.available:
         audit["reason"] = "no local GS views or SAM checkpoint"
         return [], audit
-    # the voter view grounds instances; the others only complete depth.
-    # Fallback order keeps ONE voter at all times (front preferred;
-    # without a front slot the first view votes, still one vote).
     voter = next((v for v in views if v["name"] == "front"), None)
     if voter is None:
         voter = views[0]
-    depth_views = [v for v in views if v is not voter]
+    side = next((v for v in views if v is not voter), None)
+    yaw = float(box.yaw)
+    axis = np.array([math.cos(yaw), math.sin(yaw)])
+    sc = np.asarray(box.center, dtype=float)
+    along0 = float(sc[:2] @ axis)
 
-    # ---- pass 1 (voter): VLM grounding -> SAM -> fitted instances ----
+    # ---- pass 1 (front): grounding -> SAM surface -> along spans ----
     # CLEAN image to the VLM: the wireframe overlay (prompt_image) is
     # the Stage-A box, which is often oversized/misplaced -- the VLM
     # anchors on the frame instead of the device. Same principle as
@@ -837,9 +884,10 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         voter["image"], box, voter["name"], png_path=voter["path"])
     groups = verdict.params.get("groups", []) if verdict.params else []
     va = {"view": voter["name"], "image": voter["path"], "role": "voter",
-          "answer": verdict.raw or verdict.detail, "groups": groups}
+          "answer": verdict.raw or verdict.detail, "groups": groups,
+          "spans": []}
     H, W = voter["image"].shape[:2]
-    instances = []
+    spans = []
     for gi, g in enumerate(groups):
         group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
                          float(g.get("confidence", 0.5)))
@@ -849,23 +897,29 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         masks, scores = sam.predict(voter["image"], box_pix)
         best = None
         for mi, (mask, ms) in enumerate(zip(masks, scores)):
+            # surface only (z-buffer): the front face the VLM grounded
             pts3 = _mask_to_points(scene, box, mask, voter["cam"])
-            fitted = fit_mask_points(pts3, box)
             if out_dir:
-                # debug composite: prompt box + mask + lifted pts
                 _save_sam_debug(voter, box_pix, mask, pts3, box,
-                                fitted, out_dir,
+                                None, out_dir,
                                 f"{box.box_id}_{voter['name']}_g{gi}_m{mi}")
-            if fitted is None:
+            if len(pts3) < 20:
                 continue
-            s = score_candidate(float(ms), pts3, fitted, box)
-            if best is None or s > best[0]:
-                best = (s, pts3, fitted, float(ms))
-        if best is not None and best[0] >= 0.45:
-            s, pts, fitted, ms = best
-            instances.append({"score": s, "pts": pts, "fitted": fitted,
-                              "mask_score": ms, "label": group.hypothesis,
-                              "view": voter["name"]})
+            if best is None or ms > best[0]:
+                best = (float(ms), pts3)
+        if best is None:
+            continue
+        ms, pts3 = best
+        along = pts3[:, :2] @ axis - along0
+        lo, hi = np.percentile(along, [2.0, 98.0])
+        spans.append({"lo": float(lo), "hi": float(hi), "pts": pts3,
+                      "ms": ms, "label": group.hypothesis})
+    spans = _merge_spans(spans)
+    spans = [s for s in spans
+             if (s["hi"] - s["lo"]) >= 0.30 and len(s["pts"]) >= 40]
+    va["spans"] = [{"lo": round(s["lo"], 3), "hi": round(s["hi"], 3),
+                    "points": len(s["pts"]), "label": s["label"]}
+                   for s in spans]
     if out_dir:
         try:
             with open(os.path.join(
@@ -876,21 +930,30 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         except OSError:
             pass
     audit["views"].append(va)
+    front_ok = bool(spans)
+    if not front_ok:
+        # no usable front division: the seed stays WHOLE and is still
+        # eligible for the side-view thickness correction below
+        spans = [{"lo": -float(box.size[0]) / 2.0,
+                  "hi": float(box.size[0]) / 2.0,
+                  "pts": None, "ms": 0.5, "label": "unknown"}]
 
-    # ---- pass 2 (depth views): independent grounding, DEPTH-ONLY use ----
-    # The oblique view runs the SAME local grounding prompt as front,
-    # but its groups are never adopted as instances (foreshortening
-    # merges adjacent cabinets). All groups' back-projected points form
-    # a pool; _apply_depth_from_oblique slices it per front instance
-    # (along span) and measures ONLY that cabinet's depth.
-    for dv in (depth_views if instances else []):
+    # ---- pass 2 (side): thickness correction per piece ----
+    # The side camera looks ALONG the row: every cabinet's (depth,
+    # height) profile projects into the same image region, so the mask
+    # points (lifted WITHOUT the z-buffer) form one pool containing all
+    # pieces, sliced per piece by along span. The VLM prompt already
+    # excludes open doors -- face-on in this profile -- and the strong-
+    # bin estimator drops whatever door tail still leaks through.
+    depth_ok = False
+    if side is not None:
         verdict = judge.adjudicate_sam_boxes(
-            dv["image"], box, dv["name"], png_path=dv["path"])
+            side["image"], box, side["name"], png_path=side["path"])
         groups = verdict.params.get("groups", []) if verdict.params else []
-        dva = {"view": dv["name"], "image": dv["path"],
-               "role": "depth_grounding", "groups": groups,
+        dva = {"view": side["name"], "image": side["path"],
+               "role": "depth_profile", "groups": groups,
                "instances": []}
-        H, W = dv["image"].shape[:2]
+        H, W = side["image"].shape[:2]
         pool, pool_ms = [], 0.0
         for gi, g in enumerate(groups):
             group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
@@ -899,14 +962,17 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
             if not (box_pix[2] - box_pix[0] > 4
                     and box_pix[3] - box_pix[1] > 4):
                 continue                  # degenerate/absent box
-            masks, scores = sam.predict(dv["image"], box_pix)
+            masks, scores = sam.predict(side["image"], box_pix)
             best = None
             for mi, (mask, ms) in enumerate(zip(masks, scores)):
-                pts3 = _mask_to_points(scene, box, mask, dv["cam"])
+                # NO z-buffer: from along the row, every piece overlaps
+                # in projection -- all of them must contribute points
+                pts3 = _mask_to_points(scene, box, mask, side["cam"],
+                                      z_buffer=False)
                 if out_dir:
-                    _save_sam_debug(dv, box_pix, mask, pts3, box,
+                    _save_sam_debug(side, box_pix, mask, pts3, box,
                                     None, out_dir,
-                                    f"{box.box_id}_{dv['name']}_g{gi}_m{mi}")
+                                    f"{box.box_id}_{side['name']}_g{gi}_m{mi}")
                 if len(pts3) < 20:
                     continue
                 if best is None or ms > best[1]:
@@ -915,36 +981,42 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                 pool.append(best[0])
                 pool_ms = max(pool_ms, best[1])
         if pool:
-            recs = _apply_depth_from_oblique(
+            instances = _build_split_pieces(spans, box)
+            recs = _apply_depth_from_side(
                 instances, np.vstack(pool), box)
             dva["instances"] = recs
+            depth_ok = any(r.get("accepted") for r in recs)
             for inst, rec in zip(instances, recs):
                 if not rec.get("accepted"):
-                    continue    # depth measurement rejected: front fit stands
-                inst["view"] = inst["view"] + f'+{dv["name"]}(depth)'
+                    continue    # thickness rejected: seed depth stands
+                inst["view"] = inst["view"] + f'+{side["name"]}(depth)'
                 inst["mask_score"] = 0.5 * (inst["mask_score"] + pool_ms)
-                inst["score"] = min(
-                    score_candidate(inst["mask_score"], inst["pts"],
-                                    inst["fitted"], box) + 0.08, 1.0)
+                inst["score"] = min(inst["score"] + 0.08, 1.0)
+        else:
+            instances = _build_split_pieces(spans, box)
         if out_dir:
             try:
                 with open(os.path.join(
-                        out_dir, f"sam_boxes_{box.box_id}_{dv['name']}.json"),
+                        out_dir, f"sam_boxes_{box.box_id}_{side['name']}.json"),
                           "w", encoding="utf-8") as f:
                     json.dump(dva, f, ensure_ascii=False, indent=2,
                               default=json_default)
             except OSError:
                 pass
         audit["views"].append(dva)
+    else:
+        instances = _build_split_pieces(spans, box)
 
-    if not instances:
-        audit["reason"] = "no SAM mask yielded a valid 3D box"
+    if not front_ok and not depth_ok:
+        # nothing was measured: keep the seed untouched
+        audit["reason"] = "no front span and no side depth measurement"
         return [], audit
+
     instances.sort(key=lambda e: e["score"], reverse=True)
     audit.update({"accepted": True,
                   "instances": [
                       {"score": round(e["score"], 4), "view": e["view"],
-                       "points": len(e["pts"]),
+                       "points": len(e["pts"]) if e["pts"] is not None else 0,
                        "sam_score": round(e["mask_score"], 4),
                        "label": e["label"], "box": e["fitted"].to_dict()}
                       for e in instances]})
