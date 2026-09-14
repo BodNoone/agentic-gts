@@ -195,6 +195,54 @@ def test_equipment_label_gate():
     print("PASS equipment-label gate for the type-confirm skip")
 
 
+def test_open_side_interior_veto_beats_diffuse_wall():
+    """The room-interior prior: a peripheral wall-adjacent box faces the
+    cloud's interior. An EXTREMELY diffuse wall (every 5cm bin under the
+    opacity-mass threshold) still measures a wide corridor on the wall
+    side -- the mass test is blind to it -- so the camera would again
+    render from outside the room. The geometry veto (faces away from
+    the interior median + cloud ends just past the face) must flip the
+    pick back to the aisle side."""
+    from agentic_gts.agent.mask_refine import _open_side
+    from agentic_gts.tools.gs_io import GaussianData
+    rng = np.random.default_rng(11)
+    box = OrientedBox(center=(0.0, -2.4, 1.0), size=(2.0, 1.1, 2.0),
+                      yaw=0.0)
+    # general room cloud across the whole room (positions give the
+    # interior median; opacity faint so it never blocks by mass)
+    room = np.column_stack([rng.uniform(-6, 6, 1200),
+                            rng.uniform(-3, 3, 1200),
+                            rng.uniform(0.3, 1.8, 1200)])
+    # EXTREMELY diffuse wall flush behind the back face (y = -2.95):
+    # so faint that no 5cm bin reaches mass 1.0
+    wall = np.column_stack([rng.uniform(-1.2, 1.2, 250),
+                            rng.uniform(-3.05, -2.93, 250),
+                            rng.uniform(0.3, 1.8, 250)])
+    # a real facing structure on the aisle side, 1.0 m past the front
+    # face (y = -2.4 + 0.55 + 1.0 = -0.85): opaque, mass-blocked
+    facing = np.column_stack([rng.uniform(-1.0, 1.0, 40),
+                              np.full(40, -0.85),
+                              rng.uniform(0.3, 1.8, 40)])
+    means = np.vstack([room, wall, facing]).astype(np.float32)
+    n = len(means)
+    gs = GaussianData(
+        means=means,
+        log_scales=np.full((n, 3), -6.0, dtype=np.float32),
+        quats=np.tile(np.array([[1.0, 0, 0, 0]], np.float32), (n, 1)),
+        raw_opacity=np.concatenate([np.full(1450, -8.0),
+                                    np.full(40, 2.0)]).astype(np.float32),
+        f_dc=np.zeros((n, 3), dtype=np.float32),
+    )
+    vec, corridor = _open_side(gs, box)
+    # without the veto the wall side measures 3.0 m (diffuse wall
+    # invisible) vs the aisle's 1.0 m and would win -> camera outside
+    assert vec[1] > 0.99, f"interior veto must keep the aisle side, got {vec}"
+    assert 0.5 < corridor < 1.5, \
+        f"corridor must track the facing row, got {corridor:.2f}"
+    print(f"PASS interior veto beats diffuse wall "
+          f"(aisle corridor {corridor:.2f}m)")
+
+
 def test_open_side_flush_wall_and_floaters():
     """The open-side pick for a WALL-ADJACENT box: a wall flush against
     one face (gap < 0.1 m) must BLOCK that side -- the old single-point
@@ -230,8 +278,10 @@ def test_open_side_flush_wall_and_floaters():
     assert vec[1] > 0.99, f"open side must be the aisle +y, got {vec}"
     assert corridor > 2.0, f"floaters must not block, corridor={corridor:.2f}"
 
-    # mirror: flush wall on the +y side instead -> the open side flips
-    gs.means[:400, 1] *= -1.0
+    # mirror: wall on the +y side, floaters (the aisle) on -y -> the
+    # open side flips. (Everything mirrors: an empty side facing away
+    # from the interior is correctly vetoed as outside-the-room.)
+    gs.means[:, 1] *= -1.0
     vec2, corridor2 = _open_side(gs, box)
     assert vec2[1] < -0.99, f"open side must flip to -y, got {vec2}"
     assert corridor2 > 2.0

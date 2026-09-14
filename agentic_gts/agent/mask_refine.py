@@ -289,6 +289,18 @@ def _open_side(gs, box: OrientedBox, reach: float = 3.0):
     flush wall: that side measured a full-width corridor, the camera
     walked straight through the wall and rendered the view from OUTSIDE
     the room (a fog of structure behind the wall, user report).
+
+    ROOM-INTERIOR prior (user rule): a PERIPHERAL wall-adjacent box
+    faces the cloud's interior -- extremely diffuse walls (every 5cm
+    bin under the mass threshold) still slip past the opacity test and
+    measure a wide corridor, so geometry vetoes them: when a side both
+    points AWAY from the cloud's interior (dot < -0.35 vs the median
+    centre) and the cloud ENDS just past that face (< 1.2 m from the
+    face to the 99th-pct extent of the points beyond it), that side is
+    the wall, whatever the corridor said. Only a WIDE measured corridor
+    (>= 1.5 m) is vetoed: a narrow one means a real facing structure
+    was detected and stands (e.g. the 0.4m back gap of mid-room
+    back-to-back rows must keep winning against the far aisle).
     """
     pts = np.asarray(gs.means, dtype=float)
     op = 1.0 / (1.0 + np.exp(-np.asarray(gs.raw_opacity, dtype=float)))
@@ -312,6 +324,9 @@ def _open_side(gs, box: OrientedBox, reach: float = 3.0):
     z_top = c[2] + size[2] / 2.0
     band = (z > 0.25) & (z < max(min(z_top - 0.2, 2.0), 0.5))
     bin_edges = np.arange(0.02, reach + 0.05, 0.05)
+    med_xy = np.median(pts[:, :2], axis=0)
+    to_interior = med_xy - c[:2]
+    tc = float(np.linalg.norm(to_interior))
     best_vec, best_corridor = face_axis.copy(), -1.0
     for s in (1.0, -1.0):
         beyond = du * s - face_half        # distance past the s-side face
@@ -326,6 +341,19 @@ def _open_side(gs, box: OrientedBox, reach: float = 3.0):
                        if len(blocked) else reach)
         else:
             corridor = reach
+        # interior veto: this side is the wall of a peripheral box
+        if corridor >= 1.5 and tc > 0.1:
+            out = s * face_axis
+            if float(out @ to_interior) / tc < -0.35:
+                # how far the cloud continues PAST this face (all
+                # heights/positions: a wall spans the room): a real
+                # aisle opens into the room's interior structure
+                beyond_all = (pts[:, :2] - c[:2]) @ out - face_half
+                past = beyond_all[beyond_all > 0.0]
+                edge_gap = (float(np.percentile(past, 99.0))
+                            if len(past) else 0.0)
+                if edge_gap < 1.2:
+                    corridor = 0.0
         if corridor > best_corridor:
             best_corridor, best_vec = corridor, s * face_axis
     return best_vec, min(best_corridor, reach)
