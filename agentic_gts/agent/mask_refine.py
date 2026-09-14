@@ -279,8 +279,19 @@ def _open_side(gs, box: OrientedBox, reach: float = 3.0):
     the device-height band and the row strip -- and return the open
     direction (unit world 2D vector) plus the corridor width in metres
     (capped at `reach`).
+
+    Structure detection is opacity-MASS based (5cm bins along the face
+    normal, a bin counts as blocking when its summed opacity >= 1.0): a
+    wall -- even one FLUSH against the box face or rendered diffuse and
+    low-opacity -- is a solid mass of gaussians, while an aisle holds at
+    most isolated floaters that must not count as blocking. The earlier
+    single-nearest-point test with a 0.10 m dead zone was blind to a
+    flush wall: that side measured a full-width corridor, the camera
+    walked straight through the wall and rendered the view from OUTSIDE
+    the room (a fog of structure behind the wall, user report).
     """
     pts = np.asarray(gs.means, dtype=float)
+    op = 1.0 / (1.0 + np.exp(-np.asarray(gs.raw_opacity, dtype=float)))
     c = np.asarray(box.center, dtype=float)
     yaw = float(box.yaw)
     axis = np.array([math.cos(yaw), math.sin(yaw)])       # local x
@@ -300,12 +311,21 @@ def _open_side(gs, box: OrientedBox, reach: float = 3.0):
     z = pts[:, 2]
     z_top = c[2] + size[2] / 2.0
     band = (z > 0.25) & (z < max(min(z_top - 0.2, 2.0), 0.5))
+    bin_edges = np.arange(0.02, reach + 0.05, 0.05)
     best_vec, best_corridor = face_axis.copy(), -1.0
     for s in (1.0, -1.0):
         beyond = du * s - face_half        # distance past the s-side face
-        m = (np.abs(dv) < long_half + 1.0) & (beyond > 0.10) & \
+        m = (np.abs(dv) < long_half + 1.0) & (beyond > 0.02) & \
             (beyond < reach) & band
-        corridor = float(beyond[m].min()) if m.any() else reach
+        if m.any():
+            hist, _ = np.histogram(beyond[m], bins=bin_edges, weights=op[m])
+            blocked = np.nonzero(hist >= 1.0)[0]
+            # left edge of the first blocked bin: slightly conservative
+            # (camera stands a touch closer), never through the wall
+            corridor = (float(bin_edges[blocked[0]])
+                       if len(blocked) else reach)
+        else:
+            corridor = reach
         if corridor > best_corridor:
             best_corridor, best_vec = corridor, s * face_axis
     return best_vec, min(best_corridor, reach)

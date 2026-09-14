@@ -195,6 +195,50 @@ def test_equipment_label_gate():
     print("PASS equipment-label gate for the type-confirm skip")
 
 
+def test_open_side_flush_wall_and_floaters():
+    """The open-side pick for a WALL-ADJACENT box: a wall flush against
+    one face (gap < 0.1 m) must BLOCK that side -- the old single-point
+    test's 0.10 m dead zone measured a full-width corridor there, and
+    the camera walked through the wall to render the view from outside
+    the room (fog of behind-wall structure). Isolated aisle floaters
+    must NOT count as blocking."""
+    from agentic_gts.agent.mask_refine import _open_side
+    from agentic_gts.tools.gs_io import GaussianData
+    rng = np.random.default_rng(9)
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(2.0, 1.1, 2.0), yaw=0.0)
+    # face axis is +y/-y (long edge along x). FLUSH wall on -y: a dense
+    # band 2-8 cm past the face -- inside the old test's dead zone
+    wall = np.column_stack([rng.uniform(-1.2, 1.2, 400),
+                            rng.uniform(-0.63, -0.57, 400),
+                            rng.uniform(0.3, 1.8, 400)])
+    # open aisle on +y: three isolated floaters far apart (single
+    # low-opacity splats must not read as structure)
+    floaters = np.array([[0.0, 1.2, 1.0], [0.4, 2.1, 1.2], [-0.5, 2.7, 0.8]])
+    means = np.vstack([wall, floaters]).astype(np.float32)
+    n = len(means)
+    gs = GaussianData(
+        means=means,
+        log_scales=np.full((n, 3), -6.0, dtype=np.float32),
+        quats=np.tile(np.array([[1.0, 0, 0, 0]], dtype=np.float32), (n, 1)),
+        # wall splats clearly opaque, floaters faint
+        raw_opacity=np.concatenate([np.full(400, 2.0),
+                                    np.full(3, -1.0)]).astype(np.float32),
+        f_dc=np.zeros((n, 3), dtype=np.float32),
+    )
+    vec, corridor = _open_side(gs, box)
+    # open side is the aisle (+y), corridor wide (floaters don't block)
+    assert vec[1] > 0.99, f"open side must be the aisle +y, got {vec}"
+    assert corridor > 2.0, f"floaters must not block, corridor={corridor:.2f}"
+
+    # mirror: flush wall on the +y side instead -> the open side flips
+    gs.means[:400, 1] *= -1.0
+    vec2, corridor2 = _open_side(gs, box)
+    assert vec2[1] < -0.99, f"open side must flip to -y, got {vec2}"
+    assert corridor2 > 2.0
+    print(f"PASS open side: flush wall blocked, floaters ignored "
+          f"(corridor {corridor:.1f} / {corridor2:.1f})")
+
+
 def test_projection_prompt_box_combines_front_fit_with_seed_depth():
     """The depth-view SAM prompt: the front-fitted instance keeps its
     along-row span / height, but takes DEPTH and cross-axis centre from
@@ -406,14 +450,17 @@ def test_open_side_picks_aisle():
     facing = np.column_stack([rng.uniform(-3, 3, 300),
                               np.full(300, 2.0),
                               rng.uniform(0.3, 1.7, 300)])
-    gs = SimpleNamespace(means=np.vstack([row, wall, facing]))
+    gs = SimpleNamespace(means=np.vstack([row, wall, facing]),
+                         raw_opacity=np.full(len(row) + 600, 2.0,
+                                            dtype=np.float32))
     vec, corridor = _open_side(gs, box)
     assert vec[1] > 0.9, f"open side must be +y (aisle), got {vec}"
     assert 1.3 < corridor < 1.9, f"corridor ~1.7m expected, got {corridor}"
     # mirrored scene: the aisle on -y must flip the pick
     gs2 = SimpleNamespace(
         means=np.vstack([row, wall[:, [0, 1, 2]] * np.array([1, -1, 1]),
-                         facing * np.array([1, -1, 1])]))
+                         facing * np.array([1, -1, 1])]),
+        raw_opacity=np.full(len(row) + 600, 2.0, dtype=np.float32))
     vec2, _ = _open_side(gs2, box)
     assert vec2[1] < -0.9, f"mirrored scene must pick -y, got {vec2}"
     print("PASS open side picks the aisle (and flips on mirror)")
