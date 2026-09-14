@@ -274,7 +274,22 @@ def test_calibrate_coord_scale_pixel_backend():
     img_full = np.ones((768, 768, 3), dtype=np.float32) * 0.6
     out3 = _calibrate_coord_scale(img_full, coords, labels)
     assert np.allclose(out3, coords)
-    print("PASS calibrate coord scale (pixels re-mapped, grid kept)")
+
+    # y-flip convention: device in the BOTTOM half, model answers with
+    # y measured from the BOTTOM -> grid reading lands points on the
+    # (dark) top half; the flip reading must win and re-map
+    img_bot = np.zeros((768, 768, 3), dtype=np.float32)
+    img_bot[500:, :, :] = 0.6
+    raw_flip = np.array([[500., 200.], [600., 250.], [400., 300.]])
+    labels4 = np.array([1, 1, 1])
+    coords4 = (raw_flip / 1000.0 * 767.0).astype(np.float32)
+    out4 = _calibrate_coord_scale(img_bot, coords4, labels4)
+    assert (out4[:, 1] >= 500).all(), \
+        "y-flipped positives must be re-mapped onto the bottom half"
+    assert np.allclose(out4[:, 0], coords4[:, 0], atol=2.0), \
+        "x must be untouched by the flip"
+    print("PASS calibrate coord scale (pixels re-mapped, grid kept, "
+          "y-flip re-mapped)")
 
 
 def test_open_side_picks_aisle():

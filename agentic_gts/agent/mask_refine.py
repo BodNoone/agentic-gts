@@ -677,46 +677,68 @@ def _augment_spread(view_img: np.ndarray, coords: np.ndarray,
 
 def _calibrate_coord_scale(img: np.ndarray, coords: np.ndarray,
                            labels: np.ndarray) -> np.ndarray:
-    """Re-interpret VLM point coords if they are ABSOLUTE PIXELS, not the
-    0-1000 grid (user report: points mostly off the device, pulled toward
-    one corner).
+    """Re-interpret VLM point coords when the backend's convention
+    differs from the assumed 0-1000 grid (user report: points mostly
+    off the device even on a clean probe image, so it is NOT the
+    wireframe -- it is the coordinate frame).
 
-    pixel_prompts() divides by 1000 -- Qwen3-VL's native relative grid.
-    But a backend answering in ABSOLUTE PIXELS instead (Qwen2.5-VL's
-    convention: coords on the resized input image) then has every point
-    shrunk to ~0.77x of its intended position on a 768px view, biased
-    toward the top-left corner. Two facts disambiguate:
-      * a raw value beyond the image size cannot be a pixel -> the grid
-        interpretation is certain, keep it;
-      * otherwise, the device IS the foreground (box-only local views
-        render it on black): the interpretation landing more POSITIVE
-        points on it wins, and only a CLEAR win (>= 0.25) re-maps -- a
-        tie keeps the grid (current behaviour, no regression for
-        compliant Qwen3-VL servers).
+    pixel_prompts() divides by 1000 -- Qwen3-VL's native relative grid,
+    y=0 at TOP. Two alternative conventions shift every point the same
+    systematic way:
+      * ABSOLUTE PIXELS (Qwen2.5-VL's convention): every point shrinks
+        to ~0.77x of its intended position on a 768px view, biased
+        toward the top-left corner;
+      * Y MEASURED FROM THE BOTTOM: every point mirrors vertically.
+    All four readings {grid, pixels} x {normal, Y-flip} are scored by
+    the fraction of POSITIVE points landing on the device (the device
+    IS the foreground of box-only local views). Rules:
+      * a raw value beyond the image size rules out the PIXEL readings
+        (a grid coord still runs to 1000, so Y-flip stays testable);
+      * only a CLEAR win (>= 0.25 over the grid reading) re-maps -- a
+        tie keeps the grid (no regression for compliant Qwen3-VL
+        servers).
     """
     if not len(coords) or not (labels > 0).any():
         return coords
     H, W = img.shape[:2]
     raw = coords / np.array([W - 1, H - 1], dtype=np.float64) * 1000.0
-    if raw.max() > max(W, H) + 2:
-        return coords                  # beyond pixel range: grid, for sure
+    # a raw value beyond the image size cannot be a PIXEL reading -- but
+    # it says nothing about Y-flip (a flipped grid coord still runs to
+    # 1000), so only the pixel candidates are ruled out
+    pixels_possible = raw.max() <= max(W, H) + 2
     fg = img[..., :3].mean(axis=2) > 0.08
     if not fg.any():
         return coords
     pos = raw[labels > 0]
+
+    def _read(pts, pixel: bool, flip: bool):
+        p = pts.copy()
+        if flip:
+            p[:, 1] = 1000.0 - p[:, 1]
+        if pixel:
+            return np.clip(p, 0, [W - 1, H - 1])
+        return p / 1000.0 * np.array([W - 1, H - 1])
 
     def _on_fg(pts):
         x = np.clip(np.rint(pts[:, 0]), 0, W - 1).astype(int)
         y = np.clip(np.rint(pts[:, 1]), 0, H - 1).astype(int)
         return float(fg[y, x].mean())
 
-    as_grid = _on_fg(pos / 1000.0 * np.array([W - 1, H - 1]))
-    as_pix = _on_fg(np.clip(pos, 0, [W - 1, H - 1]))
-    if as_pix - as_grid < 0.25:
+    readings = [("grid", False, False), ("grid+Yflip", False, True)]
+    if pixels_possible:
+        readings += [("pixels", True, False), ("pixels+Yflip", True, True)]
+    base = _on_fg(_read(pos, False, False))
+    best_name, best_flags, best_score = "grid", (False, False), base
+    for name, pix, fl in readings:
+        s = _on_fg(_read(pos, pix, fl))
+        if s > best_score:
+            best_name, best_flags, best_score = name, (pix, fl), s
+    if best_score - base < 0.25:
         return coords
-    print("[mask-refine] VLM points look like ABSOLUTE PIXELS, not the "
-          "0-1000 grid; re-mapped (check which model the server runs)")
-    return np.clip(raw, 0, [W - 1, H - 1]).astype(np.float32)
+    print(f"[mask-refine] VLM points read better as {best_name.upper()} "
+          f"({best_score:.2f}) than the 0-1000 grid ({base:.2f}); "
+          "re-mapped")
+    return _read(raw, *best_flags).astype(np.float32)
 
 
 def _pull_points_inward(view_img: np.ndarray, coords: np.ndarray,

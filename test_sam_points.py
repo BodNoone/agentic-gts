@@ -38,7 +38,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from agentic_gts.agent.judge import VLMJudge
 from agentic_gts.agent.mask_refine import (
-    _augment_spread, _pull_points_inward, parse_point_groups,
+    _augment_spread, _calibrate_coord_scale, _pull_points_inward,
+    parse_point_groups,
 )
 from agentic_gts.core.models import OrientedBox
 
@@ -154,22 +155,33 @@ def main() -> None:
         y = np.clip(np.rint(pts[:, 1]), 0, H - 1).astype(int)
         return float(m[y, x].mean())
 
+    def _read(raw_pts, pixel, flip):
+        p = np.asarray(raw_pts, dtype=float).copy()
+        if flip:
+            p[:, 1] = 1000.0 - p[:, 1]
+        if pixel:
+            return np.clip(p, 0, [W - 1, H - 1])
+        return p / 1000.0 * np.array([W - 1, H - 1])
+
     for gi, g in enumerate(parsed):
         coords, labels = g.pixel_prompts(W, H)
         if not len(coords):
             continue
         # ---- coordinate-convention diagnosis -------------------------
-        # pixel_prompts assumed the 0-1000 grid; recover the raw values
-        # and test the alternative (absolute pixels) interpretation
+        # score all four readings {grid, pixels} x {normal, Y-flip}
         raw = coords / np.array([W - 1, H - 1]) * 1000.0
         all_pts = g.positive_norm + g.negative_norm
         xs = [p[0] for p in all_pts]
         ys = [p[1] for p in all_pts]
         certain_grid = max(max(xs), max(ys)) > max(W, H) + 2
         pos = coords[labels > 0]
-        coords_pix = np.clip(raw, 0, [W - 1, H - 1])
-        fg_grid = _fg_frac(pos)
-        fg_pix = _fg_frac(coords_pix[labels > 0])
+        scores = {}
+        for name, pix, fl in (("grid", False, False),
+                              ("pixels", True, False),
+                              ("grid+Yflip", False, True),
+                              ("pixels+Yflip", True, True)):
+            scores[name] = _fg_frac(_read(pos, pix, fl))
+        best = max(scores, key=scores.get)
         print(f"[group {gi}] hypothesis={g.hypothesis} "
               f"conf={g.confidence:.2f} "
               f"pos={int((labels > 0).sum())} "
@@ -177,29 +189,41 @@ def main() -> None:
         print(f"[group {gi}] raw x range [{min(xs):.0f}, {max(xs):.0f}] "
               f"y range [{min(ys):.0f}, {max(ys):.0f}] "
               f"(image {W}x{H})")
+        print(f"[group {gi}] on-device fractions: "
+              + " | ".join(f"{k} {v:.2f}" for k, v in scores.items()))
         if certain_grid:
-            print(f"[group {gi}] convention: 0-1000 GRID for certain "
-                  f"(values beyond pixel range)")
-        elif fg_pix - fg_grid >= 0.25:
-            print(f"[group {gi}] convention: looks like ABSOLUTE PIXELS "
-                  f"(on-device: pixels {fg_pix:.2f} vs grid {fg_grid:.2f})")
+            print(f"[group {gi}] convention: pixel readings ruled out "
+                  f"(values beyond pixel range); grid vs grid+Yflip "
+                  f"tested above")
+            del scores["pixels"], scores["pixels+Yflip"]
+            best = max(scores, key=scores.get)
+        if scores[best] - scores["grid"] >= 0.25:
+            print(f"[group {gi}] convention: looks like "
+                  f"{best.upper()} (clear win over grid)")
         else:
-            print(f"[group {gi}] convention: assumed 0-1000 grid "
-                  f"(on-device: grid {fg_grid:.2f} vs pixels {fg_pix:.2f})")
+            print(f"[group {gi}] convention: no clear winner -- keeping "
+                  f"the 0-1000 grid (if points still look off in the "
+                  "panels below, the model is just mis-grounding)")
         # the production postprocess chain, verbatim
-        coords2, labels2 = _pull_points_inward(img, coords, labels)
+        coords1 = _calibrate_coord_scale(img, coords, labels)
+        coords2, labels2 = _pull_points_inward(img, coords1, labels)
         coords2, labels2 = _augment_spread(img, coords2, labels2)
         moved = [not np.allclose(a, b)
                  for a, b in zip(coords, coords2[:len(coords)])]
         n_pos1 = int((labels2 > 0).sum())
         print(f"[group {gi}] after postprocess pos={n_pos1} "
-              f"({sum(moved)} moved by pull-inward)\n")
-        # three panels: grid reading / pixel reading / what SAM gets
+              f"({sum(moved)} moved by postproc)\n")
+        # five panels: four readings + what SAM actually receives
         panels = []
         for title, cc, ll, mv in (
                 ("1. as 0-1000 grid (assumed)", coords, labels, None),
-                ("2. as ABSOLUTE PIXELS", coords_pix, labels, None),
-                ("3. to SAM (postproc)",
+                ("2. as ABSOLUTE PIXELS",
+                 _read(raw, True, False), labels, None),
+                ("3. grid + Y-FLIPPED",
+                 _read(raw, False, True), labels, None),
+                ("4. pixels + Y-FLIPPED",
+                 _read(raw, True, True), labels, None),
+                ("5. to SAM (calibrated+postproc)",
                  coords2, labels2, moved)):
             panel, strip = _draw_points(img, cc, ll, title, moved=mv)
             panels.append((panel, strip))
