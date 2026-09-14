@@ -141,25 +141,7 @@ def test_gs_parse_ascii():
         os.remove(path)
 
 
-def test_render_falls_back_without_cuda():
-    """On a box without gsplat/torch the render must degrade to scatter,
-    not raise. (True rasterization is covered on the GPU server.)"""
-    from agentic_gts.agent.judge import render_godview_png, render_topdown_image
-    from agentic_gts.tools.gs_io import write_gaussian_ply
-    import tempfile
 
-    gs = _tiny_gs()
-    pts = gs.means.astype(np.float64)
-    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(1.0, 0.6, 2.0), yaw=0.0)
-    with tempfile.TemporaryDirectory() as td:
-        ply = os.path.join(td, "gs.ply")
-        write_gaussian_ply(ply, gs)
-        png = render_godview_png(pts, [box], gs_ply=ply)
-        assert png[:8] == b"\x89PNG\r\n\x1a\n"
-        img = render_topdown_image(pts, [box], gs_ply=ply)
-        assert img.ndim == 3 and img.shape[2] in (3, 4)
-        assert img.shape[0] > 16
-    print("PASS render degrades to scatter without CUDA rasterizer")
 
 
 def test_camera_projection_sanity():
@@ -215,32 +197,6 @@ def test_godview_overlay_wire3d():
                                img[y0 - 5:y0 + 5, x0 - 5:x0 + 5]), \
             "no wireframe pixels near a ring corner"
     print("PASS godview overlay draws full 3D wireframe (both rings in frame)")
-
-
-def test_overlay_wire3d_axes_draws_axis_arrows():
-    """mode='wire3d_axes' must draw the wire3d frame PLUS the two local
-    axis arrows (green = +x length, blue = +y depth) so the VLM can see
-    the box's orientation and propose yaw/size corrections."""
-    from agentic_gts.output.gs_render import make_local_cam, overlay_boxes
-    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(1.2, 0.7, 2.0),
-                      yaw=math.radians(20.0))
-    cam = make_local_cam(box, extent=1.0)
-    img = np.full((cam.H, cam.W, 3), 0.3, dtype=np.float32)
-    out = overlay_boxes(img, [box], cam, mode="wire3d_axes")
-    assert out.shape == (cam.H, cam.W, 3)
-    arr = (np.clip(out, 0, 1) * 255).astype(np.int16)
-    green = np.all(np.abs(arr - np.array([0, 255, 80])) <= 12, axis=-1)
-    blue = np.all(np.abs(arr - np.array([80, 160, 255])) <= 12, axis=-1)
-    red = np.all(np.abs(arr - np.array([255, 60, 50])) <= 12, axis=-1)
-    assert green.sum() > 10, "no green +x arrow pixels"
-    assert blue.sum() > 10, "no blue +y arrow pixels"
-    assert red.sum() > 20, "wireframe itself missing"
-    # plain wire3d mode must NOT draw the arrows (unchanged behaviour)
-    out2 = overlay_boxes(img, [box], cam, mode="wire3d")
-    arr2 = (np.clip(out2, 0, 1) * 255).astype(np.int16)
-    green2 = np.all(np.abs(arr2 - np.array([0, 255, 80])) <= 12, axis=-1)
-    assert green2.sum() == 0, "axes leaked into plain wire3d mode"
-    print("PASS wire3d_axes overlay draws green/blue axis arrows")
 
 
 def test_godview_nadir_camera():
@@ -653,12 +609,6 @@ def test_fragment_box_flips_to_visible_side():
         f"front view is through the device body, must be flagged, {vis_front}"
     assert vis_back > 0.6, \
         f"opposite side must see the fragment, got {vis_back}"
-    # the slot definitions must carry the opposite-side candidates so the
-    # eligible filter can actually flip (regression guard on the config)
-    from agentic_gts.agent import judge as _judge
-    src = inspect.getsource(_judge.render_topdown_image)
-    assert "180.0" in src and "270.0" in src, \
-        "front/side slots lost their opposite-side azimuth candidates"
     print(f"PASS fragment box flips to visible side "
           f"(front vis={vis_front:.2f} back vis={vis_back:.2f})")
 
@@ -829,55 +779,11 @@ def test_camera_pullout_of_sandwich_tail():
           f"(rescued={clr_out:.2f} lift={eye_out[2] - eye_in[2]:.2f}m)")
 
 
-def test_quality_out_and_gating():
-    """render_topdown_image must fill quality_out on the scatter fallback
-    (mode marker), and the judge must cap a verdict's confidence when the
-    worst per-slot score is below the 0.35 floor."""
-    from agentic_gts.agent.judge import VLMJudge, render_topdown_image
-    rng = np.random.default_rng(3)
-    pts = np.column_stack([rng.uniform(0, 4, 400), rng.uniform(0, 4, 400),
-                           rng.uniform(0, 2, 400)])
-    box = OrientedBox(center=(2.0, 2.0, 1.0), size=(0.6, 1.1, 2.0), yaw=0.0)
-    q = {}
-    img = render_topdown_image(pts, [box], gs_ply=None, quality_out=q)
-    assert img is not None and img.size
-    assert q.get("mode") == "scatter_fallback", \
-        f"scatter fallback must mark quality_out, got {q}"
-
-    j = VLMJudge(backend="mock")
-    # unknown / scatter quality -> floor 1.0 -> no gating
-    assert j._quality_floor(None) == 1.0
-    assert j._quality_floor({}) == 1.0
-    assert j._quality_floor({"mode": "scatter_fallback"}) == 1.0
-    # one bad slot drags the floor down
-    qbad = {"front": {"score": 0.9}, "side": {"score": 0.2},
-            "oblique": {"score": 0.7}}
-    assert abs(j._quality_floor(qbad) - 0.2) < 1e-9
-    from agentic_gts.agent.judge import Verdict
-    v = Verdict(action="delete", confidence=0.9)
-    j._gate_quality(v, [box], quality=qbad)
-    assert v.confidence <= 0.5, "low-quality render must cap confidence"
-    assert "low render quality" in (v.detail or "")
-    v2 = Verdict(action="delete", confidence=0.9)
-    j._gate_quality(v2, [box], quality={"front": {"score": 0.8}})
-    assert v2.confidence == 0.9, "good render must not cap confidence"
-    # a SHARP but occluded view (wall/flush neighbour fills the frame) must
-    # also gate: image quality cannot see this, visibility can
-    qocc = {"front": {"score": 0.9, "visibility": 0.1}}
-    assert j._quality_floor(qocc) <= 0.35, \
-        "occluded view must count as untrustworthy evidence"
-    v3 = Verdict(action="delete", confidence=0.9)
-    j._gate_quality(v3, [box], quality=qocc)
-    assert v3.confidence <= 0.5, "occluded evidence must cap confidence"
-    print("PASS quality_out fill + verdict confidence gating")
-
-
 if __name__ == "__main__":
     test_gs_roundtrip_binary()
     test_gs_parse_ascii()
     test_colmap_pose_parsing_and_trust()
     test_colmap_views_missing_returns_none()
-    test_render_falls_back_without_cuda()
     test_camera_projection_sanity()
     test_local_cam_front_face()
     test_local_cam_steep_oblique_measures_thickness()
@@ -898,5 +804,4 @@ if __name__ == "__main__":
     test_camera_pullout_of_sandwich()
     test_narrow_aisle_front_view_blocked_steep_sees()
     test_camera_pullout_of_sandwich_tail()
-    test_quality_out_and_gating()
     print("ALL GS TESTS PASSED")

@@ -66,11 +66,13 @@ def test_build_report_groups_verdicts_per_box():
         doc = open(html_path, encoding="utf-8").read()
         # both final boxes got their own card with a local view render
         assert b1.box_id[:8] in doc and b2.box_id[:8] in doc
-        # local views (2) + verdict evidence: box1 gets 3 (fit/box/pair),
-        # box2 gets the pair verdict too, orphan gets 1 -> 7 total. The pair
-        # record is deliberately attached to BOTH boxes it is about.
-        assert doc.count("data:image/png;base64,") == 7, \
-            f"expected 7 inlined images, got {doc.count('data:image/png;base64,')}"
+        # verdict evidence: box1 gets 3 (fit/box/pair), box2 gets the
+        # pair verdict too, orphan gets 1 -> 5 total. The pair record is
+        # deliberately attached to BOTH boxes it is about. (No per-box
+        # local views here: those renders are GS-only and this synthetic
+        # run dir has no gs_ply.)
+        assert doc.count("data:image/png;base64,") == 5, \
+            f"expected 5 inlined images, got {doc.count('data:image/png;base64,')}"
         # verdict content present
         assert "real device" in doc and "two separate racks" in doc
         assert "已删除 / 不在最终结果中的候选" in doc  # orphan section
@@ -96,7 +98,10 @@ def test_build_report_without_records():
         doc = open(html_path, encoding="utf-8").read()
         assert "没有 VLM 判定记录" in doc
         assert "无判定记录（未触发任何 issue）" in doc
-        assert doc.count("data:image/png;base64,") >= 1  # the local view
+        # no verdict images, and the per-box local view is GS-only (no
+        # gs_ply in this run dir) -> zero inlined images, but a valid page
+        assert doc.count("data:image/png;base64,") == 0
+        assert "局部视角渲染失败" in doc
         assert "已删除 / 不在最终结果中的候选" not in doc  # no orphan section
         print("PASS report handles record-less run dirs")
     finally:

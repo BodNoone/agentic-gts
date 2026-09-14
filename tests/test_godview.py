@@ -1,4 +1,11 @@
-"""God-view pass tests: rendering, JSON parsing, and issue injection."""
+"""Misc regression tests: VLM reply parsing, box IO roundtrip, PLY
+artifacts, split profile cuts, refit trust flags.
+
+(The old god-view nomination / repair-loop tests were removed with the
+pre-grounding pipeline: the flow is now global nadir 2D grounding ->
+per-box local refine -> row split, which has its own tests in
+test_ground.py / test_mask_refine.py.)
+"""
 from __future__ import annotations
 
 import os
@@ -9,8 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 
 from agentic_gts.core.models import Scene
-from agentic_gts.agent.judge import VLMJudge, render_godview_png, _extract_json
-from agentic_gts.agent.loop import LayoutAgent
+from agentic_gts.agent.judge import _extract_json
 
 
 def _scene_with_racks(n: int = 12, seed: int = 0) -> Scene:
@@ -34,56 +40,6 @@ def _scene_with_racks(n: int = 12, seed: int = 0) -> Scene:
     return Scene(points=np.vstack(pts))
 
 
-def test_godview_render_produces_png():
-    scene = _scene_with_racks()
-    boxes = scene.boxes
-    png = render_godview_png(scene.points, boxes)
-    assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 20_000
-    print(f"PASS godview render: {len(png) // 1024} KB png")
-
-
-def test_ceiling_autocut():
-    """A separated dense top slab (ceiling) must be cut; a bare scene with
-    no ceiling must not be."""
-    from agentic_gts.agent.judge import _auto_ceiling_z
-    rng = np.random.default_rng(1)
-    floor = np.zeros(4000)                     # dense floor z=0
-    racks = rng.uniform(0, 2.0, 8000)          # devices 0..2m
-    no_ceiling = np.concatenate([floor, racks])
-    assert not np.isfinite(_auto_ceiling_z(no_ceiling)), \
-        "bare scene wrongly cut"
-    ceiling = rng.uniform(4.0, 4.3, 50000)     # dense slab at 4m (big gap)
-    with_ceiling = np.concatenate([no_ceiling, ceiling])
-    cut = _auto_ceiling_z(with_ceiling)
-    assert np.isfinite(cut) and 1.9 < cut < 2.3, f"cut={cut}"
-    print(f"PASS ceiling autocut: cut at z={cut:.1f} (ceiling 4.0-4.3 kept out)")
-
-
-def test_godview_render_drops_ceiling():
-    """With boxes given, the cut is the tallest box top + margin: the dense
-    4m ceiling slab must be excluded, the 2m racks kept."""
-    from agentic_gts.agent.judge import _render_cut_z
-    from agentic_gts.core.models import OrientedBox
-    scene = _scene_with_racks()
-    rng = np.random.default_rng(2)
-    cx = rng.uniform(-1, 4, 60000)
-    cy = rng.uniform(-1, 7, 60000)
-    cz = rng.uniform(4.0, 4.2, 60000)          # dense ceiling slab at 4m
-    pts = np.vstack([scene.points, np.stack([cx, cy, cz], axis=1)])
-    boxes = [OrientedBox(center=(k * 0.62, r * 2.4, 1.0),
-                         size=(0.6, 1.1, 2.0), yaw=0.0)
-             for r in range(3) for k in range(4)]
-    cut = _render_cut_z(pts, boxes)
-    assert 2.0 < cut < 2.5, f"cut={cut} (expected just above box tops)"
-    kept = pts[pts[:, 2] < cut]
-    assert (kept[:, 2] < 2.5).all(), "ceiling points leaked into the render"
-    assert len(kept) < len(pts), "nothing was cut"
-    png = render_godview_png(pts, boxes)
-    assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 20_000
-    print(f"PASS ceiling cut from box heights: cut={cut:.1f}, "
-          f"{len(pts) - len(kept)} of {len(pts)} points removed")
-
-
 def test_extract_json_variants():
     assert _extract_json('{"suspicious": []}') == {"suspicious": []}
     assert _extract_json('Here it is:\n{"suspicious": [{"index": 2, '
@@ -91,143 +47,6 @@ def test_extract_json_variants():
     assert _extract_json("no json at all") is None
     assert _extract_json("broken { not json") is None
     print("PASS json extraction")
-
-
-def test_mock_backend_godview_is_noop():
-    """Mock judge must return no godview issues (pipeline unaffected)."""
-    scene = _scene_with_racks()
-    agent = LayoutAgent(judge=VLMJudge(backend="mock"))
-    issues = agent.godview_pass(scene)
-    assert issues == []
-    print("PASS mock godview noop")
-
-
-def test_godview_bad_reply_is_contained():
-    """A VLM backend that returns garbage must not crash the loop."""
-    class BrokenJudge(VLMJudge):
-        def adjudicate_godview(self, scene, boxes):
-            raise RuntimeError("network down")
-
-    scene = _scene_with_racks()
-    agent = LayoutAgent(judge=BrokenJudge(backend="qwen"))
-    issues = agent.godview_pass(scene)
-    assert issues == []
-    print("PASS broken backend contained")
-
-
-def test_godview_flag_becomes_issue():
-    """A judge flagging box 0 must produce a FALSE_POSITIVE issue for it."""
-    class FlaggingJudge(VLMJudge):
-        def adjudicate_godview(self, scene, boxes):
-            return [{"index": 0, "reason": "in aisle"}]
-
-    scene = _scene_with_racks()
-    from agentic_gts.core.models import OrientedBox
-    scene.boxes = [OrientedBox(center=(0, 0, 1), size=(0.6, 1.1, 2.0), yaw=0.0)
-                   for _ in range(3)]
-    agent = LayoutAgent(judge=FlaggingJudge(backend="qwen"))
-    issues = agent.godview_pass(scene)
-    assert len(issues) == 1
-    assert issues[0].box_ids == [scene.boxes[0].box_id]
-    assert "godview" in issues[0].detail
-    print("PASS godview flag -> issue")
-
-
-def test_local_evidence_saved():
-    """The per-box evidence (three-view composite) must be persisted during
-    the repair loop -- by the JUDGE, before the VLM call, so it is saved
-    even when the backend call itself fails."""
-    import glob
-    import tempfile
-    import shutil
-    class FlaggingJudge(VLMJudge):
-        def adjudicate_godview(self, scene, boxes):
-            return [{"index": 0, "reason": "in aisle"}]
-
-    scene = _scene_with_racks()
-    from agentic_gts.core.models import OrientedBox
-    scene.boxes = [OrientedBox(center=(0, 0, 1), size=(0.6, 1.1, 2.0), yaw=0.0)
-                   for _ in range(3)]
-    out = tempfile.mkdtemp(prefix="godview_ev_")
-    try:
-        judge = FlaggingJudge(backend="qwen")
-        # enable the judge-side evidence dir (as pipeline.py does)
-        judge.set_record(os.path.join(out, "vlm_records.jsonl"))
-        agent = LayoutAgent(judge=judge, out_dir=out)
-        agent.run(scene)
-        ev = glob.glob(os.path.join(out, "evidence_*.png"))
-        assert ev, f"no evidence png saved to {out}"
-        assert os.path.getsize(ev[0]) > 1_000
-        print(f"PASS local evidence saved: {os.path.basename(ev[0])}")
-    finally:
-        shutil.rmtree(out, ignore_errors=True)
-
-
-def test_final_godview_qa_flags_low_confidence():
-    """The post-repair god-view QA must NOT delete late-flagged boxes --
-    it marks them LOW confidence and reports them unresolved."""
-    import tempfile
-    import shutil
-    class LateFlaggingJudge(VLMJudge):
-        """First god-view: clean. Final QA (2nd call): flag box 0."""
-        def __init__(self, *a, **kw):
-            super().__init__(*a, **kw)
-            self.calls = 0
-        def adjudicate_godview(self, scene, boxes):
-            self.calls += 1
-            if self.calls >= 2:
-                return [{"index": 0, "reason": "off every row"}]
-            return []
-
-    scene = _scene_with_racks()
-    from agentic_gts.core.models import OrientedBox, Confidence
-    # boxes placed ON the racks (no overlap issues: those would be fixed
-    # by resolve_overlap and change the count this test asserts on)
-    scene.boxes = [OrientedBox(center=(k * 0.62, 0, 1),
-                               size=(0.6, 1.1, 2.0), yaw=0.0)
-                   for k in range(3)]
-    out = tempfile.mkdtemp(prefix="godview_qa_")
-    try:
-        judge = LateFlaggingJudge(backend="qwen")
-        agent = LayoutAgent(judge=judge, out_dir=out)
-        report = agent.run(scene)
-        # box 0 still exists (no late deletion) ...
-        assert len(scene.boxes) == 3, "final QA must not delete boxes"
-        # ... but is flagged LOW and unresolved for human review
-        assert scene.boxes[0].confidence == Confidence.LOW
-        assert any("final godview" in str(e) for e in report.unresolved), \
-            "late flag must surface as unresolved"
-        assert os.path.exists(os.path.join(out, "godview_final.png")), \
-            "final godview render must be persisted"
-        print("PASS final godview QA: flags LOW, no deletion")
-    finally:
-        shutil.rmtree(out, ignore_errors=True)
-
-
-def test_low_confidence_empty_verdict_not_deleted():
-    """A low-confidence 'empty space' verdict must NOT delete the box --
-    deletion requires confidence >= 0.6 (irreversible action)."""
-    import tempfile
-    import shutil
-    class UnsureJudge(VLMJudge):
-        def adjudicate_godview(self, scene, boxes):
-            return [{"index": 0, "reason": "in aisle"}]
-        def adjudicate_box(self, scene, box, question, options):
-            return type("V", (), {"action": "answer",
-                                  "params": {"choice": "empty space"},
-                                  "confidence": 0.3, "detail": "unsure",
-                                  "raw": ""})()
-
-    scene = _scene_with_racks()
-    from agentic_gts.core.models import OrientedBox
-    scene.boxes = [OrientedBox(center=(k * 0.62, 0, 1),
-                               size=(0.6, 1.1, 2.0), yaw=0.0)
-                   for k in range(3)]
-    agent = LayoutAgent(judge=UnsureJudge(backend="qwen"))
-    agent.run(scene)
-    assert len(scene.boxes) == 3, \
-        "low-confidence empty-space verdict must not delete"
-    print("PASS low-confidence verdict does not delete")
 
 
 def test_objects_format_roundtrip():
@@ -264,53 +83,6 @@ def test_objects_format_roundtrip():
         print("PASS objects-format roundtrip (center/size/yaw exact)")
     finally:
         shutil.rmtree(out, ignore_errors=True)
-
-
-def test_scatter_fallback_draws_axes_arrows():
-    """Without a GS rasterizer the fit evidence falls back to a scatter
-    view -- it must still draw the green (+x) / blue (+y) axis arrows so
-    the prompt-image contract (yaw is judgeable) holds on every path."""
-    from agentic_gts.agent.judge import render_topdown_image
-    from agentic_gts.core.models import OrientedBox
-    rng = np.random.default_rng(2)
-    pts = rng.uniform(-2, 2, (400, 3))
-    box = OrientedBox(center=(0, 0, 1), size=(0.6, 1.1, 2.0), yaw=0.4)
-    img = render_topdown_image(pts, [box], gs_ply=None,
-                               overlay="wire3d_axes")
-    rgb = np.asarray(img)[..., :3]
-    lime = np.all(np.abs(rgb - np.array([0.0, 1.0, 0.0])) < 0.1, axis=-1)
-    blue = np.all(np.abs(rgb - np.array([0.118, 0.565, 1.0])) < 0.1,
-                  axis=-1)
-    assert lime.any(), "no GREEN (+x) arrow in the fallback render"
-    assert blue.any(), "no BLUE (+y) arrow in the fallback render"
-    print("PASS scatter fallback draws the axis arrows (prompt contract)")
-
-
-def test_agent_merges_fragments_geometrically():
-    """Front + back surface fragments of ONE rack must be fused by the
-    agent's geometric merge pass, with NO VLM merge adjudication (mock
-    judge): refine aligns the fragments, the deterministic rules pair
-    them. This is the replacement for the retired MERGED_NEIGHBORS pass."""
-    from agentic_gts.core.models import OrientedBox
-
-    rng = np.random.default_rng(3)
-    pts = []
-    for y_off in (0.55, -0.55):
-        u = rng.uniform(-0.3, 0.3, 300)
-        z = rng.uniform(0, 2.0, 300)
-        pts.append(np.stack([u, np.full(300, y_off), z], axis=1))
-    scene = Scene(points=np.vstack(pts))
-    scene.boxes = [
-        OrientedBox(center=(0, 0.55, 1), size=(0.6, 0.08, 2.0), yaw=0.0),
-        OrientedBox(center=(0, -0.55, 1), size=(0.6, 0.08, 2.0), yaw=0.0),
-    ]
-    agent = LayoutAgent(judge=VLMJudge(backend="mock"))
-    agent.run(scene)
-    assert len(scene.boxes) == 1, \
-        f"front/back fragments not fused: {len(scene.boxes)} boxes left"
-    b = scene.boxes[0]
-    assert b.size[1] > 0.9, f"merged depth {b.size[1]:.2f} -- fusion hollow"
-    print("PASS agent geometric merge fuses front/back fragments (no VLM)")
 
 
 def _rack_pts(rng, x_lo, x_hi, n=400, y_depth=1.1, z_h=2.0):
@@ -363,72 +135,9 @@ def test_profile_cuts_gap_and_tail():
     print("PASS profile_cuts (gap / tail / clean)")
 
 
-def test_width_misfit_splits_at_aisle_gap():
-    """A box over two racks separated by an aisle must split AT THE GAP,
-    not at the equal-division midpoint."""
-    from agentic_gts.core.models import OrientedBox
-
-    rng = np.random.default_rng(6)
-    pts = np.vstack([_rack_pts(rng, 0.0, 0.6), _rack_pts(rng, 0.7, 1.3)])
-    scene = Scene(points=pts)
-    scene.boxes = [OrientedBox(center=(0.65, 0, 1), size=(1.3, 1.1, 2.0),
-                               yaw=0.0)]
-    agent = LayoutAgent(judge=VLMJudge(backend="mock"))
-    agent.run(scene)
-    assert len(scene.boxes) == 2, f"expected 2 racks, got {len(scene.boxes)}"
-    centers = sorted(b.center[0] for b in scene.boxes)
-    assert abs(centers[0] - 0.3) < 0.08 and abs(centers[1] - 1.0) < 0.08, \
-        f"pieces not on the rack centers: {centers}"
-    print("PASS width audit splits at the aisle gap (cliff cuts)")
-
-
-def test_width_misfit_truncates_half_device():
-    """The 1.5-device box: one full rack + a sparse half-observed neighbour.
-    The fading tail must be truncated, leaving a ~0.6m box on the full rack."""
-    from agentic_gts.core.models import OrientedBox
-
-    rng = np.random.default_rng(7)
-    pts = np.vstack([
-        _rack_pts(rng, 0.0, 0.6),
-        _rack_pts(rng, 0.6, 0.9, n=30),   # half device, sparse
-    ])
-    scene = Scene(points=pts)
-    scene.boxes = [OrientedBox(center=(0.45, 0, 1), size=(0.9, 1.1, 2.0),
-                               yaw=0.0)]
-    agent = LayoutAgent(judge=VLMJudge(backend="mock"))
-    agent.run(scene)
-    assert len(scene.boxes) >= 1
-    main = max(scene.boxes, key=lambda b: b.size[0])
-    assert 0.45 < main.size[0] < 0.72, \
-        f"half-device tail not truncated: L={main.size[0]:.2f}"
-    assert abs(main.center[0] - 0.3) < 0.1, \
-        f"truncated box drifted: {main.center[0]:.2f}"
-    print(f"PASS width audit truncates half-device tail "
-          f"(0.9 -> {main.size[0]:.2f}m)")
-
-
-def test_width_misfit_keeps_wide_single_device():
-    """A genuinely wide (0.9m) device with uniform dense support: no gap,
-    no tail, mock VLM gives no 'multiple' answer -> the box must be KEPT.
-    The grid prior alone must never butcher a wide device."""
-    from agentic_gts.core.models import OrientedBox
-
-    rng = np.random.default_rng(8)
-    scene = Scene(points=_rack_pts(rng, 0.0, 0.9, n=600))
-    scene.boxes = [OrientedBox(center=(0.45, 0, 1), size=(0.9, 1.1, 2.0),
-                               yaw=0.0)]
-    agent = LayoutAgent(judge=VLMJudge(backend="mock"))
-    agent.run(scene)
-    assert len(scene.boxes) == 1, f"wide device destroyed: {len(scene.boxes)}"
-    assert scene.boxes[0].size[0] > 0.8, \
-        f"wide device shrank to {scene.boxes[0].size[0]:.2f}"
-    print("PASS width audit keeps a wide single device (no false butchery)")
-
-
 def test_ply_artifacts():
     """Output PLYs: boxes_only.ply (no cloud) + cloud_with_boxes.ply
     (height-tinted when no GS, SH-DC colored when GS available)."""
-    import struct
     import tempfile
     import shutil
     from agentic_gts.core.models import OrientedBox
@@ -506,101 +215,10 @@ def _tiny_gs_ply(out: str) -> str:
     return p
 
 
-def _hollow_row_points(n_dev=3, pitch=0.62, depth=1.1, height=2.0, seed=3):
-    """Surface-only points for a row of CLOSED cabinets: two face bands
-    per device (the row observed from its two facades), hollow interior,
-    open aisle on both sides. 3DGS of a closed cabinet has no interior
-    points -- the depth-completion scenario's point cloud."""
-    rng = np.random.default_rng(seed)
-    pts = []
-    for k in range(n_dev):
-        cx = k * pitch
-        for off in (depth / 2, -depth / 2):
-            u = rng.uniform(cx - 0.28, cx + 0.28, 400)
-            z = rng.uniform(0.05, height - 0.05, 400)
-            c = off + rng.uniform(-0.03, 0.03, 400)
-            pts.append(np.stack([u, c, z], axis=1))
-    return np.vstack(pts)
-
-
-def test_complete_row_depth_geometry():
-    """A thin front-face fragment must expand to the row's full depth from
-    the cross-axis surface-band profile (front band + back band = the
-    two faces of the row; the hollow interior is empty)."""
-    from agentic_gts.core.models import OrientedBox
-    from agentic_gts.tools import geometry as geo
-    scene = Scene(points=_hollow_row_points())
-    # thin fragments on the FRONT face of each device (single-side scan:
-    # all row mates hug the same face -- direction must fall back to the
-    # nearest band, which is the device's other face)
-    frags = [OrientedBox(center=(k * 0.62, 0.52, 1.0),
-                         size=(0.6, 0.12, 2.0), yaw=0.0)
-             for k in range(3)]
-    new = geo.complete_row_depth(scene, frags[0], frags[1:])
-    assert new is not None, "thin fragment must find the opposite face"
-    assert 1.0 < new.size[1] < 1.3, f"depth not completed: {new.size[1]}"
-    assert abs(new.center[1]) < 0.1, "completed box must straddle the row"
-    assert new.size[0] == frags[0].size[0] and new.size[2] == frags[0].size[2]
-    print(f"PASS complete_row_depth geometry ({frags[0].size[1]:.2f} -> "
-          f"{new.size[1]:.2f} m)")
-
-
-def test_complete_row_depth_rejects_wall():
-    """A tall structure (wall) behind the observed face must NOT be taken
-    as the device's opposite face: its points continue well above the box
-    top, a rack face does not."""
-    from agentic_gts.core.models import OrientedBox
-    from agentic_gts.tools import geometry as geo
-    rng = np.random.default_rng(5)
-    pts = []
-    for cx in (0.0, 0.8):     # two devices in the row
-        u = rng.uniform(cx - 0.28, cx + 0.28, 400)
-        z = rng.uniform(0.05, 1.95, 400)
-        c = 0.55 + rng.uniform(-0.03, 0.03, 400)
-        pts.append(np.stack([u, c, z], axis=1))
-    # wall right behind the row, full height to 3.5 m
-    u = rng.uniform(-0.5, 1.1, 800)
-    z = rng.uniform(0.05, 3.45, 800)
-    c = -0.55 + rng.uniform(-0.05, 0.05, 800)
-    pts.append(np.stack([u, c, z], axis=1))
-    scene = Scene(points=np.vstack(pts))
-    frags = [OrientedBox(center=(cx, 0.52, 1.0), size=(0.6, 0.12, 2.0),
-                        yaw=0.0) for cx in (0.0, 0.8)]
-    new = geo.complete_row_depth(scene, frags[0], frags[1:])
-    assert new is None, f"wall must be rejected, got depth {new.size[1]}"
-    print("PASS complete_row_depth rejects wall behind the row")
-
-
-def test_depth_completion_agent_pass():
-    """The agent's depth-completion pass expands every thin front-face
-    fragment of a row to the full row depth and absorbs the opposite-face
-    fragment of the same device (its observed face IS the expansion
-    target band)."""
-    from agentic_gts.core.models import OrientedBox
-    from agentic_gts.agent.loop import AgentReport
-    scene = Scene(points=_hollow_row_points())
-    scene.boxes = [OrientedBox(center=(k * 0.62, 0.52, 1.0),
-                               size=(0.6, 0.12, 2.0), yaw=0.0)
-                   for k in range(3)]
-    # back-face fragment of the MIDDLE device (the row was also scanned
-    # from behind; this fragment survived B0 un-paired)
-    scene.boxes.append(OrientedBox(center=(0.62, -0.52, 1.0),
-                                   size=(0.6, 0.12, 2.0), yaw=0.0))
-    agent = LayoutAgent(judge=VLMJudge(backend="qwen"))
-    agent._depth_completion(scene, AgentReport())
-    assert len(scene.boxes) == 3, \
-        f"back-face fragment must be absorbed, got {len(scene.boxes)}"
-    for b in scene.boxes:
-        assert b.size[1] > 0.9, f"depth not completed: {b.size[1]}"
-        assert b.meta.get("depth_completed"), "completion marker missing"
-    print(f"PASS depth completion agent pass "
-          f"(3 fragments -> {[round(b.size[1], 2) for b in scene.boxes]})")
-
-
 def test_fit_box_to_points_keep_depth():
     """keep_depth=True must preserve the seed's cross extent even when
-    the interior is hollow and only ONE face has points (the completed
-    box's span is trusted knowledge, not point support); without it the
+    the interior is hollow and only ONE face has points (the split piece's
+    span is trusted knowledge, not point support); without it the
     percentile refit collapses the box back to the observed face shell."""
     from agentic_gts.tools import geometry as geo
     rng = np.random.default_rng(7)

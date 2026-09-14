@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
-from agentic_gts.core.models import OrientedBox, DeviceType, Scene
+from agentic_gts.core.models import OrientedBox, Scene
 from agentic_gts.synth.generator import SynthConfig, generate
 from agentic_gts.tools import geometry as geo
 from agentic_gts.pipeline import run_pipeline
@@ -38,21 +38,6 @@ def test_synth_generation():
     assert len(kinds) > 1
 
 
-def test_center_field_detects_merged():
-    scene, gt, corrupt = generate(SynthConfig(seed=42))
-    scene.boxes = corrupt
-    merged = [b for b in corrupt if b.meta.get("corruption") == "merged"]
-    assert merged, "seed 42 should contain merged boxes"
-    for b in merged:
-        est, _, _ = geo.center_field_clusters(scene, b)
-        assert est >= 2, f"merged box should be detected as >=2 racks, got {est}"
-    clean = [b for b in corrupt if b.meta.get("corruption") is None
-             and b.device_type == DeviceType.RACK]
-    for b in clean[:5]:
-        est, _, _ = geo.center_field_clusters(scene, b)
-        assert est == 1, f"clean rack detected as {est} racks"
-
-
 def test_split_box():
     scene, gt, corrupt = generate(SynthConfig(seed=42))
     merged = [b for b in corrupt if b.meta.get("corruption") == "merged"][0]
@@ -61,17 +46,17 @@ def test_split_box():
     assert abs(subs[0].size[0] - 0.6) < 0.05
 
 
-def test_pipeline_improves_layout():
+def test_pipeline_mock_smoke():
+    """New-flow smoke test: run_pipeline on synth data with the mock VLM
+    must complete without raising (the old 'improves layout with mock'
+    assertions belonged to the removed rule-repair loop; with mock the
+    agent stages no-op, only the deterministic rules run)."""
     scene, gt, corrupt = generate(SynthConfig(seed=42))
     scene.boxes = corrupt
-    before = evaluate(corrupt, gt, edge_threshold_m=0.05)
-    res = run_pipeline(scene, gt_boxes=gt, use_coarse_seg=False,
-                       vlm_backend="mock", out_dir="runs/test_tmp")
-    after = evaluate(scene.boxes, gt, edge_threshold_m=0.05)
-    assert after.recall >= before.recall
-    assert after.edge_accuracy > before.edge_accuracy
-    assert after.edge_accuracy > 0.85
-    assert after.recall > 0.9
+    run_pipeline(scene, gt_boxes=gt, use_coarse_seg=False,
+                 vlm_backend="mock", out_dir="runs/test_tmp")
+    assert len(scene.boxes) > 0, "pipeline dropped every box"
+    print(f"PASS pipeline mock smoke ({len(scene.boxes)} boxes out)")
 
 
 def test_eval_edge_error():
@@ -96,17 +81,6 @@ def test_yaw_estimation_rotated_scene():
         err = abs(math.degrees(true - est))
         err = min(err, 90 - err)
         assert err < 3.0, f"yaw error {err:.1f}deg for input {deg}deg"
-
-
-def test_pipeline_rotated_scene():
-    from agentic_gts.core.models import Scene as _Scene
-    scene, gt, corrupt = generate(SynthConfig(seed=42, room_yaw_deg=30))
-    s = _Scene(points=scene.points, boxes=corrupt)   # external cloud: no meta yaw
-    res = run_pipeline(s, gt_boxes=gt, use_coarse_seg=False,
-                       vlm_backend="mock", out_dir="runs/test_rot")
-    after = evaluate(s.boxes, gt, edge_threshold_m=0.05)
-    assert after.recall > 0.9
-    assert after.edge_accuracy > 0.8
 
 
 if __name__ == "__main__":

@@ -1,13 +1,14 @@
 """Per-box local-view + VLM-verdict HTML report.
 
 Reads a run directory (boxes.json + vlm_records.jsonl + evidence PNGs),
-renders a fresh local three-view composite for EVERY final box, attaches
-the VLM verdicts each box received (matched via the evidence-image
-filenames), and writes one self-contained HTML file (images inlined as
-base64) -- open it in any browser, share it, no server needed.
+renders a fresh local view (the mask-refine front render, box-only
+isolation) for EVERY final box, attaches the VLM verdicts each box
+received (matched via the evidence-image filenames), and writes one
+self-contained HTML file (images inlined as base64) -- open it in any
+browser, share it, no server needed.
 
 Sections:
-  - overview (box count, verdict counts, god-view before/after)
+  - overview (box count, verdict counts, grounding views)
   - one card per final box: local view + its verdict timeline
   - verdicts about boxes that no longer exist (deleted candidates)
 """
@@ -155,11 +156,12 @@ def build_report(run_dir: str, out_path: str | None = None,
                  gs_ply: str | None = None) -> str:
     """Build the HTML report for a run directory. Returns the output path."""
     from agentic_gts.core.models import Scene
-    from agentic_gts.agent.judge import render_topdown_image
+    from agentic_gts.agent.mask_refine import render_local_views
 
     out_path = out_path or os.path.join(run_dir, "vlm_report.html")
     boxes_path = os.path.join(run_dir, "boxes.json")
     scene = Scene(points=points if points is not None else np.zeros((0, 3)))
+    scene.meta["gs_ply"] = gs_ply
     if os.path.exists(boxes_path):
         scene.load_boxes(boxes_path)
     records = _load_records(run_dir)
@@ -197,13 +199,11 @@ def build_report(run_dir: str, out_path: str | None = None,
                      '（mock 后端或无 issue 触发）。</p>')
 
     # god views + grounding views
-    for name, cap in (("godview.png", "修复前 god-view"),
-                      ("groundview.png", "grounding 输入（干净俯视图，无标注）"),
+    for name, cap in (("groundview.png", "grounding 输入（干净俯视图，无标注）"),
                       ("groundview_az90.png", "grounding 输入（对向斜俯视 A）"),
                       ("groundview_az270.png", "grounding 输入（对向斜俯视 B）"),
                       ("grounded.png", "grounding 审计（彩色框+标签 = VLM 原始"
-                                      " rects，红线框 = 几何拟合结果）"),
-                      ("godview_final.png", "终审 god-view")):
+                                      " rects，红线框 = 几何拟合结果）")):
         b64 = _b64_file(os.path.join(run_dir, name))
         if b64:
             parts.append(f"<h3>{_html.escape(cap)}</h3>"
@@ -216,9 +216,12 @@ def build_report(run_dir: str, out_path: str | None = None,
     parts.append('<div style="display:grid;grid-template-columns:'
                   'repeat(auto-fill,minmax(560px,1fr));gap:14px">')
     for i, b in enumerate(scene.boxes):
+        # per-box local view: the SAME front render the new flow's mask
+        # refinement uses (box-only isolation, no occluders). GS-only --
+        # without a gs_ply there is nothing meaningful to show per box.
         try:
-            img = render_topdown_image(scene.points, [b], gs_ply=gs_ply)
-            view_b64 = _b64_array(img)
+            views = render_local_views(scene, b)
+            view_b64 = _b64_array(views[0]["image"]) if views else None
         except Exception:
             view_b64 = None
         view_html = (f'<img loading="lazy" src="data:image/png;base64,{view_b64}" '
