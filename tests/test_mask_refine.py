@@ -405,6 +405,49 @@ def test_mask_overlay_is_rgb_plus_tint():
     print("PASS mask overlay (rgb + tint, no uint8 wraparound)")
 
 
+def test_augment_spread_scatters_clustered_points():
+    """Clustered VLM points (all bunched on one panel) must be augmented
+    with farthest-point samples from the device's interior pixels until
+    the positives span a good fraction of the image; already-spread
+    prompts pass through untouched."""
+    from agentic_gts.agent.mask_refine import _augment_spread
+
+    H, W = 96, 128
+    # device: bright rectangle filling most of the frame
+    img = np.zeros((H, W, 3), dtype=np.float32)
+    img[10:86, 10:118] = 0.6
+    # clustered positives: 3 points bunched near the centre-left
+    coords = np.array([[50.0, 48.0], [55.0, 50.0], [60.0, 47.0],
+                       [10.0, 5.0], [120.0, 90.0]])   # 2 negatives
+    labels = np.array([1, 1, 1, 0, 0])
+    c2, l2 = _augment_spread(img, coords, labels, min_points=6,
+                             min_spread=0.5, max_add=4)
+    n_add = len(l2) - len(coords)
+    assert 3 <= n_add <= 4, f"expected ~4 added points, got {n_add}"
+    assert (l2[-n_add:] == 1).all(), "appended points are positives"
+    assert (l2[:5] == labels).all(), "existing points unchanged"
+    pos = c2[l2 > 0]
+    diag = math.hypot(H, W)
+    spread = np.linalg.norm(pos.max(axis=0) - pos.min(axis=0))
+    assert len(pos) >= 6, "at least min_points positives after augment"
+    assert spread >= 0.5 * diag, \
+        f"positives must now span the device, spread {spread:.0f}px < " \
+        f"{0.5 * diag:.0f}px"
+    # added points sit on bright interior pixels, not background
+    for x, y in c2[5:5 + n_add]:
+        assert img[int(y), int(x)].mean() > 0.1, \
+            f"added point ({x:.0f},{y:.0f}) landed on background"
+    # already spread + enough points: no-op
+    coords3 = np.array([[15.0, 12.0], [110.0, 14.0], [60.0, 48.0],
+                        [16.0, 82.0], [112.0, 80.0], [60.0, 20.0]])
+    labels3 = np.ones(6, dtype=int)
+    c3, l3 = _augment_spread(img, coords3, labels3, min_points=6,
+                             min_spread=0.5, max_add=4)
+    assert len(l3) == 6 and np.allclose(c3, coords3), \
+        "well-spread prompts must pass through unchanged"
+    print("PASS augment spread (clustered points scattered onto device)")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed = 0

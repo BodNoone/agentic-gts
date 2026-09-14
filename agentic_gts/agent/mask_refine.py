@@ -605,6 +605,75 @@ def _save_sam_debug(view: dict | None, coords, labels, mask, pts3,
               f"({type(e).__name__}: {e})")
 
 
+def _augment_spread(view_img: np.ndarray, coords: np.ndarray,
+                    labels: np.ndarray, min_points: int = 6,
+                    min_spread: float = 0.45, max_add: int = 4):
+    """Guard against clustered VLM point prompts (user report: points
+    bunched on one door/panel make SAM segment a LOCAL part of the rack).
+
+    When the positive points span less than `min_spread` of the image
+    diagonal (or there are fewer than `min_points`), add points sampled
+    from the device's interior pixels: the local views render ONLY the
+    box's own gaussians, so every non-background pixel belongs to the
+    target. Candidates are picked farthest-point style -- each new point
+    maximizes its distance to the points already in the set -- so the
+    additions spread the coverage instead of re-clustering.
+
+    Returns (coords, labels) with the added positives appended.
+    """
+    coords = np.asarray(coords, dtype=np.float64).reshape(-1, 2)
+    labels = np.asarray(labels).reshape(-1)
+    if not len(coords):
+        return coords, labels
+    pos = coords[labels > 0]
+    H, W = view_img.shape[:2]
+    diag = math.hypot(H, W)
+
+    def _spread(ps):
+        return float(np.linalg.norm(ps.max(axis=0) - ps.min(axis=0))) \
+            if len(ps) else 0.0
+
+    if (len(pos) >= min_points and
+            _spread(pos) >= min_spread * diag):
+        return coords, labels
+
+    # device foreground: non-background pixels (local views are box-only
+    # renders, so fg == the target device), eroded so sampled points sit
+    # safely inside the silhouette, away from boundaries
+    img = np.asarray(view_img, dtype=np.float32)
+    if img.ndim == 2:
+        img = img[..., None]
+    gray = img[..., :3].mean(axis=2)
+    if float(gray.max()) > 1.5:            # uint8-scale input
+        gray = gray / 255.0
+    fg = gray > 0.08
+    if not fg.any():
+        return coords, labels
+    inside = fg.copy()
+    for dy in (-2, 0, 2):
+        for dx in (-2, 0, 2):
+            inside &= np.roll(np.roll(fg, dy, axis=0), dx, axis=1)
+    ys, xs = np.nonzero(inside if inside.sum() > 50 else fg)
+    cands = np.column_stack([xs, ys]).astype(np.float64)
+
+    pts = [p for p in pos]
+    for _ in range(max_add):
+        if len(pts) >= min_points and _spread(np.asarray(pts)) >= \
+                min_spread * diag:
+            break
+        d = np.min(np.linalg.norm(
+            cands[:, None, :] - np.asarray(pts)[None, :, :], axis=2),
+            axis=1) if pts else \
+            np.linalg.norm(cands - cands.mean(axis=0), axis=1)
+        pts.append(cands[int(np.argmax(d))])
+    if not pts:
+        return coords, labels
+    new_pos = np.asarray(pts, dtype=np.float64)
+    return (np.vstack([coords, new_pos[len(pos):]]),
+            np.concatenate([labels,
+                            np.ones(len(pts) - len(pos), dtype=labels.dtype)]))
+
+
 def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                out_dir: str | None = None,
                views: list | None = None) -> tuple[OrientedBox | None, dict]:
@@ -633,6 +702,9 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                                                   view["image"].shape[0])
             if not len(coords):
                 continue
+            # clustered VLM points make SAM segment a local part; spread
+            # them with device-interior samples when coverage is poor
+            coords, labels = _augment_spread(view["image"], coords, labels)
             masks, scores = sam.predict(view["image"], coords, labels)
             for mi, (mask, ms) in enumerate(zip(masks, scores)):
                 pts3 = _mask_to_points(scene, box, mask, view["cam"])
