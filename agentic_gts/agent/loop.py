@@ -94,13 +94,13 @@ class LayoutAgent:
         """Local per-box VLM pass: SAM mask refinement + type confirmation.
 
         Both questions share ONE render_local_views call per box (front
-        + diagonal views). Per box the VLM cost is 2 local-grounding
-        calls + 1 type-confirm; the type-confirm is SKIPPED when the
-        local grounding already labelled every accepted instance as
-        equipment with a strong score (the redundant third call is the
-        common case for clean racks). The type confirmation runs even
-        when SAM is not configured -- it only needs the local view and
-        the VLM.
+        + oblique views). Per box the VLM cost is 1 local-grounding call
+        (the FRONT view alone votes on instance division; the oblique
+        view only completes depth via projected SAM prompts) + 1
+        type-confirm; the type-confirm is SKIPPED when the grounding
+        already labelled every accepted instance as equipment with a
+        strong score. The type confirmation runs even when SAM is not
+        configured -- it only needs the local view and the VLM.
         """
         from agentic_gts.agent.mask_refine import (SamPredictorAdapter,
                                                     confirm_device_type,

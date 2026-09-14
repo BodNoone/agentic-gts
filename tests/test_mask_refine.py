@@ -195,6 +195,42 @@ def test_equipment_label_gate():
     print("PASS equipment-label gate for the type-confirm skip")
 
 
+def test_projection_prompt_box_combines_front_fit_with_seed_depth():
+    """The depth-view SAM prompt: the front-fitted instance keeps its
+    along-row span / height, but takes DEPTH and cross-axis centre from
+    the seed (front points are a face shell -- the fitted cross position
+    is the face, not the cabinet's middle)."""
+    from agentic_gts.agent.mask_refine import _projection_prompt_box
+    from agentic_gts.output.gs_render import _box_corners_3d, Cam
+    seed = OrientedBox(center=(5.0, 3.0, 1.05), size=(6.0, 1.1, 2.1),
+                       yaw=0.3)
+    # a front-shell fit: along-span tight (one cabinet of the row),
+    # cross position biased to the front face
+    fitted = OrientedBox(center=(4.9, 2.95, 1.0), size=(1.0, 0.12, 2.0),
+                        yaw=0.3)
+    pb = _projection_prompt_box(fitted, seed)
+    # along size + height from fitted, depth from seed
+    assert abs(pb.size[0] - 1.0) < 1e-9 and abs(pb.size[2] - 2.0) < 1e-9
+    assert abs(pb.size[1] - 1.1) < 1e-9
+    # the centre sits at the seed's cross coordinate, the fitted's along
+    axis = np.array([np.cos(0.3), np.sin(0.3)])
+    cross = np.array([-np.sin(0.3), np.cos(0.3)])
+    assert abs(np.asarray(pb.center)[:2] @ axis
+               - np.asarray(fitted.center)[:2] @ axis) < 1e-9
+    assert abs(np.asarray(pb.center)[:2] @ cross
+               - np.asarray(seed.center)[:2] @ cross) < 1e-9
+    # projected into ANY camera it yields a finite, positive-size pixel
+    # box (that is the oblique SAM prompt)
+    cam = Cam(eye=np.array([0.0, 0.0, 2.0]),
+              target=np.array([5.0, 3.0, 1.0]), up=np.array([0.0, 0.0, 1.0]),
+              fovy_deg=60.0, W=768, H=768)
+    uv = cam.project_cv(_box_corners_3d(pb))
+    assert uv[:, 0].min() > 0 and uv[:, 0].max() < 768
+    assert uv[:, 1].min() > 0 and uv[:, 1].max() < 768
+    assert uv[:, 0].max() - uv[:, 0].min() > 4
+    print("PASS projection prompt box (front fit + seed depth -> pixel box)")
+
+
 def test_parse_rack_confirm():
     from agentic_gts.agent.judge import VLMJudge
     p = VLMJudge._parse_rack_confirm(

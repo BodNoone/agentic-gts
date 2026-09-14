@@ -373,10 +373,11 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # top-down component: the local views must show the device's
     # vertical surfaces, which the ground-level 3DGS training observed
     # well): FRONT (the face: doors, panels) + the DIAGONAL halfway
-    # between front and side (front+45 deg: corner view showing two
-    # adjacent faces at once -- the device's 3D extent along BOTH axes
-    # is measurable, which neither the face-on nor the pure side view
-    # alone can give).
+    # between front and side. The roles are DECOUPLED (refine_box):
+    # front is the sole voter on instance division (door seams / height
+    # / color are legible face-on); the diagonal's foreshortening makes
+    # adjacent cabinets visually merge, so it NEVER grounds -- it only
+    # completes DEPTH via SAM prompts projected from the front fit.
     slots = (("front", 18.0, azim_front),
              ("oblique", 18.0, azim_front + 45.0))
     # standoff: ~80% into the corridor, never further than 2.2m; the
@@ -653,6 +654,32 @@ def _save_sam_debug(view: dict | None, box_prompt, mask, pts3,
               f"({type(e).__name__}: {e})")
 
 
+def _projection_prompt_box(fitted: "OrientedBox",
+                           seed: "OrientedBox") -> "OrientedBox":
+    """The front-fitted instance re-boxed for projecting a SAM prompt
+    into the depth view.
+
+    The front view measures along-row span and height precisely, but its
+    points are a front-face SHELL -- the fitted cross (depth) position
+    and span are unreliable. Projection therefore combines the fitted
+    along/height with the seed's depth and cross-axis centre (Stage A /
+    grounding boxes are full-depth by construction).
+    """
+    yaw = float(seed.yaw)
+    axis = np.array([math.cos(yaw), math.sin(yaw)])
+    cross = np.array([-math.sin(yaw), math.cos(yaw)])
+    fc = np.asarray(fitted.center, dtype=float)
+    sc = np.asarray(seed.center, dtype=float)
+    along = float(fc[:2] @ axis)
+    cross_c = float(sc[:2] @ cross)
+    cxy = axis * along + cross * cross_c
+    return OrientedBox(
+        center=(float(cxy[0]), float(cxy[1]), float(fc[2])),
+        size=(float(fitted.size[0]), float(seed.size[1]),
+              float(fitted.size[2])),
+        yaw=yaw)
+
+
 def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                out_dir: str | None = None,
                views: list | None = None) -> tuple[list, dict]:
@@ -666,15 +693,22 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     snaps the mask to the device inside it; the 3D fit comes from the
     mask's back-projected gaussians.
 
-    MULTI-instance: the local-grounding prompt separates a joined row
-    into one group per visually distinct cabinet (different height /
-    color). Each group is refined independently (best SAM mask per
-    group per view); the same physical cabinet grounded in BOTH views
-    is matched by fitted-footprint IoU and its points UNIONed (front
-    gives width/height, the diagonal adds depth). Returns the list of
-    accepted instances (score >= 0.45) -- more than one means the
-    grounding split the row, and the caller replaces the old box with
-    all of them.
+    DECOUPLED views (user decision): instance division is voted on by
+    the FRONT view ONLY -- door seams / height / color differences are
+    legible face-on, and letting a second view vote too produced
+    count inconsistencies (oblique's foreshortening merges adjacent
+    cabinets; a merged oblique mask then polluted whichever front
+    instance the greedy footprint match attached it to, refitting it
+    back over the whole row). The oblique view is a pure DEPTH
+    COMPLETION pass with no VLM call: each front instance's box is
+    projected into the oblique image as the SAM box prompt, and the
+    back-projected depth points are unioned with the front points.
+
+    MULTI-instance: the front grounding separates a joined row into one
+    group per visually distinct cabinet (different height / color).
+    Returns the list of accepted instances (score >= 0.45) -- more than
+    one means the grounding split the row, and the caller replaces the
+    old box with all of them.
     """
     if views is None:
         views = render_local_views(scene, box, out_dir)
@@ -682,102 +716,139 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     if not views or not sam.available:
         audit["reason"] = "no local GS views or SAM checkpoint"
         return [], audit
-    # per (view, group): the group's best candidate
-    # (score, pts, fitted, mask_score)
-    grounded = []
-    for view in views:
-        # CLEAN image to the VLM: the wireframe overlay (prompt_image)
-        # is the Stage-A box, which is often oversized/misplaced -- the
-        # VLM anchors on the frame instead of the device. Same principle
-        # as global grounding: no box prompts in the input image. The
-        # rack TYPE-CONFIRM call keeps the wireframe (it judges the box
-        # fit); box grounding judges the DEVICE.
-        verdict = judge.adjudicate_sam_boxes(
-            view["image"], box, view["name"],
-            png_path=view["path"])
-        groups = verdict.params.get("groups", []) if verdict.params else []
-        va = {"view": view["name"], "image": view["path"],
-              "answer": verdict.raw or verdict.detail, "groups": groups}
-        H, W = view["image"].shape[:2]
-        for gi, g in enumerate(groups):
-            group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
-                             float(g.get("confidence", 0.5)))
-            box_pix = group.pixel_box(W, H)
-            if not (box_pix[2] - box_pix[0] > 4 and box_pix[3] - box_pix[1] > 4):
-                continue                  # degenerate/absent box
-            masks, scores = sam.predict(view["image"], box_pix)
-            best = None
-            for mi, (mask, ms) in enumerate(zip(masks, scores)):
-                pts3 = _mask_to_points(scene, box, mask, view["cam"])
-                fitted = fit_mask_points(pts3, box)
-                if out_dir:
-                    # debug composite: prompt box + mask + lifted pts
-                    _save_sam_debug(view, box_pix, mask, pts3, box,
-                                    fitted, out_dir,
-                                    f"{box.box_id}_{view['name']}_g{gi}_m{mi}")
-                if fitted is None:
-                    continue
-                s = score_candidate(float(ms), pts3, fitted, box)
-                if best is None or s > best[0]:
-                    best = (s, pts3, fitted, float(ms))
-            if best is not None:
-                grounded.append((view["name"], *best, group.hypothesis))
+    # the voter view grounds instances; the others only complete depth.
+    # Fallback order keeps ONE voter at all times (front preferred;
+    # without a front slot the first view votes, still one vote).
+    voter = next((v for v in views if v["name"] == "front"), None)
+    if voter is None:
+        voter = views[0]
+    depth_views = [v for v in views if v is not voter]
+
+    # ---- pass 1 (voter): VLM grounding -> SAM -> fitted instances ----
+    # CLEAN image to the VLM: the wireframe overlay (prompt_image) is
+    # the Stage-A box, which is often oversized/misplaced -- the VLM
+    # anchors on the frame instead of the device. Same principle as
+    # global grounding: no box prompts in the input image.
+    verdict = judge.adjudicate_sam_boxes(
+        voter["image"], box, voter["name"], png_path=voter["path"])
+    groups = verdict.params.get("groups", []) if verdict.params else []
+    va = {"view": voter["name"], "image": voter["path"], "role": "voter",
+          "answer": verdict.raw or verdict.detail, "groups": groups}
+    H, W = voter["image"].shape[:2]
+    instances = []
+    for gi, g in enumerate(groups):
+        group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
+                         float(g.get("confidence", 0.5)))
+        box_pix = group.pixel_box(W, H)
+        if not (box_pix[2] - box_pix[0] > 4 and box_pix[3] - box_pix[1] > 4):
+            continue                  # degenerate/absent box
+        masks, scores = sam.predict(voter["image"], box_pix)
+        best = None
+        for mi, (mask, ms) in enumerate(zip(masks, scores)):
+            pts3 = _mask_to_points(scene, box, mask, voter["cam"])
+            fitted = fit_mask_points(pts3, box)
+            if out_dir:
+                # debug composite: prompt box + mask + lifted pts
+                _save_sam_debug(voter, box_pix, mask, pts3, box,
+                                fitted, out_dir,
+                                f"{box.box_id}_{voter['name']}_g{gi}_m{mi}")
+            if fitted is None:
+                continue
+            s = score_candidate(float(ms), pts3, fitted, box)
+            if best is None or s > best[0]:
+                best = (s, pts3, fitted, float(ms))
+        if best is not None and best[0] >= 0.45:
+            s, pts, fitted, ms = best
+            instances.append({"score": s, "pts": pts, "fitted": fitted,
+                              "mask_score": ms, "label": group.hypothesis,
+                              "view": voter["name"]})
+    if out_dir:
+        try:
+            with open(os.path.join(
+                    out_dir, f"sam_boxes_{box.box_id}_{voter['name']}.json"),
+                      "w", encoding="utf-8") as f:
+                json.dump(va, f, ensure_ascii=False, indent=2,
+                          default=json_default)
+        except OSError:
+            pass
+    audit["views"].append(va)
+
+    # ---- pass 2 (depth views): projected SAM prompts, no VLM ----
+    # The oblique image answers ONE question per instance -- the depth
+    # extent -- from a prompt that is a deterministic projection of the
+    # voter's fit. It cannot disagree about instance division because
+    # it never divides: one prompt in, one mask out.
+    from agentic_gts.output.gs_render import _box_corners_3d
+    for dv in (depth_views if instances else []):
+        dva = {"view": dv["name"], "image": dv["path"],
+               "role": "depth_completion", "instances": []}
+        H, W = dv["image"].shape[:2]
+        for ii, inst in enumerate(instances):
+            pb = _projection_prompt_box(inst["fitted"], box)
+            corners = _box_corners_3d(pb)
+            uv = dv["cam"].project_cv(corners)
+            x0, y0 = float(uv[:, 0].min()), float(uv[:, 1].min())
+            x1, y1 = float(uv[:, 0].max()), float(uv[:, 1].max())
+            pad = 0.05 * max(x1 - x0, y1 - y0)
+            box_pix = np.array([max(x0 - pad, 0.0), max(y0 - pad, 0.0),
+                                min(x1 + pad, W - 1.0), min(y1 + pad, H - 1.0)])
+            drec = {"from_view": inst["view"], "points": 0}
+            dva["instances"].append(drec)
+            if not (box_pix[2] - box_pix[0] > 4
+                    and box_pix[3] - box_pix[1] > 4):
+                drec["reason"] = "degenerate projection"
+                continue
+            masks, scores = sam.predict(dv["image"], box_pix)
+            mi = int(np.argmax(scores))
+            mask, ms = masks[mi], float(scores[mi])
+            pts3 = _mask_to_points(scene, box, mask, dv["cam"])
+            if out_dir:
+                _save_sam_debug(dv, box_pix, mask, pts3, box,
+                                inst["fitted"], out_dir,
+                                f"{box.box_id}_{dv['name']}_i{ii}_depth")
+            if len(pts3) < 20:
+                drec["reason"] = "too few depth points"
+                continue
+            union = np.vstack([inst["pts"], pts3])
+            refit = fit_mask_points(union, box)
+            if refit is None:
+                drec["reason"] = "union refit failed"
+                continue
+            # BLEED guard: the oblique mask may have eaten a neighbour
+            # (the projected prompt is generous in depth). The union
+            # must not balloon along the row -- if it does, the depth
+            # pass is discarded and the front-only fit stands.
+            if refit.size[0] > 1.3 * inst["fitted"].size[0] + 0.1:
+                drec["reason"] = "depth mask bled into a neighbour"
+                continue
+            drec.update({"points": int(len(pts3)), "accepted": True})
+            inst["pts"] = union
+            inst["fitted"] = refit
+            inst["view"] = f'{inst["view"]}+{dv["name"]}'
+            inst["mask_score"] = 0.5 * (inst["mask_score"] + ms)
+            inst["score"] = min(
+                score_candidate(inst["mask_score"], union, refit, box) + 0.08,
+                1.0)
         if out_dir:
             try:
                 with open(os.path.join(
-                        out_dir, f"sam_boxes_{box.box_id}_{view['name']}.json"),
+                        out_dir, f"sam_boxes_{box.box_id}_{dv['name']}.json"),
                           "w", encoding="utf-8") as f:
-                    json.dump(va, f, ensure_ascii=False, indent=2,
+                    json.dump(dva, f, ensure_ascii=False, indent=2,
                               default=json_default)
             except OSError:
                 pass
-        audit["views"].append(va)
-    if not grounded:
+        audit["views"].append(dva)
+
+    if not instances:
         audit["reason"] = "no SAM mask yielded a valid 3D box"
         return [], audit
-    # ---- cross-view instance matching: the same physical cabinet
-    # grounded in both views. Fitted footprints live in WORLD coords, so
-    # matching by 2D IoU is view-independent; greedy first-match is fine
-    # (groups from one view never overlap much).
-    instances = []
-    for entry in grounded:
-        for inst in instances:
-            if inst["fitted"].iou_2d(entry[3]) >= 0.3:
-                inst["views"].append(entry)
-                break
-        else:
-            instances.append({"fitted": entry[3], "views": [entry],
-                             "label": entry[5]})
-    # ---- per-instance verdict: union the matched views (more complete
-    # than either surface alone), score, keep the accepted ones.
-    # Entries are DICTS ({"score", "fitted", "view", "points",
-    # "mask_score", "label"}): the caller adopts e["fitted"] and gates
-    # the type-confirm pass on e["label"]/e["score"].
-    accepted = []
-    for inst in instances:
-        vs = inst["views"]
-        if len(vs) >= 2:
-            union_pts = np.vstack([v[2] for v in vs])
-            fitted = fit_mask_points(union_pts, box) or inst["fitted"]
-            ms = float(np.mean([v[4] for v in vs]))
-            s = min(score_candidate(ms, union_pts, fitted, box) + 0.08, 1.0)
-            entry = {"score": s, "fitted": fitted,
-                     "view": "+".join(v[0] for v in vs),
-                     "points": len(union_pts), "mask_score": ms,
-                     "label": inst["label"]}
-        else:
-            name, s, pts, fitted, ms, _ = vs[0]
-            entry = {"score": s, "fitted": fitted, "view": name,
-                     "points": len(pts), "mask_score": ms,
-                     "label": inst["label"]}
-        if entry["score"] >= 0.45:
-            accepted.append(entry)
-    accepted.sort(key=lambda e: e["score"], reverse=True)
-    audit.update({"accepted": bool(accepted),
+    instances.sort(key=lambda e: e["score"], reverse=True)
+    audit.update({"accepted": True,
                   "instances": [
                       {"score": round(e["score"], 4), "view": e["view"],
-                       "points": e["points"],
+                       "points": len(e["pts"]),
                        "sam_score": round(e["mask_score"], 4),
                        "label": e["label"], "box": e["fitted"].to_dict()}
-                      for e in accepted]})
-    return accepted, audit
+                      for e in instances]})
+    return instances, audit
