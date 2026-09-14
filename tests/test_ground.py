@@ -106,6 +106,9 @@ def test_ground_stage_with_patched_vlm():
     # build the same deterministic render to fabricate the VLM answer
     _, cam, W, H = ground._render_topdown(scene, scene.boxes, 0.0)
     true_rects = [((-0.5, 6.5), (-0.8, 0.8)),      # row 1 XY
+                  ((-0.5, 6.5), (-0.8, 0.8)),      # row 1 AGAIN: the VLM
+                  # often outlines one device twice (user report:
+                  # duplicated mask_prompt_<id>_front.png renders)
                   ((-1.5, 5.5), (2.2, 3.8))]       # row 2 XY
     import json as _json
     regions = []
@@ -152,6 +155,10 @@ def test_ground_stage_with_patched_vlm():
         frac = float(diff.mean())
         assert frac < 0.05, \
             f"views differ over {frac:.1%} of pixels (base not shared?)"
+    # 3 rects (row 1 outlined TWICE) -> still exactly 2 boxes: the
+    # duplicate fit must be dropped by the IoU >= 0.5 dedup, or the
+    # local refine stage renders one mask_prompt_<id>_front.png per
+    # box -- duplicated images of one device
     assert len(scene.boxes) == 2, f"want 2 row boxes, got {len(scene.boxes)}"
     rows = sorted(scene.boxes, key=lambda b: b.center[1])
     # row 1: full length ~6m, FULL depth ~1.1m, height ~2.1m

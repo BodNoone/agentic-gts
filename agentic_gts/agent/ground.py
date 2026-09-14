@@ -280,7 +280,8 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     c = (lo + hi) / 2.0
     return OrientedBox(center=(float(c[0]), float(c[1]), z_top / 2.0),
                        size=(dx, dy, z_top), yaw=0.0,
-                       device_type=DeviceType.RACK)
+                       device_type=DeviceType.RACK,
+                       meta={"n_pts": len(dev)})
 
 
 # ---------- grounding stage ----------
@@ -372,7 +373,8 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         box = OrientedBox(center=(float(c[0]), float(c[1]), bb.center[2]),
                           size=bb.size, yaw=yaw,
                           device_type=DeviceType.RACK,
-                          meta={"grounded": True})
+                          meta={"grounded": True,
+                                "n_pts": bb.meta.get("n_pts", 0)})
         boxes.append(box)
     if not boxes:
         print("[ground] no region survived the point-support guards "
@@ -382,6 +384,21 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                                     "no region survived point-support guards")
         return False
     print(f"[ground] {len(rects)} VLM regions -> {len(boxes)} fitted boxes")
+    # DEDUPLICATE: the VLM often outlines the SAME device more than
+    # once (overlapping rects in one reply). Each rect fits its own
+    # near-identical box with a DIFFERENT box_id, and the per-box local
+    # refinement then renders mask_prompt_<id>_front.png per box --
+    # one device, several duplicate renders (user report). Keep the
+    # best-point-supported fit per IoU >= 0.5 cluster.
+    dedup = []
+    for b in sorted(boxes, key=lambda x: -int(x.meta.get("n_pts", 0))):
+        if any(b.iou_2d(d) >= 0.5 for d in dedup):
+            continue
+        dedup.append(b)
+    if len(dedup) < len(boxes):
+        print(f"[ground] dropped {len(boxes) - len(dedup)} duplicate "
+              f"box(es) (IoU >= 0.5 with a better-supported fit)")
+    boxes = dedup
     scene.boxes = boxes
     # result audit: the grounded.png shows the view's own raw VLM rects
     # (colored) plus the final fitted boxes (red) projected through the
