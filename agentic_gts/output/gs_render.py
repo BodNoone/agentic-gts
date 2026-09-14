@@ -232,12 +232,14 @@ def make_local_cam(boxes, extent: float = 1.2, W: int = 768, H: int = 768,
     renders upright.
 
     standoff (metres, from the box's camera-facing silhouette): keep the
-    eye AT that distance and WIDEN THE LENS (60 -> 95 deg) to frame the
-    box. Backing off instead pushes the eye past the middle of the aisle
-    into the facing row -- the render then needs x-ray isolation (delete
-    the row around the camera) and degenerates into a sliced, see-through
-    collage. Only when even 95 deg cannot frame the box does the camera
-    fall back to backing off.
+    eye AT that distance and WIDEN THE LENS (60 -> 110 deg) to frame the
+    box. This keeps the ground-level perspective honest (a 2 m rack
+    from a ~1 m aisle is exactly the wide-angle view a person gets).
+    Only when even 110 deg cannot frame the box (a long joined row in a
+    narrow aisle) does the camera back off -- the local renders are
+    box-only (gaussians outside the OBB are hidden), so distance past
+    the facing row costs nothing visually; the back-off ladder is
+    seeded analytically from the box's spans so even a 6 m row frames.
 
     W/H default 768: each tile of the three-view composite the VLM
     adjudicates on carries ~5cm-scale misfits (wireframe overhang); at
@@ -286,9 +288,18 @@ def make_local_cam(boxes, extent: float = 1.2, W: int = 768, H: int = 768,
             if _framed(cand):
                 return cand
             cam = cand
-        # even 95 deg could not frame it (very long box): back off from
-        # the standoff distance instead (old behaviour)
-        dist0 = dist
+        # even 110 deg could not frame it (a very LONG box in a narrow
+        # aisle): back off. The local renders are box-only (every
+        # gaussian outside the OBB is hidden), so standing far -- even
+        # past the facing row -- costs nothing visually. Seed the
+        # back-off ANALYTICALLY from the corner spans: a 6 m row needs
+        # ~5+ m at 60 deg, and the old ladder (3.5x a ~1 m standoff,
+        # max ~4 m) could not reach it -- it fell through to an
+        # UNFRAMED camera and the box wireframe overflowed the image
+        # (user report: mask_prompt views with the row not fully
+        # observed).
+        dist0 = max(dist, (spans[0] + extent) / 2.0 / fx,
+                    spans[2] / 2.0 / fy)
     else:
         # first-guess distance from the union's extent (plus margin), then
         # verify by projection and back off until every corner is in frame

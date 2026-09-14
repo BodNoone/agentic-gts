@@ -408,6 +408,33 @@ def test_local_cam_standoff_widens_lens():
           f"fovy {cam.fovy_deg:.0f} deg, box framed)")
 
 
+def test_local_cam_standoff_frames_long_row():
+    """A LONG joined row in a NARROW aisle: no lens frames it (a 6 m row
+    from ~1.2 m needs >120 deg), so the camera must fall back to backing
+    off -- seeded ANALYTICALLY from the row's spans. The old back-off
+    ladder (3.5x the ~1.2 m standoff, max ~4 m at 60 deg) could not
+    reach the row ends and fell through to an UNFRAMED camera: the box
+    wireframe overflowed mask_prompt images and the row was not fully
+    observed (user report). Box-only rendering makes the back-off free
+    of occlusion, so distance is safe."""
+    from agentic_gts.output.gs_render import _box_corners_3d, make_local_cam
+    for L in (4.0, 6.0, 9.0):
+        box = OrientedBox(center=(0.0, 0.0, 1.05), size=(L, 1.1, 2.1),
+                          yaw=0.0)
+        for azim in (0.0, 45.0, 90.0):
+            cam = make_local_cam([box], W=768, H=768, elev_deg=18.0,
+                                 azim_deg=azim, standoff=0.6)
+            cs = _box_corners_3d(box)
+            uv = cam.project_cv(cs)
+            assert (uv[:, 0].min() > 0 and uv[:, 0].max() < cam.W and
+                    uv[:, 1].min() > 0 and uv[:, 1].max() < cam.H), (
+                f"L={L} azim={azim} row clips out of view: "
+                f"x[{uv[:, 0].min():.0f},{uv[:, 0].max():.0f}] "
+                f"y[{uv[:, 1].min():.0f},{uv[:, 1].max():.0f}]")
+    print("PASS local cam standoff frames long rows (4/6/9 m, "
+          "front/diag/side)")
+
+
 def test_near_boxes_mask_isolates():
     """The local render keeps only gaussians inside the (inflated) box
     OBBs: everything else -- e.g. an occluding rack 2m in front -- must be
@@ -776,6 +803,7 @@ if __name__ == "__main__":
     test_local_cam_steep_oblique_measures_thickness()
     test_local_cam_frames_pair()
     test_local_cam_standoff_widens_lens()
+    test_local_cam_standoff_frames_long_row()
     test_near_boxes_mask_isolates()
     test_local_cam_azim_rotates_view()
     test_godview_overlay_wire3d()
