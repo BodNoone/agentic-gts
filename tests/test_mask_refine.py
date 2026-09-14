@@ -239,40 +239,58 @@ def test_open_side_flush_wall_and_floaters():
           f"(corridor {corridor:.1f} / {corridor2:.1f})")
 
 
-def test_projection_prompt_box_combines_front_fit_with_seed_depth():
-    """The depth-view SAM prompt: the front-fitted instance keeps its
-    along-row span / height, but takes DEPTH and cross-axis centre from
-    the seed (front points are a face shell -- the fitted cross position
-    is the face, not the cabinet's middle)."""
-    from agentic_gts.agent.mask_refine import _projection_prompt_box
-    from agentic_gts.output.gs_render import _box_corners_3d, Cam
-    seed = OrientedBox(center=(5.0, 3.0, 1.05), size=(6.0, 1.1, 2.1),
-                       yaw=0.3)
-    # a front-shell fit: along-span tight (one cabinet of the row),
-    # cross position biased to the front face
-    fitted = OrientedBox(center=(4.9, 2.95, 1.0), size=(1.0, 0.12, 2.0),
-                        yaw=0.3)
-    pb = _projection_prompt_box(fitted, seed)
-    # along size + height from fitted, depth from seed
-    assert abs(pb.size[0] - 1.0) < 1e-9 and abs(pb.size[2] - 2.0) < 1e-9
-    assert abs(pb.size[1] - 1.1) < 1e-9
-    # the centre sits at the seed's cross coordinate, the fitted's along
-    axis = np.array([np.cos(0.3), np.sin(0.3)])
-    cross = np.array([-np.sin(0.3), np.cos(0.3)])
-    assert abs(np.asarray(pb.center)[:2] @ axis
-               - np.asarray(fitted.center)[:2] @ axis) < 1e-9
-    assert abs(np.asarray(pb.center)[:2] @ cross
-               - np.asarray(seed.center)[:2] @ cross) < 1e-9
-    # projected into ANY camera it yields a finite, positive-size pixel
-    # box (that is the oblique SAM prompt)
-    cam = Cam(eye=np.array([0.0, 0.0, 2.0]),
-              target=np.array([5.0, 3.0, 1.0]), up=np.array([0.0, 0.0, 1.0]),
-              fovy_deg=60.0, W=768, H=768)
-    uv = cam.project_cv(_box_corners_3d(pb))
-    assert uv[:, 0].min() > 0 and uv[:, 0].max() < 768
-    assert uv[:, 1].min() > 0 and uv[:, 1].max() < 768
-    assert uv[:, 0].max() - uv[:, 0].min() > 4
-    print("PASS projection prompt box (front fit + seed depth -> pixel box)")
+def test_apply_depth_from_oblique_single_merged_pool():
+    """The oblique depth rule: front instances keep along/height; the
+    oblique pool (typically ONE merged mask covering the whole row --
+    that is why its instance division is never adopted) is sliced per
+    instance by along span and measures ONLY each cabinet's depth."""
+    from agentic_gts.agent.mask_refine import _apply_depth_from_oblique
+    seed = OrientedBox(center=(0.0, 0.0, 1.05), size=(2.0, 1.0, 2.1),
+                       yaw=0.0)
+    # two front-split instances: along [-0.55,-0.05] and [0.05,0.55]
+    inst_a = {"fitted": OrientedBox(center=(-0.3, 0.1, 1.0),
+                                    size=(0.5, 0.15, 2.0), yaw=0.0),
+              "pts": np.zeros((30, 3)), "view": "front",
+              "mask_score": 0.8, "score": 0.6, "label": "rack"}
+    inst_b = {"fitted": OrientedBox(center=(0.3, 0.1, 1.0),
+                                    size=(0.5, 0.15, 2.0), yaw=0.0),
+              "pts": np.zeros((30, 3)), "view": "front",
+              "mask_score": 0.8, "score": 0.6, "label": "rack"}
+    # oblique pool: ONE merged cloud over both cabinets, y in [-0.4,0.4]
+    # (true depth 0.8m), split per along range
+    rng = np.random.default_rng(3)
+    def slab(along_c):
+        return np.column_stack([
+            rng.uniform(along_c - 0.22, along_c + 0.22, 200),
+            rng.uniform(-0.4, 0.4, 200),
+            rng.uniform(0.1, 1.9, 200)])
+    pool = np.vstack([slab(-0.3), slab(0.3)])
+    recs = _apply_depth_from_oblique([inst_a, inst_b], pool, seed)
+    assert len(recs) == 2 and all(r.get("accepted") for r in recs), recs
+    for inst in (inst_a, inst_b):
+        fb = inst["fitted"]
+        # along span and height untouched (front-measured)
+        assert abs(fb.size[0] - 0.5) < 1e-9
+        assert abs(fb.size[2] - 2.0) < 1e-9
+        assert abs(fb.center[0] - (0.3 if inst is inst_b else -0.3)) < 1e-9
+        # depth now measured from the oblique pool, centred on it
+        assert 0.6 < fb.size[1] < 1.0, fb.size[1]
+        assert abs(fb.center[1]) < 0.1, fb.center[1]
+        # the pool points were folded in
+        assert len(inst["pts"]) == 30 + 200
+    # rejection: a pool with an implausible depth (thin sliver) leaves
+    # the front fit untouched
+    thin = np.column_stack([rng.uniform(-1, 1, 50), np.full(50, 0.05),
+                             rng.uniform(0.1, 1.9, 50)])
+    inst_c = {"fitted": OrientedBox(center=(0.0, 0.1, 1.0),
+                                    size=(0.5, 0.15, 2.0), yaw=0.0),
+              "pts": np.zeros((30, 3)), "view": "front",
+              "mask_score": 0.8, "score": 0.6, "label": "rack"}
+    recs = _apply_depth_from_oblique([inst_c], thin, seed)
+    assert not recs[0].get("accepted"), recs
+    assert abs(inst_c["fitted"].size[1] - 0.15) < 1e-9
+    assert len(inst_c["pts"]) == 30
+    print("PASS oblique depth-only application (merged pool + rejection)")
 
 
 def test_parse_rack_confirm():

@@ -674,30 +674,67 @@ def _save_sam_debug(view: dict | None, box_prompt, mask, pts3,
               f"({type(e).__name__}: {e})")
 
 
-def _projection_prompt_box(fitted: "OrientedBox",
-                           seed: "OrientedBox") -> "OrientedBox":
-    """The front-fitted instance re-boxed for projecting a SAM prompt
-    into the depth view.
+def _apply_depth_from_oblique(instances: list, pts: np.ndarray,
+                              seed: "OrientedBox",
+                              min_pts: int = 20) -> list[dict]:
+    """Update each front instance's DEPTH dimension from oblique-view
+    back-projected points (the ONLY thing the oblique view contributes).
 
-    The front view measures along-row span and height precisely, but its
-    points are a front-face SHELL -- the fitted cross (depth) position
-    and span are unreliable. Projection therefore combines the fitted
-    along/height with the seed's depth and cross-axis centre (Stage A /
-    grounding boxes are full-depth by construction).
+    The oblique grounding may see a joined row as ONE instance -- its
+    foreshortening merges adjacent cabinets -- so its instance division
+    is NEVER adopted. Only the points matter, sliced per instance: an
+    oblique mask's points whose ALONG coordinate falls inside a front
+    instance's along span belong to that cabinet, and their cross-axis
+    (depth) extent measures it (the 45-deg view sees front AND side
+    faces). Along/height stay front-measured: oblique perspective
+    distorts along-row spans, which is exactly why the front view alone
+    votes on division.
     """
+    recs = []
     yaw = float(seed.yaw)
     axis = np.array([math.cos(yaw), math.sin(yaw)])
     cross = np.array([-math.sin(yaw), math.cos(yaw)])
-    fc = np.asarray(fitted.center, dtype=float)
+    if pts is None or len(pts) == 0:
+        return recs
+    along_all = pts[:, :2] @ axis
+    cross_all = pts[:, :2] @ cross
     sc = np.asarray(seed.center, dtype=float)
-    along = float(fc[:2] @ axis)
-    cross_c = float(sc[:2] @ cross)
-    cxy = axis * along + cross * cross_c
-    return OrientedBox(
-        center=(float(cxy[0]), float(cxy[1]), float(fc[2])),
-        size=(float(fitted.size[0]), float(seed.size[1]),
-              float(fitted.size[2])),
-        yaw=yaw)
+    seed_cross_c = float(sc[:2] @ cross)
+    seed_half_d = float(np.asarray(seed.size)[1]) / 2.0
+    for inst in instances:
+        f = inst["fitted"]
+        fc = np.asarray(f.center, dtype=float)
+        along_c = float(fc[:2] @ axis)
+        half = float(f.size[0]) / 2.0
+        m = np.abs(along_all - along_c) <= half + 0.10
+        sel = pts[m]
+        rec = {"points": int(len(sel))}
+        recs.append(rec)
+        if len(sel) < min_pts:
+            rec["reason"] = "too few oblique points in along span"
+            continue
+        c_lo, c_hi = np.percentile(cross_all[m], [2.0, 98.0])
+        depth = float(c_hi - c_lo)
+        if not (0.3 <= depth <= 2.5):
+            rec["reason"] = f"implausible depth {depth:.2f}m"
+            continue
+        mid = 0.5 * (c_lo + c_hi)
+        # the measured cabinet centre must still live inside the seed's
+        # cross span (padded) -- the Stage-A box bounds the device
+        if abs(mid - seed_cross_c) > seed_half_d + 0.30:
+            rec["reason"] = "depth centre too far from seed"
+            continue
+        # rebuild: front's along/height/centre-height, oblique-measured
+        # depth and cross centre
+        cxy = axis * along_c + cross * mid
+        inst["fitted"] = OrientedBox(
+            center=(float(cxy[0]), float(cxy[1]), float(fc[2])),
+            size=(float(f.size[0]), depth, float(f.size[2])),
+            yaw=yaw)
+        inst["pts"] = np.vstack([inst["pts"], sel])
+        rec["accepted"] = True
+        rec["depth"] = round(depth, 3)
+    return recs
 
 
 def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
@@ -717,12 +754,12 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     the FRONT view ONLY -- door seams / height / color differences are
     legible face-on, and letting a second view vote too produced
     count inconsistencies (oblique's foreshortening merges adjacent
-    cabinets; a merged oblique mask then polluted whichever front
-    instance the greedy footprint match attached it to, refitting it
-    back over the whole row). The oblique view is a pure DEPTH
-    COMPLETION pass with no VLM call: each front instance's box is
-    projected into the oblique image as the SAM box prompt, and the
-    back-projected depth points are unioned with the front points.
+    cabinets). The oblique view DOES run its own local grounding (same
+    prompt), but its groups are never adopted as instances -- all its
+    back-projected points form a pool, sliced per front instance by
+    along-row span, from which ONLY the depth dimension is measured
+    (_apply_depth_from_oblique): whether oblique grounds 1 merged box
+    or N boxes, each front instance takes just its cabinet's depth.
 
     MULTI-instance: the front grounding separates a joined row into one
     group per visually distinct cabinet (different height / color).
@@ -793,62 +830,55 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
             pass
     audit["views"].append(va)
 
-    # ---- pass 2 (depth views): projected SAM prompts, no VLM ----
-    # The oblique image answers ONE question per instance -- the depth
-    # extent -- from a prompt that is a deterministic projection of the
-    # voter's fit. It cannot disagree about instance division because
-    # it never divides: one prompt in, one mask out.
-    from agentic_gts.output.gs_render import _box_corners_3d
+    # ---- pass 2 (depth views): independent grounding, DEPTH-ONLY use ----
+    # The oblique view runs the SAME local grounding prompt as front,
+    # but its groups are never adopted as instances (foreshortening
+    # merges adjacent cabinets). All groups' back-projected points form
+    # a pool; _apply_depth_from_oblique slices it per front instance
+    # (along span) and measures ONLY that cabinet's depth.
     for dv in (depth_views if instances else []):
+        verdict = judge.adjudicate_sam_boxes(
+            dv["image"], box, dv["name"], png_path=dv["path"])
+        groups = verdict.params.get("groups", []) if verdict.params else []
         dva = {"view": dv["name"], "image": dv["path"],
-               "role": "depth_completion", "instances": []}
+               "role": "depth_grounding", "groups": groups,
+               "instances": []}
         H, W = dv["image"].shape[:2]
-        for ii, inst in enumerate(instances):
-            pb = _projection_prompt_box(inst["fitted"], box)
-            corners = _box_corners_3d(pb)
-            uv = dv["cam"].project_cv(corners)
-            x0, y0 = float(uv[:, 0].min()), float(uv[:, 1].min())
-            x1, y1 = float(uv[:, 0].max()), float(uv[:, 1].max())
-            pad = 0.05 * max(x1 - x0, y1 - y0)
-            box_pix = np.array([max(x0 - pad, 0.0), max(y0 - pad, 0.0),
-                                min(x1 + pad, W - 1.0), min(y1 + pad, H - 1.0)])
-            drec = {"from_view": inst["view"], "points": 0}
-            dva["instances"].append(drec)
+        pool, pool_ms = [], 0.0
+        for gi, g in enumerate(groups):
+            group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
+                             float(g.get("confidence", 0.5)))
+            box_pix = group.pixel_box(W, H)
             if not (box_pix[2] - box_pix[0] > 4
                     and box_pix[3] - box_pix[1] > 4):
-                drec["reason"] = "degenerate projection"
-                continue
+                continue                  # degenerate/absent box
             masks, scores = sam.predict(dv["image"], box_pix)
-            mi = int(np.argmax(scores))
-            mask, ms = masks[mi], float(scores[mi])
-            pts3 = _mask_to_points(scene, box, mask, dv["cam"])
-            if out_dir:
-                _save_sam_debug(dv, box_pix, mask, pts3, box,
-                                inst["fitted"], out_dir,
-                                f"{box.box_id}_{dv['name']}_i{ii}_depth")
-            if len(pts3) < 20:
-                drec["reason"] = "too few depth points"
-                continue
-            union = np.vstack([inst["pts"], pts3])
-            refit = fit_mask_points(union, box)
-            if refit is None:
-                drec["reason"] = "union refit failed"
-                continue
-            # BLEED guard: the oblique mask may have eaten a neighbour
-            # (the projected prompt is generous in depth). The union
-            # must not balloon along the row -- if it does, the depth
-            # pass is discarded and the front-only fit stands.
-            if refit.size[0] > 1.3 * inst["fitted"].size[0] + 0.1:
-                drec["reason"] = "depth mask bled into a neighbour"
-                continue
-            drec.update({"points": int(len(pts3)), "accepted": True})
-            inst["pts"] = union
-            inst["fitted"] = refit
-            inst["view"] = f'{inst["view"]}+{dv["name"]}'
-            inst["mask_score"] = 0.5 * (inst["mask_score"] + ms)
-            inst["score"] = min(
-                score_candidate(inst["mask_score"], union, refit, box) + 0.08,
-                1.0)
+            best = None
+            for mi, (mask, ms) in enumerate(zip(masks, scores)):
+                pts3 = _mask_to_points(scene, box, mask, dv["cam"])
+                if out_dir:
+                    _save_sam_debug(dv, box_pix, mask, pts3, box,
+                                    None, out_dir,
+                                    f"{box.box_id}_{dv['name']}_g{gi}_m{mi}")
+                if len(pts3) < 20:
+                    continue
+                if best is None or ms > best[1]:
+                    best = (pts3, float(ms))
+            if best is not None:
+                pool.append(best[0])
+                pool_ms = max(pool_ms, best[1])
+        if pool:
+            recs = _apply_depth_from_oblique(
+                instances, np.vstack(pool), box)
+            dva["instances"] = recs
+            for inst, rec in zip(instances, recs):
+                if not rec.get("accepted"):
+                    continue    # depth measurement rejected: front fit stands
+                inst["view"] = inst["view"] + f'+{dv["name"]}(depth)'
+                inst["mask_score"] = 0.5 * (inst["mask_score"] + pool_ms)
+                inst["score"] = min(
+                    score_candidate(inst["mask_score"], inst["pts"],
+                                    inst["fitted"], box) + 0.08, 1.0)
         if out_dir:
             try:
                 with open(os.path.join(
