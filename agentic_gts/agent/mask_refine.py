@@ -538,7 +538,10 @@ def _save_sam_debug(view: dict | None, coords, labels, mask, pts3,
             # ---- panel 1: prompt points on the clean view ----
             p1 = Image.fromarray(img.copy())
             d1 = ImageDraw.Draw(p1)
-            for (x, y), lab in zip(coords or [], labels or []):
+            # NB: coords/labels are numpy arrays -- `coords or []` would
+            # evaluate the array's truth value (ValueError: ambiguous).
+            for (x, y), lab in zip(coords if coords is not None else (),
+                                   labels if labels is not None else ()):
                 r = max(6, W // 128)
                 color = (0, 255, 0) if lab > 0 else (255, 40, 40)
                 d1.ellipse((x - r, y - r, x + r, y + r),

@@ -176,8 +176,11 @@ def test_sam_debug_composite():
                            rng.uniform(30, 70, n),
                            rng.uniform(0.0, 2.0, n)])
     with tempfile.TemporaryDirectory() as td:
-        _save_sam_debug(view, [(50, 50), (60, 45), (20, 20)],
-                        [1, 1, 0], mask, pts3,
+        # numpy arrays (the runtime types) -- `coords or []` on an array
+        # raises ValueError (ambiguous truth value), lists hid the bug
+        _save_sam_debug(view,
+                        np.array([[50.0, 50.0], [60.0, 45.0], [20.0, 20.0]]),
+                        np.array([1, 1, 0]), mask, pts3,
                         OrientedBox(center=(50, 50, 1), size=(40, 40, 2),
                                     yaw=0.0),
                         OrientedBox(center=(50, 50, 1), size=(36, 36, 1.9),
