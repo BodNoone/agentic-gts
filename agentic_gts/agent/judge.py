@@ -1288,17 +1288,23 @@ class VLMJudge:
         return Verdict(action="keep" if p["count"] <= 1 else "split",
                        params=p, confidence=0.6, detail="")
 
+    # Prompt style follows the OFFICIAL 2d_grounding cookbook verbatim
+    # (same lesson as _GROUND_PROMPT above): categories + the JSON
+    # template ONLY. Explaining the coordinate system or dictating a
+    # custom reply structure (the earlier candidate_groups draft) is
+    # off-distribution instruction the model must second-guess. The
+    # official {"bbox_2d": ..., "label": ...} array is the trained
+    # output; parse_box_groups accepts it natively (top-level array,
+    # label -> hypothesis).
     _SAM_BOX_PROMPT = (
-        "Locate ONE target device (a server rack / IT cabinet, or an "
-        "air-conditioning unit) in a local {view_name} view. The image is "
-        "a clean render of the device itself on a dark background: the "
-        "bright structure filling most of the frame IS the target. Draw "
-        "the tight 2D bounding box around the whole visible device. "
-        "Return 1-3 candidate boxes if the target extent is ambiguous. "
-        "Coordinates use the relative 0-1000 image grid (x=0 left, "
-        "x=1000 right, y=0 top, y=1000 bottom). Output ONLY JSON:\n"
-        '{"candidate_groups": [{"bbox_2d": [x1, y1, x2, y2], '
-        '"hypothesis": "rack", "confidence": 0.0}]}'
+        "This is a local {view_name} view of one target device in a "
+        "data-center room, rendered clean on a dark background: the "
+        "bright structure filling most of the frame IS the target.\n"
+        "Locate every instance that belongs to the following categories: "
+        '"server rack / IT cabinet, air-conditioning unit". The box '
+        "must cover the whole visible device.\n"
+        "Report bbox coordinates in JSON format like this: "
+        '{"bbox_2d": [x1, y1, x2, y2], "label": "rack"}'
     )
 
     def adjudicate_sam_boxes(self, image: np.ndarray, box,

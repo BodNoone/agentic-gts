@@ -45,20 +45,47 @@ def test_box_groups_accept_fractional_and_swapped():
 
 
 def test_sam_box_prompt_construction():
-    """The real-VLM prompt must survive construction: the JSON example's
-    literal braces ({\"candidate_groups\": ...}) used to be parsed by
-    str.format as a replacement field -> KeyError on every call (the
-    mock backend never formats, so only a real run caught it)."""
+    """The real-VLM prompt must survive construction (literal JSON
+    braces vs .format) AND follow the official 2d_grounding cookbook
+    style, same as _GROUND_PROMPT: categories + JSON template only,
+    no coordinate-system explanation, no custom reply structure."""
     from agentic_gts.agent.judge import VLMJudge
     j = VLMJudge(backend="qwen")
     prompt = j._SAM_BOX_PROMPT.replace("{view_name}", "front")
     assert "{view_name}" not in prompt and "front" in prompt
-    assert '{"candidate_groups"' in prompt, \
+    assert '{"bbox_2d"' in prompt, \
         "the JSON example braces must stay literal"
-    assert "bbox_2d" in prompt, "the box prompt must ask for bbox_2d"
-    # regression: .format would raise KeyError '"candidate_groups"'
-    # (field name includes the quotes) -- nothing may raise now
-    print("PASS SAM box prompt construction (literal JSON braces)")
+    assert '"label"' in prompt, "cookbook template carries a label field"
+    assert "candidate_groups" not in prompt, \
+        "no custom reply structure (off-distribution instruction)"
+    assert "0-1000" not in prompt, \
+        "no coordinate-system explanation (the trained format implies it)"
+    assert "Locate every instance" in prompt, \
+        "the cookbook's trained locate phrasing must be kept"
+    print("PASS SAM box prompt construction (cookbook style, literal braces)")
+
+
+def test_box_groups_official_cookbook_array():
+    """Qwen's native 2d_grounding reply: a top-level ARRAY of
+    {"bbox_2d": ..., "label": ...} items. The structural scan enters
+    every inner object too -- a reversed first-hit used to return only
+    the LAST item of a multi-box reply (truncating 1-3 candidates)."""
+    reply = ('[{"bbox_2d": [100, 200, 500, 600], "label": "rack"}, '
+             '{"bbox_2d": [300, 150, 480, 620], "label": "crac"}]')
+    groups = parse_box_groups(reply)
+    assert len(groups) == 2, \
+        "both items must survive (was truncated to the last one)"
+    assert groups[0].bbox_norm == (100.0, 200.0, 500.0, 600.0)
+    assert groups[0].hypothesis == "rack"
+    assert groups[1].hypothesis == "crac"
+    # multi-candidate custom draft still parses in full
+    reply2 = ('{"candidate_groups": ['
+              '{"bbox_2d": [50, 60, 400, 500]}, '
+              '{"bbox_2d": [80, 90, 420, 520]}, '
+              '{"bbox_2d": [100, 120, 440, 540]}]}')
+    assert len(parse_box_groups(reply2)) == 3, \
+        "candidate_groups replies must not truncate either"
+    print("PASS box groups (official cookbook array, no truncation)")
 
 
 def test_fit_mask_points_preserves_length_axis():

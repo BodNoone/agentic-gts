@@ -65,18 +65,32 @@ def parse_box_groups(text: str) -> list[BoxGroup]:
         except json.JSONDecodeError:
             continue
     if values:
-        # Prefer a complete top-level structure carrying box-group keys;
-        # later values may just be nested [x1,y1,x2,y2] arrays from the scan.
-        for value in reversed(values):
-            if (isinstance(value, dict) and
-                    any(k in value for k in ("candidate_groups", "groups",
-                                              "bbox_2d", "bbox", "box"))):
-                data = value
-                break
-            if (isinstance(value, list) and value and
-                    all(isinstance(x, dict) for x in value)):
-                data = value
-                break
+        # Pick the strongest structure, not the LAST-scanned fragment:
+        # the scan above also enters every INNER object, so a reversed
+        # first-hit would return the final single item of a multi-box
+        # reply (truncating 1-3 candidates to the last one). Priority:
+        # candidate_groups dict > official cookbook ARRAY of
+        # {"bbox_2d", "label"} items > one bare box dict.
+        def _has_bbox(v) -> bool:
+            return (isinstance(v, dict)
+                    and any(k in v for k in ("bbox_2d", "bbox", "box")))
+
+        best, best_rank = None, -1
+        for value in values:
+            if (isinstance(value, dict)
+                    and ("candidate_groups" in value or "groups" in value)):
+                rank = 3
+            elif (isinstance(value, list) and value
+                    and all(isinstance(x, dict) for x in value)
+                    and any(_has_bbox(x) for x in value)):
+                rank = 2
+            elif _has_bbox(value):
+                rank = 1
+            else:
+                continue
+            if rank > best_rank:
+                best, best_rank = value, rank
+        data = best
     if data is None:
         return []
     if isinstance(data, dict):
@@ -116,8 +130,11 @@ def parse_box_groups(text: str) -> list[BoxGroup]:
             conf = float(item.get("confidence", 0.5))
         except (TypeError, ValueError):
             conf = 0.5
-        groups.append(BoxGroup(bbox, str(item.get("hypothesis", "rack")),
-                               min(max(conf, 0.0), 1.0)))
+        # official cookbook emits "label"; the earlier custom draft
+        # asked for "hypothesis" -- accept both
+        label = str(item.get("label") or item.get("hypothesis")
+                    or "rack")[:20]
+        groups.append(BoxGroup(bbox, label, min(max(conf, 0.0), 1.0)))
     return groups
 
 
