@@ -479,12 +479,21 @@ def render_local_views(scene: Scene, box: OrientedBox,
 
 
 def _mask_to_points(scene: Scene, box: OrientedBox, mask: np.ndarray, cam,
-                    margin: float = 0.8) -> np.ndarray:
+                    margin: float = 0.25) -> np.ndarray:
     """Lift mask to visible local 3DGS centers with a small z-buffer.
 
     Selecting every center whose projection lands in the mask also selects
     surfaces hidden behind the visible rack, inflating the fitted OBB. Keep
     only points close to the nearest projected depth in each pixel.
+
+    margin: the candidate region is the seed OBB grown by this much.
+    Backprojected points far outside the seed are NOISE -- a mask edge
+    bleeding onto the floor / neighbouring structure picks up their
+    pixels, and the P1-P99 fit balloons toward them (user report:
+    backprojected points well past the initial box). 0.25 m allows the
+    legitimate case (a slightly conservative grounding box growing to
+    the true surface, which the nadir point-fit places within ~0.2 m)
+    while dropping the bleed the old 0.8 m margin let through.
     """
     pts = np.asarray(scene.points, dtype=float)
     region = box.contains(pts, margin=margin)

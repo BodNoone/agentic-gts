@@ -312,6 +312,41 @@ def test_open_side_flush_wall_and_floaters():
           f"(corridor {corridor:.1f} / {corridor2:.1f})")
 
 
+def test_mask_to_points_clips_far_outside_seed():
+    """Backprojected points must stay within a small pad of the seed OBB:
+    mask-edge bleed onto floor / neighbouring structure picks up their
+    pixels, and the P1-P99 fit balloons toward them (user report:
+    backprojected points well past the initial box). 0.15 m outside the
+    face survives (a conservative grounding box growing to the true
+    surface); 0.4 m outside is dropped."""
+    from agentic_gts.agent.mask_refine import _mask_to_points
+    from agentic_gts.output.gs_render import Cam
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(2.0, 1.0, 2.0),
+                      yaw=0.0)
+    # front-view camera in the +y aisle looking back at the box
+    cam = Cam(eye=np.array([0.0, 4.0, 1.2]),
+              target=np.array([0.0, 0.0, 1.0]), up=np.array([0.0, 0.0, 1.0]),
+              fovy_deg=60.0, W=768, H=768)
+    pts = np.array([
+        [0.0, 0.0, 1.0],           # inside: kept
+        [0.5, -0.3, 1.6],          # inside: kept
+        [0.0, 0.65, 1.0],          # 0.15 m past the front face: kept
+        [0.2, 0.90, 1.0],          # 0.40 m past the front face: DROPPED
+        [1.6, 0.0, 1.0],           # 0.60 m past the row end: DROPPED
+        [0.0, 0.0, -0.30],         # 0.30 m below the box floor: DROPPED
+    ])
+    scene = Scene(points=pts)
+    mask = np.ones((768, 768), dtype=bool)
+    out = _mask_to_points(scene, box, mask, cam)
+    got = {tuple(np.round(p, 3)) for p in out}
+    assert (0.0, 0.0, 1.0) in got and (0.5, -0.3, 1.6) in got, got
+    assert (0.0, 0.65, 1.0) in got, (
+        f"slight growth past the face must survive, got {got}")
+    for p in ((0.2, 0.90, 1.0), (1.6, 0.0, 1.0), (0.0, 0.0, -0.30)):
+        assert p not in got, f"noise point {p} must be clipped, got {got}"
+    print("PASS mask backprojection clips points far outside the seed")
+
+
 def test_apply_depth_from_oblique_single_merged_pool():
     """The oblique depth rule: front instances keep along/height; the
     oblique pool (typically ONE merged mask covering the whole row --
