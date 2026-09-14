@@ -27,31 +27,29 @@ from agentic_gts.core.models import BoxSource, Confidence, OrientedBox, Scene
 
 
 @dataclass
-class PointGroup:
-    positive_norm: list[tuple[float, float]]
-    negative_norm: list[tuple[float, float]]
+class BoxGroup:
+    bbox_norm: tuple[float, float, float, float]   # x1,y1,x2,y2 on 0..1000
     hypothesis: str = "rack"
     confidence: float = 0.5
 
-    def pixel_prompts(self, W: int, H: int) -> tuple[np.ndarray, np.ndarray]:
-        pts = self.positive_norm + self.negative_norm
-        labels = [1] * len(self.positive_norm) + [0] * len(self.negative_norm)
-        if not pts:
-            return np.empty((0, 2), dtype=np.float32), np.empty(0, dtype=np.int32)
-        xy = np.asarray([[x / 1000.0 * (W - 1), y / 1000.0 * (H - 1)]
-                         for x, y in pts], dtype=np.float32)
-        return xy, np.asarray(labels, dtype=np.int32)
+    def pixel_box(self, W: int, H: int) -> np.ndarray:
+        x1, y1, x2, y2 = self.bbox_norm
+        return np.array([x1 / 1000.0 * (W - 1), y1 / 1000.0 * (H - 1),
+                          x2 / 1000.0 * (W - 1), y2 / 1000.0 * (H - 1)],
+                         dtype=np.float32)
 
 
-def parse_point_groups(text: str) -> list[PointGroup]:
-    """Parse Qwen point-grounding JSON (relative 0..1000 coordinates).
+def parse_box_groups(text: str) -> list[BoxGroup]:
+    """Parse Qwen box-grounding JSON (relative 0..1000 coordinates).
 
     Accepted shapes:
-      {"candidate_groups": [{"positive": [[x,y]], "negative": ...}]}
-      [{"positive_points": ..., "negative_points": ...}]
-      {"positive": ..., "negative": ...}
-    Points may be [x,y] or {"x": x, "y": y}. Values in 0..1 are accepted
-    as normalized fractions and converted to 0..1000 for robustness.
+      {"candidate_groups": [{"bbox_2d": [x1,y1,x2,y2], ...}]}
+      [{"bbox_2d" | "bbox" | "box": [...]}]
+      {"bbox_2d": [...]}
+
+    Box grounding is Qwen3-VL's NATIVE task format (bbox_2d), unlike
+    point placement which the model does poorly -- the reason the
+    pipeline switched from point prompts to a pure box prompt for SAM.
     """
     if not text:
         return []
@@ -67,12 +65,12 @@ def parse_point_groups(text: str) -> list[PointGroup]:
         except json.JSONDecodeError:
             continue
     if values:
-        # Prefer a complete top-level structure carrying prompt-group keys;
-        # later values may just be nested [x,y] arrays encountered by the scan.
+        # Prefer a complete top-level structure carrying box-group keys;
+        # later values may just be nested [x1,y1,x2,y2] arrays from the scan.
         for value in reversed(values):
             if (isinstance(value, dict) and
                     any(k in value for k in ("candidate_groups", "groups",
-                                              "positive", "positive_points"))):
+                                              "bbox_2d", "bbox", "box"))):
                 data = value
                 break
             if (isinstance(value, list) and value and
@@ -88,41 +86,43 @@ def parse_point_groups(text: str) -> list[PointGroup]:
     else:
         return []
 
-    def _points(raw):
-        out = []
-        for p in raw or []:
-            try:
-                if isinstance(p, dict):
-                    x, y = float(p["x"]), float(p["y"])
-                else:
-                    x, y = float(p[0]), float(p[1])
-            except (KeyError, IndexError, TypeError, ValueError):
-                continue
-            if max(abs(x), abs(y)) <= 1.0:
-                x, y = x * 1000.0, y * 1000.0
-            if 0 <= x <= 1000 and 0 <= y <= 1000:
-                out.append((x, y))
-        return out
+    def _bbox(raw):
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            raw = raw.get("bbox_2d") or raw.get("bbox") or raw.get("box")
+        try:
+            x1, y1, x2, y2 = (float(v) for v in raw[:4])
+        except (TypeError, ValueError):
+            return None
+        if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.0:
+            x1, y1, x2, y2 = x1 * 1000.0, y1 * 1000.0, \
+                x2 * 1000.0, y2 * 1000.0
+        x1, x2 = min(x1, x2), max(x1, x2)
+        y1, y2 = min(y1, y2), max(y1, y2)
+        if not (0 <= x1 < x2 <= 1000 and 0 <= y1 < y2 <= 1000):
+            return None
+        return (x1, y1, x2, y2)
 
     groups = []
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
             continue
-        pos = _points(item.get("positive") or item.get("positive_points"))
-        neg = _points(item.get("negative") or item.get("negative_points"))
-        if not pos:
+        bbox = _bbox(item.get("bbox_2d") or item.get("bbox")
+                     or item.get("box"))
+        if bbox is None:
             continue
         try:
             conf = float(item.get("confidence", 0.5))
         except (TypeError, ValueError):
             conf = 0.5
-        groups.append(PointGroup(pos, neg, str(item.get("hypothesis", "rack")),
-                                 min(max(conf, 0.0), 1.0)))
+        groups.append(BoxGroup(bbox, str(item.get("hypothesis", "rack")),
+                               min(max(conf, 0.0), 1.0)))
     return groups
 
 
 class SamPredictorAdapter:
-    """Lazy SAM2/SAM1 predictor with a uniform point-prompt interface."""
+    """Lazy SAM2/SAM1 predictor with a uniform box-prompt interface."""
 
     def __init__(self, checkpoint: str | None = None,
                  model_cfg: str | None = None):
@@ -198,13 +198,19 @@ class SamPredictorAdapter:
         except ImportError as e:
             raise RuntimeError("install SAM2 or segment-anything") from e
 
-    def predict(self, image: np.ndarray, point_coords: np.ndarray,
-                point_labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def predict(self, image: np.ndarray,
+                box: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Segment with a pure BOX prompt (pixel coords [x1,y1,x2,y2]).
+
+        The box prompt is SAM's canonical interaction: coarse anchoring
+        from the VLM, fine boundaries from the mask. multimask_output
+        keeps the 3 granularity candidates (object / part / supart)
+        competing downstream."""
         self._load()
         u8 = (np.clip(image[..., :3], 0, 1) * 255).astype(np.uint8)
         self._predictor.set_image(u8)
         masks, scores, _ = self._predictor.predict(
-            point_coords=point_coords, point_labels=point_labels,
+            box=np.asarray(box, dtype=np.float32),
             multimask_output=True)
         return np.asarray(masks, dtype=bool), np.asarray(scores, dtype=float)
 
@@ -504,18 +510,18 @@ def _overlay_mask(img_u8: np.ndarray, m: np.ndarray,
                    0, 255).astype(np.uint8)
 
 
-def _save_sam_debug(view: dict | None, coords, labels, mask, pts3,
+def _save_sam_debug(view: dict | None, box_prompt, mask, pts3,
                     box, fitted, out_dir: str, tag: str) -> None:
     """Composite debug render for ONE SAM candidate (user request):
-      panel 1: the view image with the VLM's prompt points drawn
-               (green = positive, red = negative)
+      panel 1: the view image with the VLM's box prompt drawn (green)
       panel 2: the same image with the SAM mask overlaid (cyan tint +
                solid edge)
       panel 3: the back-projected 3D points top-down (z colored), the
                OLD box (dashed blue) and the FITTED box (solid red)
     view=None renders panel 3 only (the multi-view union candidate has
     no single owning view). Never raises: debug output must not break
-    the refinement."""
+    the refinement.
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -553,17 +559,12 @@ def _save_sam_debug(view: dict | None, coords, labels, mask, pts3,
             img = np.asarray(view["image"], dtype=np.float32)
             img = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3]
             H, W = img.shape[:2]
-            # ---- panel 1: prompt points on the clean view ----
+            # ---- panel 1: the VLM's box prompt on the clean view ----
             p1 = Image.fromarray(img.copy())
             d1 = ImageDraw.Draw(p1)
-            # NB: coords/labels are numpy arrays -- `coords or []` would
-            # evaluate the array's truth value (ValueError: ambiguous).
-            for (x, y), lab in zip(coords if coords is not None else (),
-                                   labels if labels is not None else ()):
-                r = max(6, W // 128)
-                color = (0, 255, 0) if lab > 0 else (255, 40, 40)
-                d1.ellipse((x - r, y - r, x + r, y + r),
-                           fill=color, outline=(255, 255, 255), width=2)
+            if box_prompt is not None:
+                x1, y1, x2, y2 = (float(v) for v in box_prompt[:4])
+                d1.rectangle((x1, y1, x2, y2), outline=(0, 255, 0), width=3)
             # ---- panel 2: mask overlay on the same view ----
             p2 = Image.fromarray(img.copy())
             if mask is not None:
@@ -584,7 +585,7 @@ def _save_sam_debug(view: dict | None, coords, labels, mask, pts3,
                     for xx, yy in zip(xs.tolist(), ys.tolist()):
                         d2.point((xx, yy), fill=(0, 220, 255))
             panels = [p1, p2, p3]
-            titles = ["1. VLM prompt pts (+=green -=red)",
+            titles = ["1. VLM box prompt (green)",
                       "2. SAM mask", "3. back-projected pts (top-down)"]
 
         # ---- tile horizontally with label strips ----
@@ -606,197 +607,18 @@ def _save_sam_debug(view: dict | None, coords, labels, mask, pts3,
               f"({type(e).__name__}: {e})")
 
 
-def _augment_spread(view_img: np.ndarray, coords: np.ndarray,
-                    labels: np.ndarray, min_points: int = 6,
-                    min_spread: float = 0.45, max_add: int = 4):
-    """Guard against clustered VLM point prompts (user report: points
-    bunched on one door/panel make SAM segment a LOCAL part of the rack).
-
-    When the positive points span less than `min_spread` of the image
-    diagonal (or there are fewer than `min_points`), add points sampled
-    from the device's interior pixels: the local views render ONLY the
-    box's own gaussians, so every non-background pixel belongs to the
-    target. Candidates are picked farthest-point style -- each new point
-    maximizes its distance to the points already in the set -- so the
-    additions spread the coverage instead of re-clustering.
-
-    Returns (coords, labels) with the added positives appended.
-    """
-    coords = np.asarray(coords, dtype=np.float64).reshape(-1, 2)
-    labels = np.asarray(labels).reshape(-1)
-    if not len(coords):
-        return coords, labels
-    pos = coords[labels > 0]
-    H, W = view_img.shape[:2]
-    diag = math.hypot(H, W)
-
-    def _spread(ps):
-        return float(np.linalg.norm(ps.max(axis=0) - ps.min(axis=0))) \
-            if len(ps) else 0.0
-
-    if (len(pos) >= min_points and
-            _spread(pos) >= min_spread * diag):
-        return coords, labels
-
-    # device foreground: non-background pixels (local views are box-only
-    # renders, so fg == the target device), eroded so sampled points sit
-    # safely inside the silhouette, away from boundaries
-    img = np.asarray(view_img, dtype=np.float32)
-    if img.ndim == 2:
-        img = img[..., None]
-    gray = img[..., :3].mean(axis=2)
-    if float(gray.max()) > 1.5:            # uint8-scale input
-        gray = gray / 255.0
-    fg = gray > 0.08
-    if not fg.any():
-        return coords, labels
-    inside = fg.copy()
-    for dy in (-2, 0, 2):
-        for dx in (-2, 0, 2):
-            inside &= np.roll(np.roll(fg, dy, axis=0), dx, axis=1)
-    ys, xs = np.nonzero(inside if inside.sum() > 50 else fg)
-    cands = np.column_stack([xs, ys]).astype(np.float64)
-
-    pts = [p for p in pos]
-    for _ in range(max_add):
-        if len(pts) >= min_points and _spread(np.asarray(pts)) >= \
-                min_spread * diag:
-            break
-        d = np.min(np.linalg.norm(
-            cands[:, None, :] - np.asarray(pts)[None, :, :], axis=2),
-            axis=1) if pts else \
-            np.linalg.norm(cands - cands.mean(axis=0), axis=1)
-        pts.append(cands[int(np.argmax(d))])
-    if not pts:
-        return coords, labels
-    new_pos = np.asarray(pts, dtype=np.float64)
-    return (np.vstack([coords, new_pos[len(pos):]]),
-            np.concatenate([labels,
-                            np.ones(len(pts) - len(pos), dtype=labels.dtype)]))
-
-
-def _calibrate_coord_scale(img: np.ndarray, coords: np.ndarray,
-                           labels: np.ndarray) -> np.ndarray:
-    """Re-interpret VLM point coords when the backend's convention
-    differs from the assumed 0-1000 grid (user report: points mostly
-    off the device even on a clean probe image, so it is NOT the
-    wireframe -- it is the coordinate frame).
-
-    pixel_prompts() divides by 1000 -- Qwen3-VL's native relative grid,
-    y=0 at TOP. Two alternative conventions shift every point the same
-    systematic way:
-      * ABSOLUTE PIXELS (Qwen2.5-VL's convention): every point shrinks
-        to ~0.77x of its intended position on a 768px view, biased
-        toward the top-left corner;
-      * Y MEASURED FROM THE BOTTOM: every point mirrors vertically.
-    All four readings {grid, pixels} x {normal, Y-flip} are scored by
-    the fraction of POSITIVE points landing on the device (the device
-    IS the foreground of box-only local views). Rules:
-      * a raw value beyond the image size rules out the PIXEL readings
-        (a grid coord still runs to 1000, so Y-flip stays testable);
-      * only a CLEAR win (>= 0.25 over the grid reading) re-maps -- a
-        tie keeps the grid (no regression for compliant Qwen3-VL
-        servers).
-    """
-    if not len(coords) or not (labels > 0).any():
-        return coords
-    H, W = img.shape[:2]
-    raw = coords / np.array([W - 1, H - 1], dtype=np.float64) * 1000.0
-    # a raw value beyond the image size cannot be a PIXEL reading -- but
-    # it says nothing about Y-flip (a flipped grid coord still runs to
-    # 1000), so only the pixel candidates are ruled out
-    pixels_possible = raw.max() <= max(W, H) + 2
-    fg = img[..., :3].mean(axis=2) > 0.08
-    if not fg.any():
-        return coords
-    pos = raw[labels > 0]
-
-    def _read(pts, pixel: bool, flip: bool):
-        p = pts.copy()
-        if flip:
-            p[:, 1] = 1000.0 - p[:, 1]
-        if pixel:
-            return np.clip(p, 0, [W - 1, H - 1])
-        return p / 1000.0 * np.array([W - 1, H - 1])
-
-    def _on_fg(pts):
-        x = np.clip(np.rint(pts[:, 0]), 0, W - 1).astype(int)
-        y = np.clip(np.rint(pts[:, 1]), 0, H - 1).astype(int)
-        return float(fg[y, x].mean())
-
-    readings = [("grid", False, False), ("grid+Yflip", False, True)]
-    if pixels_possible:
-        readings += [("pixels", True, False), ("pixels+Yflip", True, True)]
-    base = _on_fg(_read(pos, False, False))
-    best_name, best_flags, best_score = "grid", (False, False), base
-    for name, pix, fl in readings:
-        s = _on_fg(_read(pos, pix, fl))
-        if s > best_score:
-            best_name, best_flags, best_score = name, (pix, fl), s
-    if best_score - base < 0.25:
-        return coords
-    print(f"[mask-refine] VLM points read better as {best_name.upper()} "
-          f"({best_score:.2f}) than the 0-1000 grid ({base:.2f}); "
-          "re-mapped")
-    return _read(raw, *best_flags).astype(np.float32)
-
-
-def _pull_points_inward(view_img: np.ndarray, coords: np.ndarray,
-                        labels: np.ndarray,
-                        margin_frac: float = 0.06) -> tuple[np.ndarray,
-                                                            np.ndarray]:
-    """Pull POSITIVE prompts off the target's boundary (user report:
-    points sitting on the device's edge hit attached cables / conduit /
-    ladders, and SAM then segments those connected things in too).
-
-    The local views render ONLY the box's own gaussians, so the
-    foreground silhouette IS the device. Erode it by `margin_frac` of
-    the image's shorter side and snap every positive that falls outside
-    the eroded interior to its nearest interior pixel. Negatives are
-    left alone (they are SUPPOSED to sit on the surroundings). Points
-    already deep inside pass through unchanged.
-    """
-    coords = np.asarray(coords, dtype=np.float64).reshape(-1, 2)
-    labels = np.asarray(labels).reshape(-1)
-    if not len(coords) or not (labels > 0).any():
-        return coords, labels
-    img = np.asarray(view_img, dtype=np.float32)
-    if img.ndim == 2:
-        img = img[..., None]
-    gray = img[..., :3].mean(axis=2)
-    if float(gray.max()) > 1.5:            # uint8-scale input
-        gray = gray / 255.0
-    fg = gray > 0.08
-    if not fg.any():
-        return coords, labels
-    H, W = fg.shape
-    r = max(2, int(margin_frac * min(H, W)))
-    er = fg.copy()
-    for _ in range(r):
-        er = er & np.roll(er, 1, axis=0) & np.roll(er, -1, axis=0) \
-               & np.roll(er, 1, axis=1) & np.roll(er, -1, axis=1)
-        if er.sum() < 20:                  # thin device: stop eroding
-            break
-    if er.sum() < 20:
-        er = fg                            # degenerate: no interior left
-    if er.all():
-        return coords, labels
-    ys, xs = np.nonzero(er)
-    inside = np.column_stack([xs, ys]).astype(np.float64)
-    out = coords.copy()
-    for i in np.nonzero(labels > 0)[0]:
-        iy, ix = int(round(coords[i, 1])), int(round(coords[i, 0]))
-        if (0 <= iy < H and 0 <= ix < W) and er[iy, ix]:
-            continue
-        j = int(np.argmin(np.linalg.norm(inside - coords[i], axis=1)))
-        out[i] = inside[j]
-    return out, labels
-
-
 def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                out_dir: str | None = None,
                views: list | None = None) -> tuple[OrientedBox | None, dict]:
-    """Run Qwen point grounding + SAM + 3D fitting for one box."""
+    """Run VLM box grounding + SAM + 3D fitting for one box.
+
+    Box-only prompting (no points): point placement is a WEAK Qwen3-VL
+    skill (user report: prompts mostly off the device despite a clean
+    input image), while box grounding is the model's NATIVE task -- and
+    the box prompt is SAM's canonical interaction, forgiving of prompt
+    error where points are brittle. The VLM draws the coarse box; SAM
+    snaps the mask to the device inside it; the 3D fit comes from the
+    mask's back-projected gaussians."""
     if views is None:
         views = render_local_views(scene, box, out_dir)
     audit = {"box_id": box.box_id, "views": [], "accepted": False}
@@ -808,44 +630,31 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     for view in views:
         # CLEAN image to the VLM: the wireframe overlay (prompt_image)
         # is the Stage-A box, which is often oversized/misplaced -- the
-        # VLM anchors its points on the frame and lands them off the
-        # device (user report: mostly off-device points). Same principle
+        # VLM anchors on the frame instead of the device. Same principle
         # as global grounding: no box prompts in the input image. The
         # rack TYPE-CONFIRM call keeps the wireframe (it judges the box
-        # fit); point generation judges the DEVICE.
-        verdict = judge.adjudicate_sam_points(
+        # fit); box grounding judges the DEVICE.
+        verdict = judge.adjudicate_sam_boxes(
             view["image"], box, view["name"],
             png_path=view["path"])
         groups = verdict.params.get("groups", []) if verdict.params else []
         va = {"view": view["name"], "image": view["path"],
               "answer": verdict.raw or verdict.detail, "groups": groups}
         view_candidates = []
+        H, W = view["image"].shape[:2]
         for gi, g in enumerate(groups):
-            group = PointGroup(g["positive"], g.get("negative", []),
-                               g.get("hypothesis", "rack"),
-                               float(g.get("confidence", 0.5)))
-            coords, labels = group.pixel_prompts(view["image"].shape[1],
-                                                  view["image"].shape[0])
-            if not len(coords):
-                continue
-            # a backend answering in absolute pixels (Qwen2.5-VL's
-            # convention) gets shrunk ~0.77x toward the top-left by the
-            # 0-1000 grid conversion; re-map when the evidence says so
-            coords = _calibrate_coord_scale(view["image"], coords, labels)
-            # edge-sitting positives hit attached cables/ladders -> SAM
-            # segments them in; pull them back onto the device interior
-            coords, labels = _pull_points_inward(view["image"], coords,
-                                                 labels)
-            # clustered VLM points make SAM segment a local part; spread
-            # them with device-interior samples when coverage is poor
-            coords, labels = _augment_spread(view["image"], coords, labels)
-            masks, scores = sam.predict(view["image"], coords, labels)
+            group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
+                             float(g.get("confidence", 0.5)))
+            box_pix = group.pixel_box(W, H)
+            if not (box_pix[2] - box_pix[0] > 4 and box_pix[3] - box_pix[1] > 4):
+                continue                  # degenerate/absent box
+            masks, scores = sam.predict(view["image"], box_pix)
             for mi, (mask, ms) in enumerate(zip(masks, scores)):
                 pts3 = _mask_to_points(scene, box, mask, view["cam"])
                 fitted = fit_mask_points(pts3, box)
                 if out_dir:
-                    # debug composite: prompt points + mask + lifted pts
-                    _save_sam_debug(view, coords, labels, mask, pts3, box,
+                    # debug composite: prompt box + mask + lifted pts
+                    _save_sam_debug(view, box_pix, mask, pts3, box,
                                     fitted, out_dir,
                                     f"{box.box_id}_{view['name']}_g{gi}_m{mi}")
                 if fitted is None:
@@ -859,7 +668,7 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         if out_dir:
             try:
                 with open(os.path.join(
-                        out_dir, f"sam_points_{box.box_id}_{view['name']}.json"),
+                        out_dir, f"sam_boxes_{box.box_id}_{view['name']}.json"),
                           "w", encoding="utf-8") as f:
                     json.dump(va, f, ensure_ascii=False, indent=2)
             except OSError:
@@ -872,7 +681,7 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         fitted = fit_mask_points(union_pts, box)
         if out_dir:
             # union debug: panel 3 only (no single owning view)
-            _save_sam_debug(None, None, None, None, union_pts, box, fitted,
+            _save_sam_debug(None, None, None, union_pts, box, fitted,
                             out_dir, f"{box.box_id}_union")
         if fitted is not None:
             ms = float(np.mean([x[2] for x in best_points_per_view]))

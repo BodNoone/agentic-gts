@@ -1288,49 +1288,37 @@ class VLMJudge:
         return Verdict(action="keep" if p["count"] <= 1 else "split",
                        params=p, confidence=0.6, detail="")
 
-    _SAM_POINT_PROMPT = (
-        "You are preparing point prompts for SAM to segment ONE target "
-        "device (a server rack / IT cabinet, or an air-conditioning unit) "
-        "in a local {view_name} view. The image is a clean render of the "
-        "device itself on a dark background: the bright structure filling "
-        "most of the frame IS the target. Return 1-3 candidate prompt "
-        "groups. For each "
-        "group, place 5-8 POSITIVE points safely inside the target device "
-        "surface (door/panel/body), SPREAD ACROSS THE WHOLE target: put "
-        "points near its top, middle and bottom, and near its left, centre "
-        "and right -- clustered points make SAM segment only a local part "
-        "(one door, one panel) instead of the entire device. Also place "
-        "3-6 NEGATIVE points on the dark background around the target, "
-        "spread around it. Keep every POSITIVE point "
-        "well inside the target -- at least a tenth of the target's size "
-        "away from its edges: points near the edge land on attached "
-        "cables, conduit or ladders, and SAM then segments those in too. "
-        "Coordinates MUST use Qwen's official relative 0-1000 "
-        "image grid (x=0 left, x=1000 right, y=0 top, y=1000 bottom), not "
-        "pixels and not metres. Output ONLY JSON:\n"
-        '{"candidate_groups": [{"positive": [[x,y], ...], '
-        '"negative": [[x,y], ...], "hypothesis": "rack", '
-        '"confidence": 0.0}]}'
+    _SAM_BOX_PROMPT = (
+        "Locate ONE target device (a server rack / IT cabinet, or an "
+        "air-conditioning unit) in a local {view_name} view. The image is "
+        "a clean render of the device itself on a dark background: the "
+        "bright structure filling most of the frame IS the target. Draw "
+        "the tight 2D bounding box around the whole visible device. "
+        "Return 1-3 candidate boxes if the target extent is ambiguous. "
+        "Coordinates use the relative 0-1000 image grid (x=0 left, "
+        "x=1000 right, y=0 top, y=1000 bottom). Output ONLY JSON:\n"
+        '{"candidate_groups": [{"bbox_2d": [x1, y1, x2, y2], '
+        '"hypothesis": "rack", "confidence": 0.0}]}'
     )
 
-    def adjudicate_sam_points(self, image: np.ndarray, box,
-                              view_name: str,
-                              png_path: str | None = None) -> Verdict:
-        """Qwen3-VL point grounding for SAM (native 0..1000 coordinates)."""
-        from agentic_gts.agent.mask_refine import parse_point_groups
+    def adjudicate_sam_boxes(self, image: np.ndarray, box,
+                             view_name: str,
+                             png_path: str | None = None) -> Verdict:
+        """Qwen3-VL box grounding for SAM's box prompt (native task)."""
+        from agentic_gts.agent.mask_refine import parse_box_groups
         # .replace, NOT .format: the prompt's JSON example carries
         # literal braces ({"candidate_groups": ...}) that str.format
         # parses as a replacement field named '"candidate_groups"'
         # (quotes included) -> KeyError on EVERY real-VLM call (mock
         # never formats, so the tests could not catch it)
-        prompt = self._SAM_POINT_PROMPT.replace("{view_name}", view_name)
+        prompt = self._SAM_BOX_PROMPT.replace("{view_name}", view_name)
         if self.backend == "mock":
             return Verdict(action="keep", params={"groups": []},
-                           confidence=0.0, detail="mock: no SAM points")
+                           confidence=0.0, detail="mock: no SAM boxes")
         png = self._array_png_bytes(image)
         if png_path is None:
             png_path = self._save_evidence_png(
-                image, f"sam_points_{box.box_id}_{view_name}.png")
+                image, f"sam_boxes_{box.box_id}_{view_name}.png")
         try:
             if self.backend == "local":
                 text = self._local_image_call(png, prompt,
@@ -1338,19 +1326,19 @@ class VLMJudge:
             else:
                 text = self._qwen_image_call(png, prompt, max_tokens=800)
         except Exception as e:
-            self._record("sam_points", prompt, "", "", 0.0,
+            self._record("sam_boxes", prompt, "", "", 0.0,
                          f"call failed: {e}", png_path=png_path)
             return Verdict(action="keep", params={"groups": []},
                            confidence=0.0, detail=f"call failed: {e}")
-        parsed = parse_point_groups(self._strip_think(text))
-        groups = [{"positive": g.positive_norm,
-                   "negative": g.negative_norm,
+        parsed = parse_box_groups(self._strip_think(text))
+        groups = [{"bbox": g.bbox_norm,
                    "hypothesis": g.hypothesis,
                    "confidence": g.confidence} for g in parsed]
         conf = max((g.confidence for g in parsed), default=0.0)
-        self._record("sam_points", prompt, text,
+        self._record("sam_boxes", prompt, text,
                      f"{len(groups)} groups", conf,
-                     "normalized 0-1000; converted once to pixels for SAM",
+                     "bbox_2d normalized 0-1000; converted once to "
+                     "pixels for SAM's box prompt",
                      png_path=png_path)
         return Verdict(action="segment" if groups else "keep",
                        params={"groups": groups}, confidence=conf,

@@ -12,48 +12,53 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agentic_gts.agent.mask_refine import (
-    PointGroup, SamPredictorAdapter, fit_mask_points, parse_point_groups,
+    BoxGroup, SamPredictorAdapter, fit_mask_points, parse_box_groups,
     refine_box,
 )
 from agentic_gts.core.models import OrientedBox, Scene
 
 
-def test_point_groups_qwen_1000_to_pixels_once():
+def test_box_groups_qwen_1000_to_pixels_once():
     reply = (
         'analysis\n{"candidate_groups": ['
-        '{"positive": [[100,200], {"x":500,"y":600}], '
-        '"negative": [[900,800]], "confidence": 0.8}]}'
+        '{"bbox_2d": [100,200,500,600], "confidence": 0.8}]}'
     )
-    groups = parse_point_groups(reply)
+    groups = parse_box_groups(reply)
     assert len(groups) == 1
-    xy, labels = groups[0].pixel_prompts(768, 512)
-    assert labels.tolist() == [1, 1, 0]
-    assert np.allclose(xy[0], [76.7, 102.2], atol=0.1)
-    assert np.allclose(xy[2], [690.3, 408.8], atol=0.1)
-    print("PASS Qwen 0-1000 points converted to SAM pixels exactly once")
+    box_pix = groups[0].pixel_box(768, 512)
+    # 0-1000 grid converted to pixels exactly once
+    assert np.allclose(box_pix, [76.7, 102.2, 383.5, 306.6], atol=0.1)
+    print("PASS Qwen 0-1000 bbox_2d converted to SAM box pixels once")
 
 
-def test_point_groups_accept_fractional_normalized():
-    groups = parse_point_groups(
-        '{"positive": [[0.25,0.5]], "negative": [[0.9,0.1]]}')
-    assert groups[0].positive_norm == [(250.0, 500.0)]
-    print("PASS fractional [0,1] points normalized to Qwen 0-1000")
+def test_box_groups_accept_fractional_and_swapped():
+    # fractional [0,1] values normalized to the 0-1000 grid
+    groups = parse_box_groups('{"bbox_2d": [0.25, 0.5, 0.9, 1.0]}')
+    assert groups[0].bbox_norm == (250.0, 500.0, 900.0, 1000.0)
+    # swapped corners (x2 < x1) are normalized, not dropped
+    groups2 = parse_box_groups('{"bbox_2d": [900, 600, 250, 200]}')
+    assert groups2[0].bbox_norm == (250.0, 200.0, 900.0, 600.0)
+    # degenerate / out-of-range boxes dropped
+    assert parse_box_groups('{"bbox_2d": [500, 500, 500, 600]}') == []
+    assert parse_box_groups('{"bbox_2d": [100, 100, 2000, 300]}') == []
+    print("PASS box groups (fractional, swapped corners, degenerates)")
 
 
-def test_sam_point_prompt_construction():
+def test_sam_box_prompt_construction():
     """The real-VLM prompt must survive construction: the JSON example's
     literal braces ({\"candidate_groups\": ...}) used to be parsed by
     str.format as a replacement field -> KeyError on every call (the
     mock backend never formats, so only a real run caught it)."""
     from agentic_gts.agent.judge import VLMJudge
     j = VLMJudge(backend="qwen")
-    prompt = j._SAM_POINT_PROMPT.replace("{view_name}", "front")
+    prompt = j._SAM_BOX_PROMPT.replace("{view_name}", "front")
     assert "{view_name}" not in prompt and "front" in prompt
     assert '{"candidate_groups"' in prompt, \
         "the JSON example braces must stay literal"
+    assert "bbox_2d" in prompt, "the box prompt must ask for bbox_2d"
     # regression: .format would raise KeyError '"candidate_groups"'
     # (field name includes the quotes) -- nothing may raise now
-    print("PASS SAM point prompt construction (literal JSON braces)")
+    print("PASS SAM box prompt construction (literal JSON braces)")
 
 
 def test_fit_mask_points_preserves_length_axis():
@@ -157,9 +162,9 @@ def test_type_confirm_marks_low_not_deleted():
 
 
 def test_sam_debug_composite():
-    """The debug composite (user request): prompt points + mask overlay +
+    """The debug composite (user request): prompt box + mask overlay +
     back-projected points, one PNG per SAM candidate. Must produce a
-    readable image even with empty points / no fitted box."""
+    readable image even with no box prompt / no fitted box."""
     import tempfile
     from agentic_gts.agent.mask_refine import _save_sam_debug
 
@@ -167,7 +172,9 @@ def test_sam_debug_composite():
     H = W = 96
     view = {"name": "front", "image": rng.uniform(0, 1, (H, W, 3)),
             "cam": None, "path": None, "prompt_path": None}
-    # prompt points: 2 positive, 1 negative; mask: a filled ellipse
+    # the VLM's box prompt (pixels) around the device
+    box_pix = np.array([20.0, 25.0, 75.0, 70.0], dtype=np.float32)
+    # mask: a filled ellipse
     yy, xx = np.mgrid[0:H, 0:W]
     mask = ((xx - 50) ** 2 / 30 ** 2 + (yy - 50) ** 2 / 20 ** 2) <= 1.0
     # back-projected points: scattered inside the same ellipse footprint
@@ -176,11 +183,7 @@ def test_sam_debug_composite():
                            rng.uniform(30, 70, n),
                            rng.uniform(0.0, 2.0, n)])
     with tempfile.TemporaryDirectory() as td:
-        # numpy arrays (the runtime types) -- `coords or []` on an array
-        # raises ValueError (ambiguous truth value), lists hid the bug
-        _save_sam_debug(view,
-                        np.array([[50.0, 50.0], [60.0, 45.0], [20.0, 20.0]]),
-                        np.array([1, 1, 0]), mask, pts3,
+        _save_sam_debug(view, box_pix, mask, pts3,
                         OrientedBox(center=(50, 50, 1), size=(40, 40, 2),
                                     yaw=0.0),
                         OrientedBox(center=(50, 50, 1), size=(36, 36, 1.9),
@@ -188,10 +191,10 @@ def test_sam_debug_composite():
                         td, "box1_front_g0_m0")
         p = os.path.join(td, "sam_debug_box1_front_g0_m0.png")
         assert os.path.isfile(p) and os.path.getsize(p) > 5000, \
-            "3-panel composite (points + mask + lifted pts) must be written"
+            "3-panel composite (box + mask + lifted pts) must be written"
         # union path: view=None renders the top-down panel only, and a
         # failed fit (None) must still render
-        _save_sam_debug(None, None, None, None, pts3[:5],
+        _save_sam_debug(None, None, None, pts3[:5],
                         OrientedBox(center=(50, 50, 1), size=(40, 40, 2),
                                    yaw=0.0),
                         None, td, "box1_union")
@@ -238,58 +241,6 @@ def test_box_only_mask_hides_everything_outside():
     m2 = _box_only_mask(gs2, box2)
     assert m2[0] and not m2[1], "mask must follow the OBB's rotated axes"
     print("PASS box-only mask (everything outside the OBB hidden)")
-
-
-def test_calibrate_coord_scale_pixel_backend():
-    """A backend answering in ABSOLUTE PIXELS (Qwen2.5-VL convention)
-    gets its points shrunk ~0.77x toward the top-left by the 0-1000 grid
-    conversion; the calibrator must re-map them onto the device. A
-    compliant 0-1000 reply (values beyond pixel range) must pass through
-    untouched, and a tie must keep the grid."""
-    from agentic_gts.agent.mask_refine import _calibrate_coord_scale
-
-    # box-only view: the device is the bright band on the RIGHT half
-    img = np.zeros((768, 768, 3), dtype=np.float32)
-    img[:, 500:, :] = 0.6
-    # VLM answered in absolute pixels, pointing into the device
-    raw_pix = np.array([[550., 380.], [650., 380.], [720., 380.]])
-    coords = np.vstack([raw_pix, [[10., 10.], [750., 750.]]])
-    labels = np.array([1, 1, 1, 0, 0])
-    # as produced by pixel_prompts (the assumed 0-1000 grid conversion)
-    coords = (coords / 1000.0 * 767.0).astype(np.float32)
-    out = _calibrate_coord_scale(img, coords, labels)
-    assert (out[labels > 0][:, 0] >= 500).all(), \
-        "pixel-convention positives must be re-mapped onto the device"
-    assert not np.allclose(out, coords)
-
-    # compliant 0-1000 grid: raw values beyond the pixel range cannot be
-    # pixels -> keep the grid conversion untouched
-    raw_grid = np.array([[900., 200.], [950., 500.], [100., 800.]])
-    labels2 = np.array([1, 1, 1])
-    coords2 = (raw_grid / 1000.0 * 767.0).astype(np.float32)
-    out2 = _calibrate_coord_scale(img, coords2, labels2)
-    assert np.allclose(out2, coords2)
-
-    # tie (device fills the frame: both readings on it) -> keep grid
-    img_full = np.ones((768, 768, 3), dtype=np.float32) * 0.6
-    out3 = _calibrate_coord_scale(img_full, coords, labels)
-    assert np.allclose(out3, coords)
-
-    # y-flip convention: device in the BOTTOM half, model answers with
-    # y measured from the BOTTOM -> grid reading lands points on the
-    # (dark) top half; the flip reading must win and re-map
-    img_bot = np.zeros((768, 768, 3), dtype=np.float32)
-    img_bot[500:, :, :] = 0.6
-    raw_flip = np.array([[500., 200.], [600., 250.], [400., 300.]])
-    labels4 = np.array([1, 1, 1])
-    coords4 = (raw_flip / 1000.0 * 767.0).astype(np.float32)
-    out4 = _calibrate_coord_scale(img_bot, coords4, labels4)
-    assert (out4[:, 1] >= 500).all(), \
-        "y-flipped positives must be re-mapped onto the bottom half"
-    assert np.allclose(out4[:, 0], coords4[:, 0], atol=2.0), \
-        "x must be untouched by the flip"
-    print("PASS calibrate coord scale (pixels re-mapped, grid kept, "
-          "y-flip re-mapped)")
 
 
 def test_open_side_picks_aisle():
@@ -455,85 +406,6 @@ def test_mask_overlay_is_rgb_plus_tint():
     assert out[0, 0, 2] > out[0, 0, 0], "blue channel must dominate"
     # 3D SAM2 mask shape (1, H, W) handled by the caller's squeeze
     print("PASS mask overlay (rgb + tint, no uint8 wraparound)")
-
-
-def test_augment_spread_scatters_clustered_points():
-    """Clustered VLM points (all bunched on one panel) must be augmented
-    with farthest-point samples from the device's interior pixels until
-    the positives span a good fraction of the image; already-spread
-    prompts pass through untouched."""
-    from agentic_gts.agent.mask_refine import _augment_spread
-
-    H, W = 96, 128
-    # device: bright rectangle filling most of the frame
-    img = np.zeros((H, W, 3), dtype=np.float32)
-    img[10:86, 10:118] = 0.6
-    # clustered positives: 3 points bunched near the centre-left
-    coords = np.array([[50.0, 48.0], [55.0, 50.0], [60.0, 47.0],
-                       [10.0, 5.0], [120.0, 90.0]])   # 2 negatives
-    labels = np.array([1, 1, 1, 0, 0])
-    c2, l2 = _augment_spread(img, coords, labels, min_points=6,
-                             min_spread=0.5, max_add=4)
-    n_add = len(l2) - len(coords)
-    assert 3 <= n_add <= 4, f"expected ~4 added points, got {n_add}"
-    assert (l2[-n_add:] == 1).all(), "appended points are positives"
-    assert (l2[:5] == labels).all(), "existing points unchanged"
-    pos = c2[l2 > 0]
-    diag = math.hypot(H, W)
-    spread = np.linalg.norm(pos.max(axis=0) - pos.min(axis=0))
-    assert len(pos) >= 6, "at least min_points positives after augment"
-    assert spread >= 0.5 * diag, \
-        f"positives must now span the device, spread {spread:.0f}px < " \
-        f"{0.5 * diag:.0f}px"
-    # added points sit on bright interior pixels, not background
-    for x, y in c2[5:5 + n_add]:
-        assert img[int(y), int(x)].mean() > 0.1, \
-            f"added point ({x:.0f},{y:.0f}) landed on background"
-    # already spread + enough points: no-op
-    coords3 = np.array([[15.0, 12.0], [110.0, 14.0], [60.0, 48.0],
-                        [16.0, 82.0], [112.0, 80.0], [60.0, 20.0]])
-    labels3 = np.ones(6, dtype=int)
-    c3, l3 = _augment_spread(img, coords3, labels3, min_points=6,
-                             min_spread=0.5, max_add=4)
-    assert len(l3) == 6 and np.allclose(c3, coords3), \
-        "well-spread prompts must pass through unchanged"
-    print("PASS augment spread (clustered points scattered onto device)")
-
-
-def test_pull_points_inward_snaps_edge_positives():
-    """Edge-sitting positives (cables/ladders attach at the device's
-    border, SAM follows the connection) must be snapped onto the eroded
-    device interior; negatives and deep-interior points pass through."""
-    from agentic_gts.agent.mask_refine import _pull_points_inward
-
-    H, W = 96, 128
-    img = np.zeros((H, W, 3), dtype=np.float32)
-    img[10:86, 10:118] = 0.6            # device rectangle
-    coords = np.array([
-        [12.0, 48.0],    # positive ON the left edge band -> pulled in
-        [64.0, 48.0],    # positive deep inside -> unchanged
-        [116.0, 48.0],    # positive in the right edge band -> pulled in
-        [5.0, 5.0],      # negative on background -> untouched
-    ])
-    labels = np.array([1, 1, 1, 0])
-    c2, l2 = _pull_points_inward(img, coords, labels, margin_frac=0.08)
-    assert np.array_equal(l2, labels), "labels must not change"
-    # deep interior point unchanged
-    assert np.allclose(c2[1], coords[1])
-    # negatives untouched
-    assert np.allclose(c2[3], coords[3])
-    # pulled positives now sit inside the eroded interior (erosion
-    # radius r = int(margin_frac * min(H, W)) = int(0.08*96) = 7)
-    r = int(0.08 * min(H, W))
-    for i in (0, 2):
-        x, y = int(round(c2[i, 0])), int(round(c2[i, 1]))
-        assert img[y, x].mean() > 0.1, f"point {i} must stay on device"
-        assert 10 + r <= x <= 118 - r, \
-            f"point {i} must be >=margin from the border, got x={x}"
-    # pulled points actually moved (were in the edge band)
-    assert not np.allclose(c2[0], coords[0])
-    assert not np.allclose(c2[2], coords[2])
-    print("PASS pull points inward (edge positives snapped to interior)")
 
 
 if __name__ == "__main__":
