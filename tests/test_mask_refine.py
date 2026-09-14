@@ -195,52 +195,75 @@ def test_equipment_label_gate():
     print("PASS equipment-label gate for the type-confirm skip")
 
 
-def test_open_side_interior_veto_beats_diffuse_wall():
-    """The room-interior prior: a peripheral wall-adjacent box faces the
-    cloud's interior. An EXTREMELY diffuse wall (every 5cm bin under the
-    opacity-mass threshold) still measures a wide corridor on the wall
-    side -- the mass test is blind to it -- so the camera would again
-    render from outside the room. The geometry veto (faces away from
-    the interior median + cloud ends just past the face) must flip the
-    pick back to the aisle side."""
+def test_open_side_far_mass_beats_diffuse_wall():
+    """The room-boundary override: an EXTREMELY diffuse wall smear
+    (faint enough that no 5cm opacity bin reaches mass 1.0, and
+    extending well past 1.2 m so the old extent test could not catch
+    it either) still measures a full-width corridor on the wall side.
+    What it cannot fake is far-field CONTENT: past the aisle the room
+    continues (the facing row 2 m out), past the wall there is only
+    faint smear. The far-mass override must pick the aisle side."""
     from agentic_gts.agent.mask_refine import _open_side
     from agentic_gts.tools.gs_io import GaussianData
     rng = np.random.default_rng(11)
     box = OrientedBox(center=(0.0, -2.4, 1.0), size=(2.0, 1.1, 2.0),
                       yaw=0.0)
-    # general room cloud across the whole room (positions give the
-    # interior median; opacity faint so it never blocks by mass)
-    room = np.column_stack([rng.uniform(-6, 6, 1200),
-                            rng.uniform(-3, 3, 1200),
-                            rng.uniform(0.3, 1.8, 1200)])
-    # EXTREMELY diffuse wall flush behind the back face (y = -2.95):
-    # so faint that no 5cm bin reaches mass 1.0
-    wall = np.column_stack([rng.uniform(-1.2, 1.2, 250),
-                            rng.uniform(-3.05, -2.93, 250),
-                            rng.uniform(0.3, 1.8, 250)])
-    # a real facing structure on the aisle side, 1.0 m past the front
-    # face (y = -2.4 + 0.55 + 1.0 = -0.85): opaque, mass-blocked
-    facing = np.column_stack([rng.uniform(-1.0, 1.0, 40),
-                              np.full(40, -0.85),
-                              rng.uniform(0.3, 1.8, 40)])
-    means = np.vstack([room, wall, facing]).astype(np.float32)
+    # diffuse wall smear behind the back face (y < -2.95), faint AND far
+    smear = np.column_stack([rng.uniform(-1.2, 1.2, 250),
+                              rng.uniform(-4.2, -2.9, 250),
+                              rng.uniform(0.3, 1.8, 250)])
+    # a real facing row across the aisle, 2.0 m past the front face:
+    # opaque -- big far-field mass, and bin-blocks the aisle corridor
+    facing = np.column_stack([rng.uniform(-1.0, 1.0, 300),
+                              np.full(300, 0.15),
+                              rng.uniform(0.3, 1.8, 300)])
+    means = np.vstack([smear, facing]).astype(np.float32)
     n = len(means)
     gs = GaussianData(
         means=means,
         log_scales=np.full((n, 3), -6.0, dtype=np.float32),
         quats=np.tile(np.array([[1.0, 0, 0, 0]], np.float32), (n, 1)),
-        raw_opacity=np.concatenate([np.full(1450, -8.0),
-                                    np.full(40, 2.0)]).astype(np.float32),
+        raw_opacity=np.concatenate([np.full(250, -8.0),
+                                    np.full(300, 2.0)]).astype(np.float32),
         f_dc=np.zeros((n, 3), dtype=np.float32),
     )
     vec, corridor = _open_side(gs, box)
-    # without the veto the wall side measures 3.0 m (diffuse wall
-    # invisible) vs the aisle's 1.0 m and would win -> camera outside
-    assert vec[1] > 0.99, f"interior veto must keep the aisle side, got {vec}"
-    assert 0.5 < corridor < 1.5, \
+    # wall side measures the full 3.0 m corridor (smear is mass-
+    # invisible) vs the aisle's 2.0 m: without the override the WALL
+    # side wins and the camera renders from outside the room
+    assert vec[1] > 0.99, f"far-mass override must keep the aisle, got {vec}"
+    assert 1.5 < corridor < 2.5, \
         f"corridor must track the facing row, got {corridor:.2f}"
-    print(f"PASS interior veto beats diffuse wall "
+    print(f"PASS far-mass override beats diffuse wall "
           f"(aisle corridor {corridor:.2f}m)")
+
+
+def test_front_azim_puts_camera_on_open_side():
+    """The front-view azimuth must place make_local_cam's EYE on the
+    open side -- for BOTH box layouts. The old flip compared open_vec
+    against the face normal (+x for cross-long boxes), but azim 90
+    stands the camera on the -x side: for boxes whose long edge is on
+    the cross axis the flip was INVERTED and the camera landed on the
+    wall side even when _open_side was right."""
+    from agentic_gts.agent.mask_refine import _front_azim
+    from agentic_gts.output.gs_render import make_local_cam
+    for size, yaw in [((2.0, 0.6, 2.0), 0.3), ((0.6, 2.0, 2.0), -0.7)]:
+        box = OrientedBox(center=(1.0, -2.0, 1.0), size=size, yaw=yaw)
+        cross = np.array([-np.sin(yaw), np.cos(yaw)])
+        axis = np.array([np.cos(yaw), np.sin(yaw)])
+        open_dirs = ([cross, -cross] if size[0] >= size[1]
+                     else [axis, -axis])
+        for od in open_dirs:
+            azim = _front_azim(box, od)
+            cam = make_local_cam([box], elev_deg=18.0, azim_deg=azim,
+                                 standoff=1.0)
+            side = np.asarray(cam.eye)[:2] - np.asarray(box.center)[:2]
+            side = side / (np.linalg.norm(side) + 1e-12)
+            assert float(side @ od) > 0.9, (
+                f"camera on the WRONG side: yaw={yaw}, size={size}, "
+                f"open={od}, azim={azim}, eye_side={side}")
+    print("PASS front azimuth places the camera on the open side "
+          "(both layouts, both directions)")
 
 
 def test_open_side_flush_wall_and_floaters():

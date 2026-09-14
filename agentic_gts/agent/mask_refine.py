@@ -290,17 +290,17 @@ def _open_side(gs, box: OrientedBox, reach: float = 3.0):
     walked straight through the wall and rendered the view from OUTSIDE
     the room (a fog of structure behind the wall, user report).
 
-    ROOM-INTERIOR prior (user rule): a PERIPHERAL wall-adjacent box
-    faces the cloud's interior -- extremely diffuse walls (every 5cm
-    bin under the mass threshold) still slip past the opacity test and
-    measure a wide corridor, so geometry vetoes them: when a side both
-    points AWAY from the cloud's interior (dot < -0.35 vs the median
-    centre) and the cloud ENDS just past that face (< 1.2 m from the
-    face to the 99th-pct extent of the points beyond it), that side is
-    the wall, whatever the corridor said. Only a WIDE measured corridor
-    (>= 1.5 m) is vetoed: a narrow one means a real facing structure
-    was detected and stands (e.g. the 0.4m back gap of mid-room
-    back-to-back rows must keep winning against the far aisle).
+    ROOM-BOUNDARY override (user rule: a peripheral wall-adjacent box
+    faces the room's interior): the corridor measurement stays blind to
+    an EXTREMELY diffuse wall -- when every 5cm bin stays under the
+    mass threshold, the wall side measures a full-width corridor and
+    wins. What a diffuse wall cannot fake is far-field CONTENT: past a
+    real aisle the room continues (devices, floor, facing rows -- a
+    large opacity mass beyond 1.2 m from the face), while past a wall
+    there is only faint smear. When one side carries >= 3x the other's
+    far-field mass (floor 20), that side is the room side and wins
+    outright, whatever its measured corridor. Symmetric far mass
+    (back-to-back rows mid-room) falls back to the corridor pick.
     """
     pts = np.asarray(gs.means, dtype=float)
     op = 1.0 / (1.0 + np.exp(-np.asarray(gs.raw_opacity, dtype=float)))
@@ -323,40 +323,32 @@ def _open_side(gs, box: OrientedBox, reach: float = 3.0):
     z = pts[:, 2]
     z_top = c[2] + size[2] / 2.0
     band = (z > 0.25) & (z < max(min(z_top - 0.2, 2.0), 0.5))
+    strip = np.abs(dv) < long_half + 1.0
     bin_edges = np.arange(0.02, reach + 0.05, 0.05)
-    med_xy = np.median(pts[:, :2], axis=0)
-    to_interior = med_xy - c[:2]
-    tc = float(np.linalg.norm(to_interior))
-    best_vec, best_corridor = face_axis.copy(), -1.0
+    side_corridor, side_far = {}, {}
     for s in (1.0, -1.0):
         beyond = du * s - face_half        # distance past the s-side face
-        m = (np.abs(dv) < long_half + 1.0) & (beyond > 0.02) & \
-            (beyond < reach) & band
+        m = strip & (beyond > 0.02) & (beyond < reach) & band
+        corridor = reach
         if m.any():
             hist, _ = np.histogram(beyond[m], bins=bin_edges, weights=op[m])
             blocked = np.nonzero(hist >= 1.0)[0]
-            # left edge of the first blocked bin: slightly conservative
-            # (camera stands a touch closer), never through the wall
-            corridor = (float(bin_edges[blocked[0]])
-                       if len(blocked) else reach)
-        else:
-            corridor = reach
-        # interior veto: this side is the wall of a peripheral box
-        if corridor >= 1.5 and tc > 0.1:
-            out = s * face_axis
-            if float(out @ to_interior) / tc < -0.35:
-                # how far the cloud continues PAST this face (all
-                # heights/positions: a wall spans the room): a real
-                # aisle opens into the room's interior structure
-                beyond_all = (pts[:, :2] - c[:2]) @ out - face_half
-                past = beyond_all[beyond_all > 0.0]
-                edge_gap = (float(np.percentile(past, 99.0))
-                            if len(past) else 0.0)
-                if edge_gap < 1.2:
-                    corridor = 0.0
-        if corridor > best_corridor:
-            best_corridor, best_vec = corridor, s * face_axis
-    return best_vec, min(best_corridor, reach)
+            if len(blocked):
+                # left edge of the first blocked bin: slightly
+                # conservative (camera stands a touch closer), never
+                # through the wall
+                corridor = float(bin_edges[blocked[0]])
+        side_corridor[s] = corridor
+        far = strip & (beyond > 1.2) & band
+        side_far[s] = float(op[far].sum())
+    f1, f2 = side_far[1.0], side_far[-1.0]
+    if f1 >= 3.0 * f2 and f1 >= 20.0:
+        s = 1.0
+    elif f2 >= 3.0 * f1 and f2 >= 20.0:
+        s = -1.0
+    else:
+        s = 1.0 if side_corridor[1.0] >= side_corridor[-1.0] else -1.0
+    return s * face_axis, min(side_corridor[s], reach)
 
 
 def _box_only_mask(gs, box: OrientedBox, pad: float = 0.15) -> np.ndarray:
@@ -373,6 +365,31 @@ def _box_only_mask(gs, box: OrientedBox, pad: float = 0.15) -> np.ndarray:
     exactly the device under adjudication, on a clean background.
     """
     return box.contains(np.asarray(gs.means, dtype=float), margin=pad)
+
+
+def _front_azim(box: OrientedBox, open_vec) -> float:
+    """The front-view azimuth that puts make_local_cam's EYE on the box's
+    open side.
+
+    Sign trap (the bug that kept wall-adjacent boxes rendering from
+    outside the room): make_local_cam's horizontal direction at azim A
+    is R(A) @ base with base = local +y -- so azim 0 stands on the
+    local +y side, but azim 90 stands on the local -x side, NOT +x.
+    The flip must therefore compare open_vec against the side the
+    camera would actually STAND ON, not against the face normal it is
+    supposed to look at; comparing against +x inverted the flip for
+    boxes whose long edge is on the cross axis.
+    """
+    yaw = float(box.yaw)
+    cross = np.array([-math.sin(yaw), math.cos(yaw)])   # local +y
+    axis = np.array([math.cos(yaw), math.sin(yaw)])    # local +x
+    if box.size[0] >= box.size[1]:
+        azim, cam_side = 0.0, cross
+    else:
+        azim, cam_side = 90.0, -axis
+    if float(np.asarray(open_vec) @ cam_side) < 0.0:
+        azim += 180.0       # the aisle is on the other side
+    return azim
 
 
 def render_local_views(scene: Scene, box: OrientedBox,
@@ -406,17 +423,10 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # points. FRONT must additionally face the big face: perpendicular to
     # the long edge (a yaw running along the row, or a 90-deg flip from
     # PCA, otherwise makes azim=0 look along the LONG edge -- the visible
-    # SIDE, an earlier user report).
+    # SIDE, an earlier user report). _front_azim compares the open side
+    # against the side the camera would actually STAND ON.
     open_vec, corridor = _open_side(gs, box)
-    yaw = float(box.yaw)
-    cross_dir = np.array([-math.sin(yaw), math.cos(yaw)])  # local +y
-    axis_dir = np.array([math.cos(yaw), math.sin(yaw)])    # local +x
-    if box.size[0] >= box.size[1]:
-        azim_front, face_dir = 0.0, cross_dir
-    else:
-        azim_front, face_dir = 90.0, axis_dir
-    if float(open_vec @ face_dir) < 0.0:
-        azim_front += 180.0            # the aisle is on the other side
+    azim_front = _front_azim(box, open_vec)
     # view pair, both at GROUND level (elev 18 deg, rack height -- no
     # top-down component: the local views must show the device's
     # vertical surfaces, which the ground-level 3DGS training observed
