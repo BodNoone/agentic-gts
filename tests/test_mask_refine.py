@@ -65,6 +65,34 @@ def test_sam_box_prompt_construction():
     print("PASS SAM box prompt construction (cookbook style, literal braces)")
 
 
+def test_audit_json_survives_numpy_meta():
+    """mask_refine.json save regression: audits carry box.to_dict(),
+    whose meta transparently forwards numpy values from earlier stages
+    (np.int64 is NOT an int subclass -> plain json.dump raised TypeError
+    and killed the whole audit save with '[mask-refine] audit save
+    failed (TypeError)')."""
+    import json as _json
+    from agentic_gts.agent.mask_refine import json_default
+
+    box = OrientedBox(center=(1, 2, 1), size=(0.6, 1.1, 2.0), yaw=0.0,
+                      meta={"n_pts": np.int64(1234),
+                            "mean_z": np.float32(1.23),
+                            "yaw_samples": np.arange(3, dtype=np.float64)})
+    audit = {"box_id": box.box_id, "accepted": True, "score": 0.62,
+             "box": box.to_dict()}
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "mask_refine.json")
+        with open(p, "w", encoding="utf-8") as f:
+            _json.dump([audit], f, ensure_ascii=False, indent=2,
+                       default=json_default)
+        with open(p, encoding="utf-8") as f:
+            back = _json.load(f)
+    assert back[0]["box"]["meta"]["n_pts"] == 1234
+    assert back[0]["box"]["meta"]["mean_z"] == float(np.float32(1.23))
+    assert back[0]["box"]["meta"]["yaw_samples"] == [0.0, 1.0, 2.0]
+    print("PASS audit json save survives numpy meta values")
+
+
 def test_box_groups_official_cookbook_array():
     """Qwen's native 2d_grounding reply: a top-level ARRAY of
     {"bbox_2d": ..., "label": ...} items. The structural scan enters

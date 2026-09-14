@@ -375,6 +375,7 @@ class LayoutAgent:
         """
         from agentic_gts.agent.mask_refine import (SamPredictorAdapter,
                                                     confirm_device_type,
+                                                    json_default,
                                                     refine_box,
                                                     render_local_views)
         import json as _json
@@ -455,13 +456,14 @@ class LayoutAgent:
                 if audits:
                     with open(_os.path.join(self.out_dir, "mask_refine.json"),
                               "w", encoding="utf-8") as f:
-                        _json.dump(audits, f, ensure_ascii=False, indent=2)
+                        _json.dump(audits, f, ensure_ascii=False, indent=2,
+                                   default=json_default)
                 if conf_audits:
                     with open(_os.path.join(self.out_dir,
                                             "type_confirm.json"),
                               "w", encoding="utf-8") as f:
                         _json.dump(conf_audits, f, ensure_ascii=False,
-                                   indent=2)
+                                   indent=2, default=json_default)
             except Exception as e:
                 print(f"[mask-refine] audit save failed ({type(e).__name__})")
 

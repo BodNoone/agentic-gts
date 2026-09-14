@@ -232,6 +232,23 @@ class SamPredictorAdapter:
         return np.asarray(masks, dtype=bool), np.asarray(scores, dtype=float)
 
 
+def json_default(o):
+    """json.dump default handler: numpy scalars/arrays and paths.
+
+    Audit dicts carry box.to_dict() output, whose `meta` transparently
+    forwards whatever earlier stages stored there -- numpy floats, int64
+    counts, small arrays. Plain json.dump raises TypeError on those
+    (np.int64 is not an int subclass on Windows), which used to kill the
+    whole mask_refine.json / type_confirm.json save."""
+    if isinstance(o, np.generic):
+        return o.item()
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, os.PathLike):
+        return os.fspath(o)
+    raise TypeError(f"not JSON serializable: {type(o).__name__}")
+
+
 def _subset_or_none(gs, keep: np.ndarray):
     """gs restricted to the keep mask, or None when nothing survives."""
     if keep is None or not keep.any():
@@ -687,7 +704,8 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                 with open(os.path.join(
                         out_dir, f"sam_boxes_{box.box_id}_{view['name']}.json"),
                           "w", encoding="utf-8") as f:
-                    json.dump(va, f, ensure_ascii=False, indent=2)
+                    json.dump(va, f, ensure_ascii=False, indent=2,
+                              default=json_default)
             except OSError:
                 pass
         audit["views"].append(va)
