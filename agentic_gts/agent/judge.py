@@ -1299,8 +1299,11 @@ class VLMJudge:
         "and right -- clustered points make SAM segment only a local part "
         "(one door, one panel) instead of the entire device. Also place "
         "3-6 NEGATIVE points on adjacent devices, aisle, wall, cables, or "
-        "background, spread around the target. Do not put points on "
-        "boundaries. Coordinates MUST use Qwen's official relative 0-1000 "
+        "background, spread around the target. Keep every POSITIVE point "
+        "well inside the target -- at least a tenth of the target's size "
+        "away from its edges: points near the edge land on attached "
+        "cables, conduit or ladders, and SAM then segments those in too. "
+        "Coordinates MUST use Qwen's official relative 0-1000 "
         "image grid (x=0 left, x=1000 right, y=0 top, y=1000 bottom), not "
         "pixels and not metres. Output ONLY JSON:\n"
         '{"candidate_groups": [{"positive": [[x,y], ...], '

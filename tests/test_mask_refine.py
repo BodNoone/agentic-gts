@@ -448,6 +448,42 @@ def test_augment_spread_scatters_clustered_points():
     print("PASS augment spread (clustered points scattered onto device)")
 
 
+def test_pull_points_inward_snaps_edge_positives():
+    """Edge-sitting positives (cables/ladders attach at the device's
+    border, SAM follows the connection) must be snapped onto the eroded
+    device interior; negatives and deep-interior points pass through."""
+    from agentic_gts.agent.mask_refine import _pull_points_inward
+
+    H, W = 96, 128
+    img = np.zeros((H, W, 3), dtype=np.float32)
+    img[10:86, 10:118] = 0.6            # device rectangle
+    coords = np.array([
+        [12.0, 48.0],    # positive ON the left edge band -> pulled in
+        [64.0, 48.0],    # positive deep inside -> unchanged
+        [116.0, 48.0],    # positive in the right edge band -> pulled in
+        [5.0, 5.0],      # negative on background -> untouched
+    ])
+    labels = np.array([1, 1, 1, 0])
+    c2, l2 = _pull_points_inward(img, coords, labels, margin_frac=0.08)
+    assert np.array_equal(l2, labels), "labels must not change"
+    # deep interior point unchanged
+    assert np.allclose(c2[1], coords[1])
+    # negatives untouched
+    assert np.allclose(c2[3], coords[3])
+    # pulled positives now sit inside the eroded interior (erosion
+    # radius r = int(margin_frac * min(H, W)) = int(0.08*96) = 7)
+    r = int(0.08 * min(H, W))
+    for i in (0, 2):
+        x, y = int(round(c2[i, 0])), int(round(c2[i, 1]))
+        assert img[y, x].mean() > 0.1, f"point {i} must stay on device"
+        assert 10 + r <= x <= 118 - r, \
+            f"point {i} must be >=margin from the border, got x={x}"
+    # pulled points actually moved (were in the edge band)
+    assert not np.allclose(c2[0], coords[0])
+    assert not np.allclose(c2[2], coords[2])
+    print("PASS pull points inward (edge positives snapped to interior)")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed = 0

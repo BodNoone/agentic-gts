@@ -675,6 +675,58 @@ def _augment_spread(view_img: np.ndarray, coords: np.ndarray,
                             np.ones(len(pts) - len(pos), dtype=labels.dtype)]))
 
 
+def _pull_points_inward(view_img: np.ndarray, coords: np.ndarray,
+                        labels: np.ndarray,
+                        margin_frac: float = 0.06) -> tuple[np.ndarray,
+                                                            np.ndarray]:
+    """Pull POSITIVE prompts off the target's boundary (user report:
+    points sitting on the device's edge hit attached cables / conduit /
+    ladders, and SAM then segments those connected things in too).
+
+    The local views render ONLY the box's own gaussians, so the
+    foreground silhouette IS the device. Erode it by `margin_frac` of
+    the image's shorter side and snap every positive that falls outside
+    the eroded interior to its nearest interior pixel. Negatives are
+    left alone (they are SUPPOSED to sit on the surroundings). Points
+    already deep inside pass through unchanged.
+    """
+    coords = np.asarray(coords, dtype=np.float64).reshape(-1, 2)
+    labels = np.asarray(labels).reshape(-1)
+    if not len(coords) or not (labels > 0).any():
+        return coords, labels
+    img = np.asarray(view_img, dtype=np.float32)
+    if img.ndim == 2:
+        img = img[..., None]
+    gray = img[..., :3].mean(axis=2)
+    if float(gray.max()) > 1.5:            # uint8-scale input
+        gray = gray / 255.0
+    fg = gray > 0.08
+    if not fg.any():
+        return coords, labels
+    H, W = fg.shape
+    r = max(2, int(margin_frac * min(H, W)))
+    er = fg.copy()
+    for _ in range(r):
+        er = er & np.roll(er, 1, axis=0) & np.roll(er, -1, axis=0) \
+               & np.roll(er, 1, axis=1) & np.roll(er, -1, axis=1)
+        if er.sum() < 20:                  # thin device: stop eroding
+            break
+    if er.sum() < 20:
+        er = fg                            # degenerate: no interior left
+    if er.all():
+        return coords, labels
+    ys, xs = np.nonzero(er)
+    inside = np.column_stack([xs, ys]).astype(np.float64)
+    out = coords.copy()
+    for i in np.nonzero(labels > 0)[0]:
+        iy, ix = int(round(coords[i, 1])), int(round(coords[i, 0]))
+        if (0 <= iy < H and 0 <= ix < W) and er[iy, ix]:
+            continue
+        j = int(np.argmin(np.linalg.norm(inside - coords[i], axis=1)))
+        out[i] = inside[j]
+    return out, labels
+
+
 def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                out_dir: str | None = None,
                views: list | None = None) -> tuple[OrientedBox | None, dict]:
@@ -703,6 +755,10 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                                                   view["image"].shape[0])
             if not len(coords):
                 continue
+            # edge-sitting positives hit attached cables/ladders -> SAM
+            # segments them in; pull them back onto the device interior
+            coords, labels = _pull_points_inward(view["image"], coords,
+                                                 labels)
             # clustered VLM points make SAM segment a local part; spread
             # them with device-interior samples when coverage is poor
             coords, labels = _augment_spread(view["image"], coords, labels)
