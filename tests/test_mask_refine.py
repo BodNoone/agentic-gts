@@ -378,6 +378,33 @@ def test_sam2_model_cfg_file_path_registers_hydra_dir():
     print("PASS sam2 model_cfg file path re-rooted for hydra")
 
 
+def test_mask_overlay_is_rgb_plus_tint():
+    """The debug panel must be an RGB image with a semi-transparent mask
+    tint on top. Regression: the blend used uint8 * uint8, which wraps
+    modulo 256 (150*165 -> 174) -- the masked region turned into dark
+    garbage and only the solid edge line survived ('contour drawing')."""
+    from agentic_gts.agent.mask_refine import _overlay_mask
+
+    # mid-gray image, 4x4, top half masked
+    img = np.full((4, 4, 3), 150, dtype=np.uint8)
+    m = np.zeros((4, 4), dtype=bool)
+    m[:2] = True
+    out = _overlay_mask(img, m, alpha=115)
+    # unmasked rows unchanged
+    assert np.all(out[2:] == 150), "unmasked pixels must stay untouched"
+    # masked rows: rgb pushed toward cyan, no uint8 wraparound garbage
+    a = 115 / 255.0
+    expect = np.array([round(150 * (1 - a)),
+                       round(150 * (1 - a) + 220 * a),
+                       round(150 * (1 - a) + 255 * a)])
+    assert np.abs(out[0, 0].astype(int) - expect).max() <= 1, \
+        f"masked pixel must be gray*toward cyan, got {out[0, 0]}"
+    assert out[0, 0, 1] > out[0, 0, 0], "green channel must dominate"
+    assert out[0, 0, 2] > out[0, 0, 0], "blue channel must dominate"
+    # 3D SAM2 mask shape (1, H, W) handled by the caller's squeeze
+    print("PASS mask overlay (rgb + tint, no uint8 wraparound)")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed = 0

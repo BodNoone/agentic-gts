@@ -486,6 +486,23 @@ def confirm_device_type(judge, box: OrientedBox, views: list,
                                       verdict.confidence or 0.5))}
 
 
+def _overlay_mask(img_u8: np.ndarray, m: np.ndarray,
+                  alpha: int = 115) -> np.ndarray:
+    """Semi-transparent cyan fill over the RGB image: a proper
+    rgb+mask overlay. NB: promote to int32 BEFORE multiplying --
+    uint8 * uint8 wraps modulo 256 (150*165 -> 174), which made the
+    masked region dark garbage with only the solid edge line
+    surviving: the 'contour drawing' look the user reported."""
+    alpha = int(alpha)
+    tint = np.zeros(img_u8.shape, dtype=np.int32)
+    tint[..., 1] = 220
+    tint[..., 2] = 255
+    a3 = m.astype(np.int32)[..., None] * alpha
+    base = np.asarray(img_u8, dtype=np.int32)
+    return np.clip(base * (255 - a3) // 255 + tint * a3 // 255,
+                   0, 255).astype(np.uint8)
+
+
 def _save_sam_debug(view: dict | None, coords, labels, mask, pts3,
                     box, fitted, out_dir: str, tag: str) -> None:
     """Composite debug render for ONE SAM candidate (user request):
@@ -550,17 +567,10 @@ def _save_sam_debug(view: dict | None, coords, labels, mask, pts3,
             p2 = Image.fromarray(img.copy())
             if mask is not None:
                 m = np.asarray(mask, dtype=bool)
+                if m.ndim == 3:            # SAM2 returns (C, H, W)
+                    m = m.reshape(-1, H, W)[0]
                 if m.shape == (H, W):
-                    # semi-transparent cyan fill
-                    alpha = (m.astype(np.uint8) * 90)
-                    tint = np.zeros((H, W, 3), dtype=np.uint8)
-                    tint[..., 0] = 0
-                    tint[..., 1] = 220
-                    tint[..., 2] = 255
-                    a3 = alpha[..., None]
-                    p2 = Image.fromarray(
-                        (np.asarray(p2) * (255 - a3) // 255
-                         + tint * a3 // 255).astype(np.uint8))
+                    p2 = Image.fromarray(_overlay_mask(img, m))
                     # solid edge: mask minus its erosion (no scipy needed)
                     er = m.copy()
                     er[1:] &= m[:-1]
