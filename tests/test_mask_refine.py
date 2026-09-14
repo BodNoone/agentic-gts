@@ -292,6 +292,89 @@ def test_front_view_axis_swap():
     print("PASS front view axis swap (perpendicular to the long edge)")
 
 
+def test_sam2_model_cfg_file_path_registers_hydra_dir():
+    """A model_cfg that is a real FILE path must be re-rooted: hydra's
+    compose(config_name=...) strips the leading '/' of an absolute path
+    (-> 'home/bod/code/...', MissingConfigException). _build_sam2_model
+    must register the file's own directory as the search path and pass
+    only the basename; a package-relative name goes through unchanged.
+    Runs against stub sam2/hydra modules (no SAM install needed)."""
+    import sys
+    import types
+    import contextlib
+    import tempfile
+    from agentic_gts.agent.mask_refine import SamPredictorAdapter
+
+    calls = {}
+
+    @contextlib.contextmanager
+    def _init_dir(config_dir, version_base=None):
+        calls["dir"] = config_dir
+        yield
+
+    hydra_mod = types.ModuleType("hydra")
+    hydra_mod.initialize_config_dir = _init_dir
+    hydra_core = types.ModuleType("hydra.core")
+    gh_mod = types.ModuleType("hydra.core.global_hydra")
+
+    class _GH:
+        @staticmethod
+        def instance():
+            return _GH()
+
+        @staticmethod
+        def is_initialized():
+            return True
+
+        @staticmethod
+        def clear():
+            calls["cleared"] = True
+    gh_mod.GlobalHydra = _GH
+
+    sam2_mod = types.ModuleType("sam2")
+    sam2_mod.__path__ = []
+    build_mod = types.ModuleType("sam2.build_sam")
+
+    def _build(cfg, ckpt):
+        calls["name"], calls["ckpt"] = cfg, ckpt
+        return "model"
+    build_mod.build_sam2 = _build
+
+    old = {k: sys.modules.get(k) for k in ("sam2", "sam2.build_sam", "hydra",
+                                           "hydra.core",
+                                           "hydra.core.global_hydra")}
+    sys.modules.update({"sam2": sam2_mod, "sam2.build_sam": build_mod,
+                        "hydra": hydra_mod, "hydra.core": hydra_core,
+                        "hydra.core.global_hydra": gh_mod})
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_path = os.path.join(td, "sam2.1_hiera_b+.yaml")
+            with open(cfg_path, "w") as f:
+                f.write("model: 1\n")
+            m = SamPredictorAdapter._build_sam2_model(cfg_path, "ckpt.pt")
+        assert m == "model"
+        assert calls["name"] == "sam2.1_hiera_b+.yaml", \
+            "must pass the basename, not the full path"
+        assert os.path.normpath(calls["dir"]) == \
+            os.path.normpath(os.path.dirname(cfg_path)), \
+            "the yaml's directory must become the hydra search path"
+        assert calls["cleared"] is True, \
+            "sam2's own GlobalHydra binding must be cleared first"
+        # package-relative name: straight through, no search-path swap
+        m2 = SamPredictorAdapter._build_sam2_model("sam2.1_hiera_b+.yaml",
+                                                   "ckpt.pt")
+        assert m2 == "model"
+        assert "dir" not in calls or calls["name"] == "sam2.1_hiera_b+.yaml"
+        assert calls["ckpt"] == "ckpt.pt"
+    finally:
+        for k, v in old.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+    print("PASS sam2 model_cfg file path re-rooted for hydra")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     passed = 0

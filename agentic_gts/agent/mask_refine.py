@@ -134,6 +134,33 @@ class SamPredictorAdapter:
     def available(self) -> bool:
         return bool(self.checkpoint)
 
+    @staticmethod
+    def _build_sam2_model(model_cfg: str, checkpoint: str):
+        """build_sam2, tolerant of a model_cfg that is a FILE PATH.
+
+        build_sam2 feeds the cfg to hydra's compose(config_name=...), which
+        only searches the sam2 package's own configs dir and interprets the
+        name as a path RELATIVE to it -- an absolute path like
+        /home/bod/code/sam2.1_hiera_b+.yaml loses its leading slash and
+        becomes 'home/bod/code/...' (MissingConfigException). When the
+        cfg is an existing file, register ITS directory as the hydra
+        search path and pass only the basename; anything else (e.g.
+        'sam2.1_hiera_b+.yaml', the package-relative name) goes through
+        unchanged.
+        """
+        from sam2.build_sam import build_sam2
+        if os.path.isfile(model_cfg):
+            import hydra
+            from hydra.core.global_hydra import GlobalHydra
+            gh = GlobalHydra.instance()
+            if gh.is_initialized():
+                gh.clear()   # sam2's __init__ already bound sam2.configs
+            cfg_dir = os.path.dirname(os.path.abspath(model_cfg))
+            with hydra.initialize_config_dir(config_dir=cfg_dir,
+                                             version_base="1.2"):
+                return build_sam2(os.path.basename(model_cfg), checkpoint)
+        return build_sam2(model_cfg, checkpoint)
+
     def _load(self):
         if self._predictor is not None:
             return
@@ -141,11 +168,10 @@ class SamPredictorAdapter:
             raise RuntimeError("SAM_CHECKPOINT not configured")
         # SAM2 first (recommended). SAM_MODEL_CFG is required by build_sam2.
         try:
-            from sam2.build_sam import build_sam2
             from sam2.sam2_image_predictor import SAM2ImagePredictor
             if not self.model_cfg:
                 raise RuntimeError("SAM_MODEL_CFG is required for SAM2")
-            model = build_sam2(self.model_cfg, self.checkpoint)
+            model = self._build_sam2_model(self.model_cfg, self.checkpoint)
             try:
                 import torch
                 if torch.cuda.is_available():
