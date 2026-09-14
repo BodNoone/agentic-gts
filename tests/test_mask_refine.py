@@ -240,6 +240,43 @@ def test_box_only_mask_hides_everything_outside():
     print("PASS box-only mask (everything outside the OBB hidden)")
 
 
+def test_calibrate_coord_scale_pixel_backend():
+    """A backend answering in ABSOLUTE PIXELS (Qwen2.5-VL convention)
+    gets its points shrunk ~0.77x toward the top-left by the 0-1000 grid
+    conversion; the calibrator must re-map them onto the device. A
+    compliant 0-1000 reply (values beyond pixel range) must pass through
+    untouched, and a tie must keep the grid."""
+    from agentic_gts.agent.mask_refine import _calibrate_coord_scale
+
+    # box-only view: the device is the bright band on the RIGHT half
+    img = np.zeros((768, 768, 3), dtype=np.float32)
+    img[:, 500:, :] = 0.6
+    # VLM answered in absolute pixels, pointing into the device
+    raw_pix = np.array([[550., 380.], [650., 380.], [720., 380.]])
+    coords = np.vstack([raw_pix, [[10., 10.], [750., 750.]]])
+    labels = np.array([1, 1, 1, 0, 0])
+    # as produced by pixel_prompts (the assumed 0-1000 grid conversion)
+    coords = (coords / 1000.0 * 767.0).astype(np.float32)
+    out = _calibrate_coord_scale(img, coords, labels)
+    assert (out[labels > 0][:, 0] >= 500).all(), \
+        "pixel-convention positives must be re-mapped onto the device"
+    assert not np.allclose(out, coords)
+
+    # compliant 0-1000 grid: raw values beyond the pixel range cannot be
+    # pixels -> keep the grid conversion untouched
+    raw_grid = np.array([[900., 200.], [950., 500.], [100., 800.]])
+    labels2 = np.array([1, 1, 1])
+    coords2 = (raw_grid / 1000.0 * 767.0).astype(np.float32)
+    out2 = _calibrate_coord_scale(img, coords2, labels2)
+    assert np.allclose(out2, coords2)
+
+    # tie (device fills the frame: both readings on it) -> keep grid
+    img_full = np.ones((768, 768, 3), dtype=np.float32) * 0.6
+    out3 = _calibrate_coord_scale(img_full, coords, labels)
+    assert np.allclose(out3, coords)
+    print("PASS calibrate coord scale (pixels re-mapped, grid kept)")
+
+
 def test_open_side_picks_aisle():
     """_open_side must find the aisle side: the rack's front faces a
     1.7m corridor, its back a 0.7m gap to the wall -> the open direction

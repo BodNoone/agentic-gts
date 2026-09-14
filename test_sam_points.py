@@ -145,39 +145,73 @@ def main() -> None:
     if not parsed:
         print("[parse] no groups parsed from the reply "
               "(mock backend returns none)")
-    left = np.full((H, W, 3), 0.02, dtype=np.float32)
-    right = img
+
+    def _fg_frac(pts):
+        """Fraction of points on the (bright) device -- box-only local
+        views render the device on black, so fg = the device."""
+        m = img[..., :3].mean(axis=2) > 0.08
+        x = np.clip(np.rint(pts[:, 0]), 0, W - 1).astype(int)
+        y = np.clip(np.rint(pts[:, 1]), 0, H - 1).astype(int)
+        return float(m[y, x].mean())
+
     for gi, g in enumerate(parsed):
         coords, labels = g.pixel_prompts(W, H)
         if not len(coords):
             continue
+        # ---- coordinate-convention diagnosis -------------------------
+        # pixel_prompts assumed the 0-1000 grid; recover the raw values
+        # and test the alternative (absolute pixels) interpretation
+        raw = coords / np.array([W - 1, H - 1]) * 1000.0
+        all_pts = g.positive_norm + g.negative_norm
+        xs = [p[0] for p in all_pts]
+        ys = [p[1] for p in all_pts]
+        certain_grid = max(max(xs), max(ys)) > max(W, H) + 2
+        pos = coords[labels > 0]
+        coords_pix = np.clip(raw, 0, [W - 1, H - 1])
+        fg_grid = _fg_frac(pos)
+        fg_pix = _fg_frac(coords_pix[labels > 0])
+        print(f"[group {gi}] hypothesis={g.hypothesis} "
+              f"conf={g.confidence:.2f} "
+              f"pos={int((labels > 0).sum())} "
+              f"neg={int((labels < 1).sum())}")
+        print(f"[group {gi}] raw x range [{min(xs):.0f}, {max(xs):.0f}] "
+              f"y range [{min(ys):.0f}, {max(ys):.0f}] "
+              f"(image {W}x{H})")
+        if certain_grid:
+            print(f"[group {gi}] convention: 0-1000 GRID for certain "
+                  f"(values beyond pixel range)")
+        elif fg_pix - fg_grid >= 0.25:
+            print(f"[group {gi}] convention: looks like ABSOLUTE PIXELS "
+                  f"(on-device: pixels {fg_pix:.2f} vs grid {fg_grid:.2f})")
+        else:
+            print(f"[group {gi}] convention: assumed 0-1000 grid "
+                  f"(on-device: grid {fg_grid:.2f} vs pixels {fg_pix:.2f})")
         # the production postprocess chain, verbatim
         coords2, labels2 = _pull_points_inward(img, coords, labels)
         coords2, labels2 = _augment_spread(img, coords2, labels2)
         moved = [not np.allclose(a, b)
                  for a, b in zip(coords, coords2[:len(coords)])]
-        n_pos0 = int((labels > 0).sum())
         n_pos1 = int((labels2 > 0).sum())
-        print(f"[group {gi}] hypothesis={g.hypothesis} "
-              f"conf={g.confidence:.2f} "
-              f"pos={n_pos0} neg={int((labels < 1).sum())} -> "
-              f"after postprocess pos={n_pos1} "
-              f"({sum(moved)} moved by pull-inward)")
-        l_panel, l_strip = _draw_points(
-            img, coords, labels, f"1. VLM raw (pos={n_pos0})")
-        r_panel, r_strip = _draw_points(
-            img, coords2, labels2,
-            f"2. to SAM (pos={n_pos1}, orange=moved)", moved=moved)
-        left, right = l_panel, r_panel
-        # save one side-by-side per group
+        print(f"[group {gi}] after postprocess pos={n_pos1} "
+              f"({sum(moved)} moved by pull-inward)\n")
+        # three panels: grid reading / pixel reading / what SAM gets
+        panels = []
+        for title, cc, ll, mv in (
+                ("1. as 0-1000 grid (assumed)", coords, labels, None),
+                ("2. as ABSOLUTE PIXELS", coords_pix, labels, None),
+                ("3. to SAM (postproc)",
+                 coords2, labels2, moved)):
+            panel, strip = _draw_points(img, cc, ll, title, moved=mv)
+            panels.append((panel, strip))
         from PIL import Image
-        gap = 8
-        comp = Image.new("RGB", (W * 2 + gap, H + 26),
-                         (10, 10, 10))
-        comp.paste(Image.fromarray(l_strip), (0, 0))
-        comp.paste(Image.fromarray(r_strip), (W + gap, 0))
-        comp.paste(Image.fromarray(l_panel), (0, 26))
-        comp.paste(Image.fromarray(r_panel), (W + gap, 26))
+        gap, strip_h = 8, panels[0][1].shape[0]
+        pw = panels[0][0].shape[1]
+        comp = Image.new("RGB", ((pw + gap) * len(panels) - gap,
+                                 H + strip_h), (10, 10, 10))
+        for i, (panel, strip) in enumerate(panels):
+            x0 = i * (pw + gap)
+            comp.paste(Image.fromarray(strip), (x0, 0))
+            comp.paste(Image.fromarray(panel), (x0, strip_h))
         out_path = (args.out if len(parsed) == 1
                     else args.out.replace(".png", f"_g{gi}.png"))
         comp.save(out_path)

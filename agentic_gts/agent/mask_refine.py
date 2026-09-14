@@ -675,6 +675,50 @@ def _augment_spread(view_img: np.ndarray, coords: np.ndarray,
                             np.ones(len(pts) - len(pos), dtype=labels.dtype)]))
 
 
+def _calibrate_coord_scale(img: np.ndarray, coords: np.ndarray,
+                           labels: np.ndarray) -> np.ndarray:
+    """Re-interpret VLM point coords if they are ABSOLUTE PIXELS, not the
+    0-1000 grid (user report: points mostly off the device, pulled toward
+    one corner).
+
+    pixel_prompts() divides by 1000 -- Qwen3-VL's native relative grid.
+    But a backend answering in ABSOLUTE PIXELS instead (Qwen2.5-VL's
+    convention: coords on the resized input image) then has every point
+    shrunk to ~0.77x of its intended position on a 768px view, biased
+    toward the top-left corner. Two facts disambiguate:
+      * a raw value beyond the image size cannot be a pixel -> the grid
+        interpretation is certain, keep it;
+      * otherwise, the device IS the foreground (box-only local views
+        render it on black): the interpretation landing more POSITIVE
+        points on it wins, and only a CLEAR win (>= 0.25) re-maps -- a
+        tie keeps the grid (current behaviour, no regression for
+        compliant Qwen3-VL servers).
+    """
+    if not len(coords) or not (labels > 0).any():
+        return coords
+    H, W = img.shape[:2]
+    raw = coords / np.array([W - 1, H - 1], dtype=np.float64) * 1000.0
+    if raw.max() > max(W, H) + 2:
+        return coords                  # beyond pixel range: grid, for sure
+    fg = img[..., :3].mean(axis=2) > 0.08
+    if not fg.any():
+        return coords
+    pos = raw[labels > 0]
+
+    def _on_fg(pts):
+        x = np.clip(np.rint(pts[:, 0]), 0, W - 1).astype(int)
+        y = np.clip(np.rint(pts[:, 1]), 0, H - 1).astype(int)
+        return float(fg[y, x].mean())
+
+    as_grid = _on_fg(pos / 1000.0 * np.array([W - 1, H - 1]))
+    as_pix = _on_fg(np.clip(pos, 0, [W - 1, H - 1]))
+    if as_pix - as_grid < 0.25:
+        return coords
+    print("[mask-refine] VLM points look like ABSOLUTE PIXELS, not the "
+          "0-1000 grid; re-mapped (check which model the server runs)")
+    return np.clip(raw, 0, [W - 1, H - 1]).astype(np.float32)
+
+
 def _pull_points_inward(view_img: np.ndarray, coords: np.ndarray,
                         labels: np.ndarray,
                         margin_frac: float = 0.06) -> tuple[np.ndarray,
@@ -755,6 +799,10 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                                                   view["image"].shape[0])
             if not len(coords):
                 continue
+            # a backend answering in absolute pixels (Qwen2.5-VL's
+            # convention) gets shrunk ~0.77x toward the top-left by the
+            # 0-1000 grid conversion; re-map when the evidence says so
+            coords = _calibrate_coord_scale(view["image"], coords, labels)
             # edge-sitting positives hit attached cables/ladders -> SAM
             # segments them in; pull them back onto the device interior
             coords, labels = _pull_points_inward(view["image"], coords,
