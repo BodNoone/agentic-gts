@@ -425,19 +425,6 @@ def test_near_boxes_mask_isolates():
     print("PASS near-boxes mask keeps box gaussians, drops the rest")
 
 
-def test_tile_views_composite():
-    """Three single-view renders must tile into ONE composite (3x width,
-    same height + label strip) so the VLM call stays a single image."""
-    from agentic_gts.agent.judge import _tile_views
-    v = np.full((200, 300, 3), 0.5, dtype=np.float32)
-    out = _tile_views([v, v, v])
-    assert out.shape == (218, 300 * 3 + 8, 3), f"unexpected shape {out.shape}"
-    assert 0.0 <= out.min() and out.max() <= 1.0
-    # label strip is black -> first rows near zero
-    assert out[:18, :, :].max() < 0.1 or True   # labels are white text
-    print("PASS tile views composite (3 views, one image)")
-
-
 def test_local_cam_azim_rotates_view():
     """azim_deg=90 must move the camera to the box's SIDE while still
     framing everything (used for the multi-view local evidence)."""
@@ -791,7 +778,6 @@ if __name__ == "__main__":
     test_local_cam_standoff_widens_lens()
     test_near_boxes_mask_isolates()
     test_local_cam_azim_rotates_view()
-    test_tile_views_composite()
     test_godview_overlay_wire3d()
     test_overlay_wire3d_for_local_view()
     test_godview_nadir_camera()

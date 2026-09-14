@@ -3,7 +3,12 @@
 New-flow contract (user-directed architecture):
   global nadir 2D grounding (ground.py) -> per-box local refine
   (VLM box grounding -> SAM2 mask -> 3DGS backprojection -> metric OBB,
-  plus the rack type-confirm guard) -> row split.
+  plus the rack type-confirm guard).
+
+The row split is NOT a separate stage anymore: the local-grounding
+prompt separates a joined row into one instance per visually distinct
+cabinet (different height / color), and refine_box returns ALL of
+them -- the split comes from the same SAM evidence as the refinement.
 
 There is NO issue/repair loop anymore: the old rule-detected
 (MERGED_ROW / FALSE_POSITIVE / OVERLAP / WIDTH_MISFIT) repair rounds,
@@ -55,17 +60,11 @@ class LayoutAgent:
         # clean local render, SAM2 segments it with the box prompt, and
         # projected 3DGS centers fit the metric OBB. Runs for BOTH
         # externally supplied and VLM-grounded boxes; grounding finds
-        # where, local masks refine edges.
+        # where, local masks refine edges -- and the local grounding
+        # itself splits joined rows whose cabinets differ (the former
+        # split_stage's job, now decided on the same SAM evidence).
         self._local_mask_refine(scene, report)
-        # 2. row split AFTER the local refinement (user-directed order):
-        # each grounded region is refined on its own evidence FIRST, then
-        # the joined rows are divided into cabinets. Pre-merging / splitting
-        # before the refinement decided structure membership before the SAM
-        # masks had a vote.
-        if self.opts.get("vlm_grounded"):
-            from agentic_gts.agent.ground import split_stage
-            split_stage(scene, self.judge, self.out_dir)
-        # 3. confidence tagging from point support. The type-confirm LOW
+        # 2. confidence tagging from point support. The type-confirm LOW
         # marks from step 1 are the last word: a well-supported structure
         # the VLM says is NOT equipment must stay LOW for human review.
         for b in scene.boxes:
@@ -137,12 +136,12 @@ class LayoutAgent:
                          "ok": False})
                     print(f"[type-confirm] {old.box_id[:6]} NOT a rack "
                           f"(conf {r['confidence']:.2f}) -> LOW + review")
-            # ---- SAM mask refinement ----
+            # ---- SAM mask refinement (multi-instance) ----
             if not sam.available:
                 continue
             try:
-                new, audit = refine_box(scene, old, self.judge, sam,
-                                        self.out_dir, views=views)
+                instances, audit = refine_box(scene, old, self.judge, sam,
+                                             self.out_dir, views=views)
             except Exception as e:
                 print(f"[mask-refine] {old.box_id[:6]} failed "
                       f"({type(e).__name__}: {e}) -> keep")
@@ -150,22 +149,45 @@ class LayoutAgent:
                                "reason": f"{type(e).__name__}: {e}"})
                 continue
             audits.append(audit)
-            if new is None:
+            if not instances:
                 print(f"[mask-refine] {old.box_id[:6]} no valid mask -> keep")
                 continue
-            # conservative guard: a local mask may not jump to a neighbour
-            if new.iou_2d(old) < 0.2:
+            # conservative guard: every instance must stay near the old
+            # box (a local mask may not jump to a neighbour)
+            valid = [b for b in instances if b.iou_2d(old) >= 0.2]
+            if not valid:
                 print(f"[mask-refine] {old.box_id[:6]} rejected: IoU<0.2")
                 continue
-            self._adopt_refit(scene, old, new)
-            report.actions_taken.append({
-                "issue_id": "sam_refine", "action": "mask_refine",
-                "params": {"box_id": old.box_id,
-                           "score": audit.get("score"),
-                           "view": audit.get("view"),
-                           "points": audit.get("points")}})
-            print(f"[mask-refine] {old.box_id[:6]} accepted from "
-                  f"{audit.get('view')} score={audit.get('score')}")
+            if len(valid) == 1:
+                self._adopt_refit(scene, old, valid[0])
+                report.actions_taken.append({
+                    "issue_id": "sam_refine", "action": "mask_refine",
+                    "params": {"box_id": old.box_id,
+                               "score": audit["instances"][0]["score"],
+                               "view": audit["instances"][0]["view"],
+                               "points": audit["instances"][0]["points"]}})
+                print(f"[mask-refine] {old.box_id[:6]} accepted from "
+                      f"{audit['instances'][0]['view']} "
+                      f"score={audit['instances'][0]['score']}")
+            else:
+                # the local grounding split a joined row into distinct
+                # cabinets: the primary keeps the old identity, the rest
+                # enter as new boxes
+                import uuid as _uuid
+                self._adopt_refit(scene, old, valid[0])
+                for b in valid[1:]:
+                    b.box_id = _uuid.uuid4().hex[:8]
+                    b.source = BoxSource.AGENT_FIX
+                    b.row_id = old.row_id
+                    scene.boxes.append(b)
+                report.actions_taken.append({
+                    "issue_id": "sam_refine", "action": "mask_refine_split",
+                    "params": {"box_id": old.box_id,
+                               "instances": [
+                                   {"box_id": b.box_id}
+                                   for b in valid]}})
+                print(f"[mask-refine] {old.box_id[:6]} split into "
+                      f"{len(valid)} instances by local grounding")
         if self.out_dir:
             try:
                 if audits:

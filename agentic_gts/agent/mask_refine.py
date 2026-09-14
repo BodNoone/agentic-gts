@@ -643,7 +643,7 @@ def _save_sam_debug(view: dict | None, box_prompt, mask, pts3,
 
 def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                out_dir: str | None = None,
-               views: list | None = None) -> tuple[OrientedBox | None, dict]:
+               views: list | None = None) -> tuple[list, dict]:
     """Run VLM box grounding + SAM + 3D fitting for one box.
 
     Box-only prompting (no points): point placement is a WEAK Qwen3-VL
@@ -652,15 +652,27 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     the box prompt is SAM's canonical interaction, forgiving of prompt
     error where points are brittle. The VLM draws the coarse box; SAM
     snaps the mask to the device inside it; the 3D fit comes from the
-    mask's back-projected gaussians."""
+    mask's back-projected gaussians.
+
+    MULTI-instance: the local-grounding prompt separates a joined row
+    into one group per visually distinct cabinet (different height /
+    color). Each group is refined independently (best SAM mask per
+    group per view); the same physical cabinet grounded in BOTH views
+    is matched by fitted-footprint IoU and its points UNIONed (front
+    gives width/height, the diagonal adds depth). Returns the list of
+    accepted instances (score >= 0.45) -- more than one means the
+    grounding split the row, and the caller replaces the old box with
+    all of them.
+    """
     if views is None:
         views = render_local_views(scene, box, out_dir)
     audit = {"box_id": box.box_id, "views": [], "accepted": False}
     if not views or not sam.available:
         audit["reason"] = "no local GS views or SAM checkpoint"
-        return None, audit
-    candidates = []
-    best_points_per_view = []
+        return [], audit
+    # per (view, group): the group's best candidate
+    # (score, pts, fitted, mask_score)
+    grounded = []
     for view in views:
         # CLEAN image to the VLM: the wireframe overlay (prompt_image)
         # is the Stage-A box, which is often oversized/misplaced -- the
@@ -674,7 +686,6 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         groups = verdict.params.get("groups", []) if verdict.params else []
         va = {"view": view["name"], "image": view["path"],
               "answer": verdict.raw or verdict.detail, "groups": groups}
-        view_candidates = []
         H, W = view["image"].shape[:2]
         for gi, g in enumerate(groups):
             group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
@@ -683,6 +694,7 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
             if not (box_pix[2] - box_pix[0] > 4 and box_pix[3] - box_pix[1] > 4):
                 continue                  # degenerate/absent box
             masks, scores = sam.predict(view["image"], box_pix)
+            best = None
             for mi, (mask, ms) in enumerate(zip(masks, scores)):
                 pts3 = _mask_to_points(scene, box, mask, view["cam"])
                 fitted = fit_mask_points(pts3, box)
@@ -694,11 +706,10 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                 if fitted is None:
                     continue
                 s = score_candidate(float(ms), pts3, fitted, box)
-                candidates.append((s, fitted, view["name"], len(pts3), float(ms)))
-                view_candidates.append((s, pts3, float(ms), gi, mi))
-        if view_candidates:
-            view_candidates.sort(key=lambda x: x[0], reverse=True)
-            best_points_per_view.append(view_candidates[0])
+                if best is None or s > best[0]:
+                    best = (s, pts3, fitted, float(ms))
+            if best is not None:
+                grounded.append((view["name"], *best))
         if out_dir:
             try:
                 with open(os.path.join(
@@ -709,27 +720,43 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
             except OSError:
                 pass
         audit["views"].append(va)
-    # Multi-view union candidate: front provides width/height, side provides
-    # depth. It is usually more complete than either visible surface alone.
-    if len(best_points_per_view) >= 2:
-        union_pts = np.vstack([x[1] for x in best_points_per_view])
-        fitted = fit_mask_points(union_pts, box)
-        if out_dir:
-            # union debug: panel 3 only (no single owning view)
-            _save_sam_debug(None, None, None, union_pts, box, fitted,
-                            out_dir, f"{box.box_id}_union")
-        if fitted is not None:
-            ms = float(np.mean([x[2] for x in best_points_per_view]))
-            s = score_candidate(ms, union_pts, fitted, box) + 0.08
-            candidates.append((min(s, 1.0), fitted, "front+side",
-                               len(union_pts), ms))
-    if not candidates:
+    if not grounded:
         audit["reason"] = "no SAM mask yielded a valid 3D box"
-        return None, audit
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    score, best, view_name, npts, mask_score = candidates[0]
-    audit.update({"accepted": score >= 0.45, "score": round(score, 4),
-                  "view": view_name, "points": npts,
-                  "sam_score": round(mask_score, 4),
-                  "box": best.to_dict()})
-    return (best if score >= 0.45 else None), audit
+        return [], audit
+    # ---- cross-view instance matching: the same physical cabinet
+    # grounded in both views. Fitted footprints live in WORLD coords, so
+    # matching by 2D IoU is view-independent; greedy first-match is fine
+    # (groups from one view never overlap much).
+    instances = []
+    for name, s, pts, fitted, ms in grounded:
+        for inst in instances:
+            if inst["fitted"].iou_2d(fitted) >= 0.3:
+                inst["views"].append((name, s, pts, ms))
+                break
+        else:
+            instances.append({"fitted": fitted,
+                              "views": [(name, s, pts, ms)]})
+    # ---- per-instance verdict: union the matched views (more complete
+    # than either surface alone), score, keep the accepted ones
+    accepted = []
+    for inst in instances:
+        vs = inst["views"]
+        if len(vs) >= 2:
+            union_pts = np.vstack([v[2] for v in vs])
+            fitted = fit_mask_points(union_pts, box) or inst["fitted"]
+            ms = float(np.mean([v[3] for v in vs]))
+            s = min(score_candidate(ms, union_pts, fitted, box) + 0.08, 1.0)
+            entry = (s, fitted, "+".join(v[0] for v in vs),
+                     len(union_pts), ms)
+        else:
+            name, s, pts, fitted, ms = vs[0]
+            entry = (s, fitted, name, len(pts), ms)
+        if s >= 0.45:
+            accepted.append(entry)
+    accepted.sort(key=lambda x: x[0], reverse=True)
+    audit.update({"accepted": bool(accepted),
+                  "instances": [
+                      {"score": round(s, 4), "view": vn, "points": n,
+                       "sam_score": round(ms, 4), "box": b.to_dict()}
+                      for s, b, vn, n, ms in accepted]})
+    return accepted, audit

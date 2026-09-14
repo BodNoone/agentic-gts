@@ -62,6 +62,12 @@ def test_sam_box_prompt_construction():
         "no coordinate-system explanation (the trained format implies it)"
     assert "Locate every instance" in prompt, \
         "the cookbook's trained locate phrasing must be kept"
+    # instance rules (the split_stage replacement): distinct cabinets
+    # in a joined row ground separately; an open door is excluded
+    assert "differ in height or in color" in prompt, \
+        "joined-row cabinets must be separated by visual difference"
+    assert "door standing" in prompt and "exclude" in prompt, \
+        "an open door swung out of the body must stay outside the box"
     print("PASS SAM box prompt construction (cookbook style, literal braces)")
 
 

@@ -85,56 +85,6 @@ def test_objects_format_roundtrip():
         shutil.rmtree(out, ignore_errors=True)
 
 
-def _rack_pts(rng, x_lo, x_hi, n=400, y_depth=1.1, z_h=2.0):
-    """Surface points of a rack footprint [x_lo, x_hi]: front/back faces +
-    top. Dense enough for profile_cuts min_points."""
-    pts = []
-    for off in (y_depth / 2, -y_depth / 2):
-        u = rng.uniform(x_lo, x_hi, n)
-        z = rng.uniform(0, z_h, n)
-        pts.append(np.stack([u, np.full(n, off), z], axis=1))
-    u = rng.uniform(x_lo, x_hi, n // 2)
-    v = rng.uniform(-y_depth / 2, y_depth / 2, n // 2)
-    pts.append(np.stack([u, v, np.full(n // 2, z_h)], axis=1))
-    return np.vstack(pts)
-
-
-def test_profile_cuts_gap_and_tail():
-    """profile_cuts must find: the empty aisle between two racks (gap cut),
-    the sparse fading end of a half-observed device (tail truncation), and
-    nothing in a uniform dense box."""
-    from agentic_gts.core.models import OrientedBox
-    from agentic_gts.tools import geometry as geo
-
-    rng = np.random.default_rng(5)
-    # two racks with a 0.1m aisle, one box over both
-    pts = np.vstack([_rack_pts(rng, 0.0, 0.6), _rack_pts(rng, 0.7, 1.3)])
-    scene = Scene(points=pts)
-    box = OrientedBox(center=(0.65, 0, 1), size=(1.3, 1.1, 2.0), yaw=0.0)
-    prof = geo.profile_cuts(scene, box)
-    assert len(prof["gaps"]) == 1, f"aisle gap not found: {prof}"
-    assert abs(prof["gaps"][0]) < 0.06, "cut should sit at the aisle middle"
-
-    # one rack + a sparse fading half-device tail
-    pts = np.vstack([
-        _rack_pts(rng, 0.0, 0.6),
-        _rack_pts(rng, 0.6, 0.9, n=30),   # ~8x sparser
-    ])
-    scene = Scene(points=pts)
-    box = OrientedBox(center=(0.45, 0, 1), size=(0.9, 1.1, 2.0), yaw=0.0)
-    prof = geo.profile_cuts(scene, box)
-    assert not prof["gaps"], "fading tail must not read as an aisle gap"
-    assert prof["tails"][1] is not None, "fading tail not detected"
-    assert 0.1 < prof["tails"][1] < 0.25, f"tail cut {prof['tails']} misplaced"
-
-    # uniform dense wide device: neither gaps nor tails
-    scene = Scene(points=_rack_pts(rng, 0.0, 0.9, n=600))
-    box = OrientedBox(center=(0.45, 0, 1), size=(0.9, 1.1, 2.0), yaw=0.0)
-    prof = geo.profile_cuts(scene, box)
-    assert not prof["gaps"] and prof["tails"] == (None, None)
-    print("PASS profile_cuts (gap / tail / clean)")
-
-
 def test_ply_artifacts():
     """Output PLYs: boxes_only.ply (no cloud) + cloud_with_boxes.ply
     (height-tinted when no GS, SH-DC colored when GS available)."""
@@ -213,31 +163,6 @@ def _tiny_gs_ply(out: str) -> str:
         f.write(hdr.encode("ascii"))
         f.write(b"".join(rows))
     return p
-
-
-def test_fit_box_to_points_keep_depth():
-    """keep_depth=True must preserve the seed's cross extent even when
-    the interior is hollow and only ONE face has points (the split piece's
-    span is trusted knowledge, not point support); without it the
-    percentile refit collapses the box back to the observed face shell."""
-    from agentic_gts.tools import geometry as geo
-    rng = np.random.default_rng(7)
-    # ONE observed face (single-side scan): points only at y ~ +0.55
-    u = rng.uniform(-0.28, 0.28, 500)
-    z = rng.uniform(0.1, 1.9, 500)
-    c = 0.55 + rng.uniform(-0.03, 0.03, 500)
-    scene = Scene(points=np.stack([u, c, z], axis=1))
-    refit = geo.fit_box_to_points(scene, (0.0, 0.0), (0.6, 1.1, 2.0), 0.0,
-                                  keep_height=True, keep_depth=True)
-    assert refit is not None
-    assert abs(refit.size[1] - 1.1) < 0.05, \
-        f"keep_depth must preserve the span, got {refit.size[1]}"
-    collapsed = geo.fit_box_to_points(scene, (0.0, 0.0), (0.6, 1.1, 2.0),
-                                      0.0, keep_height=True)
-    assert collapsed.size[1] < 0.5, \
-        f"without keep_depth the refit must collapse, got {collapsed.size[1]}"
-    print(f"PASS fit_box_to_points keep_depth "
-          f"(keep={refit.size[1]:.2f} collapse={collapsed.size[1]:.2f})")
 
 
 if __name__ == "__main__":

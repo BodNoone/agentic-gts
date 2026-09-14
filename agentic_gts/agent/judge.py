@@ -40,42 +40,6 @@ class Verdict:
 
 # ---------- image rendering helpers ----------
 
-def _tile_views(views: list, labels=("front", "side", "oblique")) -> np.ndarray:
-    """Tile multiple single-view renders into ONE composite image.
-
-    One image per VLM call keeps the (OpenAI-compatible / transformers)
-    API payload unchanged -- a single image input -- while showing the box
-    from several viewpoints. Views are laid out horizontally with a small
-    label strip above each so the VLM (and auditors reading the saved
-    evidence) can tell them apart.
-    """
-    from PIL import Image, ImageDraw
-    tiles = []
-    label_h = max(18, views[0].shape[0] // 25)   # scale with tile resolution
-    for i, v in enumerate(views):
-        arr = (np.clip(v, 0, 1) * 255).astype(np.uint8)
-        if arr.shape[2] == 4:
-            arr = arr[:, :, :3]
-        im = Image.fromarray(arr)
-        strip = Image.new("RGB", (im.width, label_h), (0, 0, 0))
-        d = ImageDraw.Draw(strip)
-        d.text((10, label_h // 6), labels[i % len(labels)],
-               fill=(255, 255, 255))
-        tile = Image.new("RGB", (im.width, im.height + label_h), (0, 0, 0))
-        tile.paste(strip, (0, 0))
-        tile.paste(im, (0, label_h))
-        tiles.append(tile)
-    gap = max(4, label_h // 4)
-    W = sum(t.width for t in tiles) + gap * (len(tiles) - 1)
-    H = max(t.height for t in tiles)
-    out = Image.new("RGB", (W, H), (0, 0, 0))
-    x = 0
-    for t in tiles:
-        out.paste(t, (x, 0))
-        x += t.width + gap
-    return np.asarray(out).astype(np.float32) / 255.0
-
-
 def _extract_json(text: str):
     """Best-effort JSON object extraction from a VLM reply.
 
@@ -239,49 +203,6 @@ def _salvage_bboxes(text: str, W: int, H: int) -> list[tuple]:
 
 def _png_to_b64(png_bytes: bytes) -> str:
     return base64.b64encode(png_bytes).decode("ascii")
-
-
-def _render_split_views(scene, box, extent: float = 1.2):
-    """Two-panel evidence image for the row-split question: the row box's
-    FRONT face (azim ~0) and BACK face (azim ~180), each best-of nearby
-    azimuths with the same quality/visibility selection as the local
-    view. Both long faces are needed because a joined row's cabinet
-    boundaries are door seams -- often clearer on one face than the
-    other.
-
-    Returns (image, quality_dict); (None, {}) when no GS render came
-    out (split is GS-only in the new flow -- the caller keeps the row
-    whole rather than adjudicate on a degraded view)."""
-    gs_ply = scene.meta.get("gs_ply")
-    if gs_ply:
-        try:
-            from agentic_gts.tools.gs_io import read_gaussian_ply
-            from agentic_gts.output.gs_render import (make_local_cam,
-                                                      render_slot_candidates)
-            gs = read_gaussian_ply(gs_ply)
-            cut_z = box.center[2] + box.size[2] / 2.0 - 0.08
-            iso = extent + 1.0
-            faces = {
-                "front": ((18.0, 0.0), (18.0, 12.0), (18.0, -12.0)),
-                "back": ((18.0, 180.0), (18.0, 168.0), (18.0, 192.0)),
-            }
-            views, quality = [], {}
-            for name, cands in faces.items():
-                img, q, chosen = render_slot_candidates(
-                    gs, [box],
-                    lambda e, a: make_local_cam([box], extent=extent * 2,
-                                                elev_deg=e, azim_deg=a),
-                    cands, cut_z=cut_z, overlay="wire3d", iso_margin=iso)
-                if img is None:
-                    continue
-                views.append(img)
-                quality[name] = dict(q, view=[chosen[0], chosen[1]])
-            if views:
-                return _tile_views(views, labels=list(quality)), quality
-        except Exception as e:
-            print(f"[gs][split] true render failed ({type(e).__name__}: {e}) "
-                  f"-> keep whole")
-    return None, {}
 
 
 class VLMJudge:
@@ -485,113 +406,6 @@ class VLMJudge:
                     f"{len(rects)} regions", 0.5, "", png_path=png_path)
         return rects
 
-    # ---- per-row split (how many cabinets in one row box) ----
-    _SPLIT_PROMPT = (
-        "You are auditing ONE row structure in a data center. The image is "
-        "a composite of up to TWO views of the SAME row, tiled side by "
-        "side, each labeled above the panel: 'front' and 'back' (the two "
-        "opposite long faces of the row; in a fallback render a single "
-        "top-down view is shown instead). The red wireframe marks the row "
-        "box -- it spans the WHOLE row by design, so do NOT flag its "
-        "ends.\n\n"
-        "The row may contain MULTIPLE separate cabinets joined side by "
-        "side, or a single wide cabinet. Judge the cabinet units by door "
-        "seams, panel boundaries, and the width rhythm; use BOTH faces "
-        "(seams are often clearer on one side).\n\n"
-        "Work step by step:\n"
-        "1. Write ONE short sentence per view about how many distinct "
-        "cabinet units you count and where the boundaries are.\n"
-        "2. Then output ONE JSON object on the LAST line:\n"
-        '{"count": <int>, "gaps": [<float>, ...]}\n'
-        "- count: how many distinct cabinet units the row contains.\n"
-        "- gaps: for count > 1, the internal boundary positions as "
-        "fractions 0.0-1.0 along the row, measured in the FRONT view "
-        "from its LEFT edge to its RIGHT edge (count-1 values, "
-        "increasing). Empty list when count is 1."
-    )
-
-    @staticmethod
-    def _parse_split_reply(text: str) -> dict | None:
-        """Parse the split reply. None = keep whole (unparseable -> no
-        split is the safe default)."""
-        data = _extract_json(text)
-        if not isinstance(data, dict):
-            return None
-        try:
-            count = int(data.get("count", 1))
-        except (TypeError, ValueError):
-            return None
-        count = max(1, min(count, 40))
-        gaps = []
-        for g in data.get("gaps", []) or []:
-            try:
-                g = float(g)
-            except (TypeError, ValueError):
-                continue
-            if 0.02 < g < 0.98:
-                gaps.append(min(max(g, 0.02), 0.98))
-        gaps = sorted(set(round(g, 4) for g in gaps))[: max(count, 1)]
-        return {"count": count, "gaps": gaps}
-
-    def adjudicate_split(self, scene, box) -> Verdict:
-        """How many cabinets does one whole-row box contain, and where
-        are the internal boundaries? Renders the row's two long faces.
-        Mock / any failure degrades to keep (no split without evidence
-        -- an over-split row is far harder to repair downstream)."""
-        if self.backend == "mock":
-            return Verdict(action="keep", params={"count": 1, "gaps": []},
-                           confidence=0.5, detail="mock: no split")
-        try:
-            img, quality = _render_split_views(scene, box)
-        except Exception as e:
-            print(f"[vlm][split] render failed ({type(e).__name__}: {e}) "
-                  f"-> keep whole")
-            return Verdict(action="keep", params={"count": 1, "gaps": []},
-                           confidence=0.3, detail=f"render failed: {e}")
-        if img is None:
-            print("[vlm][split] no usable GS view -> keep whole")
-            return Verdict(action="keep", params={"count": 1, "gaps": []},
-                           confidence=0.3, detail="no split evidence view")
-        from agentic_gts.output.gs_render import png_bytes as _pb
-        png = _pb(img)
-        png_path = self._save_evidence_png(
-            img, f"split_evidence_{box.box_id[:8]}.png")
-        use_thinking = bool(self.thinking_model)
-        text = None
-        try:
-            for thinking in ((True, False) if use_thinking else (False,)):
-                try:
-                    if self.backend == "local":
-                        text = self._local_image_call(
-                            png, self._SPLIT_PROMPT,
-                            max_new_tokens=2048 if thinking else 300,
-                            thinking=thinking)
-                    else:
-                        text = self._qwen_image_call(
-                            png, self._SPLIT_PROMPT,
-                            max_tokens=2048 if thinking else 300,
-                            thinking=thinking)
-                    break
-                except Exception as e:
-                    if not thinking:
-                        raise
-                    print(f"[vlm][split][thinking] failed "
-                          f"({type(e).__name__}: {e}) -> fast model")
-        except Exception as e:
-            print(f"[vlm][split] failed ({type(e).__name__}: {e}) -> keep")
-            return Verdict(action="keep", params={"count": 1, "gaps": []},
-                           confidence=0.3, detail=f"call failed: {e}")
-        p = self._parse_split_reply(text)
-        if p is None:
-            print(f"[vlm][split] unparseable reply -> keep: {text[:120]!r}")
-            return Verdict(action="keep", params={"count": 1, "gaps": []},
-                           confidence=0.3, detail="unparseable")
-        self._record("split", self._SPLIT_PROMPT, text or "",
-                    f"count={p['count']} gaps={p['gaps']}", 0.6,
-                    "", png_path=png_path, quality=quality or None)
-        return Verdict(action="keep" if p["count"] <= 1 else "split",
-                       params=p, confidence=0.6, detail="")
-
     # Prompt style follows the OFFICIAL 2d_grounding cookbook verbatim
     # (same lesson as _GROUND_PROMPT above): categories + the JSON
     # template ONLY. Explaining the coordinate system or dictating a
@@ -600,13 +414,24 @@ class VLMJudge:
     # official {"bbox_2d": ..., "label": ...} array is the trained
     # output; parse_box_groups accepts it natively (top-level array,
     # label -> hypothesis).
+    # The splitting rules replace the removed split_stage: a joined row
+    # whose cabinets differ in height or color must be grounded as
+    # SEPARATE instances (the row split now comes from this grounding,
+    # not a separate VLM pass); an open door swung out of the body is
+    # not part of the device and must stay outside the box.
     _SAM_BOX_PROMPT = (
         "This is a local {view_name} view of one target device in a "
         "data-center room, rendered clean on a dark background: the "
         "bright structure filling most of the frame IS the target.\n"
         "Locate every instance that belongs to the following categories: "
-        '"server rack / IT cabinet, air-conditioning unit". The box '
-        "must cover the whole visible device.\n"
+        '"server rack / IT cabinet, air-conditioning unit".\n'
+        "Instance rules: cabinets joined side by side in one row are "
+        "DIFFERENT instances when they differ in height or in color -- "
+        "give each its own box at its own boundary; truly identical "
+        "joined cabinets may be covered by one box. A door standing "
+        "open, swung out of the cabinet body, is NOT part of the "
+        "device -- the box must exclude it.\n"
+        "Each box must cover the whole visible device it belongs to.\n"
         "Report bbox coordinates in JSON format like this: "
         '{"bbox_2d": [x1, y1, x2, y2], "label": "rack"}'
     )

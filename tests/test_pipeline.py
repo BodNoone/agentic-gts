@@ -9,7 +9,6 @@ import numpy as np
 
 from agentic_gts.core.models import OrientedBox, Scene
 from agentic_gts.synth.generator import SynthConfig, generate
-from agentic_gts.tools import geometry as geo
 from agentic_gts.pipeline import run_pipeline
 from agentic_gts.eval.metrics import evaluate
 
@@ -36,14 +35,6 @@ def test_synth_generation():
     # some corruption must exist
     kinds = {b.meta.get("corruption") for b in corrupt}
     assert len(kinds) > 1
-
-
-def test_split_box():
-    scene, gt, corrupt = generate(SynthConfig(seed=42))
-    merged = [b for b in corrupt if b.meta.get("corruption") == "merged"][0]
-    subs = geo.split_box(scene, merged, 2, width_unit=0.6)
-    assert len(subs) == 2
-    assert abs(subs[0].size[0] - 0.6) < 0.05
 
 
 def test_pipeline_mock_smoke():

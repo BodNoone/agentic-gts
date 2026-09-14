@@ -1,12 +1,10 @@
-"""Tests for the VLM 2D grounding + split stage (no server / GPU needed).
+"""Tests for the VLM 2D grounding stage (no server / GPU needed).
 
 Covers:
   - unproject_ground: pixel -> world roundtrip through the god-view cam
   - _fit_region_box: a region rect becomes a FULL-DEPTH box (the
     thin-fragment killer: both face bands + hollow interior inside)
-  - _split_row: VLM gap fractions snap to the measured density gaps
   - ground_stage end-to-end with a patched VLM answer (scatter path)
-  - _parse_split_reply robustness
 """
 from __future__ import annotations
 
@@ -78,30 +76,6 @@ def test_fit_region_box_full_depth():
     assert _fit_region_box(floor, (-1.2, -1.2, 1.2, 1.2)) is None
     print(f"PASS region fit full depth "
           f"(L={bb.size[0]:.2f} D={bb.size[1]:.2f} H={bb.size[2]:.2f})")
-
-
-def test_split_row_snaps_to_profile_gaps():
-    from agentic_gts.agent.ground import _split_row
-    rng = np.random.default_rng(11)
-    # 3 cabinets of 1.8m separated by 0.2m real gaps
-    pts = np.vstack([_row_points(0.0, 1.8, rng=rng, n=3000),
-                     _row_points(2.0, 3.8, rng=rng, n=3000),
-                     _row_points(4.0, 5.8, rng=rng, n=3000)])
-    scene = Scene(points=pts)
-    row = _hint(2.9, 0.0, size=(5.8, 1.1, 2.1))
-    # VLM nominates COARSE fractions (0.30 / 0.72); the measured gaps are
-    # at x ~1.9 / 3.9 (local ~ -1.0 / +1.0) -- geometry must snap there
-    subs = _split_row(scene, row, 3, [0.30, 0.72])
-    assert len(subs) == 3, f"expected 3 cabinets, got {len(subs)}"
-    centers = sorted(s.center[0] for s in subs)
-    assert abs(centers[0] - 0.9) < 0.15, f"cabinet 1 centre {centers[0]:.2f}"
-    assert abs(centers[1] - 2.9) < 0.15, f"cabinet 2 centre {centers[1]:.2f}"
-    assert abs(centers[2] - 4.9) < 0.15, f"cabinet 3 centre {centers[2]:.2f}"
-    for s in subs:
-        assert 1.4 < s.size[0] < 2.1, f"piece length {s.size[0]:.2f}"
-        assert 0.7 < s.size[1] < 1.4, f"piece depth {s.size[1]:.2f} (kept full)"
-    print(f"PASS split snaps to gaps ({len(subs)} cabinets, centres "
-          f"{[round(c, 2) for c in centers]})")
 
 
 def test_ground_stage_with_patched_vlm():
@@ -194,25 +168,6 @@ def test_ground_stage_with_patched_vlm():
     print(f"PASS ground stage end-to-end "
           f"(row1 {rows[0].size[0]:.2f}x{rows[0].size[1]:.2f}, "
           f"row2 {b2.size[0]:.2f}x{b2.size[1]:.2f})")
-
-
-def test_split_reply_parse():
-    from agentic_gts.agent.judge import VLMJudge
-    p = VLMJudge._parse_split_reply(
-        'Three cabinets, boundaries near a third and two thirds.\n'
-        '{"count": 3, "gaps": [0.33, 0.67]}')
-    assert p == {"count": 3, "gaps": [0.33, 0.67]}
-    # garbage / nonsense -> None (keep whole: the safe default)
-    assert VLMJudge._parse_split_reply("cannot tell") is None
-    # out-of-range gaps dropped, count clamped
-    p = VLMJudge._parse_split_reply('{"count": 2, "gaps": [0.0, 0.5, 1.0]}')
-    assert p == {"count": 2, "gaps": [0.5]}
-    # thinking-style chain prefix before the JSON
-    p = VLMJudge._parse_split_reply(
-        'Looking at the two views, this row holds two units. '
-        '{"count": 2, "gaps": [0.5]}')
-    assert p == {"count": 2, "gaps": [0.5]}
-    print("PASS split reply parse (incl. think-block + range clamps)")
 
 
 def test_parse_ground_regions_official_format():
@@ -311,9 +266,7 @@ def test_ground_mock_returns_false():
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
-    test_split_row_snaps_to_profile_gaps()
     test_ground_stage_with_patched_vlm()
-    test_split_reply_parse()
     test_parse_ground_regions_official_format()
     test_parse_ground_regions_salvage()
     test_ground_mock_returns_false()
