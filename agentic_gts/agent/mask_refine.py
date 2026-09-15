@@ -784,6 +784,19 @@ def _save_sam_debug(view: dict | None, box_prompt, mask, pts3,
               f"({type(e).__name__}: {e})")
 
 
+def _rebuild(f: "OrientedBox", center=None, size=None) -> "OrientedBox":
+    """Copy-preserving rebuild: the _apply_* passes REPLACE fitted
+    boxes; identity and meta (box_id, device_type, row_id, ...) must
+    survive the replacement -- a plain OrientedBox(center=..., size=...)
+    dropped them."""
+    return OrientedBox(
+        center=tuple(center) if center is not None else tuple(f.center),
+        size=tuple(size) if size is not None else tuple(f.size),
+        yaw=f.yaw, box_id=f.box_id, device_type=f.device_type,
+        source=f.source, confidence=f.confidence, row_id=f.row_id,
+        meta=dict(f.meta))
+
+
 def _apply_depth_from_side(instances: list, pts: np.ndarray,
                            seed: "OrientedBox",
                            min_pts: int = 20) -> list[dict]:
@@ -843,14 +856,109 @@ def _apply_depth_from_side(instances: list, pts: np.ndarray,
             continue
         # rebuild: seed's along/height, side-measured thickness + centre
         cxy = axis * along_c + cross * mid
-        inst["fitted"] = OrientedBox(
-            center=(float(cxy[0]), float(cxy[1]), float(fc[2])),
-            size=(float(f.size[0]), depth, float(f.size[2])),
-            yaw=yaw)
+        inst["fitted"] = _rebuild(
+            f, center=(float(cxy[0]), float(cxy[1]), float(fc[2])),
+            size=(float(f.size[0]), depth, float(f.size[2])))
         inst["pts"] = sel
+        inst["depth_ok"] = "side"
         rec["accepted"] = True
         rec["depth"] = round(depth, 3)
     return recs
+
+
+def _apply_height_and_geom_depth(instances: list, seed: "OrientedBox",
+                                 scene: Scene) -> int:
+    """Per-piece HEIGHT correction + geometry THICKNESS fallback.
+
+    Height: split pieces inherit the seed's height, but the seed is the
+    region fit -- the row's TALLEST cabinet (P99.5 over the whole
+    rect). A row the VLM split precisely BECAUSE cabinets differ in
+    height (prompt rule) must get each piece's OWN height, measured as
+    the P99.5 top of the piece's own points (front-view surface or
+    side-view slice). The bottom stays the seed's bottom (devices stand
+    on the ground; the region fit put it at ~0).
+
+    Thickness fallback: the side view is the primary thickness source
+    (VLM excludes open doors), but when it is missing or rejected a
+    piece, the only thing left is the seed's depth -- fit over the
+    row's UNION footprint, wrong for every piece of a front-back
+    STAGGERED row (user report: the actual thickness cannot be assigned
+    per device). The fallback slices the RAW CLOUD by the piece's
+    along-span and runs the same strong-bin estimator: the cabinet's
+    front/back shells concentrate into strong bins while an open
+    door's swing smears into a low plateau -- the statistical door
+    exclusion the side view provides explicitly survives approximately.
+
+    Returns the number of geometry-fallback depth corrections.
+    """
+    if not instances:
+        return 0
+    yaw = float(seed.yaw)
+    axis = np.array([math.cos(yaw), math.sin(yaw)])
+    cross = np.array([-math.sin(yaw), math.cos(yaw)])
+    sc = np.asarray(seed.center, dtype=float)
+    seed_cross_c = float(sc[:2] @ cross)
+    seed_half_d = float(np.asarray(seed.size)[1]) / 2.0
+    seed_bottom = float(sc[2] - seed.size[2] / 2.0)
+    seed_top = float(sc[2] + seed.size[2] / 2.0)
+    # raw-cloud device band for the geometry fallback (same band the
+    # region fit used: floor texture out, ceiling out)
+    P = np.asarray(scene.points, dtype=float)
+    band = P[(P[:, 2] > 0.30) & (P[:, 2] <= seed_top + 0.10)] \
+        if len(P) else P
+    n_geom = 0
+    for inst in instances:
+        f = inst["fitted"]
+        # ---- height: the piece's own top ----
+        pts = inst.get("pts")
+        if pts is not None and len(pts) >= 20:
+            z_top = float(np.percentile(np.asarray(pts)[:, 2], 99.5))
+            # guards: plausible device height, not a partial-mask
+            # under-measure (>= 25% of the seed top), not above the
+            # row's tallest cabinet by more than fit slop
+            if (0.50 <= z_top <= 4.50
+                    and 0.25 * seed_top <= z_top <= seed_top + 0.25):
+                h = z_top - seed_bottom
+                if abs(h - float(f.size[2])) > 0.05:
+                    f = _rebuild(
+                        f,
+                        center=(float(f.center[0]), float(f.center[1]),
+                                seed_bottom + h / 2.0),
+                        size=(float(f.size[0]), float(f.size[1]), h))
+                    inst["fitted"] = f
+                    inst["height"] = round(h, 3)
+        # ---- thickness: geometry fallback for uncorrected pieces ----
+        if inst.get("depth_ok"):
+            continue
+        fc = np.asarray(f.center, dtype=float)
+        along_c = float(fc[:2] @ axis)
+        half = float(f.size[0]) / 2.0
+        if len(band) < 100:
+            continue
+        along_b = band[:, :2] @ axis
+        sel = band[np.abs(along_b - along_c) <= half + 0.05]
+        if len(sel) < 40:
+            continue
+        span = _robust_span(sel[:, :2] @ cross)
+        if span is None:
+            continue
+        c_lo, c_hi = span
+        depth = float(c_hi - c_lo)
+        if not (0.3 <= depth <= 2.5):
+            continue
+        mid = 0.5 * (c_lo + c_hi)
+        # the measured centre must stay inside the seed's cross span
+        # (padded) -- the region bounds the device
+        if abs(mid - seed_cross_c) > seed_half_d + 0.30:
+            continue
+        cxy = axis * along_c + cross * mid
+        inst["fitted"] = _rebuild(
+            f, center=(float(cxy[0]), float(cxy[1]), float(f.center[2])),
+            size=(float(f.size[0]), depth, float(f.size[2])))
+        inst["depth_ok"] = "geometry"
+        inst["depth"] = round(depth, 3)
+        n_geom += 1
+    return n_geom
 
 
 def _build_split_pieces(spans: list, seed: "OrientedBox") -> list:
@@ -1120,6 +1228,13 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         audit["views"].append(dva)
     else:
         instances = _build_split_pieces(spans, box)
+
+    # ---- pass 3: per-piece height + geometry thickness fallback ----
+    # Heights are NEVER seed-inherited past this point when the piece
+    # has its own points, and a piece the side view left uncorrected
+    # gets its thickness from the raw cloud instead of the seed's
+    # union-footprint depth (staggered rows, user report).
+    _apply_height_and_geom_depth(instances, box, scene)
 
     if not front_ok and not depth_ok:
         # nothing was measured: keep the seed untouched

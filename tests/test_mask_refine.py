@@ -245,6 +245,59 @@ def test_build_split_pieces_trusts_seed_dims():
     print("PASS split pieces keep seed dims, spans give along extent")
 
 
+def test_height_and_staggered_thickness_per_piece():
+    """Per-piece height + geometry thickness fallback (user report:
+    refine never corrected HEIGHTS, and a front-back STAGGERED row
+    kept the seed's UNION depth on every piece). Two cabinets in one
+    seed: A along [0,1.2] tall 2.1m at cross [-0.2,0.9]; B along
+    [1.2,2.4] short 1.2m at cross [-0.9,0.2] -- union cross [-0.9,0.9]
+    (seed depth 1.8, the row's tallest height 2.1). No side view: the
+    geometry fallback must give each piece its OWN ~1.1m thickness at
+    its OWN offset, and the short one its OWN height."""
+    from agentic_gts.agent.mask_refine import (_apply_height_and_geom_depth,
+                                                _build_split_pieces)
+    rng = np.random.default_rng(7)
+
+    def cabinet(x0, x1, c_lo, c_hi, z_hi, n=900):
+        # shell-heavy sampling: half the points on each cross wall
+        # (what a real cabinet's front/back faces look like to the
+        # strong-bin estimator), spread along/z inside
+        xs = rng.uniform(x0, x1, n)
+        cs = np.where(rng.random(n) < 0.5,
+                      c_lo + 0.02 * rng.random(n),
+                      c_hi - 0.02 * rng.random(n))
+        zs = rng.uniform(0.1, z_hi, n)
+        return np.column_stack([xs, cs, zs])
+
+    a = cabinet(0.0, 1.2, -0.2, 0.9, 2.1)
+    b = cabinet(1.2, 2.4, -0.9, 0.2, 1.2)
+    scene = Scene(points=np.vstack([a, b]))
+    seed = OrientedBox(center=(1.2, 0.0, 1.05), size=(2.4, 1.8, 2.1),
+                       yaw=0.0)
+    spans = [
+        {"lo": -1.2, "hi": 0.0, "pts": a, "ms": 0.8, "label": "rack"},
+        {"lo": 0.0, "hi": 1.2, "pts": b, "ms": 0.8, "label": "rack"},
+    ]
+    instances = _build_split_pieces(spans, seed)
+    n_geom = _apply_height_and_geom_depth(instances, seed, scene)
+    assert n_geom == 2, "both pieces need the geometry depth fallback"
+    by_along = sorted(instances, key=lambda e: e["fitted"].center[0])
+    pa, pb = (e["fitted"] for e in by_along)
+    # per-piece height: A keeps ~2.1, B drops to ~1.2 (was seed 2.1)
+    assert 1.9 < pa.size[2] < 2.2, f"A height {pa.size[2]:.2f}"
+    assert 1.0 < pb.size[2] < 1.35, \
+        f"B height {pb.size[2]:.2f} -- its OWN, not the seed's 2.1"
+    assert abs(pb.center[2] - pb.size[2] / 2.0) < 0.05, \
+        "B bottom must stay on the ground (seed bottom ~0)"
+    # per-piece thickness at its own stagger offset (was seed 1.8 union)
+    for p, mid_exp in ((pa, 0.35), (pb, -0.35)):
+        assert 0.9 < p.size[1] < 1.35, \
+            f"thickness {p.size[1]:.2f} -- its OWN, not the union 1.8"
+        assert abs(p.center[1] - mid_exp) < 0.15, \
+            f"cross centre {p.center[1]:.2f}, expected ~{mid_exp}"
+    print("PASS per-piece height + staggered geometry thickness")
+
+
 def test_sam_unconfigured_is_conservative():
     old = os.environ.pop("SAM_CHECKPOINT", None)
     try:
@@ -651,8 +704,15 @@ def test_local_refine_splits_joined_row_end_to_end():
              f"into 2 boxes, got {len(scene.boxes)}: "
              + str([b.to_dict().get("center") for b in scene.boxes]))
         for b in scene.boxes:
-            assert abs(b.size[1] - 1.0) < 1e-6, "depth stays seed-trusted"
-            assert abs(b.size[2] - 1.9) < 1e-6, "height stays seed-trusted"
+            # depth/height are now MEASURED per piece (side view for
+            # depth, the piece's own points for height), not
+            # seed-inherited: both cabinets are 1.0 deep / ~1.9 tall
+            # here, so the measured values must land on the truth,
+            # within the strong-bin / P99.5 quantization slop
+            assert 0.85 < b.size[1] < 1.15, \
+                f"depth {b.size[1]:.2f} -- measured, near the true 1.0"
+            assert 1.75 < b.size[2] < 2.05, \
+                f"height {b.size[2]:.2f} -- measured, near the true 1.9"
         centers = sorted(b.center[axis_i] for b in scene.boxes)
         assert centers[0] < -0.2 < 0.2 < centers[1], \
             f"the two pieces must sit on their own cabinets: {centers}"
