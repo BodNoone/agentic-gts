@@ -588,7 +588,7 @@ def test_open_side_far_mass_beats_diffuse_wall():
                                     np.full(300, 2.0)]).astype(np.float32),
         f_dc=np.zeros((n, 3), dtype=np.float32),
     )
-    vec, corridor = _open_side(gs, box)
+    vec, corridor, _closed = _open_side(gs, box)
     # wall side measures the full 3.0 m corridor (smear is mass-
     # invisible) vs the aisle's 2.0 m: without the override the WALL
     # side wins and the camera renders from outside the room
@@ -657,16 +657,19 @@ def test_open_side_flush_wall_and_floaters():
                                     np.full(3, -1.0)]).astype(np.float32),
         f_dc=np.zeros((n, 3), dtype=np.float32),
     )
-    vec, corridor = _open_side(gs, box)
+    vec, corridor, closed = _open_side(gs, box)
     # open side is the aisle (+y), corridor wide (floaters don't block)
     assert vec[1] > 0.99, f"open side must be the aisle +y, got {vec}"
     assert corridor > 2.0, f"floaters must not block, corridor={corridor:.2f}"
+    # the closed side (flush wall) reports its narrow gap -- the back
+    # view's gate reads this
+    assert closed < 0.35, f"flush wall must measure narrow, got {closed:.2f}"
 
     # mirror: wall on the +y side, floaters (the aisle) on -y -> the
     # open side flips. (Everything mirrors: an empty side facing away
     # from the interior is correctly vetoed as outside-the-room.)
     gs.means[:, 1] *= -1.0
-    vec2, corridor2 = _open_side(gs, box)
+    vec2, corridor2, _closed2 = _open_side(gs, box)
     assert vec2[1] < -0.99, f"open side must flip to -y, got {vec2}"
     assert corridor2 > 2.0
     print(f"PASS open side: flush wall blocked, floaters ignored "
@@ -1161,7 +1164,7 @@ def test_open_side_picks_aisle():
     gs = SimpleNamespace(means=np.vstack([row, wall, facing]),
                          raw_opacity=np.full(len(row) + 600, 2.0,
                                             dtype=np.float32))
-    vec, corridor = _open_side(gs, box)
+    vec, corridor, _closed = _open_side(gs, box)
     assert vec[1] > 0.9, f"open side must be +y (aisle), got {vec}"
     assert 1.3 < corridor < 1.9, f"corridor ~1.7m expected, got {corridor}"
     # mirrored scene: the aisle on -y must flip the pick
@@ -1169,7 +1172,7 @@ def test_open_side_picks_aisle():
         means=np.vstack([row, wall[:, [0, 1, 2]] * np.array([1, -1, 1]),
                          facing * np.array([1, -1, 1])]),
         raw_opacity=np.full(len(row) + 600, 2.0, dtype=np.float32))
-    vec2, _ = _open_side(gs2, box)
+    vec2, _, _closed2 = _open_side(gs2, box)
     assert vec2[1] < -0.9, f"mirrored scene must pick -y, got {vec2}"
     print("PASS open side picks the aisle (and flips on mirror)")
 
@@ -1213,6 +1216,60 @@ def test_side_view_looks_along_row_axis():
     assert abs(look[0]) > 3 * abs(look[1]), (
         f"side view must look along the row, got direction {look}")
     print("PASS side view looks along the row axis (thickness profile)")
+
+
+def test_back_view_skipped_behind_wall():
+    """BACK GATE (user report: a wall-adjacent box's back view puts the
+    camera THROUGH the wall -- a fog render). render_local_views must
+    skip the back slot when the CLOSED side's corridor cannot hold the
+    minimum standoff (0.6m) and keep front + side."""
+    from types import SimpleNamespace
+
+    from agentic_gts.agent import mask_refine as mr
+    from agentic_gts.tools.gs_io import GaussianData
+    rng = np.random.default_rng(5)
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(4.0, 1.0, 2.0),
+                      yaw=0.0)
+    scene = Scene(points=np.zeros((10, 3)))
+    scene.meta["gs_ply"] = "fake.ply"
+    # aisle on +y (2m clear); FLUSH WALL on -y right at the back face
+    aisle_side = rng.uniform(0.55, 2.4, 400)
+    means = np.vstack([
+        np.column_stack([rng.uniform(-2, 2, 400), aisle_side,
+                         rng.uniform(0.3, 1.7, 400)]),   # aisle floaters
+        np.column_stack([rng.uniform(-2, 2, 400),
+                         np.full(400, -0.60),
+                         rng.uniform(0.3, 1.7, 400)]),  # flush wall
+    ]).astype(np.float32)
+    n = len(means)
+    gs = GaussianData(
+        means=means,
+        log_scales=np.full((n, 3), -6.0, dtype=np.float32),
+        quats=np.tile(np.array([[1.0, 0, 0, 0]], np.float32), (n, 1)),
+        # aisle points FAINT (floaters must not block), wall opaque
+        raw_opacity=np.concatenate([np.full(400, -1.0),
+                                    np.full(400, 2.0)]).astype(np.float32),
+        f_dc=np.zeros((n, 3), dtype=np.float32),
+    )
+    import agentic_gts.output.gs_render as gsr
+    import agentic_gts.tools.gs_io as gio
+    _real = (gsr.rasterize_gs, gsr.render_gs_view, gsr.png_bytes,
+             gio.read_gaussian_ply)
+    img = np.zeros((768, 768, 3), np.float32)
+    gsr.rasterize_gs = lambda sub, cam: img
+    gsr.render_gs_view = lambda *a, **k: img
+    gsr.png_bytes = lambda a: b"png"
+    gio.read_gaussian_ply = lambda p: gs
+    try:
+        views = mr.render_local_views(scene, box, None)
+    finally:
+        (gsr.rasterize_gs, gsr.render_gs_view, gsr.png_bytes,
+         gio.read_gaussian_ply) = _real
+    names = [v["name"] for v in views]
+    assert "back" not in names, \
+        f"wall-adjacent box must skip the back view, got {names}"
+    assert "front" in names and "side" in names, names
+    print("PASS back view skipped behind a wall (front + side kept)")
 
 
 def test_sam2_model_cfg_file_path_registers_hydra_dir():

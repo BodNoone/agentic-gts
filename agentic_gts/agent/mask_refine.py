@@ -304,6 +304,12 @@ def _open_side(gs, box: OrientedBox, reach: float = 3.0):
     far-field mass (floor 20), that side is the room side and wins
     outright, whatever its measured corridor. Symmetric far mass
     (back-to-back rows mid-room) falls back to the corridor pick.
+
+    Returns (open_vec, open_corridor, closed_corridor): the CLOSED
+    side's corridor width too -- the back view's gate (a wall-adjacent
+    box's back has no room for a camera, user report: it renders a
+    fog; the caller skips the back view when the closed side cannot
+    hold even the minimum standoff).
     """
     pts = np.asarray(gs.means, dtype=float)
     op = 1.0 / (1.0 + np.exp(-np.asarray(gs.raw_opacity, dtype=float)))
@@ -351,7 +357,8 @@ def _open_side(gs, box: OrientedBox, reach: float = 3.0):
         s = -1.0
     else:
         s = 1.0 if side_corridor[1.0] >= side_corridor[-1.0] else -1.0
-    return s * face_axis, min(side_corridor[s], reach)
+    return (s * face_axis, min(side_corridor[s], reach),
+            min(side_corridor[-s], reach))
 
 
 def _box_only_mask(gs, box: OrientedBox, pad: float = 0.15) -> np.ndarray:
@@ -428,7 +435,7 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # PCA, otherwise makes azim=0 look along the LONG edge -- the visible
     # SIDE, an earlier user report). _front_azim compares the open side
     # against the side the camera would actually STAND ON.
-    open_vec, corridor = _open_side(gs, box)
+    open_vec, corridor, corridor_back = _open_side(gs, box)
     azim_front = _front_azim(box, open_vec)
     # view set, all at GROUND level (elev 18 deg, rack height -- no
     # top-down component: the local views must show the device's
@@ -437,19 +444,29 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # division, door seams / height / color are legible face-on) +
     # BACK (the mirrored face: the front aisle is sometimes a NARROW
     # corridor -- poor standoff, foreshortened row ends -- while the
-    # back is open; the same cabinets, a second, often cleaner vote
-    # (user report)) + SIDE (along the row axis: the depth/height
-    # PROFILE, where an open door sticks out horizontally beyond the
-    # cabinet body and the true thickness is measurable -- the front
-    # view cannot separate a door, user report).
-    slots = (("front", 18.0, azim_front),
-             ("back", 18.0, azim_front + 180.0),
-             ("side", 18.0, azim_front + 90.0))
-    # standoff: ~80% into the corridor, never further than 2.2m; the
-    # camera widens its lens to frame, it does not back off
-    standoff = float(np.clip(0.8 * corridor, 0.6, 2.2))
+    # back is open; the same cabinets, a second, often cleaner vote)
+    # + SIDE (along the row axis: the depth/height PROFILE, where an
+    # open door sticks out horizontally beyond the cabinet body and
+    # the true thickness is measurable -- the front view cannot
+    # separate a door, user report).
+    # BACK GATE: a wall-adjacent box has NO room behind it -- the back
+    # camera would stand through the wall and render a fog (user
+    # report). The back view only exists when the CLOSED side can
+    # hold at least the minimum standoff; each face's camera uses its
+    # OWN corridor for standoff (the front's wide aisle must not push
+    # the back camera through a 0.3m wall gap).
+    slots = [("front", 18.0, azim_front, corridor)]
+    if corridor_back >= 0.6:
+        slots.append(("back", 18.0, azim_front + 180.0, corridor_back))
+    else:
+        print(f"[mask-refine] back view skipped: closed-side corridor "
+              f"{corridor_back:.2f}m < 0.6m (wall behind the box)")
+    slots.append(("side", 18.0, azim_front + 90.0, corridor))
     out = []
-    for name, elev, azim in slots:
+    for name, elev, azim, corr in slots:
+        # standoff: ~80% into THIS view's corridor, never further than
+        # 2.2m; the camera widens its lens to frame, it does not back off
+        standoff = float(np.clip(0.8 * corr, 0.6, 2.2))
         cam = make_local_cam([box], W=768, H=768, elev_deg=elev,
                              azim_deg=azim, standoff=standoff)
         # render ONLY the device: every gaussian outside the box's OBB
