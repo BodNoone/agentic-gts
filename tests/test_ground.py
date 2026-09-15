@@ -254,6 +254,101 @@ def test_ground_stage_row_along_y():
           f"(yaw=pi/2, L={b.size[0]:.2f}, D={b.size[1]:.2f})")
 
 
+def test_yaw_bootstrap_byproducts():
+    """The hint-free bootstrap: estimate_yaw_detailed's surviving cells
+    (device layout; walls dropped as boundary cells, ceiling outside
+    the height band) must export z_top ~= the rack top (NOT the
+    ceiling) and a footprint that excludes the walls -- these feed
+    ground_stage's framing and ceiling cut when no hint boxes exist
+    (user request: no-hint input)."""
+    from agentic_gts.segment.orientation import estimate_yaw_detailed
+    import math
+    rng = np.random.default_rng(5)
+    pts = np.vstack([
+        _row_points(0.0, 6.0, y=0.0, rng=rng),      # rack row 1
+        _row_points(0.0, 6.0, y=3.0, rng=rng),      # rack row 2
+    ])
+    # walls well OUTSIDE the layout (boundary cells get dropped)
+    wall1 = np.column_stack([np.full(3000, -3.0),
+                             rng.uniform(-2.0, 5.0, 3000),
+                             rng.uniform(0.0, 3.0, 3000)])
+    wall2 = np.column_stack([np.full(3000, 9.0),
+                             rng.uniform(-2.0, 5.0, 3000),
+                             rng.uniform(0.0, 3.0, 3000)])
+    # ceiling slab at 2.9m spanning the whole room
+    ceil = np.column_stack([rng.uniform(-3.5, 9.5, 3000),
+                            rng.uniform(-2.5, 5.5, 3000),
+                            np.full(3000, 2.9)])
+    info = estimate_yaw_detailed(np.vstack([pts, wall1, wall2, ceil]))
+    assert abs(math.degrees(info["yaw"])) < 3.0
+    z_top = info["z_top"]
+    assert z_top is not None, "the bootstrap must measure a device top"
+    assert 1.9 < z_top < 2.2, \
+        f"z_top must track the rack top (~2.1), got {z_top:.2f}"
+    fp = info["device_footprint"]
+    assert fp is not None
+    assert -1.0 < fp[0] < 0.5 and 5.5 < fp[2] < 7.0, \
+        f"footprint x must hug the rows, not the walls: {fp}"
+    assert -1.0 < fp[1] < 0.5 and 2.5 < fp[3] < 4.0, \
+        f"footprint y must hug the rows: {fp}"
+    print(f"PASS yaw bootstrap byproducts "
+          f"(z_top={z_top:.2f}, footprint={tuple(round(v, 2) for v in fp)})")
+
+
+def test_ground_stage_without_hints():
+    """Hint-FREE grounding end-to-end (user request): no initial boxes;
+    the stage0 bootstrap byproducts (meta z_top + device_footprint)
+    drive the nadir framing and the ceiling cut. The VLM answer is
+    fabricated by projecting the TRUE row rects through the same cam
+    the renderer builds -- full pixel->world->fit path, no hints."""
+    import tempfile
+    from agentic_gts.agent import ground
+    from agentic_gts.agent.judge import VLMJudge
+
+    rng = np.random.default_rng(3)
+    pts = np.vstack([_row_points(0.0, 6.0, y=0.0, rng=rng),
+                     _row_points(-1.0, 5.0, y=3.0, rng=rng)])
+    ceil = np.column_stack([rng.uniform(-2.0, 7.0, 3000),
+                            rng.uniform(-2.0, 5.0, 3000),
+                            np.full(3000, 2.9)])   # ceiling at 2.9m
+    scene = Scene(points=np.vstack([pts, ceil]))
+    scene.meta["yaw"] = 0.0
+    scene.meta["z_top"] = 2.1            # what stage0 exports for racks
+    scene.meta["device_footprint"] = (-0.5, -0.8, 6.5, 3.8)
+    scene.boxes = []                     # NO hint boxes at all
+    _, cam, W, H = ground._render_topdown(scene, [], 0.0)
+    true_rects = [(( -0.5, 6.5), (-0.8, 0.8)),
+                  ((-1.5, 5.5), (2.2, 3.8))]
+    import json as _json
+    regions = []
+    for (xa, xb), (ya, yb) in true_rects:
+        uv = cam.project_cv(np.column_stack([
+            [xa, xb, xb, xa], [ya, ya, yb, yb], np.full(4, 1.0)]))
+        px = (np.clip(uv[:, 0].min(), 0, W), np.clip(uv[:, 1].min(), 0, H),
+              np.clip(uv[:, 0].max(), 0, W), np.clip(uv[:, 1].max(), 0, H))
+        regions.append({"bbox_2d": [
+            int(round(px[0] / W * 1000)), int(round(px[1] / H * 1000)),
+            int(round(px[2] / W * 1000)), int(round(px[3] / H * 1000))],
+            "label": "row"})
+    reply = _json.dumps(regions)
+    judge = VLMJudge(backend="qwen")
+    judge._qwen_image_call = lambda png, prompt, *a, **k: reply
+    with tempfile.TemporaryDirectory() as td:
+        ok = ground.ground_stage(scene, judge, out_dir=td)
+        assert ok, "grounding must succeed on the bootstrap footprint"
+    assert len(scene.boxes) == 2, \
+        f"two rows grounded without any hint boxes, got {len(scene.boxes)}"
+    rows = sorted(scene.boxes, key=lambda b: b.center[1])
+    for b in rows:
+        assert 5.0 < b.size[0] < 6.5, f"length {b.size[0]:.2f}"
+        assert 0.85 < b.size[1] < 1.35, f"depth {b.size[1]:.2f} (FULL)"
+        assert 1.9 < b.size[2] < 2.35, \
+            f"height {b.size[2]:.2f} (ceiling must be excluded!)"
+    print(f"PASS hint-free ground stage "
+          f"(row1 {rows[0].size[0]:.2f}x{rows[0].size[1]:.2f}, "
+          f"row2 {rows[1].size[0]:.2f}x{rows[1].size[1]:.2f})")
+
+
 def test_parse_ground_regions_official_format():
     """The official Qwen3-VL grounding reply format (per the 2d_grounding
     cookbook) parses correctly: bare JSON array of {"bbox_2d": [x1,y1,
@@ -353,6 +448,8 @@ if __name__ == "__main__":
     test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()
     test_ground_stage_row_along_y()
+    test_yaw_bootstrap_byproducts()
+    test_ground_stage_without_hints()
     test_parse_ground_regions_official_format()
     test_parse_ground_regions_salvage()
     test_ground_mock_returns_false()

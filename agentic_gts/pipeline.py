@@ -268,6 +268,15 @@ def run_pipeline(scene: Scene,
         yaw = info["yaw"]
         scene.meta["yaw"] = yaw
         print(f"[stage0] estimated dominant yaw = {math.degrees(yaw):.1f} deg")
+        # hint-free bootstrap byproducts: the yaw pass already isolated
+        # the device layout (vertical-surface filter + boundary-cell
+        # removal); stash the device footprint and top height so the
+        # grounding can frame the nadir view and cut the ceiling
+        # WITHOUT initial hint boxes (user request: no-hint input)
+        if info.get("z_top") is not None:
+            scene.meta["z_top"] = info["z_top"]
+        if info.get("device_footprint") is not None:
+            scene.meta["device_footprint"] = info["device_footprint"]
         try:
             from agentic_gts.output.visualize import render_yaw_diagnosis
             png = os.path.join(out_dir, "yaw_check.png")

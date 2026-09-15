@@ -81,10 +81,39 @@ def estimate_yaw_detailed(points: np.ndarray, z_range: tuple[float, float] = (0.
     np.add.at(cnts, inv, 1.0)
     cells = sums / cnts[:, None]
     print(f"[diag][yaw] voxel cells: {len(cells)}")
-    cells = _remove_boundary_cells(cells)
+    # Hint-free bootstrap byproducts (user request: run the grounding
+    # WITHOUT initial boxes): the cells that SURVIVE boundary removal
+    # are the device layout -- walls sit on the room boundary (dropped
+    # here), floors/ceilings/cable trays are horizontal (dropped by the
+    # vertical-surface filter) or outside the height band. Export
+    #   device_footprint  world-frame xy bounds of the surviving cells
+    #   z_top             device top height (P99.5 of the z of the band
+    #                     points inside those cells) -- the ceiling-cut
+    #                     and framing reference ground_stage needs when
+    #                     the caller provides no hint boxes.
+    boot = {"z_top": None, "device_footprint": None}
+    keep = boundary_keep_mask(cells)
+    print(f"[diag][yaw] boundary (wall) cell removal: {len(cells)} -> {int(keep.sum())}")
+    if keep.any():
+        kc = cells[keep]
+        boot["device_footprint"] = (
+            float(kc[:, 0].min()), float(kc[:, 1].min()),
+            float(kc[:, 0].max()), float(kc[:, 1].max()))
+        # band points whose voxel survived: the pk encoding (kx * M + ky)
+        # is collision-free for any realistic grid (|k| < M/2 voxels)
+        pk = key[:, 0].astype(np.int64) * 10_000_000 + key[:, 1]
+        kept_pk = (uniq[keep][:, 0].astype(np.int64) * 10_000_000
+                   + uniq[keep][:, 1])
+        memb = np.isin(pk, kept_pk)
+        if int(memb.sum()) > 500:
+            boot["z_top"] = float(np.percentile(band[memb][:, 2], 99.5))
+            print(f"[diag][yaw] bootstrap: z_top={boot['z_top']:.2f} "
+                  f"footprint={tuple(round(v, 2) for v in boot['device_footprint'])}")
+    cells = cells[keep]
     if len(cells) < 12:
         print("[diag][yaw] too few cells after boundary removal -> fallback yaw=0")
-        return {"yaw": 0.0, "candidates": [], "cells": None, "device_pts": pts}
+        return {"yaw": 0.0, "candidates": [], "cells": None, "device_pts": pts,
+                **boot}
 
     # local direction per cell: PCA over neighboring cells within radius
     from scipy.spatial import cKDTree
@@ -94,7 +123,7 @@ def estimate_yaw_detailed(points: np.ndarray, z_range: tuple[float, float] = (0.
     if len(pairs) < 10:
         print("[diag][yaw] too few pairs -> fallback global PCA")
         return {"yaw": _global_pca_yaw(cells), "candidates": [], "cells": cells,
-                "device_pts": pts}
+                "device_pts": pts, **boot}
     d = cells[pairs[:, 1]] - cells[pairs[:, 0]]
     ang = np.arctan2(d[:, 1], d[:, 0])          # [-pi, pi]
     ang = np.mod(ang, math.pi / 2)              # fold to [0, pi/2): Manhattan
@@ -125,7 +154,7 @@ def estimate_yaw_detailed(points: np.ndarray, z_range: tuple[float, float] = (0.
     if not cands:
         print("[diag][yaw] no candidates -> fallback global PCA")
         return {"yaw": _global_pca_yaw(cells), "candidates": [], "cells": cells,
-                "device_pts": pts}
+                "device_pts": pts, **boot}
 
     best_yaw, best_score = 0.0, -1.0
     cand_scores: list[tuple[float, float]] = []
@@ -155,7 +184,7 @@ def estimate_yaw_detailed(points: np.ndarray, z_range: tuple[float, float] = (0.
     elif yaw < -math.pi / 4:
         yaw += math.pi / 2
     return {"yaw": float(yaw), "candidates": cand_scores, "cells": cells,
-            "device_pts": pts}
+            "device_pts": pts, **boot}
 
 
 def _ang_dist(a: float, b: float) -> float:

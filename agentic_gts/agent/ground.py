@@ -59,10 +59,17 @@ def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
                                               render_gs_view)
     points = np.asarray(scene.points, dtype=np.float64)
     # ceiling cut from the box tops (same policy as the god-view): cut
-    # 0.45m into the tallest structure so trays don't bury the layout
-    top = max((b.center[2] + b.size[2] / 2.0 for b in frame_boxes),
-              default=2.5)
-    cut = float(top) - 0.45 if frame_boxes else float("inf")
+    # 0.45m into the tallest structure so trays don't bury the layout.
+    # Hint-free input (no boxes): stage0's yaw pass already measured
+    # the device top (vertical-surface points, walls/ceiling excluded)
+    # -- its z_top is the same reference without a hint.
+    if frame_boxes:
+        top = max((b.center[2] + b.size[2] / 2.0 for b in frame_boxes))
+        cut = float(top) - 0.45
+    elif scene.meta.get("z_top"):
+        cut = float(scene.meta["z_top"]) - 0.45
+    else:
+        cut = float("inf")
     band = points[points[:, 2] < cut] if np.isfinite(cut) else points
     band = band[band[:, 2] > 0.30]
     if len(band) < 100:
@@ -73,12 +80,29 @@ def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
     # walls too, and the racks rendered small). The hint boxes are
     # only used for FRAMING (camera placement) -- they are not drawn
     # on the VLM input, so grounding itself stays hint-free.
+    # Hint-free input: the stage0 device_footprint (world frame) is
+    # rotated into this row frame and AABB'd -- walls were already
+    # dropped as boundary cells, so the framing hugs the layout.
     boxes_rot = []
-    for b in frame_boxes:
-        c = _rot_xy(np.array([[b.center[0], b.center[1], 0.0]]), -yaw)[0]
-        boxes_rot.append(OrientedBox(center=(float(c[0]), float(c[1]),
-                                             b.center[2]),
-                                     size=b.size, yaw=0.0))
+    if frame_boxes:
+        for b in frame_boxes:
+            c = _rot_xy(np.array([[b.center[0], b.center[1], 0.0]]), -yaw)[0]
+            boxes_rot.append(OrientedBox(center=(float(c[0]), float(c[1]),
+                                                 b.center[2]),
+                                         size=b.size, yaw=0.0))
+    else:
+        fp = scene.meta.get("device_footprint")
+        if fp:
+            corners_w = np.array([[fp[0], fp[1]], [fp[2], fp[1]],
+                                  [fp[2], fp[3]], [fp[0], fp[3]]])
+            cr = _rot_xy(np.column_stack([corners_w,
+                                          np.zeros(4)]), -yaw)
+            lo, hi = cr.min(axis=0), cr.max(axis=0)
+            c = (lo + hi) / 2.0
+            boxes_rot.append(OrientedBox(
+                center=(float(c[0]), float(c[1]), 1.0),
+                size=(float(hi[0] - lo[0]), float(hi[1] - lo[1]), 2.0),
+                yaw=0.0))
     cam_r = make_godview_cam(pts_rot, boxes_rot, nadir=True, W=W, H=H)
     # rotate the camera back into world (rotation about z: the nadir
     # axis rotates with it)
@@ -311,11 +335,20 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     False = grounding unavailable (mock backend / VLM failure / no
     region survived the point-support guards) and the caller keeps the
     original hint boxes -- grounding must never destroy the layout.
+
+    Hint-FREE input (user request): with no initial boxes, the stage0
+    yaw pass's bootstrap byproducts (scene.meta z_top +
+    device_footprint -- device vertical surfaces, walls/ceiling
+    excluded) replace the hints for the nadir framing and the ceiling
+    cut, so grounding runs on a bare point cloud.
     """
     import os
     from agentic_gts.output.gs_render import png_bytes, unproject_ground
     hints = list(scene.boxes)
-    if not hints:
+    if not hints and not (scene.meta.get("device_footprint")
+                          and scene.meta.get("z_top")):
+        print("[ground] no hint boxes and no stage0 bootstrap "
+              "footprint -> nothing to ground")
         return False
     yaw = float(scene.meta.get("yaw", 0.0) or 0.0)
     try:
@@ -352,7 +385,11 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # (user report: red boxes all too large and wrong while the raw
     # colored rects were right).
     hint_top = max((b.center[2] + b.size[2] / 2.0 for b in hints),
-                   default=2.5)
+                   default=None)
+    if hint_top is None:
+        # hint-free input: the stage0 device top replaces the hint tops
+        # (same ceiling exclusion, measured from vertical surfaces)
+        hint_top = float(scene.meta.get("z_top", 2.5) or 2.5)
     pts_fit = pts_rot[(pts_rot[:, 2] > 0.30) &
                       (pts_rot[:, 2] <= hint_top + 0.10)]
     if len(pts_fit) < 100:
