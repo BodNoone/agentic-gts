@@ -1217,13 +1217,15 @@ def test_side_view_looks_along_row_axis():
 
 def test_view_quality_gate_drops_haze_views():
     """VIEW QUALITY GATE (user rule, replaces the reverted corridor
-    pre-gate: judge the RENDER, not the geometry -- a wall-adjacent box
-    can fog up whichever camera lands in structure). _view_quality
-    must pass a clean bimodal render (dark bg + bright device, however
-    much of the frame the device fills) and reject the two failure
-    modes: flat/frame-filling haze and an empty frame. And
-    render_local_views must DROP a fogged view instead of feeding it
-    to the VLM."""
+    pre-gate: judge the RENDER, not the geometry). The discriminator
+    is GRADIENT ENERGY: a veil is smooth, a device render is full of
+    crisp steps. Must pass clean renders (however much of the frame
+    the device fills, INCLUDING a uniform-panel close-up the old
+    std/coverage rule wrongly rejected) and reject empty frames,
+    flat veils and GRADIENT veils (a smooth brightness ramp -- spread
+    the histogram, fooling std).
+    And render_local_views must DROP a fogged view instead of feeding
+    it to the VLM."""
     from agentic_gts.agent.mask_refine import _view_quality
 
     def clean(device_frac=0.3, H=128, W=128):
@@ -1238,11 +1240,30 @@ def test_view_quality_gate_drops_haze_views():
     assert ok, f"clean bimodal render must pass, got {why}"
     ok, _ = _view_quality(clean(device_frac=0.85))
     assert ok, "a close-up filling most of the frame is still clean"
-    # haze: the camera inside structure -- full-frame semi-bright, no
-    # contrast
-    haze = np.full((128, 128, 3), 0.42, np.float32)
-    ok, why = _view_quality(haze)
-    assert not ok, "flat haze must be rejected"
+    # uniform-panel close-up: 95% of the frame one flat value, only
+    # the contour carries a step -- low std, near-total coverage.
+    # The old rule (cov > 0.90 and std < 0.15) REJECTED this legit
+    # render; the edges must save it.
+    uni = np.full((128, 128, 3), 0.0, np.float32)
+    uni[6:122, 6:122] = 0.5
+    ok, why = _view_quality(uni)
+    assert ok, f"uniform-panel close-up must pass, got {why}"
+    # flat veil: the camera inside structure, no structure in frame
+    ok, why = _view_quality(np.full((128, 128, 3), 0.42, np.float32))
+    assert not ok, "flat veil must be rejected"
+    # GRADIENT veil: a smooth brightness ramp -- spreads the histogram
+    # (std ~0.09 would pass the old std rule); per-pixel slope is tiny
+    def _ramp(ramp_1d):
+        return np.repeat(ramp_1d[:, None], 128, axis=1)[..., None] \
+            * np.ones(3, np.float32)
+
+    ok, why = _view_quality(
+        _ramp(np.linspace(0.2, 0.5, 128, dtype=np.float32)))
+    assert not ok, "gradient veil must be rejected"
+    ok, why = _view_quality(
+        _ramp(np.linspace(0.2, 0.5, 128, dtype=np.float32))
+        .transpose(1, 0, 2))
+    assert not ok, "horizontal gradient veil must be rejected"
     # empty: nothing rendered
     ok, why = _view_quality(np.zeros((128, 128, 3), np.float32))
     assert not ok, "empty frame must be rejected"
@@ -1303,7 +1324,7 @@ def test_view_quality_gate_drops_haze_views():
     assert "back" not in names, \
         f"the fogged back view must be dropped, got {names}"
     assert "front" in names, names
-    print("PASS view quality gate (haze dropped, clean kept)")
+    print("PASS view quality gate (veils dropped, clean kept)")
 
 
 def test_sam2_model_cfg_file_path_registers_hydra_dir():

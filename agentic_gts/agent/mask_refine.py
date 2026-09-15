@@ -512,18 +512,23 @@ def _view_quality(img: np.ndarray) -> tuple[bool, str]:
     """Gross quality judgement of one local-view render (user rule: a
     view too poor to judge must not participate in the refinement).
 
-    The renders are ONE device on a dark background (everything
-    outside the OBB is hidden), so the failure modes are readable from
-    the luminance histogram alone:
-      * HAZE -- the camera stood inside structure (a flush wall's
-        diffuse gaussians surviving the OBB margin, the narrow-gap
-        side of a wall-adjacent box): the whole frame fills with
-        semi-bright fog -- near-total coverage and NO contrast;
+    Two signals, matched to what the failure modes actually look like:
       * EMPTY -- nothing rendered (a broken placement): near-zero
-        coverage.
-    A clean render is BIMODAL -- dark background, bright device --
-    so it carries high contrast whatever share of the frame the device
-    occupies (a close-up filling most of the frame is still clean).
+        visible coverage.
+      * VEIL -- the camera stood inside structure (a flush wall's
+        diffuse gaussians, the narrow gap of a wall-adjacent box):
+        the frame fills with a SMOOTH semi-bright veil. The
+        discriminator is GRADIENT ENERGY, not the value spread: a veil
+        is smooth (at most slow gradients, mean squared gradient
+        ~1e-7) while a device render is full of crisp steps --
+        cabinet contours, panel seams, door frames (~1e-3), two to
+        three orders of magnitude apart, so the threshold has margin
+        both ways. Unlike a std/coverage histogram test, gradient
+        energy is not fooled by a TEXTURED veil (its own variation
+        counts toward std), by a GRADIENT veil (a brightness ramp
+        spreads the histogram); and it does not reject a legitimate
+        close-up of a flat-panel cabinet (uniform values, low std, but
+        its seams and contour still carry edges).
 
     Returns (ok, reason); reason is "" when ok.
     """
@@ -532,15 +537,14 @@ def _view_quality(img: np.ndarray) -> tuple[bool, str]:
     lum = np.clip(np.asarray(img, dtype=float)[..., :3], 0.0, 1.0)
     lum = lum.mean(axis=2)
     cov = float((lum > 0.10).mean())
-    std = float(lum.std())
     if cov < 0.02:
         return False, f"empty frame (device coverage {cov:.1%})"
-    if std < 0.07:
-        return False, (f"flat haze, no contrast (std {std:.3f}, "
-                      f"coverage {cov:.1%})")
-    if cov > 0.90 and std < 0.15:
-        return False, (f"frame-filling haze (coverage {cov:.1%}, "
-                       f"std {std:.3f})")
+    gx = np.diff(lum, axis=1)
+    gy = np.diff(lum, axis=0)
+    edge = float(np.mean(gx * gx) + np.mean(gy * gy))
+    if edge < 1e-5:
+        return False, (f"smooth veil, no structure (edge energy "
+                       f"{edge:.2e}, coverage {cov:.1%})")
     return True, ""
 
 
