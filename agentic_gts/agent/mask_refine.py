@@ -987,10 +987,15 @@ def _apply_height_and_geom_depth(instances: list, seed: "OrientedBox",
     Height: split pieces inherit the seed's height, but the seed is the
     region fit -- the row's TALLEST cabinet (P99.5 over the whole
     rect). A row the VLM split precisely BECAUSE cabinets differ in
-    height (prompt rule) must get each piece's OWN height, measured as
-    the P99.5 top of the piece's own points (front-view surface or
-    side-view slice). The bottom stays the seed's bottom (devices stand
-    on the ground; the region fit put it at ~0).
+    height (prompt rule) must get each piece's OWN height. The z source
+    is the RAW-CLOUD COLUMN under the piece's footprint (along span x
+    fitted cross bounds), NOT the piece's mask points: a VLM box that
+    covered only part of the cabinet, or the side pass REPLACING pts
+    with a profile slice whose mask was vertically short, truncates
+    the mask points' z-range and the height collapsed with it (user
+    report: some boxes came out very low). The raw column cannot
+    under-measure -- the cabinet's full height is in the cloud. The
+    bottom stays the seed's bottom (devices stand on the ground).
 
     Thickness fallback: the side view is the primary thickness source
     (VLM excludes open doors), but when it is missing or rejected a
@@ -1023,55 +1028,72 @@ def _apply_height_and_geom_depth(instances: list, seed: "OrientedBox",
     n_geom = 0
     for inst in instances:
         f = inst["fitted"]
-        # ---- height: the piece's own top ----
-        pts = inst.get("pts")
-        if pts is not None and len(pts) >= 20:
-            z_top = float(np.percentile(np.asarray(pts)[:, 2], 99.5))
-            # guards: plausible device height, not a partial-mask
-            # under-measure (>= 25% of the seed top), not above the
+        # ---- thickness: geometry fallback for uncorrected pieces ----
+        # (FIRST, so the height pass slices the column with the piece's
+        # FINAL cross bounds)
+        if not inst.get("depth_ok"):
+            fc = np.asarray(f.center, dtype=float)
+            along_c = float(fc[:2] @ axis)
+            half = float(f.size[0]) / 2.0
+            if len(band) >= 100:
+                along_b = band[:, :2] @ axis
+                sel = band[np.abs(along_b - along_c) <= half + 0.05]
+                if len(sel) >= 40:
+                    span = _robust_span(sel[:, :2] @ cross)
+                    if span is not None:
+                        c_lo, c_hi = span
+                        depth = float(c_hi - c_lo)
+                        mid = 0.5 * (c_lo + c_hi)
+                        if (0.3 <= depth <= 2.5
+                                and abs(mid - seed_cross_c)
+                                <= seed_half_d + 0.30):
+                            cxy = axis * along_c + cross * mid
+                            f = _rebuild(
+                                f, center=(float(cxy[0]), float(cxy[1]),
+                                          float(f.center[2])),
+                                size=(float(f.size[0]), depth,
+                                      float(f.size[2])))
+                            inst["fitted"] = f
+                            inst["depth_ok"] = "geometry"
+                            inst["depth"] = round(depth, 3)
+                            n_geom += 1
+        # ---- height: the piece's own column in the raw cloud ----
+        # NOT the mask points (truncated z, user report: very low
+        # boxes) -- the raw column under the piece's final footprint
+        # carries the cabinet's full height.
+        fc = np.asarray(f.center, dtype=float)
+        along_c = float(fc[:2] @ axis)
+        cross_c = float(fc[:2] @ cross)
+        half = float(f.size[0]) / 2.0 + 0.05
+        half_d = float(f.size[1]) / 2.0 + 0.15
+        col = (band[(np.abs(band[:, :2] @ axis - along_c) <= half)
+                    & (np.abs(band[:, :2] @ cross - cross_c) <= half_d)]
+               if len(band) >= 100 else band)
+        if len(col) < 40:
+            col = inst.get("pts")        # sparse cloud: mask points
+            col = col if col is not None and len(col) >= 20 else None
+        if col is not None and len(col):
+            # strong-bin z span, not a percentile: the column's edges
+            # bleed a few NEIGHBOUR points past the span seam (taller
+            # than this piece) and a percentile tail catches them; the
+            # neighbour sliver is spread-out while the piece's own
+            # vertical surface concentrates into strong bins
+            zspan = _robust_span(np.asarray(col)[:, 2])
+            z_top = float(zspan[1]) if zspan else None
+            # guards: plausible device height, not a partial column
+            # (>= 45% of the seed top -- the raw column rarely
+            # under-measures, this catches a bad slice), not above the
             # row's tallest cabinet by more than fit slop
-            if (0.50 <= z_top <= 4.50
-                    and 0.25 * seed_top <= z_top <= seed_top + 0.25):
+            if (z_top is not None and 0.50 <= z_top <= 4.50
+                    and 0.45 * seed_top <= z_top <= seed_top + 0.25):
                 h = z_top - seed_bottom
                 if abs(h - float(f.size[2])) > 0.05:
-                    f = _rebuild(
+                    inst["fitted"] = _rebuild(
                         f,
                         center=(float(f.center[0]), float(f.center[1]),
                                 seed_bottom + h / 2.0),
                         size=(float(f.size[0]), float(f.size[1]), h))
-                    inst["fitted"] = f
                     inst["height"] = round(h, 3)
-        # ---- thickness: geometry fallback for uncorrected pieces ----
-        if inst.get("depth_ok"):
-            continue
-        fc = np.asarray(f.center, dtype=float)
-        along_c = float(fc[:2] @ axis)
-        half = float(f.size[0]) / 2.0
-        if len(band) < 100:
-            continue
-        along_b = band[:, :2] @ axis
-        sel = band[np.abs(along_b - along_c) <= half + 0.05]
-        if len(sel) < 40:
-            continue
-        span = _robust_span(sel[:, :2] @ cross)
-        if span is None:
-            continue
-        c_lo, c_hi = span
-        depth = float(c_hi - c_lo)
-        if not (0.3 <= depth <= 2.5):
-            continue
-        mid = 0.5 * (c_lo + c_hi)
-        # the measured centre must stay inside the seed's cross span
-        # (padded) -- the region bounds the device
-        if abs(mid - seed_cross_c) > seed_half_d + 0.30:
-            continue
-        cxy = axis * along_c + cross * mid
-        inst["fitted"] = _rebuild(
-            f, center=(float(cxy[0]), float(cxy[1]), float(f.center[2])),
-            size=(float(f.size[0]), depth, float(f.size[2])))
-        inst["depth_ok"] = "geometry"
-        inst["depth"] = round(depth, 3)
-        n_geom += 1
     return n_geom
 
 

@@ -468,6 +468,37 @@ def test_cross_view_single_face_yields_to_multi():
     print("PASS single-instance face yields to the multi face")
 
 
+def test_height_ignores_truncated_mask_points():
+    """The height z-source is the RAW-CLOUD column, not the piece's
+    mask points (user report: some boxes came out VERY low). Two ways
+    a mask truncates: the VLM front box covered only the lower half,
+    and the side pass REPLACED pts with a vertically short profile
+    slice -- the piece's pts all sit below 0.8m while the cabinet is
+    2.1m tall. The raw column under the piece's footprint carries the
+    full height, so the measured box must stay tall."""
+    from agentic_gts.agent.mask_refine import (_apply_height_and_geom_depth,
+                                                _build_split_pieces)
+    rng = np.random.default_rng(11)
+    # one cabinet, full height in the CLOUD
+    cab = np.column_stack([rng.uniform(-0.6, 0.6, 1200),
+                           rng.uniform(-0.5, 0.5, 1200),
+                           rng.uniform(0.1, 2.05, 1200)])
+    scene = Scene(points=cab)
+    seed = OrientedBox(center=(0.0, 0.0, 1.05), size=(1.2, 1.0, 2.1),
+                       yaw=0.0)
+    # the piece's "mask" points: TRUNCATED to the lower 0.8m
+    trunc = cab[cab[:, 2] < 0.8][:200]
+    spans = [{"lo": -0.6, "hi": 0.6, "pts": trunc, "ms": 0.8,
+              "label": "rack"}]
+    instances = _build_split_pieces(spans, seed)
+    _apply_height_and_geom_depth(instances, seed, scene)
+    h = instances[0]["fitted"].size[2]
+    assert 1.9 < h < 2.2, \
+        f"height {h:.2f} must come from the raw column (~2.1), " \
+        "not the truncated mask points (~0.8)"
+    print("PASS height ignores truncated mask points (raw column)")
+
+
 def test_sam_unconfigured_is_conservative():
     old = os.environ.pop("SAM_CHECKPOINT", None)
     try:
