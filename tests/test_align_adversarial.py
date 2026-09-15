@@ -76,7 +76,7 @@ def test_align_with_subfloor_noise():
 
     Real 3DGS exports carry floaters under the floor; a bottom-up
     first-above-threshold scan latches onto them and shifts the whole cloud
-    up (floor lands inside the device height band, drowning Stage A rows).
+    up (floor lands inside the device height band, drowning the device rows).
     """
     rng = np.random.default_rng(7)
     scene, _, _ = generate(SynthConfig(seed=42))
@@ -103,64 +103,8 @@ def test_align_with_subfloor_noise():
     assert abs(zc) < 0.15, f"floor mode at z={zc:.2f}, expected ~0"
 
 
-def test_stageA_rejects_thick_noisy_wall():
-    """Regression: thick/noisy GS walls are paired into a fake device row.
-
-    A wall reconstructed with thickness yields TWO parallel cross-axis bands
-    whose gap (0.5-1.5m) matches the rack-depth pairing window, so a wall
-    becomes a "row" of boxes. Height is the robust discriminator: wall
-    columns reach the ceiling, rack columns stop at ~2.4m.
-
-    Includes the cable-tray trap: a thin tray layer 0.5m above the rack
-    tops welds onto the rack columns (gap < 1m) and must NOT turn the whole
-    rack row into "wall" -- the tray's high part is thin (<0.5m span),
-    while a wall's high part runs to the ceiling.
-    """
-    rng = np.random.default_rng(11)
-    pts = []
-    # device row: 8 racks (0.6 x 1.1 x 2.0) along x, centered at y=0
-    for i in range(8):
-        cx = 1.0 + i * 0.7
-        for face_y in (-0.55, 0.55):
-            n = 1500
-            pts.append(np.column_stack([
-                rng.uniform(cx - 0.3, cx + 0.3, n),
-                np.full(n, face_y) + rng.normal(0, 0.01, n),
-                rng.uniform(0.05, 2.0, n)]))
-    # floor
-    pts.append(np.column_stack([
-        rng.uniform(-1, 8, 20000), rng.uniform(-3, 6, 20000),
-        np.abs(rng.normal(0, 0.01, 20000))]))
-    # cable tray 0.5m above rack tops: thin (0.2m), covers the rack row
-    pts.append(np.column_stack([
-        rng.uniform(0.7, 6.0, 8000), rng.uniform(-0.6, 0.6, 8000),
-        rng.uniform(2.5, 2.7, 8000)]))
-    # THICK noisy wall at y~3.8..4.7: two sheets 0.9m apart, full height 4m
-    for wy in (3.8, 4.7):
-        n = 12000
-        pts.append(np.column_stack([
-            rng.uniform(-1, 8, n),
-            np.full(n, wy) + rng.normal(0, 0.05, n),
-            rng.uniform(0.05, 4.0, n)]))
-    cloud = np.vstack(pts)
-
-    from agentic_gts.core.models import Scene
-    from agentic_gts.segment.coarse import coarse_segment
-    s = Scene(points=cloud, boxes=[])
-    boxes = coarse_segment(s, {"yaw": 0.0})
-
-    wall_boxes = [b for b in boxes if 3.5 < b.center[1] < 5.0]
-    assert not wall_boxes, f"{len(wall_boxes)} boxes on the thick wall"
-    rack_boxes = [b for b in boxes if abs(b.center[1]) < 1.0]
-    assert rack_boxes, "rack row missing (killed as wall?)"
-    assert sum(b.size[0] for b in rack_boxes) > 4.0, \
-        f"rack row too short: {[round(b.size[0], 2) for b in rack_boxes]}"
-
-
 if __name__ == "__main__":
     test_align_and_yaw_on_adversarial_cloud()
     print("PASS  test_align_and_yaw_on_adversarial_cloud")
     test_align_with_subfloor_noise()
     print("PASS  test_align_with_subfloor_noise")
-    test_stageA_rejects_thick_noisy_wall()
-    print("PASS  test_stageA_rejects_thick_noisy_wall")

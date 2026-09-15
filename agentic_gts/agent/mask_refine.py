@@ -1151,7 +1151,7 @@ def _apply_height_and_geom_depth(instances: list, seed: "OrientedBox",
     # raw-cloud device band for the geometry fallback (same band the
     # region fit used: floor texture out, ceiling out). The ceiling cap
     # sits 0.60 above the seed top, not 0.10: a seed whose top came in
-    # LOW (hint-free bootstrap under-measure, a low hint) must not
+    # LOW (bootstrap under-measure) must not
     # chain its error into the piece columns -- the height pass's
     # ANCHORED measurement rejects floating overhead layers (trays,
     # ceiling) anyway, so the headroom is safe.
@@ -1213,9 +1213,8 @@ def _apply_height_and_geom_depth(instances: list, seed: "OrientedBox",
             # separated by a near-empty gap. The anchored walk from the
             # ground keeps the density-connected run and stops at the
             # first real void, whichever sits above it (user report:
-            # hint-free runs left every piece at the seed height --
-            # the clutter made every column measure the same
-            # contaminated top).
+            # runs left every piece at the seed height -- the clutter
+            # made every column measure the same contaminated top).
             zspan = _anchored_top(np.asarray(col)[:, 2])
             z_top = float(zspan) if zspan is not None else None
             inst["z_col_top"] = (round(z_top, 3)
@@ -1224,8 +1223,8 @@ def _apply_height_and_geom_depth(instances: list, seed: "OrientedBox",
             # (>= 45% of the seed top -- the raw column rarely
             # under-measures, this catches a bad slice), not above the
             # row's tallest cabinet by more than fit slop + recovery
-            # headroom (an under-measured seed -- hint-free bootstrap,
-            # a low hint -- must not chain its error: the anchored
+            # headroom (an under-measured seed must not chain its
+            # error: the anchored
             # measurement already rejects floating overhead layers, so
             # the +0.60 headroom is safe)
             if (z_top is not None and 0.50 <= z_top <= 4.50

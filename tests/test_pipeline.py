@@ -38,15 +38,13 @@ def test_synth_generation():
 
 
 def test_pipeline_mock_smoke():
-    """New-flow smoke test: run_pipeline on synth data with the mock VLM
-    must complete without raising (the old 'improves layout with mock'
-    assertions belonged to the removed rule-repair loop; with mock the
-    agent stages no-op, only the deterministic rules run)."""
+    """No-hint flow smoke test: run_pipeline on synth data with the mock
+    VLM must complete without raising. Boxes come ONLY from VLM
+    grounding, and the mock backend grounds nothing -- so an empty
+    result is the expected, contract-conformant outcome here."""
     scene, gt, corrupt = generate(SynthConfig(seed=42))
-    scene.boxes = corrupt
-    run_pipeline(scene, gt_boxes=gt, use_coarse_seg=False,
+    run_pipeline(scene, gt_boxes=gt,
                  vlm_backend="mock", out_dir="runs/test_tmp")
-    assert len(scene.boxes) > 0, "pipeline dropped every box"
     print(f"PASS pipeline mock smoke ({len(scene.boxes)} boxes out)")
 
 

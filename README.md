@@ -2,18 +2,21 @@
 
 数字机房布局图自动化生成 —— Agent 化 3DGS 后处理系统。
 
-从 3DGS 重建导出的点云出发，自动生成设备（机柜等）2D 布局图。用**确定性几何规则打底、VLM 判别裁决兜底**的 agent 循环，替代人工返工中的四类修正操作：box 偏大、漏检、错检、联排机柜粘连。
+从 3DGS 重建导出的点云出发，自动生成设备（机柜等）2D 布局图。**VLM 做全局 grounding 与判别、几何算法做精确测量**：阶段0 估计朝向并 bootstrap 设备布局，阶段G 由 VLM 在俯视图上圈出所有设备结构，阶段C 对每个 box 做三视角局部细化（切分/厚度/高度修正）。无任何初始 box 输入。
 
 ## 核心设计
 
 ```
 点云 (3DGS 导出)
     ↓
-阶段A  粗分割（superpoint 过分割 + 行结构合并，高召回）    [可选：也可直接输入已有检测 box]
+阶段0  朝向估计 + 布局 bootstrap（垂直面滤波 + 边界去墙，
+       产出 device_footprint 设备外框与 z_top 设备顶高）
     ↓
-阶段B  确定性处理（B0 碎片合并 + 轻量纠偏；不做删/加/切分，那些留给 agent）
+阶段G  全局 nadir VLM 2D grounding（VLM 在俯视图上圈出每个设备结构，
+       几何按点支撑拟合全深度 box —— 唯一的 box 生产者，无任何输入 box）
     ↓
-阶段C  Agent 修复循环（取证 → VLM 诊断 → 离散动作 → 几何工具执行 → 验证/回滚）
+阶段C  每盒局部细化（三视角渲染 → VLM 质量判断 + bbox → SAM2 mask →
+       反投影 → 沿排切分 / 厚度修正 / 锚定高度修正）
     ↓
 布局图 (SVG/PNG) + boxes.json + 置信度标记 + 评测报告
 ```
@@ -22,23 +25,11 @@
 
 **任意朝向支持**：管线不假设点云横平竖直。阶段0 自动估计设备行方向 yaw（局部边缘方向直方图 + 行带质量评分，机房曼哈顿结构假设），后续所有阶段统一使用。旋转 15/30/60° 的场景 yaw 估计误差 < 1°。若你已知朝向，也可在 `run_pipeline` 的 `opts` 传 `yaw` 跳过估计。
 
-### 借鉴 FoundObj (ICML 2026) 的机制
+### 设计机制
 
-- **中心场完整性验证** → `center_field_clusters`：沿行轴统计侧面密度峰，k+1 个峰 = k 个机柜，自动触发联排切分
 - **基础模型当裁判**而非特征提取器 → VLM 判别接口跨机房免重训
 - **验证-回滚闭环** → 每次修复后重检支撑度/尺寸/重叠，不通过即回滚
-
-## 实测效果（合成数据，边误差阈值 5cm）
-
-输入为带四类噪声的模拟检测结果（对应真实 GS 分割输出）：
-
-| 阶段 | edge_acc | mean_err | recall | precision |
-|---|---:|---:|---:|---:|
-| 输入（含噪声） | 79.4% | 5.9cm | 81.0% | 100% |
-| 阶段B 规则后 | 90.5% | 1.7cm | **100%** | 95.5% |
-| 阶段C Agent 后 | **96.4%** | **1.7cm** | 100% | 95.5% |
-
-多随机种子（3/7/11/19）：edge_acc 92–94%，recall 96–100%，precision 96%。
+- **锚定高度估计** → 从地面向上按密度连通遍历，天然分离柜体与上方桥架/线缆浮层
 
 ## 安装
 
@@ -50,27 +41,18 @@ pip install -r requirements.txt
 
 ## 使用
 
-### 1. 一键 Demo（合成数据 → 全流程 → 评测）
+### 1. 处理你自己的点云
 
 ```bash
-python -m agentic_gts.cli demo --out runs/demo
-```
-
-### 2. 处理你自己的点云
-
-```bash
-# 从头跑（含粗分割）
+# 从点云直接跑（box 全部来自 VLM grounding，无需任何初始输入）
 python -m agentic_gts.cli run --point-cloud room.ply --out runs/room1
 
-# 已有初始检测 box（你现有 GS 分割 pipeline 的输出）
-python -m agentic_gts.cli run --point-cloud room.ply --boxes init_boxes.json --out runs/room1
-
 # 带真值评测
-python -m agentic_gts.cli run --point-cloud room.ply --boxes init_boxes.json \
+python -m agentic_gts.cli run --point-cloud room.ply \
     --gt gt_boxes.json --edge-thr 0.05 --out runs/room1
 ```
 
-### 3. 接入 Qwen3-VL 裁判
+### 2. 接入 Qwen3-VL 裁判
 
 启动一个 OpenAI 兼容服务（vLLM / SGLang / DashScope 均可）：
 
@@ -86,7 +68,16 @@ python -m agentic_gts.cli run --point-cloud room.ply \
     --vlm qwen --vlm-base http://127.0.0.1:8000/v1 --out runs/room1
 ```
 
-不配置 VLM 时自动使用规则降级模式（mock），整个管线仍可运行——这也是可靠性下限基线。
+不配置 VLM 时自动使用规则降级模式（mock），管线仍可运行但 grounding 不产出 box（无输入 box、无 fallback）——这也是可靠性下限基线。
+
+### 3. 局部细化的 SAM2 mask（可选但推荐）
+
+```bash
+python -m agentic_gts.cli run --point-cloud room.ply \
+    --vlm qwen --vlm-base http://127.0.0.1:8000/v1 \
+    --sam-checkpoint sam2.1_hiera_base_plus.pt --sam-model-cfg sam2.1_hiera_b+.yaml \
+    --out runs/room1
+```
 
 ### 4. 生成合成测试数据
 
@@ -147,37 +138,37 @@ python -m agentic_gts.cli view --point-cloud room.ply --boxes runs/room1/boxes.j
 agentic_gts/
 ├── core/models.py        OrientedBox / Scene / Issue 数据模型
 ├── synth/generator.py    合成机房生成器（含四类噪声注入）
-├── segment/coarse.py     阶段A：superpoint 粗分割
-├── rules/rules.py        阶段B：B0 碎片合并 + 轻量纠偏（墙/朝向），不做删加切
-├── tools/geometry.py     几何工具集（fit_box / split / 中心场 / 行结构 / 支撑度）
+├── segment/orientation.py 阶段0：yaw 估计 + 布局 bootstrap（footprint / z_top）
+├── tools/geometry.py     几何工具集（支撑度）
 ├── agent/judge.py        VLM 裁判（Qwen3-VL 接口 + mock 降级）
+├── agent/ground.py       阶段G：全局 nadir VLM 2D grounding
+├── agent/mask_refine.py  阶段C：三视角局部细化（SAM2 mask / 切分 / 高度修正）
 ├── agent/loop.py         阶段C：agent 修复循环（诊断→动作→验证→回滚）
 ├── eval/metrics.py       贴边准确率评测
 ├── output/render.py      SVG/PNG 布局图
 ├── output/visualize.py   点云+框联合可视化（2D叠加 / 3D交互 / PLY导出）
 ├── pipeline.py           全流程编排
-└── cli.py                命令行入口（demo / run / synth / view）
-tests/test_pipeline.py    单元 + 端到端测试（7 项）
+└── cli.py                命令行入口（run / synth / diagnose / view / report）
+tests/                    单元 + 端到端测试
 docs/                     设计方案文档
 ```
 
 ## 测试
 
 ```bash
-python tests/test_pipeline.py
-# 7/7 tests passed
+python -m pytest tests/ -q
+# 85 passed
 ```
 
 ## 与真实 3DGS pipeline 对接
 
-1. 3DGS 重建后导出点云（Gaussian 中心即可）为 PLY/NPY。
-2. 若已有 GS 分割结果，把 3D BBox 转成上述 JSON 作为 `--boxes` 输入（推荐，跳过粗分割）。
-3. 设备标称尺寸可选：在 `run_pipeline` 的 `opts` 里传 `width_unit`（默认 0.6m）、`depth`、`height`；没有标称尺寸时系统按点云支撑自适应。
-4. 输出 `boxes.json` 中 `confidence=low` 的项送人工复核；人工修正结果与 agent 决策记录一并留存，作为后续训练 3D 检测模型的数据（数据飞轮）。
+1. 3DGS 重建后导出点云（Gaussian 中心即可）为 PLY/NPY；管线直接从裸点云跑，box 全部来自 VLM grounding。
+2. 设备标称尺寸可选：在 `run_pipeline` 的 `opts` 里传 `width_unit`（默认 0.6m）、`depth`、`height`；没有标称尺寸时系统按点云支撑自适应。
+3. 输出 `boxes.json` 中 `confidence=low` 的项送人工复核；人工修正结果与 agent 决策记录一并留存，作为后续训练 3D 检测模型的数据（数据飞轮）。
 
 ## 已知限制
 
-- 粗分割（阶段A）在本版本中主要产出行级候选，单柜化（联排切分）交由阶段C agent 处理；如已有检测 box 建议直接走 `--boxes` 输入路径。
-- 布局假设设备按行摆放（机房通用），非行结构场景（散放设备）需调整 `row_structure` 容差。
+- 布局假设设备按行摆放（机房通用），非行结构场景（散放设备）效果会退化。
+- grounding 失败（VLM 不可用 / 无 region 通过点支撑守卫）时场景保持为空，没有 fallback box。
 - 动态场景 / 多层机房未覆盖。
-- VLM 裁判当前只在 merged / false-positive 两类 issue 上介入；证据图为俯视密度图，可扩展接入 3DGS 渲染视图。
+- 尚无设备类型校验（柱子/墙体有可能被 VLM 误圈为机柜）。

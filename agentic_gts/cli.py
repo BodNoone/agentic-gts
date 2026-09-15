@@ -3,23 +3,16 @@
 Usage:
   python -m agentic_gts.cli synth --seed 42 --out runs/synth1
   python -m agentic_gts.cli run   --point-cloud path.ply [--out runs/x]
-  python -m agentic_gts.cli run   --point-cloud path.ply --boxes boxes.json
-  python -m agentic_gts.cli demo  --out runs/demo      # synth + full pipeline + eval
 """
 from __future__ import annotations
 
 import argparse
-import json
 
 import numpy as np
 
-from agentic_gts.core.models import OrientedBox, Scene
+from agentic_gts.core.models import Scene
 from agentic_gts.pipeline import load_point_cloud, run_pipeline
 from agentic_gts.synth.generator import SynthConfig, generate
-
-
-def _load_boxes(path: str, scene: Scene) -> None:
-    scene.load_boxes(path)
 
 
 def cmd_synth(args):
@@ -36,10 +29,10 @@ def cmd_synth(args):
 
 def cmd_run(args):
     pts = load_point_cloud(args.point_cloud)
-    if args.boxes or args.gt:
-        # external boxes share the cloud's coordinate frame; transforming the
-        # cloud alone would desynchronize them. Caller must pre-align.
-        print("[diag][ground] external boxes/gt given -> skipping auto ground alignment")
+    if args.gt:
+        # ground-truth boxes share the cloud's coordinate frame; transforming
+        # the cloud alone would desynchronize them. Caller must pre-align.
+        print("[diag][ground] gt boxes given -> skipping auto ground alignment")
     else:
         from agentic_gts.pipeline import align_to_ground, denoise_cloud
         pts = denoise_cloud(pts)
@@ -67,43 +60,22 @@ def cmd_run(args):
             scene.meta["gs_cams"] = args.gs_cams
             print(f"[cli] COLMAP poses loaded: {len(tv[0])} training "
                   f"cameras -> render trust enabled")
-    if args.boxes:
-        scene.load_boxes(args.boxes)
     gt_boxes = None
     if args.gt:
         gs = Scene(points=scene.points)
         gs.load_boxes(args.gt)
         gt_boxes = gs.boxes
     opts = {}
-    if args.boxes:
-        # external boxes are semantic (detector/classifier output) -- the
-        # geometric wall-sheet prior doesn't apply to them, and single-view
-        # fragments are legitimately thin sheets
-        opts["trust_input_boxes"] = True
     if args.yaw is not None:
         import math as _math
         opts["yaw"] = _math.radians(args.yaw)
-        print(f"[cli] yaw pinned by user: {args.yaw} deg (estimation skipped)")
-    if getattr(args, "vlm_ground", False):
-        opts["vlm_ground"] = True
-        print("[cli] VLM 2D grounding enabled (initial boxes = hints only)")
+        print(f"[cli] yaw pinned by user: {args.yaw} deg")
     if getattr(args, "sam_checkpoint", None):
         opts["sam_checkpoint"] = args.sam_checkpoint
         if getattr(args, "sam_model_cfg", None):
             opts["sam_model_cfg"] = args.sam_model_cfg
         print(f"[cli] local SAM mask refinement enabled: {args.sam_checkpoint}")
-    for kv in args.stage_a_opts or []:
-        if "=" not in kv:
-            print(f"[cli] ignoring malformed --stage-a-opt '{kv}' (want key=value)")
-            continue
-        k, v = kv.split("=", 1)
-        try:
-            opts[k] = int(v) if v.lstrip("-").isdigit() else float(v)
-        except ValueError:
-            opts[k] = v
-        print(f"[cli] stage-A knob: {k}={opts[k]}")
     res = run_pipeline(scene, gt_boxes=gt_boxes,
-                       use_coarse_seg=not args.boxes,
                        vlm_backend=args.vlm,
                        vlm_api_base=args.vlm_base,
                        vlm_model=args.vlm_model,
@@ -113,15 +85,6 @@ def cmd_run(args):
                        out_dir=args.out,
                        edge_threshold_m=args.edge_thr)
     return res
-
-
-def cmd_demo(args):
-    cfg = SynthConfig(seed=args.seed)
-    scene, gt, corrupt = generate(cfg)
-    res = run_pipeline(scene, gt_boxes=gt, use_coarse_seg=True,
-                       vlm_backend=args.vlm, vlm_api_base=args.vlm_base,
-                       out_dir=args.out, edge_threshold_m=args.edge_thr)
-    print(json.dumps(res.stage_evals, ensure_ascii=False, indent=2))
 
 
 def cmd_diagnose(args):
@@ -210,7 +173,6 @@ def main():
                         "cameras.txt + images.txt) or images.txt itself. "
                         "Candidate view scores then blend the distance to "
                         "the trained ray distribution")
-    r.add_argument("--boxes", default=None, help="optional pre-detected boxes json")
     r.add_argument("--gt", default=None, help="optional ground-truth boxes json")
     r.add_argument("--out", default="runs/latest")
     r.add_argument("--vlm", default="mock", choices=["mock", "qwen", "local"])
@@ -229,12 +191,6 @@ def main():
     r.add_argument("--vlm-thinking-base", default=None,
                    help="API base for the thinking model if served separately "
                         "(defaults to --vlm-base, also env VLM_THINKING_API_BASE)")
-    r.add_argument("--vlm-ground", action="store_true", default=False,
-                   help="VLM 2D grounding: the initial boxes are used only as "
-                        "hints; the VLM outlines every device structure on a "
-                        "top-down view (a joined row = ONE region), geometry "
-                        "fits full-depth row boxes, and a front/back split "
-                         "pass resolves how many cabinets each row contains")
     r.add_argument("--sam-checkpoint", default=None,
                    help="SAM2/SAM checkpoint for local VLM-point + SAM mask "
                         "refinement (also env SAM_CHECKPOINT)")
@@ -244,21 +200,7 @@ def main():
     r.add_argument("--edge-thr", type=float, default=0.05)
     r.add_argument("--yaw", type=float, default=None,
                    help="pin device row yaw in degrees (skips estimation)")
-    r.add_argument("--stage-a-opt", dest="stage_a_opts", action="append", default=[],
-                   metavar="KEY=VALUE",
-                   help="Stage-A recall knob, repeatable. E.g. "
-                        "--stage-a-opt hist_med_factor=0.6 "
-                        "--stage-a-opt hist_max_frac=0.15 "
-                        "(others: min_side, max_gap_merge, min_pts_per_voxel, max_row_len)")
     r.set_defaults(fn=cmd_run)
-
-    d = sub.add_parser("demo", help="synthetic data -> full pipeline -> eval")
-    d.add_argument("--seed", type=int, default=42)
-    d.add_argument("--out", default="runs/demo")
-    d.add_argument("--vlm", default="mock", choices=["mock", "qwen"])
-    d.add_argument("--vlm-base", default=None)
-    d.add_argument("--edge-thr", type=float, default=0.05)
-    d.set_defaults(fn=cmd_demo)
 
     g = sub.add_parser("diagnose", help="preprocess + yaw check visualization")
     g.add_argument("--point-cloud", required=True)

@@ -14,8 +14,6 @@ from agentic_gts.agent.judge import VLMJudge
 from agentic_gts.agent.loop import LayoutAgent
 from agentic_gts.eval.metrics import EvalResult, evaluate
 from agentic_gts.output.render import boxes_to_png, boxes_to_svg
-from agentic_gts.rules.rules import apply_rules
-from agentic_gts.segment.coarse import coarse_segment
 
 
 @dataclass
@@ -63,8 +61,8 @@ def denoise_cloud(points: np.ndarray, nb_neighbors: int = 20,
 
     3DGS exports contain floaters near the floor and stray splats. They fill
     the z (0.4, 2.5) device band with diffuse mass, inflating every band in
-    the yaw histogram (device direction loses contrast) and polluting Stage A
-    row detection. Real surfaces are locally dense; isolated noise is not.
+    the yaw histogram (device direction loses contrast) and polluting the
+    grounding fit. Real surfaces are locally dense; isolated noise is not.
     """
     if len(points) < 1000:
         return points
@@ -228,7 +226,7 @@ def _render_stage(scene: Scene, tag: str, out_dir: str,
     """Save a top-down overlay PNG of the current scene state (per-stage QA).
 
     Rendered after every pipeline stage so regressions localize at a glance:
-    stage0_align_yaw -> stageA_coarse -> stageB_rules -> stageC_agent.
+    stage0_align_yaw -> stageG_ground -> stageC_agent.
     """
     try:
         from agentic_gts.output.visualize import overlay_topdown
@@ -242,7 +240,6 @@ def _render_stage(scene: Scene, tag: str, out_dir: str,
 
 def run_pipeline(scene: Scene,
                  gt_boxes: list[OrientedBox] | None = None,
-                 use_coarse_seg: bool = True,
                  vlm_backend: str = "mock",
                  vlm_api_base: str | None = None,
                  vlm_model: str | None = None,
@@ -251,39 +248,49 @@ def run_pipeline(scene: Scene,
                  opts: dict | None = None,
                  out_dir: str = "runs/latest",
                  edge_threshold_m: float = 0.05) -> PipelineResult:
-    """Run stages A -> B -> C, render outputs, and (optionally) evaluate."""
+    """Run the unified no-hint flow, render outputs, and (optionally) evaluate.
+
+    stage0 (yaw + layout bootstrap) -> stageG (global nadir VLM 2D
+    grounding) -> stageC (per-box local refine). There is no hint-box
+    input anymore: boxes come ONLY from the VLM grounding.
+    """
     opts = opts or {}
     os.makedirs(out_dir, exist_ok=True)
     evals: dict = {}
     t0 = time.time()
     diag_point_cloud(scene.points)
 
-    # --- stage 0: dominant orientation estimation ---
-    # The pipeline reasons in a row-aligned frame. If the caller didn't pin a
-    # yaw (opts or scene.meta), estimate it from the point cloud so arbitrary
-    # oriented scans work (no axis-aligned assumption).
-    if "yaw" not in opts and "yaw" not in scene.meta:
-        from agentic_gts.segment.orientation import estimate_yaw_detailed
-        info = estimate_yaw_detailed(scene.points)
+    # --- stage 0: dominant orientation + layout bootstrap ---
+    # The pipeline reasons in a row-aligned frame. The detailed yaw pass
+    # ALWAYS runs: besides the yaw, its byproducts (vertical-surface
+    # filter + boundary-cell removal) isolate the device layout --
+    # device_footprint (framing) and z_top (ceiling cut) -- which the
+    # grounding needs (there are no hint boxes to take them from). A
+    # caller-pinned yaw overrides only the ANGLE; the byproducts are
+    # yaw-independent.
+    from agentic_gts.segment.orientation import estimate_yaw_detailed
+    info = estimate_yaw_detailed(scene.points)
+    if "yaw" in opts:
+        yaw = float(opts["yaw"])
+        print(f"[stage0] yaw pinned by caller: {math.degrees(yaw):.1f} deg "
+              f"(estimation used for layout bootstrap only)")
+    elif "yaw" in scene.meta:
+        yaw = float(scene.meta["yaw"])
+    else:
         yaw = info["yaw"]
-        scene.meta["yaw"] = yaw
         print(f"[stage0] estimated dominant yaw = {math.degrees(yaw):.1f} deg")
-        # hint-free bootstrap byproducts: the yaw pass already isolated
-        # the device layout (vertical-surface filter + boundary-cell
-        # removal); stash the device footprint and top height so the
-        # grounding can frame the nadir view and cut the ceiling
-        # WITHOUT initial hint boxes (user request: no-hint input)
-        if info.get("z_top") is not None:
-            scene.meta["z_top"] = info["z_top"]
-        if info.get("device_footprint") is not None:
-            scene.meta["device_footprint"] = info["device_footprint"]
-        try:
-            from agentic_gts.output.visualize import render_yaw_diagnosis
-            png = os.path.join(out_dir, "yaw_check.png")
-            render_yaw_diagnosis(info["device_pts"], info["candidates"], yaw, png)
-            print(f"[stage0] yaw diagnosis -> {png}")
-        except Exception as e:  # diagnosis render must never break the run
-            print(f"[warn] yaw diagnosis render failed: {type(e).__name__}: {e}")
+    scene.meta["yaw"] = yaw
+    if info.get("z_top") is not None:
+        scene.meta["z_top"] = info["z_top"]
+    if info.get("device_footprint") is not None:
+        scene.meta["device_footprint"] = info["device_footprint"]
+    try:
+        from agentic_gts.output.visualize import render_yaw_diagnosis
+        png = os.path.join(out_dir, "yaw_check.png")
+        render_yaw_diagnosis(info["device_pts"], info["candidates"], yaw, png)
+        print(f"[stage0] yaw diagnosis -> {png}")
+    except Exception as e:  # diagnosis render must never break the run
+        print(f"[warn] yaw diagnosis render failed: {type(e).__name__}: {e}")
     opts.setdefault("yaw", float(scene.meta.get("yaw", 0.0)))
     _render_stage(scene, "stage0_align_yaw", out_dir, gt_boxes)
 
@@ -293,73 +300,34 @@ def run_pipeline(scene: Scene,
             evals[tag] = r.to_dict()
             print(f"[{tag}] {r.summary()}")
 
-    # --- stage A: coarse segmentation (optional; skip if boxes given) ---
-    if use_coarse_seg:
-        coarse_segment(scene, opts)
-        print(f"[stageA] coarse segmentation -> {len(scene.boxes)} candidate boxes")
-    else:
-        print(f"[stageA] skipped (using {len(scene.boxes)} provided boxes)")
-    _diag_support(scene)
-    _eval("stageA")
-    _render_stage(scene, "stageA_coarse", out_dir, gt_boxes)
-
-    # --- stage A-G: VLM 2D grounding (optional) ---
-    # The initial boxes are downgraded to HINTS: the VLM outlines every
-    # device structure on a top-down view (a joined row = ONE region),
-    # geometry turns each region into a full-depth row box, and a split
-    # pass resolves how many cabinets each row contains. Replaces the
-    # per-box two-phase refine: the region IS the whole device extent,
-    # so the thin-fragment problem never arises.
-    judge = None
-    if opts.get("vlm_ground"):
-        judge = VLMJudge(backend=vlm_backend, api_base=vlm_api_base,
-                         model=vlm_model,
-                         thinking_model=vlm_thinking_model,
-                         thinking_api_base=vlm_thinking_base)
-        try:
-            judge.set_record(os.path.join(out_dir, "vlm_records.jsonl"))
-        except Exception as e:
-            print(f"[warn] record path set failed ({type(e).__name__}: {e})")
-        from agentic_gts.agent.ground import ground_stage
-        if ground_stage(scene, judge, out_dir):
-            opts["vlm_grounded"] = True
-            # NOTE: the row SPLIT no longer runs here -- it moved into
-            # the agent loop, AFTER the per-box local refinement (SAM).
-            # User-directed order: grounding -> refine each region ->
-            # split the joined rows. Pre-splitting decided structure
-            # membership before the refinement evidence had a vote.
-            _diag_support(scene)
-            _eval("stageG")
-            _render_stage(scene, "stageG_ground", out_dir, gt_boxes)
-
-    # --- stage B: deterministic cleanup (geometry-only path only) ---
-    # Trusted external boxes and VLM-grounded boxes go directly to the local
-    # mask-refine agent. The old B0 pre-merge can destroy separate surface
-    # hypotheses before Qwen+SAM sees them, so it is intentionally bypassed.
-    if opts.get("trust_input_boxes") or opts.get("vlm_grounded"):
-        issues = []
-        print(f"[stageB] skipped for trusted/VLM-grounded boxes -> "
-              f"{len(scene.boxes)} boxes handed directly to agent")
-    else:
-        _, issues = apply_rules(scene, opts)
-        print(f"[stageB] geometry cleanup -> {len(scene.boxes)} boxes, "
-              f"{len(issues)} issues noted")
-    _diag_support(scene)
-    _eval("stageB")
-    _render_stage(scene, "stageB_rules", out_dir, gt_boxes)
-
-    # --- stage C: agent loop ---
-    if judge is None:      # the grounding stage may have created it already
-        judge = VLMJudge(backend=vlm_backend, api_base=vlm_api_base,
-                         model=vlm_model,
-                         thinking_model=vlm_thinking_model,
-                         thinking_api_base=vlm_thinking_base)
-    # record every adjudication (prompt + answer + choice + confidence) to a
-    # JSONL so the user can audit why the agent decided each issue
+    # --- stage G: VLM 2D grounding (the ONLY box producer) ---
+    # The VLM outlines every device structure on a top-down nadir view
+    # (a joined row = ONE region), geometry turns each region into a
+    # full-depth row box: the region IS the whole device extent, so the
+    # thin-fragment problem never arises. Failure leaves the scene
+    # empty (no fallback boxes exist without hint input).
+    judge = VLMJudge(backend=vlm_backend, api_base=vlm_api_base,
+                     model=vlm_model,
+                     thinking_model=vlm_thinking_model,
+                     thinking_api_base=vlm_thinking_base)
+    # record every adjudication (prompt + answer + choice + confidence)
+    # to a JSONL so the user can audit why the agent decided each issue
     try:
         judge.set_record(os.path.join(out_dir, "vlm_records.jsonl"))
     except Exception as e:
-        print(f"[warn] record path set failed ({type(e).__name__}: {e})")
+        print(f"[warn] record path set failed ({type(e).__name__}: {e}")
+    from agentic_gts.agent.ground import ground_stage
+    if ground_stage(scene, judge, out_dir):
+        # NOTE: the row SPLIT no longer runs here -- it moved into
+        # the agent loop, AFTER the per-box local refinement (SAM).
+        # User-directed order: grounding -> refine each region ->
+        # split the joined rows. Pre-splitting decided structure
+        # membership before the refinement evidence had a vote.
+        _diag_support(scene)
+        _eval("stageG")
+        _render_stage(scene, "stageG_ground", out_dir, gt_boxes)
+
+    # --- stage C: agent loop (per-box local refine) ---
     agent = LayoutAgent(judge=judge, opts=opts, out_dir=out_dir)
     report = agent.run(scene)
     n_res = len(report.resolved)
@@ -372,8 +340,8 @@ def run_pipeline(scene: Scene,
     # --- outputs ---
     scene.save_boxes(os.path.join(out_dir, "boxes.json"))
     # also persist the final layout in the detector-style 'objects' schema
-    # (same format the CLI accepts as --boxes input), so the result feeds
-    # the same downstream tools that produced the input
+    # (the format the 'view' sub-command accepts as --boxes), so the result
+    # feeds downstream viewers directly
     try:
         from agentic_gts.core.models import save_boxes_as_objects
         save_boxes_as_objects(scene.boxes,

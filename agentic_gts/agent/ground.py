@@ -1,18 +1,15 @@
 """VLM global 2D grounding -- the human surveyor's FIRST pass.
 
-Instead of repairing a set of rough per-device boxes, the initial boxes
-are downgraded to HINTS: the VLM looks at a top-down view of the whole
-room and outlines EVERY device structure (a joined cabinet ROW counts as
-one region), geometry turns each region into a full-depth 3D box, and a
-per-row split pass (front+back face renders) resolves how many cabinets
-each row box contains.
+The VLM looks at a top-down view of the whole room and outlines EVERY
+device structure (a joined cabinet ROW counts as one region), geometry
+turns each region into a full-depth 3D box, and a per-row split pass
+(front+back face renders) resolves how many cabinets each row box
+contains. There are no input boxes: the stage0 bootstrap byproducts
+(device_footprint + z_top) drive the framing and the ceiling cut.
 
 Why this kills the thin-fragment problem at its root: a region covers
 the whole row footprint, so BOTH observed faces -- and the hollow
-interior between them -- are inside one box from the start. The old
-per-box pipeline had to re-discover the row depth for every fragment
-(merge / depth-completion) and could not recover a face that had no box
-at all; here the region IS the whole device extent.
+interior between them -- are inside one box from the start.
 
 Division of labour (the project's standing contract): the VLM answers
 WHERE things are in the image; geometry MEASURES the 3D boxes (edges
@@ -60,8 +57,7 @@ def _render_cut(top: float | None) -> float:
     return min(top - 0.10, max(0.70 * top, 1.0))
 
 
-def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
-                    H: int = 1024):
+def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024):
     """Base top-down render, no overlays. Camera fitted over the
     yaw-rotated cloud (rows parallel to the image axes), then rotated
     back into world so the GS render and the pixel back-projection
@@ -71,6 +67,10 @@ def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
     True nadir: rows axis-aligned in the image (an axis-aligned image
     rectangle captures a row exactly, vertical rays carry no
     perspective dilation).
+
+    Framing and ceiling cut both come from the stage0 bootstrap
+    byproducts (scene.meta z_top + device_footprint): there is no
+    hint-box input anymore.
 
     Returns (img_float, cam, W, H).
     """
@@ -86,15 +86,7 @@ def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
     # still land above the cut. The FIT pool is cut independently
     # (top + 0.10 in ground_stage), so fitted box heights keep the true
     # rack top no matter how deep this renders.
-    # Hint-free input (no boxes): stage0's yaw pass already measured
-    # the device top (vertical-surface points, walls/ceiling excluded)
-    # -- its z_top is the same reference without a hint.
-    if frame_boxes:
-        top = max((b.center[2] + b.size[2] / 2.0 for b in frame_boxes))
-    elif scene.meta.get("z_top"):
-        top = float(scene.meta["z_top"])
-    else:
-        top = None
+    top = float(scene.meta["z_top"]) if scene.meta.get("z_top") else None
     cut = _render_cut(top)
     band = points[points[:, 2] < cut] if np.isfinite(cut) else points
     band = band[band[:, 2] > 0.30]
@@ -105,34 +97,25 @@ def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
         # exists to remove
         band = points[points[:, 2] > 0.30]
     pts_rot = _rot_xy(band, -yaw)
-    # frame over the BOX footprint, not the raw cloud bbox (user
+    # frame over the BOOTSTRAP footprint, not the raw cloud bbox (user
     # directive: the cloud-framed version raised the camera to fit
-    # walls too, and the racks rendered small). The hint boxes are
-    # only used for FRAMING (camera placement) -- they are not drawn
-    # on the VLM input, so grounding itself stays hint-free.
-    # Hint-free input: the stage0 device_footprint (world frame) is
-    # rotated into this row frame and AABB'd -- walls were already
-    # dropped as boundary cells, so the framing hugs the layout.
+    # walls too, and the racks rendered small). The stage0
+    # device_footprint (world frame) is rotated into this row frame
+    # and AABB'd -- walls were already dropped as boundary cells, so
+    # the framing hugs the layout.
     boxes_rot = []
-    if frame_boxes:
-        for b in frame_boxes:
-            c = _rot_xy(np.array([[b.center[0], b.center[1], 0.0]]), -yaw)[0]
-            boxes_rot.append(OrientedBox(center=(float(c[0]), float(c[1]),
-                                                 b.center[2]),
-                                         size=b.size, yaw=0.0))
-    else:
-        fp = scene.meta.get("device_footprint")
-        if fp:
-            corners_w = np.array([[fp[0], fp[1]], [fp[2], fp[1]],
-                                  [fp[2], fp[3]], [fp[0], fp[3]]])
-            cr = _rot_xy(np.column_stack([corners_w,
-                                          np.zeros(4)]), -yaw)
-            lo, hi = cr.min(axis=0), cr.max(axis=0)
-            c = (lo + hi) / 2.0
-            boxes_rot.append(OrientedBox(
-                center=(float(c[0]), float(c[1]), 1.0),
-                size=(float(hi[0] - lo[0]), float(hi[1] - lo[1]), 2.0),
-                yaw=0.0))
+    fp = scene.meta.get("device_footprint")
+    if fp:
+        corners_w = np.array([[fp[0], fp[1]], [fp[2], fp[1]],
+                              [fp[2], fp[3]], [fp[0], fp[3]]])
+        cr = _rot_xy(np.column_stack([corners_w,
+                                      np.zeros(4)]), -yaw)
+        lo, hi = cr.min(axis=0), cr.max(axis=0)
+        c = (lo + hi) / 2.0
+        boxes_rot.append(OrientedBox(
+            center=(float(c[0]), float(c[1]), 1.0),
+            size=(float(hi[0] - lo[0]), float(hi[1] - lo[1]), 2.0),
+            yaw=0.0))
     cam_r = make_godview_cam(pts_rot, boxes_rot, nadir=True, W=W, H=H)
     # rotate the camera back into world (rotation about z: the nadir
     # axis rotates with it)
@@ -222,7 +205,7 @@ def _draw_raw_regions(img: np.ndarray, raw_rects: list) -> np.ndarray:
 
 def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
     """Solid red outlines for the grounded result boxes (result-only
-    audit: no initial-hint overlay, grounding is independent of them)."""
+    audit: the VLM answered on the clean base, the fit is shown apart)."""
     from PIL import Image, ImageDraw
     u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3].copy()
     pil = Image.fromarray(u8)
@@ -289,7 +272,7 @@ def _save_grounded_fail_png(base_img, out_dir: str, why: str) -> None:
         except OSError:
             font = ImageFont.load_default()
         dr.rectangle(((0, 0), (pil.width, 46)), fill=(180, 0, 0))
-        dr.text((10, 9), f"GROUNDING FAILED - kept hints: {why}"[:110],
+        dr.text((10, 9), f"GROUNDING FAILED - {why}"[:110],
                 fill=(255, 255, 255), font=font)
         path = os.path.join(out_dir, "grounded.png")
         with open(path, "wb") as f:
@@ -370,31 +353,27 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     renders -> VLM SAM boxes -> mask -> back-projected points ->
     split-corrected seed) runs downstream.
 
-    False = grounding unavailable (mock backend / VLM failure / no
-    region survived the point-support guards) and the caller keeps the
-    original hint boxes -- grounding must never destroy the layout.
-
-    Hint-FREE input (user request): with no initial boxes, the stage0
-    yaw pass's bootstrap byproducts (scene.meta z_top +
+    The stage0 bootstrap byproducts (scene.meta z_top +
     device_footprint -- device vertical surfaces, walls/ceiling
-    excluded) replace the hints for the nadir framing and the ceiling
-    cut, so grounding runs on a bare point cloud.
+    excluded) drive the nadir framing and the ceiling cut; there is
+    no box input of any kind.
+
+    False = grounding unavailable (mock backend / VLM failure / no
+    region survived the point-support guards): the scene stays empty.
     """
     import os
     from agentic_gts.output.gs_render import png_bytes, unproject_ground
-    hints = list(scene.boxes)
-    if not hints and not (scene.meta.get("device_footprint")
-                          and scene.meta.get("z_top")):
-        print("[ground] no hint boxes and no stage0 bootstrap "
-              "footprint -> nothing to ground")
+    if not (scene.meta.get("device_footprint")
+            and scene.meta.get("z_top")):
+        print("[ground] no stage0 bootstrap footprint / z_top "
+              "-> nothing to ground")
         return False
     yaw = float(scene.meta.get("yaw", 0.0) or 0.0)
     try:
-        img, cam, W, H = _render_topdown(scene, hints, yaw)
-        png = png_bytes(img)           # CLEAN view: no hint overlays
+        img, cam, W, H = _render_topdown(scene, yaw)
+        png = png_bytes(img)           # CLEAN view: no overlays
     except Exception as e:
-        print(f"[ground] nadir render failed ({type(e).__name__}: {e}) "
-              f"-> keep hints")
+        print(f"[ground] nadir render failed ({type(e).__name__}: {e})")
         return False
     png_path = None
     if out_dir:
@@ -408,28 +387,23 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     rects = judge.ground_regions(png, W, H, png_path=png_path)
     print(f"[ground] nadir view: {len(rects)} regions")
     if not rects:
-        print("[ground] VLM returned no usable regions -> keep hints")
+        print("[ground] VLM returned no usable regions")
         if out_dir:
             _save_grounded_fail_png(img, out_dir,
                                     "VLM returned no usable regions")
         return False
     pts_rot = _rot_xy(np.asarray(scene.points, dtype=np.float64), -yaw)
-    # FIT points: the device band only. The render band cuts at
-    # hint_top - 0.45, but the FIT must keep the rack top, so cut at
-    # hint_top + 0.1: everything above (ceiling / cable trays -- the
-    # raw cloud still carries them) is excluded. Ceiling points span
-    # the WHOLE room in XY, so even a correct rect whose fit included
-    # them produced a tray-height box hugging the loose rect edges
-    # (user report: red boxes all too large and wrong while the raw
-    # colored rects were right).
-    hint_top = max((b.center[2] + b.size[2] / 2.0 for b in hints),
-                   default=None)
-    if hint_top is None:
-        # hint-free input: the stage0 device top replaces the hint tops
-        # (same ceiling exclusion, measured from vertical surfaces)
-        hint_top = float(scene.meta.get("z_top", 2.5) or 2.5)
+    # FIT points: the device band only. The render band cuts lower
+    # (relative to the device top), but the FIT must keep the rack
+    # top, so cut at z_top + 0.1: everything above (ceiling / cable
+    # trays -- the raw cloud still carries them) is excluded. Ceiling
+    # points span the WHOLE room in XY, so even a correct rect whose
+    # fit included them produced a tray-height box hugging the loose
+    # rect edges (user report: red boxes all too large and wrong while
+    # the raw colored rects were right).
+    fit_top = float(scene.meta.get("z_top", 2.5) or 2.5)
     pts_fit = pts_rot[(pts_rot[:, 2] > 0.30) &
-                      (pts_rot[:, 2] <= hint_top + 0.10)]
+                      (pts_rot[:, 2] <= fit_top + 0.10)]
     if len(pts_fit) < 100:
         pts_fit = pts_rot[pts_rot[:, 2] > 0.30]
 
@@ -465,8 +439,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                                 "n_pts": bb.meta.get("n_pts", 0)})
         boxes.append(box)
     if not boxes:
-        print("[ground] no region survived the point-support guards "
-              "-> keep hints")
+        print("[ground] no region survived the point-support guards")
         if out_dir:
             _save_grounded_fail_png(img, out_dir,
                                     "no region survived point-support guards")

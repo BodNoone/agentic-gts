@@ -87,10 +87,10 @@ def estimate_yaw_detailed(points: np.ndarray, z_range: tuple[float, float] = (0.
     # here), floors/ceilings/cable trays are horizontal (dropped by the
     # vertical-surface filter) or outside the height band. Export
     #   device_footprint  world-frame xy bounds of the surviving cells
-    #   z_top             device top height (P99.5 of the z of the band
-    #                     points inside those cells) -- the ceiling-cut
-    #                     and framing reference ground_stage needs when
-    #                     the caller provides no hint boxes.
+    #   z_top             device top height (anchored estimate of the
+    #                     band points inside those cells) -- the ceiling-
+    #                     cut and framing reference ground_stage needs
+    #                     (there is no box input to take them from).
     boot = {"z_top": None, "device_footprint": None}
     keep = boundary_keep_mask(cells)
     print(f"[diag][yaw] boundary (wall) cell removal: {len(cells)} -> {int(keep.sum())}")
@@ -210,8 +210,8 @@ def _ang_dist(a: float, b: float) -> float:
 def boundary_keep_mask(cells: np.ndarray, dist: float = 0.35) -> np.ndarray:
     """Boolean mask of cells farther than `dist` from the convex-hull boundary.
 
-    Walls lie on the room boundary; device rows are interior. Shared by yaw
-    estimation and Stage A to suppress wall structure.
+    Walls lie on the room boundary; device rows are interior. Used by yaw
+    estimation / layout bootstrap to suppress wall structure.
     """
     if len(cells) < 12:
         return np.ones(len(cells), dtype=bool)

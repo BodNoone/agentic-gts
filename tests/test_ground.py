@@ -31,9 +31,10 @@ def _row_points(x0, x1, y=0.0, depth=1.1, height=2.1, rng=None, n=6000):
     return np.vstack(pts)
 
 
-def _hint(cx, cy, size=(0.6, 0.5, 2.1)):
-    from agentic_gts.core.models import OrientedBox
-    return OrientedBox(center=(cx, cy, size[2] / 2), size=size, yaw=0.0)
+def _bootstrap_meta(scene, footprint, z_top=2.1):
+    """Fill scene.meta the way stage0's estimate_yaw_detailed does."""
+    scene.meta["z_top"] = z_top
+    scene.meta["device_footprint"] = footprint
 
 
 def test_unproject_ground_roundtrip():
@@ -100,11 +101,10 @@ def test_ground_stage_with_patched_vlm():
     pts = np.vstack([pts, ceil])
     scene = Scene(points=pts)
     scene.meta["yaw"] = 0.0
-    # hints: fragmented thin boxes (what the detector would give)
-    scene.boxes = [_hint(1.0, 0.0, size=(1.6, 0.45, 2.1)),
-                   _hint(4.0, 3.0, size=(1.2, 0.4, 2.1))]
+    _bootstrap_meta(scene, (-1.5, -0.8, 6.5, 3.8))
+    scene.boxes = []
     # build the same deterministic render to fabricate the VLM answer
-    _, cam, W, H = ground._render_topdown(scene, scene.boxes, 0.0)
+    _, cam, W, H = ground._render_topdown(scene, 0.0)
     true_rects = [((-0.5, 6.5), (-0.8, 0.8)),      # row 1 XY
                   ((-0.5, 6.5), (-0.8, 0.8)),      # row 1 AGAIN: the VLM
                   # often outlines one device twice (user report:
@@ -221,13 +221,9 @@ def test_ground_stage_row_along_y():
     row = row[:, [1, 0, 2]]       # the row now runs along y
     scene = Scene(points=row)
     scene.meta["yaw"] = 0.0
-    # realistic detector fragments: the row covered by SEVERAL hint
-    # pieces (the framing footprint is the boxes' union, so a single
-    # tiny centre hint would clip the row out of the nadir frame)
-    scene.boxes = [_hint(0.0, 1.0, size=(0.45, 1.2, 2.1)),
-                   _hint(0.0, 3.0, size=(0.45, 1.2, 2.1)),
-                   _hint(0.0, 5.0, size=(0.45, 1.2, 2.1))]
-    _, cam, W, H = ground._render_topdown(scene, scene.boxes, 0.0)
+    _bootstrap_meta(scene, (-0.8, -0.5, 0.8, 6.5))
+    scene.boxes = []
+    _, cam, W, H = ground._render_topdown(scene, 0.0)
     # true rect: depth on x, length on y
     uv = cam.project_cv(np.column_stack(
         [[-0.8, 0.8, 0.8, -0.8], [-0.5, -0.5, 6.5, 6.5], np.full(4, 1.0)]))
@@ -295,12 +291,12 @@ def test_yaw_bootstrap_byproducts():
           f"(z_top={z_top:.2f}, footprint={tuple(round(v, 2) for v in fp)})")
 
 
-def test_ground_stage_without_hints():
-    """Hint-FREE grounding end-to-end (user request): no initial boxes;
-    the stage0 bootstrap byproducts (meta z_top + device_footprint)
-    drive the nadir framing and the ceiling cut. The VLM answer is
-    fabricated by projecting the TRUE row rects through the same cam
-    the renderer builds -- full pixel->world->fit path, no hints."""
+def test_ground_stage_bootstrap_driven():
+    """Grounding end-to-end driven purely by the stage0 bootstrap
+    byproducts (meta z_top + device_footprint): no box input of any
+    kind. The VLM answer is fabricated by projecting the TRUE row
+    rects through the same cam the renderer builds -- full
+    pixel->world->fit path."""
     import tempfile
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
@@ -313,10 +309,9 @@ def test_ground_stage_without_hints():
                             np.full(3000, 2.9)])   # ceiling at 2.9m
     scene = Scene(points=np.vstack([pts, ceil]))
     scene.meta["yaw"] = 0.0
-    scene.meta["z_top"] = 2.1            # what stage0 exports for racks
-    scene.meta["device_footprint"] = (-0.5, -0.8, 6.5, 3.8)
-    scene.boxes = []                     # NO hint boxes at all
-    _, cam, W, H = ground._render_topdown(scene, [], 0.0)
+    _bootstrap_meta(scene, (-0.5, -0.8, 6.5, 3.8))
+    scene.boxes = []
+    _, cam, W, H = ground._render_topdown(scene, 0.0)
     true_rects = [(( -0.5, 6.5), (-0.8, 0.8)),
                   ((-1.5, 5.5), (2.2, 3.8))]
     import json as _json
@@ -337,14 +332,14 @@ def test_ground_stage_without_hints():
         ok = ground.ground_stage(scene, judge, out_dir=td)
         assert ok, "grounding must succeed on the bootstrap footprint"
     assert len(scene.boxes) == 2, \
-        f"two rows grounded without any hint boxes, got {len(scene.boxes)}"
+        f"two rows grounded from the bootstrap footprint, got {len(scene.boxes)}"
     rows = sorted(scene.boxes, key=lambda b: b.center[1])
     for b in rows:
         assert 5.0 < b.size[0] < 6.5, f"length {b.size[0]:.2f}"
         assert 0.85 < b.size[1] < 1.35, f"depth {b.size[1]:.2f} (FULL)"
         assert 1.9 < b.size[2] < 2.35, \
             f"height {b.size[2]:.2f} (ceiling must be excluded!)"
-    print(f"PASS hint-free ground stage "
+    print(f"PASS bootstrap-driven ground stage "
           f"(row1 {rows[0].size[0]:.2f}x{rows[0].size[1]:.2f}, "
           f"row2 {rows[1].size[0]:.2f}x{rows[1].size[1]:.2f})")
 
@@ -438,7 +433,8 @@ def test_parse_ground_regions_salvage():
 
 
 def test_ground_mock_returns_false():
-    """Mock backend / no VLM -> grounding must fail soft, keeping hints.
+    """Mock backend / no VLM -> grounding fails soft: the scene stays
+    EMPTY (there are no fallback boxes without hint input).
 
     The failure must also be VISIBLE: grounded.png is written with a
     red GROUNDING FAILED banner (previously it only appeared on
@@ -450,17 +446,17 @@ def test_ground_mock_returns_false():
     pts = _row_points(0.0, 6.0, rng=rng)
     scene = Scene(points=pts)
     scene.meta["yaw"] = 0.0
-    hints = [_hint(3.0, 0.0)]
-    scene.boxes = list(hints)
+    _bootstrap_meta(scene, (-0.5, -0.8, 6.5, 0.8))
+    scene.boxes = []
     judge = VLMJudge(backend="mock")
     with tempfile.TemporaryDirectory() as td:
         assert ground.ground_stage(scene, judge, out_dir=td) is False
         gpng = os.path.join(td, "grounded.png")
         assert os.path.isfile(gpng) and os.path.getsize(gpng) > 500, \
             "failure audit grounded.png (banner) must be written"
-    assert len(scene.boxes) == 1 and scene.boxes[0] is hints[0], \
-        "hints must be kept untouched on grounding failure"
-    print("PASS grounding fails soft (mock keeps hints)")
+    assert scene.boxes == [], \
+        "grounding failure must leave the scene empty (no fallback)"
+    print("PASS grounding fails soft (mock, scene stays empty)")
 
 
 if __name__ == "__main__":
@@ -470,7 +466,7 @@ if __name__ == "__main__":
     test_ground_stage_with_patched_vlm()
     test_ground_stage_row_along_y()
     test_yaw_bootstrap_byproducts()
-    test_ground_stage_without_hints()
+    test_ground_stage_bootstrap_driven()
     test_render_cut_relative_not_conservative()
     test_parse_ground_regions_official_format()
     test_parse_ground_regions_salvage()
