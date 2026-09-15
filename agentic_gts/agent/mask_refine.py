@@ -702,8 +702,15 @@ def _save_sam_debug(view: dict | None, box_prompt, mask, pts3,
         fig = plt.figure(figsize=(4.8, 4.8), dpi=160)
         ax = fig.add_axes([0.04, 0.04, 0.92, 0.92])
         if pts3 is not None and len(pts3):
+            # vmin=0.0 hardcoded the ground at z~0, but with --boxes
+            # input (no ground alignment) every back-projected z can be
+            # NEGATIVE: autoscaled vmax < vmin then makes Normalize
+            # raise 'minvalue must be less than or equal to maxvalue'
+            # and the whole debug render is lost. Clamp: vmin==vmax is
+            # tolerated (flat colour), vmin > vmax never reached.
+            zmax = float(pts3[:, 2].max())
             ax.scatter(pts3[:, 0], pts3[:, 1], s=2, c=pts3[:, 2],
-                       cmap="viridis", vmin=0.0)
+                       cmap="viridis", vmin=min(0.0, zmax))
         for b, style, color, label in ((box, "--", "deepskyblue", "old"),
                                        (fitted, "-", "red", "fitted")):
             if b is None:

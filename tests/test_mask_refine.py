@@ -493,6 +493,34 @@ def test_door_class_subtracts_from_device_points():
     print("PASS door class subtracts from device points")
 
 
+def test_sam_debug_render_survives_negative_z():
+    """Debug render regression (user report: '[mask-refine] debug
+    render failed (ValueError: minvalue must be less than or equal to
+    maxvalue)'): the top-down panel hardcoded vmin=0.0 (ground at z~0),
+    but with --boxes input (no ground alignment) every back-projected
+    z can be negative -- autoscaled vmax < vmin made matplotlib's
+    Normalize raise and the whole composite was lost. Never raises,
+    always writes the file."""
+    import tempfile
+    from agentic_gts.agent.mask_refine import _save_sam_debug
+    from agentic_gts.output.gs_render import Cam
+
+    view = {"image": np.full((64, 64, 3), 0.4, np.float32),
+            "cam": None}
+    pts3 = np.array([[-1.0, 0.0, -2.4],      # ALL z negative: the
+                    [0.5, 0.3, -2.1],        # old vmin=0.0 blew up
+                    [1.2, -0.4, -1.8]])
+    box = OrientedBox(center=(0.0, 0.0, -2.0), size=(2.0, 1.0, 1.0),
+                      yaw=0.0)
+    with tempfile.TemporaryDirectory() as td:
+        _save_sam_debug(view, (10, 10, 50, 50),
+                        np.ones((64, 64), bool), pts3, box, box, td,
+                        "negz")
+        assert os.path.isfile(os.path.join(td, "sam_debug_negz.png")), \
+            "the composite must be written despite all-negative z"
+    print("PASS SAM debug render survives all-negative z")
+
+
 def test_local_refine_splits_joined_row_end_to_end():
     """END-TO-END for the split adoption path the mock pipeline never
     covers (mock grounding returns empty groups): a seed covering TWO
