@@ -436,6 +436,38 @@ def test_back_view_rescues_poor_front_end_to_end():
     print("PASS back view rescues a poor front (coarse span dropped)")
 
 
+def test_cross_view_single_face_yields_to_multi():
+    """USER RULE: one face grounds ONE instance, the other grounds
+    SEVERAL -> the several stand (the row is one whole; the single box
+    is that whole unresolved). Even a PARTIAL single (the poor face's
+    one box covering cabinet A and half of B) must NOT union with A --
+    that would stretch A's piece across the seam. Its points are
+    clipped into the fine spans; its extent is dropped."""
+    from agentic_gts.agent.mask_refine import _merge_cross_view
+    axis = np.array([1.0, 0.0])
+    mk = lambda xs: np.column_stack(
+        [np.asarray(xs, float), np.zeros(len(xs)), np.ones(len(xs))])
+    # front (poor): ONE partial box [0, 1.3] -- A plus part of B
+    front = {"lo": 0.0, "hi": 1.3, "pts": mk([0.2, 0.8, 1.2]),
+             "ms": 0.6, "label": "rack", "view": "front"}
+    # back (open): the true two cabinets
+    backA = {"lo": 0.0, "hi": 1.0, "pts": mk([0.5]),
+             "ms": 0.9, "label": "rack", "view": "back"}
+    backB = {"lo": 1.05, "hi": 2.05, "pts": mk([1.5]),
+             "ms": 0.9, "label": "rack", "view": "back"}
+    out = _merge_cross_view([front, backA, backB], axis, 0.0)
+    assert len(out) == 2, f"the multi face's split stands: {len(out)}"
+    by_lo = sorted(out, key=lambda s: s["lo"])
+    a, b = by_lo
+    assert abs(a["lo"]) < 1e-9 and abs(a["hi"] - 1.0) < 1e-9, \
+        "A's extent must NOT stretch to the absorbed single's 1.3"
+    assert abs(b["lo"] - 1.05) < 1e-9 and abs(b["hi"] - 2.05) < 1e-9
+    # the single's real surface points were clipped into the fines
+    assert len(a["pts"]) == 3, "A keeps its 0.5 + the single's 0.2/0.8"
+    assert len(b["pts"]) == 2, "B keeps its 1.5 + the single's 1.2"
+    print("PASS single-instance face yields to the multi face")
+
+
 def test_sam_unconfigured_is_conservative():
     old = os.environ.pop("SAM_CHECKPOINT", None)
     try:

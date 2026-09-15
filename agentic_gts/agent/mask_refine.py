@@ -552,7 +552,36 @@ def _mask_to_points(scene: Scene, box: OrientedBox, mask: np.ndarray, cam,
     return pts[keep]
 
 
-def _merge_cross_view(spans: list) -> list:
+def _absorb_single(single: dict, fines: list, axis, along0: float) -> bool:
+    """Fold the single-instance face's span into the multi-instance
+    face's split (user rule: one face grounds ONE instance, the other
+    grounds SEVERAL -> the several stand; the row is one whole and the
+    single box is that whole unresolved).
+
+    The single's back-projected points are REAL surface points: they
+    are clipped into whichever fine span contains them (more evidence
+    for the piece's point support / height). Its EXTENT is dropped --
+    unioning it would stretch a piece across the seam. Returns True
+    when the single touched any fine span (absorbed); False when it
+    overlapped none (the caller keeps it -- recall: a region the
+    multi face never grounded)."""
+    hit = False
+    for f in fines:
+        if min(single["hi"], f["hi"]) - max(single["lo"], f["lo"]) > 0:
+            hit = True
+    if single["pts"] is not None and axis is not None:
+        al = single["pts"][:, :2] @ axis - along0
+        for f in fines:
+            if f["pts"] is None:
+                continue
+            m = (al >= f["lo"]) & (al <= f["hi"])
+            if m.any():
+                f["pts"] = np.vstack([f["pts"], single["pts"][m]])
+                hit = True
+    return hit
+
+
+def _merge_cross_view(spans: list, axis=None, along0: float = 0.0) -> list:
     """Reconcile the SAME cabinets voted from BOTH faces.
 
     The back view is the front's mirror: the SAME physical cabinets,
@@ -561,15 +590,35 @@ def _merge_cross_view(spans: list) -> list:
     relative threshold that adjacent cabinets, overlapping only by
     the seam-placement difference, never reach).
 
-    COARSE votes are dropped, not unioned: a poor face (narrow
-    corridor, foreshortened ends) yields ONE whole-row box; unioning
-    it with either fine span would swallow the good face's split.
-    Rule: a span overlapping TWO OR MORE distinct spans bridges
-    multiple instances -- the fine view's division wins, the bridging
-    span contributes nothing. Mutual single-overlap pairs union (both
-    faces saw one cabinet); singletons pass through (a cabinet legible
-    from only one face still splits the row).
+    USER RULE -- instance COUNT decides first: when one face grounds
+    ONE instance while the other grounds SEVERAL, the several stand
+    (the row is one whole; the single box is that whole unresolved).
+    The single face's span is ABSORBED (_absorb_single): points
+    clipped into the fine spans, extent dropped -- even a PARTIAL
+    single (covering cabinet A and half of B) must not union with A
+    and stretch it across the seam.
+
+    Graph merge handles the rest: mutual single-overlap pairs union
+    (both faces saw one cabinet), a span bridging TWO OR MORE spans
+    is dropped (a coarse whole-row vote from an N-vs-M disagreement),
+    singletons pass through (a cabinet legible from only one face
+    still splits the row).
     """
+    by_view = {}
+    for s in spans:
+        by_view.setdefault(s.get("view"), []).append(s)
+    if len(by_view) == 2:
+        a, b = list(by_view.values())
+        if len(a) == 1 and len(b) > 1:
+            if _absorb_single(a[0], b, axis, along0):
+                print(f"[mask-refine] cross-view: single-instance face "
+                      f"absorbed into the {len(b)}-instance face's split")
+                spans = b
+        elif len(b) == 1 and len(a) > 1:
+            if _absorb_single(b[0], a, axis, along0):
+                print(f"[mask-refine] cross-view: single-instance face "
+                      f"absorbed into the {len(a)}-instance face's split")
+                spans = a
     n = len(spans)
     adj = [set() for _ in range(n)]
     for i in range(n):
@@ -1153,7 +1202,8 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
         lo, hi = np.percentile(along, [2.0, 98.0])
         spans.append({"lo": float(lo), "hi": float(hi), "pts": pts3,
                       "ms": ms, "label": group.hypothesis,
-                      "pix": tuple(float(v) for v in box_pix)})
+                      "pix": tuple(float(v) for v in box_pix),
+                      "view": voter["name"]})
     spans = _merge_spans(spans)
     # clip each span's points to its (possibly seam-cut) extent: the
     # bleed points past the seam belong to the NEIGHBOUR piece, not
@@ -1241,7 +1291,7 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     for voter in voters:
         spans.extend(_voter_spans(scene, box, voter, judge, sam,
                                   out_dir, audit))
-    spans = _merge_cross_view(spans)
+    spans = _merge_cross_view(spans, axis, along0)
     front_ok = bool(spans)
     if not front_ok:
         # no usable front division: the seed stays WHOLE and is still
