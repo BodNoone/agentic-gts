@@ -123,16 +123,19 @@ def test_box_groups_official_cookbook_array():
 
 
 def test_merge_spans_dedupes_but_keeps_seams():
-    """Overlapping spans (VLM double-boxing one cabinet) merge; truly
-    adjacent cabinets keep their seam."""
+    """A duplicate (the VLM double-boxing ONE cabinet -- high 2D IoU of
+    the VLM's own pixel boxes) merges; truly adjacent cabinets keep
+    their seam."""
     from agentic_gts.agent.mask_refine import _merge_spans
     spans = [
         {"lo": 0.00, "hi": 0.60, "pts": np.zeros((50, 3)),
-         "ms": 0.8, "label": "rack"},
+         "ms": 0.8, "label": "rack", "pix": (100, 200, 500, 600)},
         {"lo": 0.05, "hi": 0.58, "pts": np.zeros((30, 3)),
-         "ms": 0.7, "label": "rack"},     # duplicate of the first
+         "ms": 0.7, "label": "rack",
+         "pix": (110, 210, 510, 610)},    # duplicate VLM box: high IoU
         {"lo": 0.62, "hi": 1.20, "pts": np.zeros((50, 3)),
-         "ms": 0.8, "label": "rack"},     # adjacent: seam must survive
+         "ms": 0.8, "label": "rack",
+         "pix": (520, 200, 900, 600)},   # adjacent: distinct box
     ]
     out = _merge_spans(spans)
     assert len(out) == 2, f"expected 2 spans, got {len(out)}"
@@ -140,6 +143,38 @@ def test_merge_spans_dedupes_but_keeps_seams():
     assert abs(out[1]["lo"] - 0.62) < 1e-6 and abs(out[1]["hi"] - 1.20) < 1e-6
     assert len(out[0]["pts"]) == 80      # points merged
     print("PASS span merging (duplicates union, seams survive)")
+
+
+def test_merge_spans_mask_bleed_keeps_instances():
+    """SAM masks bleed a few cm across the seam between joined cabinets
+    (user report: the VLM grounds DISTINCT instances but the spans
+    overlap, and the old >0.10 m overlap merge collapsed the row back
+    into one span -- joined rows stayed joined). Duplicates are now
+    detected on the VLM's OWN boxes (2D IoU); distinct instances keep
+    both spans, cut at the overlap midpoint -- the seam."""
+    from agentic_gts.agent.mask_refine import _merge_spans
+    spans = [
+        {"lo": 0.00, "hi": 0.64, "pts": np.zeros((50, 3)),
+         "ms": 0.8, "label": "rack", "pix": (100, 200, 480, 600)},
+        {"lo": 0.56, "hi": 1.20, "pts": np.zeros((50, 3)),
+         "ms": 0.8, "label": "rack", "pix": (520, 200, 900, 600)},
+    ]
+    out = _merge_spans(spans)
+    assert len(out) == 2, "two VLM-distinct instances must both survive"
+    seam = 0.5 * (0.64 + 0.56)          # the overlap midpoint
+    assert abs(out[0]["hi"] - seam) < 1e-9
+    assert abs(out[1]["lo"] - seam) < 1e-9
+    # heavy span overlap but DISTINCT VLM boxes: still never merged
+    spans2 = [
+        {"lo": 0.00, "hi": 1.00, "pts": np.zeros((50, 3)),
+         "ms": 0.8, "label": "rack", "pix": (100, 200, 480, 600)},
+        {"lo": 0.20, "hi": 1.20, "pts": np.zeros((50, 3)),
+         "ms": 0.8, "label": "rack", "pix": (520, 200, 900, 600)},
+    ]
+    out2 = _merge_spans(spans2)
+    assert len(out2) == 2, \
+        "distinct VLM boxes never merge, however far the masks bleed"
+    print("PASS mask-bleed overlap keeps instances (seam at midpoint)")
 
 
 def test_build_split_pieces_trusts_seed_dims():

@@ -537,21 +537,56 @@ def _mask_to_points(scene: Scene, box: OrientedBox, mask: np.ndarray, cam,
 
 
 def _merge_spans(spans: list) -> list:
-    """Merge overlapping along-row spans (VLM occasionally double-boxes
-    the same cabinet): sorted by lo, unioned when they overlap by more
-    than 0.10 m. Truly adjacent cabinets touch but do not overlap -- a
-    real seam between different instances survives."""
+    """Reconcile along-row spans: duplicates merge, seams normalise.
+
+    Two overlap regimes, treated OPPOSITELY (user rule: never merge
+    two instances just because their spans overlap):
+
+    * DUPLICATE -- the VLM double-boxed the SAME cabinet. Detected on
+      the VLM's OWN pixel boxes (2D IoU >= 0.5), which the mask spans
+      cannot provide: masks bleed. Union into one span.
+    * MASK BLEED -- two DISTINCT VLM instances whose SAM masks each
+      overshoot the cabinet seam by a few centimetres (joined cabinets
+      have no visual gap, so each mask edge lands inside the
+      neighbour). Both spans survive, cut at the overlap midpoint --
+      the seam. The old rule merged ANY overlap > 0.10 m, which
+      collapsed the whole row back into one span and the split never
+      happened (user report: joined rows stayed joined).
+    """
+
+    def _iou(a, b):
+        if not a or not b:
+            return 0.0
+        ix = min(a[2], b[2]) - max(a[0], b[0])
+        iy = min(a[3], b[3]) - max(a[1], b[1])
+        if ix <= 0 or iy <= 0:
+            return 0.0
+        inter = ix * iy
+        aa = (a[2] - a[0]) * (a[3] - a[1])
+        ab = (b[2] - b[0]) * (b[3] - b[1])
+        return inter / (aa + ab - inter)
+
     out = []
     for s in sorted(spans, key=lambda t: t["lo"]):
-        if out and s["lo"] < out[-1]["hi"] - 0.10:
-            p = out[-1]
-            if len(s["pts"]) > len(p["pts"]):
-                p["label"] = s["label"]
-            p["hi"] = max(p["hi"], s["hi"])
-            p["pts"] = np.vstack([p["pts"], s["pts"]])
-            p["ms"] = max(p["ms"], s["ms"])
-        else:
-            out.append(dict(s))
+        dup = next((p for p in out
+                    if s["lo"] < p["hi"]
+                    and _iou(p.get("pix"), s.get("pix")) >= 0.5), None)
+        if dup is not None:
+            # same instance double-boxed by the VLM: union
+            if len(s["pts"]) > len(dup["pts"]):
+                dup["label"] = s["label"]
+                dup["pix"] = s.get("pix")
+            dup["lo"] = min(dup["lo"], s["lo"])
+            dup["hi"] = max(dup["hi"], s["hi"])
+            dup["pts"] = np.vstack([dup["pts"], s["pts"]])
+            dup["ms"] = max(dup["ms"], s["ms"])
+            continue
+        for p in out:                      # distinct instances: cut the
+            if s["lo"] < p["hi"]:          # mask bleed at the seam
+                seam = 0.5 * (p["hi"] + s["lo"])
+                p["hi"] = seam
+                s["lo"] = seam
+        out.append(dict(s))
     return out
 
 
@@ -913,8 +948,17 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         along = pts3[:, :2] @ axis - along0
         lo, hi = np.percentile(along, [2.0, 98.0])
         spans.append({"lo": float(lo), "hi": float(hi), "pts": pts3,
-                      "ms": ms, "label": group.hypothesis})
+                      "ms": ms, "label": group.hypothesis,
+                      "pix": tuple(float(v) for v in box_pix)})
     spans = _merge_spans(spans)
+    # clip each span's points to its (possibly seam-cut) extent: the
+    # bleed points past the seam belong to the NEIGHBOUR piece, not
+    # this one (keeps point counts / scores per-instance honest)
+    for s in spans:
+        if s["pts"] is None:
+            continue
+        a = s["pts"][:, :2] @ axis - along0
+        s["pts"] = s["pts"][(a >= s["lo"]) & (a <= s["hi"])]
     spans = [s for s in spans
              if (s["hi"] - s["lo"]) >= 0.30 and len(s["pts"]) >= 40]
     va["spans"] = [{"lo": round(s["lo"], 3), "hi": round(s["hi"], 3),
