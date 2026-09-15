@@ -29,6 +29,29 @@ import numpy as np
 from agentic_gts.core.models import BoxSource, Confidence, OrientedBox, Scene
 
 
+_QUALITY_RE = re.compile(
+    r"quality\s*[:：]\s*[\"']?(good|poor|true|false|yes|no)\b",
+    re.IGNORECASE)
+
+
+def reply_view_quality(text: str) -> str:
+    """Parse the VLM's per-view quality verdict ('good' | 'poor').
+
+    The grounding prompt asks for a first line 'quality: good|poor'
+    judged IN THE SAME CALL as the box grounding (user direction: no
+    extra call, no extra budget). A garbage view -- fogged, blurred,
+    washed out -- has its boxes DROPPED however confidently the model
+    drew them: a haze invites hallucinated structure. A reply with no
+    marker (the model skipped the line) reads GOOD -- dropping a view
+    loses signal, so it takes an explicit poor verdict. The LAST
+    match wins when the model states its verdict more than once.
+    """
+    verdict = "good"
+    for m in _QUALITY_RE.finditer(text or ""):
+        verdict = m.group(1).lower()
+    return "poor" if verdict in ("poor", "false", "no") else "good"
+
+
 @dataclass
 class BoxGroup:
     bbox_norm: tuple[float, float, float, float]   # x1,y1,x2,y2 on 0..1000
@@ -1244,9 +1267,21 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
     verdict = judge.adjudicate_sam_boxes(
         voter["image"], box, voter["name"], png_path=voter["path"])
     groups = verdict.params.get("groups", []) if verdict.params else []
+    quality = (verdict.params.get("view_quality", "good")
+               if verdict.params else "good")
     va = {"view": voter["name"], "image": voter["path"], "role": "voter",
           "answer": verdict.raw or verdict.detail, "groups": groups,
-          "spans": []}
+          "quality": quality, "spans": []}
+    if quality == "poor":
+        # VLM quality verdict, judged in the SAME call as the grounding
+        # (user direction: drop garbage views): a fogged/blurred render
+        # gets its boxes dropped however confident they look -- a haze
+        # invites hallucinated structure. The audit entry keeps role
+        # and groups for review.
+        print(f"[mask-refine] {voter['name']} view dropped: "
+              f"VLM judges the render quality poor")
+        va["role"] = "voter-dropped"
+        va["groups"] = groups = []
     H, W = voter["image"].shape[:2]
     yaw = float(box.yaw)
     axis = np.array([math.cos(yaw), math.sin(yaw)])
@@ -1399,9 +1434,20 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         verdict = judge.adjudicate_sam_boxes(
             side["image"], box, side["name"], png_path=side["path"])
         groups = verdict.params.get("groups", []) if verdict.params else []
+        quality = (verdict.params.get("view_quality", "good")
+                   if verdict.params else "good")
         dva = {"view": side["name"], "image": side["path"],
                "role": "depth_profile", "groups": groups,
-               "instances": []}
+               "quality": quality, "instances": []}
+        if quality == "poor":
+            # same VLM quality verdict as the face voters (user
+            # direction: drop garbage views): a fogged side render must
+            # not feed the thickness pool -- the seed/geometry fallback
+            # takes over instead
+            print(f"[mask-refine] {side['name']} view dropped: "
+                  f"VLM judges the render quality poor")
+            dva["role"] = "depth_profile-dropped"
+            dva["groups"] = groups = []
         H, W = side["image"].shape[:2]
         # the side view is where an open door sticks out HORIZONTALLY
         # beyond the body -- subtract its mask before any thickness

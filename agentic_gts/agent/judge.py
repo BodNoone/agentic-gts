@@ -426,6 +426,11 @@ class VLMJudge:
         "This is a local {view_name} view of one target device in a "
         "data-center room, rendered clean on a dark background: the "
         "bright structure filling most of the frame IS the target.\n"
+        "First judge the IMAGE QUALITY: begin your reply with the "
+        "single line 'quality: good' when the device structure is "
+        "clearly visible and judgeable, or 'quality: poor' when the "
+        "image is too hazy, foggy, blurred, washed out or degraded "
+        "to judge devices reliably.\n"
         "Locate every instance that belongs to the following categories: "
         '"server rack / IT cabinet, air-conditioning unit, '
         'open cabinet door".\n'
@@ -445,7 +450,8 @@ class VLMJudge:
                              view_name: str,
                              png_path: str | None = None) -> Verdict:
         """Qwen3-VL box grounding for SAM's box prompt (native task)."""
-        from agentic_gts.agent.mask_refine import parse_box_groups
+        from agentic_gts.agent.mask_refine import (parse_box_groups,
+                                                   reply_view_quality)
         # .replace, NOT .format: the prompt's JSON example carries
         # literal braces ({"candidate_groups": ...}) that str.format
         # parses as a replacement field named '"candidate_groups"'
@@ -477,18 +483,21 @@ class VLMJudge:
             return Verdict(action="keep", params={"groups": []},
                            confidence=0.0, detail=f"call failed: {e}")
         parsed = parse_box_groups(self._strip_think(text))
+        quality = reply_view_quality(self._strip_think(text))
         groups = [{"bbox": g.bbox_norm,
                    "hypothesis": g.hypothesis,
                    "confidence": g.confidence} for g in parsed]
         conf = max((g.confidence for g in parsed), default=0.0)
         self._record("sam_boxes", prompt, text,
-                     f"{len(groups)} groups", conf,
+                     f"{len(groups)} groups (view {quality})", conf,
                      "bbox_2d normalized 0-1000; converted once to "
                      "pixels for SAM's box prompt",
                      png_path=png_path)
         return Verdict(action="segment" if groups else "keep",
-                       params={"groups": groups}, confidence=conf,
-                       detail=f"{len(groups)} prompt groups", raw=text,
+                       params={"groups": groups,
+                               "view_quality": quality}, confidence=conf,
+                       detail=f"{len(groups)} prompt groups "
+                              f"(view {quality})", raw=text,
                        png_path=png_path)
 
     _RACK_CONFIRM_PROMPT = (

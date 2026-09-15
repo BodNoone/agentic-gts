@@ -72,7 +72,34 @@ def test_sam_box_prompt_construction():
         "the open door must be a positive detection class"
     assert "its OWN instance" in prompt, \
         "the door must ground as its own instance, not be excluded"
+    # VLM quality verdict (user direction: judged TOGETHER with the
+    # grounding in the same call, garbage views dropped)
+    assert "quality: good" in prompt and "quality: poor" in prompt, \
+        "the prompt must ask for the first-line quality verdict"
     print("PASS SAM box prompt construction (cookbook style, literal braces)")
+
+
+def test_reply_view_quality_parsing():
+    """The per-view quality verdict parsed from the grounding reply's
+    first line (judged in the SAME call, no extra budget). Missing
+    marker reads GOOD (dropping a view loses signal -- it takes an
+    explicit poor verdict); the LAST match wins; yes/no and
+    capitalization variants accepted."""
+    from agentic_gts.agent.mask_refine import reply_view_quality
+    assert reply_view_quality(
+        'quality: good\n[{"bbox_2d": [1, 2, 3, 4]}]') == "good"
+    assert reply_view_quality("quality: poor") == "poor"
+    assert reply_view_quality("Quality: Poor.") == "poor"
+    assert reply_view_quality("quality: no") == "poor"
+    assert reply_view_quality("quality: yes") == "good"
+    assert reply_view_quality(
+        '[{"bbox_2d": [1, 2, 3, 4]}]') == "good", \
+        "no marker in the reply must read GOOD, not poor"
+    assert reply_view_quality(
+        "quality: good ... later: quality: poor") == "poor", \
+        "the LAST stated verdict wins"
+    assert reply_view_quality("") == "good"
+    print("PASS reply view quality parsing")
 
 
 def test_audit_json_survives_numpy_meta():
@@ -434,6 +461,92 @@ def test_back_view_rescues_poor_front_end_to_end():
     centers = sorted(b.center[0] for b in scene.boxes)
     assert centers[0] < -0.2 < 0.2 < centers[1], centers
     print("PASS back view rescues a poor front (coarse span dropped)")
+
+
+def test_vlm_quality_verdict_drops_garbage_view():
+    """VLM quality verdict (user direction: judged TOGETHER with the
+    grounding in the same call, garbage views DROPPED): a fogged front
+    render on which the model still HALLUCINATED a whole-row box must
+    contribute nothing -- the 'poor' verdict drops the view's boxes
+    outright, and the clean back view's two-cabinet split stands
+    (unlike the bridge test, the front's box never even reaches the
+    cross-view merge)."""
+    from agentic_gts.agent import mask_refine as mr
+    from agentic_gts.agent.judge import Verdict, VLMJudge
+    from agentic_gts.agent.loop import AgentReport, LayoutAgent
+    from agentic_gts.output.gs_render import Cam
+
+    rng = np.random.default_rng(7)
+    cabA = np.column_stack([rng.uniform(-1.0, -0.05, 800),
+                            rng.uniform(-0.5, 0.5, 800),
+                            rng.uniform(0.05, 1.95, 800)])
+    cabB = np.column_stack([rng.uniform(0.05, 1.0, 800),
+                            rng.uniform(-0.5, 0.5, 800),
+                            rng.uniform(0.05, 1.95, 800)])
+    scene = Scene(points=np.vstack([cabA, cabB]))
+    seed = OrientedBox(center=(0.0, 0.0, 1.0), size=(2.0, 1.0, 1.9),
+                       yaw=0.0)
+    scene.boxes = [seed]
+    img = np.zeros((768, 768, 3), np.float32)
+    views = [{"name": n, "cam": Cam(
+                  eye=np.array([0.0, 4.0 if n == "front" else -4.0, 1.2]),
+                  target=np.array([0.0, 0.0, 1.0]),
+                  up=np.array([0.0, 0.0, 1.0]), fovy_deg=60.0,
+                  W=768, H=768), "path": None, "prompt_path": None,
+              "image": img}
+             for n in ("front", "back", "side")]
+    _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
+             mr.SamPredictorAdapter.predict)
+    mr.render_local_views = lambda scene, box, out_dir: views
+
+    j = VLMJudge(backend="mock")
+
+    def fake_ground(image, box, view_name, png_path=None):
+        # front: the FOGGED view -- judged poor, but the model still
+        # hallucinated a confident whole-row box (the danger the
+        # verdict guards against); back: clean, the true two cabinets
+        if view_name == "front":
+            return Verdict(action="segment", params={
+                "groups": [{"bbox": (10, 10, 990, 990),
+                            "hypothesis": "rack", "confidence": 0.9}],
+                "view_quality": "poor"}, confidence=0.9,
+                detail="fake", raw="quality: poor")
+        groups = ([{"bbox": (10, 10, 490, 990), "hypothesis": "rack",
+                    "confidence": 0.9},
+                  {"bbox": (510, 10, 990, 990), "hypothesis": "rack",
+                   "confidence": 0.9}] if view_name == "back"
+                  else [{"bbox": (10, 10, 990, 990),
+                         "hypothesis": "rack", "confidence": 0.9}])
+        return Verdict(action="segment", params={
+            "groups": groups, "view_quality": "good"},
+            confidence=0.9, detail="fake", raw="quality: good")
+
+    j.adjudicate_sam_boxes = fake_ground
+
+    def fake_predict(self, image, box_pix):
+        m = np.zeros(image.shape[:2], bool)
+        x1, y1, x2, y2 = (int(round(float(v))) for v in box_pix)
+        m[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)] = True
+        return [m], [0.95]
+
+    mr.SamPredictorAdapter._load = lambda self: None
+    mr.SamPredictorAdapter.predict = fake_predict
+
+    agent = LayoutAgent(judge=j, opts={"sam_checkpoint": "fake.pt"},
+                        out_dir=None)
+    try:
+        agent._local_mask_refine(scene, AgentReport())
+    finally:
+        (mr.render_local_views, mr.SamPredictorAdapter._load,
+         mr.SamPredictorAdapter.predict) = _real
+
+    assert len(scene.boxes) == 2, \
+        (f"the poor-verdict front must be dropped and the back's "
+         f"division stand: got {len(scene.boxes)}: "
+         + str([b.to_dict().get("center") for b in scene.boxes]))
+    centers = sorted(b.center[0] for b in scene.boxes)
+    assert centers[0] < -0.2 < 0.2 < centers[1], centers
+    print("PASS VLM quality verdict drops the garbage view")
 
 
 def test_cross_view_single_face_yields_to_multi():
