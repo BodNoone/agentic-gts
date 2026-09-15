@@ -63,11 +63,15 @@ def test_sam_box_prompt_construction():
     assert "Locate every instance" in prompt, \
         "the cookbook's trained locate phrasing must be kept"
     # instance rules (the split_stage replacement): distinct cabinets
-    # in a joined row ground separately; an open door is excluded
+    # in a joined row ground separately; the open door is its OWN
+    # positive class (user finding: the model detects "open cabinet
+    # door" reliably but cannot exclude it via a negative instruction)
     assert "differ in height or in color" in prompt, \
         "joined-row cabinets must be separated by visual difference"
-    assert "door standing" in prompt and "exclude" in prompt, \
-        "an open door swung out of the body must stay outside the box"
+    assert "open cabinet door" in prompt, \
+        "the open door must be a positive detection class"
+    assert "its OWN instance" in prompt, \
+        "the door must ground as its own instance, not be excluded"
     print("PASS SAM box prompt construction (cookbook style, literal braces)")
 
 
@@ -416,6 +420,77 @@ def test_mask_to_points_clips_far_outside_seed():
     for p in ((0.2, 0.90, 1.0), (1.6, 0.0, 1.0), (0.0, 0.0, -0.30)):
         assert p not in got, f"noise point {p} must be clipped, got {got}"
     print("PASS mask backprojection clips points far outside the seed")
+
+
+def test_door_class_subtracts_from_device_points():
+    """The open-door positive class (user finding: the VLM detects
+    "open cabinet door" reliably as a detection task but cannot exclude
+    it via a negative instruction): _door_union SAM-segments the door
+    boxes into one subtractive mask, door-class groups never form
+    spans/pool entries, and _mask_to_points drops every point that
+    projects into the door mask -- the open door cannot stretch the
+    span or the thickness."""
+    from agentic_gts.agent.mask_refine import (
+        _door_union, _is_door, _mask_to_points,
+    )
+    from agentic_gts.output.gs_render import Cam
+
+    assert _is_door("open cabinet door")
+    assert _is_door("Open Cabinet DOOR")
+    assert not _is_door("rack")
+    assert not _is_door(None)
+
+    # _door_union: only door-class groups, best-score SAM mask unioned
+    IMG = np.zeros((64, 64, 3))       # 64px: VLM boxes clear the
+    # degenerate-size guard (a tiny 8px test image would not)
+
+    class _FakeSam:
+        def __init__(self):
+            self.calls = []
+
+        def predict(self, image, box_pix):
+            self.calls.append(tuple(box_pix))
+            # two door boxes -> two disjoint masks
+            m = np.zeros((64, 64), bool)
+            if box_pix[0] < 20:         # left door box
+                m[20:40, 5:20] = True
+            else:                        # right door box
+                m[25:35, 30:50] = True
+            return [m], [0.9]
+
+    sam = _FakeSam()
+    groups = [{"bbox": (100, 100, 400, 500), "hypothesis": "rack"},
+              {"bbox": (100, 200, 300, 600), "hypothesis": "open cabinet door"},
+              {"bbox": (500, 200, 800, 600), "hypothesis": "door"}]
+    u = _door_union(IMG, groups, sam)
+    assert len(sam.calls) == 2, "device-class box must NOT hit the door SAM"
+    assert u is not None and u[25, 10] and u[30, 40], \
+        "union must cover both door masks"
+    # no door group -> None (the common case): no subtraction layer
+    assert _door_union(IMG,
+                       [{"bbox": (100, 100, 400, 500),
+                         "hypothesis": "rack"}], sam) is None
+
+    # _mask_to_points: points projecting into the door mask are dropped
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(2.0, 1.0, 2.0),
+                      yaw=0.0)
+    cam = Cam(eye=np.array([0.0, 4.0, 1.2]),
+              target=np.array([0.0, 0.0, 1.0]), up=np.array([0.0, 0.0, 1.0]),
+              fovy_deg=60.0, W=768, H=768)
+    scene = Scene(points=np.array([
+        [0.0, 0.0, 1.0],           # cabinet body: kept
+        [0.5, -0.3, 1.6],          # cabinet body: kept
+    ]))
+    uv = cam.project_cv(scene.points)
+    x = np.rint(uv[:, 0]).astype(int)
+    y = np.rint(uv[:, 1]).astype(int)
+    doors = np.zeros((768, 768), bool)
+    doors[y[1], x[1]] = True       # the second point's pixel is "door"
+    out = _mask_to_points(scene, box, np.ones((768, 768), bool), cam,
+                          exclude=doors)
+    assert len(out) == 1 and np.allclose(out[0][:2], (0.0, 0.0)), \
+        "the door-pixel point must be subtracted, the body point kept"
+    print("PASS door class subtracts from device points")
 
 
 def test_apply_depth_from_side_excludes_open_door():

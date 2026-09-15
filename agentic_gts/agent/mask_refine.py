@@ -482,7 +482,8 @@ def render_local_views(scene: Scene, box: OrientedBox,
 
 
 def _mask_to_points(scene: Scene, box: OrientedBox, mask: np.ndarray, cam,
-                    margin: float = 0.25, z_buffer: bool = True) -> np.ndarray:
+                    margin: float = 0.25, z_buffer: bool = True,
+                    exclude: np.ndarray | None = None) -> np.ndarray:
     """Lift mask to local 3DGS centers.
 
     z_buffer=True (front view): only points close to the nearest
@@ -494,6 +495,14 @@ def _mask_to_points(scene: Scene, box: OrientedBox, mask: np.ndarray, cam,
     mask, at ANY depth. The side camera looks ALONG the row, so all
     cabinets of the seed overlap in projection; keeping only the nearest
     surface would starve the inner cabinets of depth-measurement points.
+
+    exclude (pixel mask, same shape): points whose projection lands in
+    this mask are DROPPED -- the open-door subtraction. The door class
+    is detected by the VLM as its own positive instance (user finding:
+    the model detects "open cabinet door" reliably but cannot exclude
+    it via a negative instruction); its SAM mask pixel-subtracts the
+    door from every device mask, so door points never reach the
+    span/thickness pools -- box refinement only ever fits devices.
 
     margin: the candidate region is the seed OBB grown by this much.
     Backprojected points far outside the seed are NOISE -- a mask edge
@@ -514,6 +523,9 @@ def _mask_to_points(scene: Scene, box: OrientedBox, mask: np.ndarray, cam,
     y = np.rint(uv[:, 1]).astype(int)
     valid = ((x >= 0) & (x < mask.shape[1]) &
              (y >= 0) & (y < mask.shape[0]))
+    if exclude is not None:
+        valid &= ~exclude[np.clip(y, 0, exclude.shape[0] - 1),
+                          np.clip(x, 0, exclude.shape[1] - 1)]
     if not z_buffer:
         selected = np.where(valid)[0]
         keep = np.zeros(len(pts), dtype=bool)
@@ -868,6 +880,37 @@ def _build_split_pieces(spans: list, seed: "OrientedBox") -> list:
     return out
 
 
+def _is_door(label) -> bool:
+    """The open-door positive class: the VLM labels its boxes
+    "open cabinet door" (user finding: the model DETECTS the open door
+    reliably as its own class, but cannot exclude it via a negative
+    instruction)."""
+    return "door" in str(label or "").lower()
+
+
+def _door_union(image: np.ndarray, groups: list, sam: SamPredictorAdapter
+                ) -> np.ndarray | None:
+    """Pixel union of the SAM masks of every door-class box -- the
+    subtractive layer for device back-projection. None when the VLM
+    found no open door in this view (the common case)."""
+    u: np.ndarray | None = None
+    for g in groups:
+        if not _is_door(g.get("hypothesis")):
+            continue
+        group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "door"),
+                         float(g.get("confidence", 0.5)))
+        H, W = image.shape[:2]
+        box_pix = group.pixel_box(W, H)
+        if not (box_pix[2] - box_pix[0] > 4 and box_pix[3] - box_pix[1] > 4):
+            continue
+        masks, scores = sam.predict(image, box_pix)
+        if not len(masks):
+            continue
+        m = masks[int(np.argmax(scores))]
+        u = m.copy() if u is None else (u | m)
+    return u
+
+
 def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                out_dir: str | None = None,
                views: list | None = None) -> tuple[list, dict]:
@@ -884,12 +927,15 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     guides HOW the seed splits (each visually distinct cabinet its own
     along-row span; the seed's yaw / height / depth / cross centre are
     TRUSTED), and the SIDE view -- the profile along the row axis --
-    corrects each piece's THICKNESS. The side view is where an open
-    door is separable: it sticks out horizontally beyond the cabinet
-    body, which the front view cannot resolve (user report) -- the
-    depth estimator (_robust_span) additionally drops the door's
-    spread-out tail as a safety net behind the VLM's door-excluding
-    prompt.
+    corrects each piece's THICKNESS.
+
+    Open doors are a positive CLASS, not a negative instruction (user
+    finding: the VLM detects "open cabinet door" reliably but cannot
+    exclude it from a device box on request): every view's door masks
+    pixel-subtract from the device back-projection, so door points
+    never enter the span or thickness pools -- box refinement only
+    ever fits devices. The strong-bin estimator (_robust_span) drops
+    whatever door tail still leaks through as the safety net.
 
     Returns the list of pieces -- more than one means the front
     grounding split the row, and the caller replaces the old box with
@@ -922,8 +968,15 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
           "answer": verdict.raw or verdict.detail, "groups": groups,
           "spans": []}
     H, W = voter["image"].shape[:2]
+    # the door class first: its SAM masks form the subtractive layer
+    # every device back-projection is pixel-cleaned with
+    doors = _door_union(voter["image"], groups, sam)
     spans = []
     for gi, g in enumerate(groups):
+        if _is_door(g.get("hypothesis")):
+            continue              # door class: subtraction only, never
+                                 # a span -- box refinement fits
+                                 # devices only (user rule)
         group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
                          float(g.get("confidence", 0.5)))
         box_pix = group.pixel_box(W, H)
@@ -932,8 +985,11 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         masks, scores = sam.predict(voter["image"], box_pix)
         best = None
         for mi, (mask, ms) in enumerate(zip(masks, scores)):
-            # surface only (z-buffer): the front face the VLM grounded
-            pts3 = _mask_to_points(scene, box, mask, voter["cam"])
+            # surface only (z-buffer): the front face the VLM grounded;
+            # door pixels subtracted so the open door never stretches
+            # the span (user report: door interference on box size)
+            pts3 = _mask_to_points(scene, box, mask, voter["cam"],
+                                   exclude=doors)
             if out_dir:
                 _save_sam_debug(voter, box_pix, mask, pts3, box,
                                 None, out_dir,
@@ -998,8 +1054,15 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                "role": "depth_profile", "groups": groups,
                "instances": []}
         H, W = side["image"].shape[:2]
+        # the side view is where an open door sticks out HORIZONTALLY
+        # beyond the body -- subtract its mask before any thickness
+        # point enters the pool (belt and braces on top of the
+        # strong-bin estimator)
+        doors = _door_union(side["image"], groups, sam)
         pool, pool_ms = [], 0.0
         for gi, g in enumerate(groups):
+            if _is_door(g.get("hypothesis")):
+                continue          # subtraction only, never a pool
             group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
                              float(g.get("confidence", 0.5)))
             box_pix = group.pixel_box(W, H)
@@ -1012,7 +1075,7 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                 # NO z-buffer: from along the row, every piece overlaps
                 # in projection -- all of them must contribute points
                 pts3 = _mask_to_points(scene, box, mask, side["cam"],
-                                      z_buffer=False)
+                                      z_buffer=False, exclude=doors)
                 if out_dir:
                     _save_sam_debug(side, box_pix, mask, pts3, box,
                                     None, out_dir,

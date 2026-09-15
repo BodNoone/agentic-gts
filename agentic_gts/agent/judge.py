@@ -417,21 +417,26 @@ class VLMJudge:
     # The splitting rules replace the removed split_stage: a joined row
     # whose cabinets differ in height or color must be grounded as
     # SEPARATE instances (the row split now comes from this grounding,
-    # not a separate VLM pass); an open door swung out of the body is
-    # not part of the device and must stay outside the box.
+    # not a separate VLM pass); an OPEN door is its OWN positive class
+    # (user finding: the model DETECTS "open cabinet door" reliably as
+    # a detection task, but cannot EXCLUDE it via a negative
+    # instruction) -- the door boxes feed pixel-level subtraction so
+    # door points never enter the span/thickness pools.
     _SAM_BOX_PROMPT = (
         "This is a local {view_name} view of one target device in a "
         "data-center room, rendered clean on a dark background: the "
         "bright structure filling most of the frame IS the target.\n"
         "Locate every instance that belongs to the following categories: "
-        '"server rack / IT cabinet, air-conditioning unit".\n'
+        '"server rack / IT cabinet, air-conditioning unit, '
+        'open cabinet door".\n'
         "Instance rules: cabinets joined side by side in one row are "
         "DIFFERENT instances when they differ in height or in color -- "
         "give each its own box at its own boundary; truly identical "
-        "joined cabinets may be covered by one box. A door standing "
-        "open, swung out of the cabinet body, is NOT part of the "
-        "device -- the box must exclude it.\n"
-        "Each box must cover the whole visible device it belongs to.\n"
+        "joined cabinets may be covered by one box.\n"
+        "A cabinet door standing open, swung out of the body, is its "
+        "OWN instance labelled \"open cabinet door\" -- the box covers "
+        "ONLY the door panel itself, NOT the cabinet body behind it.\n"
+        "Each box must cover the whole visible instance it belongs to.\n"
         "Report bbox coordinates in JSON format like this: "
         '{"bbox_2d": [x1, y1, x2, y2], "label": "rack"}'
     )
