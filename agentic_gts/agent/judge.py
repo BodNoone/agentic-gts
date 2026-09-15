@@ -460,11 +460,17 @@ class VLMJudge:
             png_path = self._save_evidence_png(
                 image, f"sam_boxes_{box.box_id}_{view_name}.png")
         try:
+            # generous budget: a LONG joined row grounds dozens of
+            # cabinets, each its own bbox_2d item (plus the door
+            # instances). The old 800-token cap truncated the reply
+            # mid-item on such rows (user report) -- parse_box_groups
+            # salvage-recovers the COMPLETE boxes, but the tail
+            # cabinets were still lost. Mirrors ground_regions' budget.
             if self.backend == "local":
                 text = self._local_image_call(png, prompt,
-                                              max_new_tokens=800)
+                                              max_new_tokens=6000)
             else:
-                text = self._qwen_image_call(png, prompt, max_tokens=800)
+                text = self._qwen_image_call(png, prompt, max_tokens=6000)
         except Exception as e:
             self._record("sam_boxes", prompt, "", "", 0.0,
                          f"call failed: {e}", png_path=png_path)

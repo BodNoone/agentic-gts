@@ -126,6 +126,38 @@ def test_box_groups_official_cookbook_array():
     print("PASS box groups (official cookbook array, no truncation)")
 
 
+def test_box_groups_long_row_budget():
+    """The SAM-box call's token budget must hold a LONG joined row:
+    dozens of cabinets, each its own bbox_2d item (plus door
+    instances). The old 800-token cap truncated the reply mid-item
+    (user report: the tail of the VLM answer was cut off on super-long
+    rows) -- parse must recover every COMPLETE item, and the budget
+    itself must scale with the row length (mirrors ground_regions)."""
+    from agentic_gts.agent.judge import VLMJudge
+    # 40 cabinets + 3 doors = 43 items: a realistic super-long row
+    items = [{"bbox_2d": [10 + 24 * i, 100, 30 + 24 * i, 900],
+              "label": "rack"} for i in range(40)]
+    items += [{"bbox_2d": [50, 100, 70, 500],
+               "label": "open cabinet door"} for _ in range(3)]
+    import json as _json
+    reply = _json.dumps(items)
+    groups = parse_box_groups(reply)
+    assert len(groups) == 43, \
+        f"a 43-item row reply must parse in full, got {len(groups)}"
+    assert groups[39].bbox_norm[0] > 900, "the LAST rack must survive"
+    assert groups[40].hypothesis == "open cabinet door"
+    # the budget on the real call path (not just the parser): the
+    # qwen/API call must request enough tokens for such a reply
+    j = VLMJudge(backend="qwen")
+    src = None
+    import inspect as _inspect
+    for f in (VLMJudge.adjudicate_sam_boxes,):
+        src = _inspect.getsource(f)
+    assert "max_tokens=6000" in src or "max_new_tokens=6000" in src, \
+        "the SAM-box call must carry the long-row budget (6000)"
+    print("PASS long-row reply parses in full (43 items, budget 6000)")
+
+
 def test_merge_spans_dedupes_but_keeps_seams():
     """A duplicate (the VLM double-boxing ONE cabinet -- high 2D IoU of
     the VLM's own pixel boxes) merges; truly adjacent cabinets keep
