@@ -430,16 +430,20 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # against the side the camera would actually STAND ON.
     open_vec, corridor = _open_side(gs, box)
     azim_front = _front_azim(box, open_vec)
-    # view pair, both at GROUND level (elev 18 deg, rack height -- no
+    # view set, all at GROUND level (elev 18 deg, rack height -- no
     # top-down component: the local views must show the device's
     # vertical surfaces, which the ground-level 3DGS training observed
-    # well): FRONT (the face: doors, panels -- the sole voter on
-    # instance division, door seams / height / color are legible
-    # face-on) + SIDE (along the row axis: the depth/height PROFILE,
-    # where an open door sticks out horizontally beyond the cabinet body
-    # and the true thickness is measurable -- the front view cannot
-    # separate a door, user report).
+    # well): FRONT (the face: doors, panels -- a voter on instance
+    # division, door seams / height / color are legible face-on) +
+    # BACK (the mirrored face: the front aisle is sometimes a NARROW
+    # corridor -- poor standoff, foreshortened row ends -- while the
+    # back is open; the same cabinets, a second, often cleaner vote
+    # (user report)) + SIDE (along the row axis: the depth/height
+    # PROFILE, where an open door sticks out horizontally beyond the
+    # cabinet body and the true thickness is measurable -- the front
+    # view cannot separate a door, user report).
     slots = (("front", 18.0, azim_front),
+             ("back", 18.0, azim_front + 180.0),
              ("side", 18.0, azim_front + 90.0))
     # standoff: ~80% into the corridor, never further than 2.2m; the
     # camera widens its lens to frame, it does not back off
@@ -546,6 +550,67 @@ def _mask_to_points(scene: Scene, box: OrientedBox, mask: np.ndarray, cam,
     selected = ids[visible & mask[y[ids], x[ids]]]
     keep[selected] = True
     return pts[keep]
+
+
+def _merge_cross_view(spans: list) -> list:
+    """Reconcile the SAME cabinets voted from BOTH faces.
+
+    The back view is the front's mirror: the SAME physical cabinets,
+    so a cabinet grounded in both views yields two spans overlapping
+    by nearly the full cabinet width (>= 50% of the shorter -- the
+    relative threshold that adjacent cabinets, overlapping only by
+    the seam-placement difference, never reach).
+
+    COARSE votes are dropped, not unioned: a poor face (narrow
+    corridor, foreshortened ends) yields ONE whole-row box; unioning
+    it with either fine span would swallow the good face's split.
+    Rule: a span overlapping TWO OR MORE distinct spans bridges
+    multiple instances -- the fine view's division wins, the bridging
+    span contributes nothing. Mutual single-overlap pairs union (both
+    faces saw one cabinet); singletons pass through (a cabinet legible
+    from only one face still splits the row).
+    """
+    n = len(spans)
+    adj = [set() for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = spans[i], spans[j]
+            ov = min(a["hi"], b["hi"]) - max(a["lo"], b["lo"])
+            shorter = min(a["hi"] - a["lo"], b["hi"] - b["lo"])
+            if ov >= 0.5 * shorter:
+                adj[i].add(j)
+                adj[j].add(i)
+    keep = [i for i in range(n) if len(adj[i]) <= 1]
+    kept_set = set(keep)
+    out, used = [], set()
+    for i in keep:
+        if i in used:
+            continue
+        used.add(i)
+        s = dict(spans[i])
+        # union only a MUTUAL pair: i's single neighbour j is also
+        # kept and j's single neighbour is i
+        if adj[i]:
+            j = next(iter(adj[i]))
+            if j in kept_set and j not in used:
+                used.add(j)
+                p = spans[j]
+                s["lo"] = min(s["lo"], p["lo"])
+                s["hi"] = max(s["hi"], p["hi"])
+                if p["pts"] is not None:
+                    s["pts"] = (np.vstack([s["pts"], p["pts"]])
+                                if s["pts"] is not None else p["pts"])
+                s["ms"] = max(s["ms"], p["ms"])
+                np_p = len(p["pts"]) if p["pts"] is not None else 0
+                np_s = len(s["pts"]) if s["pts"] is not None else 0
+                if np_p > np_s:
+                    s["label"] = p["label"]
+        out.append(s)
+    dropped = n - len(out)
+    if dropped:
+        print(f"[mask-refine] cross-view: dropped {dropped} coarse "
+              f"bridging span(s) -- the finer face's split stands")
+    return out
 
 
 def _merge_spans(spans: list) -> list:
@@ -1026,56 +1091,22 @@ def _door_union(image: np.ndarray, groups: list, sam: SamPredictorAdapter
     return u
 
 
-def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
-               out_dir: str | None = None,
-               views: list | None = None) -> tuple[list, dict]:
-    """Split-correct one seed box from local VLM grounding + SAM masks.
+def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
+                 sam: SamPredictorAdapter, out_dir: str | None,
+                 audit: dict) -> list[dict]:
+    """One face voter (front or back): VLM grounding -> SAM masks ->
+    back-projected surface -> along-row spans, per-view reconciled.
 
-    Box-only prompting (no points): point placement is a WEAK Qwen3-VL
-    skill (user report: prompts mostly off the device despite a clean
-    input image), while box grounding is the model's NATIVE task -- and
-    the box prompt is SAM's canonical interaction, forgiving of prompt
-    error where points are brittle.
-
-    Corrections are applied ON the seed box, never as a free re-fit
-    (user decision): the front view's back-projected mask surface only
-    guides HOW the seed splits (each visually distinct cabinet its own
-    along-row span; the seed's yaw / height / depth / cross centre are
-    TRUSTED), and the SIDE view -- the profile along the row axis --
-    corrects each piece's THICKNESS.
-
-    Open doors are a positive CLASS, not a negative instruction (user
-    finding: the VLM detects "open cabinet door" reliably but cannot
-    exclude it from a device box on request): every view's door masks
-    pixel-subtract from the device back-projection, so door points
-    never enter the span or thickness pools -- box refinement only
-    ever fits devices. The strong-bin estimator (_robust_span) drops
-    whatever door tail still leaks through as the safety net.
-
-    Returns the list of pieces -- more than one means the front
-    grounding split the row, and the caller replaces the old box with
-    all of them.
+    Extracted from refine_box when the back view joined (user report:
+    the front aisle is sometimes a narrow corridor -- the back face
+    votes too). CLEAN image to the VLM: no wireframe overlay, same
+    principle as global grounding. Door masks pixel-subtract from every
+    back-projection; the per-view span list carries the VLM pixel box
+    for the duplicate-detection _merge_spans does. The audit entry
+    (answer, groups, spans) lands in audit["views"] and on disk as
+    sam_boxes_<id>_<name>.json.
     """
-    if views is None:
-        views = render_local_views(scene, box, out_dir)
-    audit = {"box_id": box.box_id, "views": [], "accepted": False}
-    if not views or not sam.available:
-        audit["reason"] = "no local GS views or SAM checkpoint"
-        return [], audit
-    voter = next((v for v in views if v["name"] == "front"), None)
-    if voter is None:
-        voter = views[0]
-    side = next((v for v in views if v is not voter), None)
-    yaw = float(box.yaw)
-    axis = np.array([math.cos(yaw), math.sin(yaw)])
-    sc = np.asarray(box.center, dtype=float)
-    along0 = float(sc[:2] @ axis)
-
-    # ---- pass 1 (front): grounding -> SAM surface -> along spans ----
-    # CLEAN image to the VLM: the wireframe overlay (prompt_image) is
-    # the Stage-A box, which is often oversized/misplaced -- the VLM
-    # anchors on the frame instead of the device. Same principle as
-    # global grounding: no box prompts in the input image.
+    voter = view
     verdict = judge.adjudicate_sam_boxes(
         voter["image"], box, voter["name"], png_path=voter["path"])
     groups = verdict.params.get("groups", []) if verdict.params else []
@@ -1083,15 +1114,17 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
           "answer": verdict.raw or verdict.detail, "groups": groups,
           "spans": []}
     H, W = voter["image"].shape[:2]
+    yaw = float(box.yaw)
+    axis = np.array([math.cos(yaw), math.sin(yaw)])
+    along0 = float(np.asarray(box.center, dtype=float)[:2] @ axis)
     # the door class first: its SAM masks form the subtractive layer
     # every device back-projection is pixel-cleaned with
     doors = _door_union(voter["image"], groups, sam)
     spans = []
     for gi, g in enumerate(groups):
         if _is_door(g.get("hypothesis")):
-            continue              # door class: subtraction only, never
-                                 # a span -- box refinement fits
-                                 # devices only (user rule)
+            continue          # door class: subtraction only, never a
+                             # span -- box refinement fits devices only
         group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
                          float(g.get("confidence", 0.5)))
         box_pix = group.pixel_box(W, H)
@@ -1100,11 +1133,11 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         masks, scores = sam.predict(voter["image"], box_pix)
         best = None
         for mi, (mask, ms) in enumerate(zip(masks, scores)):
-            # surface only (z-buffer): the front face the VLM grounded;
-            # door pixels subtracted so the open door never stretches
-            # the span (user report: door interference on box size)
+            # surface only (z-buffer): the face the VLM grounded; door
+            # pixels subtracted so the open door never stretches the
+            # span (user report: door interference on box size)
             pts3 = _mask_to_points(scene, box, mask, voter["cam"],
-                                   exclude=doors)
+                                    exclude=doors)
             if out_dir:
                 _save_sam_debug(voter, box_pix, mask, pts3, box,
                                 None, out_dir,
@@ -1145,6 +1178,70 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         except OSError:
             pass
     audit["views"].append(va)
+    return spans
+
+
+def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
+               out_dir: str | None = None,
+               views: list | None = None) -> tuple[list, dict]:
+    """Split-correct one seed box from local VLM grounding + SAM masks.
+
+    Box-only prompting (no points): point placement is a WEAK Qwen3-VL
+    skill (user report: prompts mostly off the device despite a clean
+    input image), while box grounding is the model's NATIVE task -- and
+    the box prompt is SAM's canonical interaction, forgiving of prompt
+    error where points are brittle.
+
+    Corrections are applied ON the seed box, never as a free re-fit
+    (user decision): the front view's back-projected mask surface only
+    guides HOW the seed splits (each visually distinct cabinet its own
+    along-row span; the seed's yaw / height / depth / cross centre are
+    TRUSTED), and the SIDE view -- the profile along the row axis --
+    corrects each piece's THICKNESS.
+
+    Open doors are a positive CLASS, not a negative instruction (user
+    finding: the VLM detects "open cabinet door" reliably but cannot
+    exclude it from a device box on request): every view's door masks
+    pixel-subtract from the device back-projection, so door points
+    never enter the span or thickness pools -- box refinement only
+    ever fits devices. The strong-bin estimator (_robust_span) drops
+    whatever door tail still leaks through as the safety net.
+
+    Returns the list of pieces -- more than one means the front
+    grounding split the row, and the caller replaces the old box with
+    all of them.
+    """
+    if views is None:
+        views = render_local_views(scene, box, out_dir)
+    audit = {"box_id": box.box_id, "views": [], "accepted": False}
+    if not views or not sam.available:
+        audit["reason"] = "no local GS views or SAM checkpoint"
+        return [], audit
+    voters = [v for v in views if v["name"] in ("front", "back")]
+    if not voters:
+        voters = views[:1]
+    side = next((v for v in views if v["name"] == "side"), None)
+    yaw = float(box.yaw)
+    axis = np.array([math.cos(yaw), math.sin(yaw)])
+    sc = np.asarray(box.center, dtype=float)
+    along0 = float(sc[:2] @ axis)
+
+    # ---- pass 1 (front + back): grounding -> SAM surface -> spans ----
+    # TWO face voters now (user report: the front aisle is sometimes a
+    # NARROW corridor -- poor standoff, foreshortened row ends, weak
+    # render -- while the back side is open and photographs cleanly).
+    # Each face grounds independently; the SAME cabinet's spans union
+    # across views (_merge_cross_view), a cabinet legible from only
+    # one face still splits the row. CLEAN image to the VLM: the
+    # wireframe overlay (prompt_image) is the Stage-A box, which is
+    # often oversized/misplaced -- the VLM anchors on the frame
+    # instead of the device. Same principle as global grounding: no
+    # box prompts in the input image.
+    spans = []
+    for voter in voters:
+        spans.extend(_voter_spans(scene, box, voter, judge, sam,
+                                  out_dir, audit))
+    spans = _merge_cross_view(spans)
     front_ok = bool(spans)
     if not front_ok:
         # no usable front division: the seed stays WHOLE and is still

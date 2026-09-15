@@ -298,6 +298,144 @@ def test_height_and_staggered_thickness_per_piece():
     print("PASS per-piece height + staggered geometry thickness")
 
 
+def test_cross_view_merge_unions_pairs_drops_coarse():
+    """Front + back vote on the SAME cabinets (user report: the front
+    aisle is sometimes a narrow corridor -- the back face must
+    strengthen the judgement). Three regimes:
+      * mutual pair: the same cabinet seen from both faces unions;
+      * COARSE bridge: the poor face's whole-row box overlaps two
+        fine spans -- it is DROPPED (unioning it with either would
+        swallow the good face's split);
+      * singleton: a cabinet legible from only one face survives."""
+    from agentic_gts.agent.mask_refine import _merge_cross_view
+    mkpts = lambda n: np.zeros((n, 3))
+    # front (poor view): ONE whole-row box; back (open side): the
+    # true two cabinets, slightly different seam placement
+    spans = [
+        {"lo": -1.0, "hi": 1.0, "pts": mkpts(80), "ms": 0.6,
+         "label": "rack"},                       # front coarse
+        {"lo": -0.98, "hi": 0.02, "pts": mkpts(60), "ms": 0.9,
+         "label": "rack"},                       # back cabinet A
+        {"lo": 0.04, "hi": 0.98, "pts": mkpts(55), "ms": 0.9,
+         "label": "rack"},                       # back cabinet B
+        {"lo": 1.1, "hi": 1.7, "pts": mkpts(40), "ms": 0.7,
+         "label": "rack"},                       # back-only row end
+    ]
+    out = _merge_cross_view(spans)
+    assert len(out) == 3, f"coarse dropped, A/B/end survive: {len(out)}"
+    by_lo = sorted(out, key=lambda s: s["lo"])
+    a, b, e = by_lo
+    assert abs(a["lo"] + 0.98) < 1e-9 and abs(a["hi"] - 0.02) < 1e-9
+    assert abs(b["lo"] - 0.04) < 1e-9 and abs(b["hi"] - 0.98) < 1e-9
+    assert abs(e["lo"] - 1.1) < 1e-9 and abs(e["hi"] - 1.7) < 1e-9
+    # mutual pair: same cabinet from BOTH faces unions (points stack)
+    spans2 = [
+        {"lo": 0.0, "hi": 0.6, "pts": mkpts(50), "ms": 0.8,
+         "label": "rack"},
+        {"lo": 0.02, "hi": 0.58, "pts": mkpts(30), "ms": 0.7,
+         "label": "rack"},
+    ]
+    out2 = _merge_cross_view(spans2)
+    assert len(out2) == 1 and len(out2[0]["pts"]) == 80
+    assert abs(out2[0]["lo"]) < 1e-9 and abs(out2[0]["hi"] - 0.6) < 1e-9
+    print("PASS cross-view merge (pairs union, coarse bridges drop)")
+
+
+def test_back_view_rescues_poor_front_end_to_end():
+    """The user's narrow-corridor scenario END-TO-END: the front aisle
+    is cramped, its render poor, and the VLM grounds ONE whole-row box
+    there; the back side is open and grounds the true TWO cabinets.
+    With the back view voting, the row must still split into 2 -- the
+    coarse front span is dropped by the cross-view rule, the back's
+    fine division stands."""
+    import math
+
+    from agentic_gts.agent import mask_refine as mr
+    from agentic_gts.agent.judge import Verdict, VLMJudge
+    from agentic_gts.agent.loop import AgentReport, LayoutAgent
+    from agentic_gts.output.gs_render import Cam
+
+    rng = np.random.default_rng(7)
+    cabA = np.column_stack([rng.uniform(-1.0, -0.05, 800),
+                            rng.uniform(-0.5, 0.5, 800),
+                            rng.uniform(0.05, 1.95, 800)])
+    cabB = np.column_stack([rng.uniform(0.05, 1.0, 800),
+                            rng.uniform(-0.5, 0.5, 800),
+                            rng.uniform(0.05, 1.95, 800)])
+    scene = Scene(points=np.vstack([cabA, cabB]))
+    seed = OrientedBox(center=(0.0, 0.0, 1.0), size=(2.0, 1.0, 1.9),
+                       yaw=0.0)
+    scene.boxes = [seed]
+    img = np.zeros((768, 768, 3), np.float32)
+    views = [{"name": "front", "cam": Cam(
+                  eye=np.array([0.0, 4.0, 1.2]),
+                  target=np.array([0.0, 0.0, 1.0]),
+                  up=np.array([0.0, 0.0, 1.0]), fovy_deg=60.0,
+                  W=768, H=768), "path": None, "prompt_path": None,
+              "image": img},
+             {"name": "back", "cam": Cam(
+                  eye=np.array([0.0, -4.0, 1.2]),
+                  target=np.array([0.0, 0.0, 1.0]),
+                  up=np.array([0.0, 0.0, 1.0]), fovy_deg=60.0,
+                  W=768, H=768), "path": None, "prompt_path": None,
+              "image": img},
+             {"name": "side", "cam": Cam(
+                  eye=np.array([4.0, 0.0, 1.2]),
+                  target=np.array([0.0, 0.0, 1.0]),
+                  up=np.array([0.0, 0.0, 1.0]), fovy_deg=60.0,
+                  W=768, H=768), "path": None, "prompt_path": None,
+              "image": img}]
+    _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
+             mr.SamPredictorAdapter.predict)
+    mr.render_local_views = lambda scene, box, out_dir: views
+
+    j = VLMJudge(backend="mock")
+
+    def fake_ground(image, box, view_name, png_path=None):
+        # front: the POOR view -- one whole-row box; back: the open
+        # side -- the true two cabinets; side: one profile box
+        if view_name == "front":
+            groups = [{"bbox": (10, 10, 990, 990), "hypothesis": "rack",
+                       "confidence": 0.6}]
+        elif view_name == "back":
+            groups = [{"bbox": (10, 10, 490, 990), "hypothesis": "rack",
+                       "confidence": 0.9},
+                      {"bbox": (510, 10, 990, 990), "hypothesis": "rack",
+                       "confidence": 0.9}]
+        else:
+            groups = [{"bbox": (10, 10, 990, 990), "hypothesis": "rack",
+                       "confidence": 0.9}]
+        return Verdict(action="segment", params={"groups": groups},
+                       confidence=0.9, detail="fake")
+
+    j.adjudicate_sam_boxes = fake_ground
+
+    def fake_predict(self, image, box_pix):
+        m = np.zeros(image.shape[:2], bool)
+        x1, y1, x2, y2 = (int(round(float(v))) for v in box_pix)
+        m[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)] = True
+        return [m], [0.95]
+
+    mr.SamPredictorAdapter._load = lambda self: None
+    mr.SamPredictorAdapter.predict = fake_predict
+
+    agent = LayoutAgent(judge=j, opts={"sam_checkpoint": "fake.pt"},
+                        out_dir=None)
+    try:
+        agent._local_mask_refine(scene, AgentReport())
+    finally:
+        (mr.render_local_views, mr.SamPredictorAdapter._load,
+         mr.SamPredictorAdapter.predict) = _real
+
+    assert len(scene.boxes) == 2, \
+        (f"the back view's fine division must survive the poor front: "
+         f"got {len(scene.boxes)}: "
+         + str([b.to_dict().get("center") for b in scene.boxes]))
+    centers = sorted(b.center[0] for b in scene.boxes)
+    assert centers[0] < -0.2 < 0.2 < centers[1], centers
+    print("PASS back view rescues a poor front (coarse span dropped)")
+
+
 def test_sam_unconfigured_is_conservative():
     old = os.environ.pop("SAM_CHECKPOINT", None)
     try:
