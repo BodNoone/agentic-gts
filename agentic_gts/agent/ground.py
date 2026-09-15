@@ -41,6 +41,25 @@ def _rot_xy(pts: np.ndarray, yaw: float) -> np.ndarray:
 
 # ---------- grounding evidence render ----------
 
+def _render_cut(top: float | None) -> float:
+    """Nadir RENDER cut height, relative to the device top.
+
+    min(top - 0.10, max(0.70 * top, 1.0)):
+      * tall structures (top 2.1m) cut at 1.47m -- the VLM still sees
+        the full rack footprint and most of the body, while anything
+        the top reference dragged upward (trays, ceiling remnants)
+        stays far above the cut;
+      * LOW structures are protected by the max(., 1.0) floor and the
+        top - 0.10 cap: a 0.9m-high device bank cuts at 0.8m, keeping
+        nearly everything -- only tall structures get the relative trim;
+      * no reference at all -> inf (render the full height band).
+    """
+    if not top:
+        return float("inf")
+    top = float(top)
+    return min(top - 0.10, max(0.70 * top, 1.0))
+
+
 def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
                     H: int = 1024):
     """Base top-down render, no overlays. Camera fitted over the
@@ -58,22 +77,33 @@ def _render_topdown(scene, frame_boxes, yaw: float, W: int = 1280,
     from agentic_gts.output.gs_render import (Cam, make_godview_cam,
                                               render_gs_view)
     points = np.asarray(scene.points, dtype=np.float64)
-    # ceiling cut from the box tops (same policy as the god-view): cut
-    # 0.45m into the tallest structure so trays don't bury the layout.
+    # ceiling cut for the RENDER only (user decision: no need to be
+    # conservative -- devices have real height and the nadir view only
+    # needs each device's BASIC features for the VLM to outline it, not
+    # a complete structure). A RELATIVE cut (70% of the device top)
+    # also buys a large margin against top over-estimation: overhead
+    # trays or a dense ceiling mesh dragging the reference top upward
+    # still land above the cut. The FIT pool is cut independently
+    # (top + 0.10 in ground_stage), so fitted box heights keep the true
+    # rack top no matter how deep this renders.
     # Hint-free input (no boxes): stage0's yaw pass already measured
     # the device top (vertical-surface points, walls/ceiling excluded)
     # -- its z_top is the same reference without a hint.
     if frame_boxes:
         top = max((b.center[2] + b.size[2] / 2.0 for b in frame_boxes))
-        cut = float(top) - 0.45
     elif scene.meta.get("z_top"):
-        cut = float(scene.meta["z_top"]) - 0.45
+        top = float(scene.meta["z_top"])
     else:
-        cut = float("inf")
+        top = None
+    cut = _render_cut(top)
     band = points[points[:, 2] < cut] if np.isfinite(cut) else points
     band = band[band[:, 2] > 0.30]
     if len(band) < 100:
-        band = points
+        # thin band (very low structures): drop ONLY the top cut, keep
+        # the floor cut -- falling back to the raw cloud would pull the
+        # ceiling back into the view, which is exactly what the cut
+        # exists to remove
+        band = points[points[:, 2] > 0.30]
     pts_rot = _rot_xy(band, -yaw)
     # frame over the BOX footprint, not the raw cloud bbox (user
     # directive: the cloud-framed version raised the camera to fit

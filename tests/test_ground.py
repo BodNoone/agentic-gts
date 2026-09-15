@@ -349,6 +349,27 @@ def test_ground_stage_without_hints():
           f"row2 {rows[1].size[0]:.2f}x{rows[1].size[1]:.2f})")
 
 
+def test_render_cut_relative_not_conservative():
+    """The nadir render cut is RELATIVE (user decision: the view only
+    needs each device's basic features, not a complete structure, and
+    the relative cut also tolerates a top reference dragged upward by
+    trays/ceiling). Tall structures trim to 70%; low structures keep
+    nearly everything; the fit pool is independent so box heights are
+    unaffected."""
+    from agentic_gts.agent.ground import _render_cut
+    import math
+    # tall racks: 2.1m top -> 1.47m cut (70%), not 2.1-0.45=1.65
+    assert abs(_render_cut(2.1) - 1.47) < 1e-9
+    # over-estimated top (trays dragged it to 2.6): still a deep cut,
+    # the real 2.1m racks render fully below it
+    assert _render_cut(2.6) < 2.0
+    # LOW structures keep nearly everything (0.9m bank -> 0.8m cut)
+    assert abs(_render_cut(0.9) - 0.8) < 1e-9
+    # no reference at all -> no cut
+    assert math.isinf(_render_cut(None)) and math.isinf(_render_cut(0.0))
+    print("PASS relative render cut (70% of top, low structures kept)")
+
+
 def test_parse_ground_regions_official_format():
     """The official Qwen3-VL grounding reply format (per the 2d_grounding
     cookbook) parses correctly: bare JSON array of {"bbox_2d": [x1,y1,
@@ -450,6 +471,7 @@ if __name__ == "__main__":
     test_ground_stage_row_along_y()
     test_yaw_bootstrap_byproducts()
     test_ground_stage_without_hints()
+    test_render_cut_relative_not_conservative()
     test_parse_ground_regions_official_format()
     test_parse_ground_regions_salvage()
     test_ground_mock_returns_false()
