@@ -106,7 +106,21 @@ def estimate_yaw_detailed(points: np.ndarray, z_range: tuple[float, float] = (0.
                    + uniq[keep][:, 1])
         memb = np.isin(pk, kept_pk)
         if int(memb.sum()) > 500:
-            boot["z_top"] = float(np.percentile(band[memb][:, 2], 99.5))
+            # ANCHORED column top, not P99.5: a percentile lets ANY
+            # >0.5% overhead tail (cable-tray supports, hanging bundles
+            # standing in device cells) drag the reference up to the
+            # clutter height -- and this one reference feeds the
+            # grounding fit cap AND the per-piece height columns, so
+            # every box inherits the inflated top (user report:
+            # hint-free runs came out with unadjusted, too-tall
+            # heights). A device body is density-CONNECTED from the
+            # ground; floating layers sit above a near-empty gap the
+            # anchored walk stops at.
+            from agentic_gts.agent.mask_refine import _anchored_top
+            z = band[memb][:, 2]
+            top = _anchored_top(z)
+            boot["z_top"] = (float(top) if top is not None
+                             else float(np.percentile(z, 99.5)))
             print(f"[diag][yaw] bootstrap: z_top={boot['z_top']:.2f} "
                   f"footprint={tuple(round(v, 2) for v in boot['device_footprint'])}")
     cells = cells[keep]

@@ -802,6 +802,48 @@ def _merge_spans(spans: list) -> list:
     return out
 
 
+def _anchored_top(v: np.ndarray, cell: float = 0.05, dens_frac: float = 0.20,
+                  max_gap: int = 2, floor: int = 5):
+    """Top of the density-CONNECTED column anchored at the bottom.
+
+    Why not a percentile (or _robust_span): a device body is a column
+    of points CONTIGUOUS from the ground up -- every z-slice between
+    its floor and its top carries surface. Overhead clutter (cable
+    trays, their vertical supports, hanging bundles) is a FLOATING
+    layer: dense at its own z, but separated from the body by a
+    near-empty gap. A percentile lets the clutter tail drag the top up
+    (P99.5 + >0.5% clutter = hijacked); a strong-bin span is blind to
+    it too (a tray concentrates into a strong bin). Walking 5cm bins
+    upward from the anchor, keeping the run alive only through thin
+    gaps (<= max_gap bins), stops at the first real void -- the body's
+    top -- wherever the floating layer sits.
+
+    Returns the z of the run's upper edge, or None (too few points /
+    no dense run).
+    """
+    v = np.asarray(v, dtype=float)
+    if len(v) < floor:
+        return None
+    lo, hi = float(v.min()), float(v.max())
+    edges = np.arange(lo, hi + cell / 2, cell)
+    if len(edges) < 3:
+        return None
+    hist, _ = np.histogram(v, bins=edges)
+    occ = hist[hist > 0]
+    if not len(occ):
+        return None
+    thr = max(dens_frac * float(np.median(occ)), 1.0)
+    top, gap = None, 0
+    for i, c in enumerate(hist):
+        if c >= thr:
+            top, gap = float(edges[i + 1]), 0
+        elif top is not None:
+            gap += 1
+            if gap >= max_gap:
+                break
+    return top
+
+
 def _robust_span(v: np.ndarray, cell: float = 0.05,
                  strong_frac: float = 0.4, floor: int = 3):
     """Strong-bin span of a 1D sample: the extent covered by histogram
@@ -1107,9 +1149,14 @@ def _apply_height_and_geom_depth(instances: list, seed: "OrientedBox",
     seed_bottom = float(sc[2] - seed.size[2] / 2.0)
     seed_top = float(sc[2] + seed.size[2] / 2.0)
     # raw-cloud device band for the geometry fallback (same band the
-    # region fit used: floor texture out, ceiling out)
+    # region fit used: floor texture out, ceiling out). The ceiling cap
+    # sits 0.60 above the seed top, not 0.10: a seed whose top came in
+    # LOW (hint-free bootstrap under-measure, a low hint) must not
+    # chain its error into the piece columns -- the height pass's
+    # ANCHORED measurement rejects floating overhead layers (trays,
+    # ceiling) anyway, so the headroom is safe.
     P = np.asarray(scene.points, dtype=float)
-    band = P[(P[:, 2] > 0.30) & (P[:, 2] <= seed_top + 0.10)] \
+    band = P[(P[:, 2] > 0.30) & (P[:, 2] <= seed_top + 0.60)] \
         if len(P) else P
     n_geom = 0
     for inst in instances:
@@ -1159,19 +1206,30 @@ def _apply_height_and_geom_depth(instances: list, seed: "OrientedBox",
             col = inst.get("pts")        # sparse cloud: mask points
             col = col if col is not None and len(col) >= 20 else None
         if col is not None and len(col):
-            # strong-bin z span, not a percentile: the column's edges
-            # bleed a few NEIGHBOUR points past the span seam (taller
-            # than this piece) and a percentile tail catches them; the
-            # neighbour sliver is spread-out while the piece's own
-            # vertical surface concentrates into strong bins
-            zspan = _robust_span(np.asarray(col)[:, 2])
-            z_top = float(zspan[1]) if zspan else None
+            # ANCHORED column top, not a percentile / strong-bin span:
+            # the column's edges bleed a few NEIGHBOUR points past the
+            # span seam, and overhead clutter (trays and their supports
+            # -- dense enough for a strong bin) floats above the body
+            # separated by a near-empty gap. The anchored walk from the
+            # ground keeps the density-connected run and stops at the
+            # first real void, whichever sits above it (user report:
+            # hint-free runs left every piece at the seed height --
+            # the clutter made every column measure the same
+            # contaminated top).
+            zspan = _anchored_top(np.asarray(col)[:, 2])
+            z_top = float(zspan) if zspan is not None else None
+            inst["z_col_top"] = (round(z_top, 3)
+                                 if z_top is not None else None)
             # guards: plausible device height, not a partial column
             # (>= 45% of the seed top -- the raw column rarely
             # under-measures, this catches a bad slice), not above the
-            # row's tallest cabinet by more than fit slop
+            # row's tallest cabinet by more than fit slop + recovery
+            # headroom (an under-measured seed -- hint-free bootstrap,
+            # a low hint -- must not chain its error: the anchored
+            # measurement already rejects floating overhead layers, so
+            # the +0.60 headroom is safe)
             if (z_top is not None and 0.50 <= z_top <= 4.50
-                    and 0.45 * seed_top <= z_top <= seed_top + 0.25):
+                    and 0.45 * seed_top <= z_top <= seed_top + 0.60):
                 h = z_top - seed_bottom
                 if abs(h - float(f.size[2])) > 0.05:
                     inst["fitted"] = _rebuild(

@@ -323,7 +323,15 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     dev = pts[pts[:, 2] > 0.30]      # device band: exclude floor texture
     if len(dev) < max(30, min_pts // 2):
         return None                  # floor patch, no structure
-    z_top = float(np.percentile(dev[:, 2], 99.5))
+    # anchored column top, P99.5 fallback: the rect's points form one
+    # union column (mixed-height cabinets, all standing on the ground),
+    # so the density-connected run's top is the row's true tallest --
+    # a percentile lets floating overhead clutter inside the rect drag
+    # it higher (same failure the hint-free bootstrap z_top had)
+    from agentic_gts.agent.mask_refine import _anchored_top
+    _at = _anchored_top(dev[:, 2])
+    z_top = float(_at) if _at is not None \
+        else float(np.percentile(dev[:, 2], 99.5))
     if z_top < 0.50:
         return None                  # too short for a device
     lo = np.percentile(dev[:, :2], 0.5, axis=0)
