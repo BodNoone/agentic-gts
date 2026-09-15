@@ -177,6 +177,83 @@ def test_ground_stage_with_patched_vlm():
           f"row2 {b2.size[0]:.2f}x{b2.size[1]:.2f})")
 
 
+def test_fit_region_box_row_along_y():
+    """A row running along the ROTATED-Y axis: the fit must ride the
+    long side on the yaw axis (yaw = pi/2, size = (length, depth)). A
+    yaw=0 (dx, dy) fit puts the THICKNESS on the yaw axis, and the
+    downstream local refine -- which projects along-row spans on the
+    seed's yaw axis -- then splits the row ACROSS ITS DEPTH (user
+    report: 'split into 3 instances' along the thickness)."""
+    import math
+    from agentic_gts.agent.ground import _fit_region_box
+    rng = np.random.default_rng(11)
+    row = _row_points(0.0, 6.0, rng=rng)
+    row = row[:, [1, 0, 2]]       # transpose: the row now runs along y
+    bb = _fit_region_box(row, (-0.8, -0.2, 0.8, 6.2))
+    assert bb is not None, "a y-running row must produce a box"
+    assert abs(bb.yaw - math.pi / 2.0) < 1e-9, \
+        f"yaw must be pi/2 (long side on the yaw axis), got {bb.yaw}"
+    assert 5.5 < bb.size[0] < 6.4, \
+        f"size[0] must be the ROW LENGTH, got {bb.size[0]:.2f}"
+    assert 0.85 < bb.size[1] < 1.35, \
+        f"size[1] must be the depth, got {bb.size[1]:.2f}"
+    # corners must cover the same extent as the equivalent yaw=0 fit
+    cs = bb.corners_2d()
+    assert -0.7 < cs[:, 0].min() < -0.4 and 0.4 < cs[:, 0].max() < 0.7, \
+        "x extent must be the depth"
+    assert -0.1 < cs[:, 1].min() < 0.1 and 5.9 < cs[:, 1].max() < 6.1, \
+        "y extent must be the row length"
+    print(f"PASS region fit rides the long side on yaw "
+          f"(y-row: yaw=pi/2, L={bb.size[0]:.2f}, D={bb.size[1]:.2f})")
+
+
+def test_ground_stage_row_along_y():
+    """End-to-end grounding of a joined row running along the y-axis:
+    the emitted box must carry yaw = pi/2, or the downstream local
+    refine splits the row across its thickness (user report)."""
+    import math
+    import tempfile
+    from agentic_gts.agent import ground
+    from agentic_gts.agent.judge import VLMJudge
+
+    rng = np.random.default_rng(3)
+    row = _row_points(0.0, 6.0, rng=rng)
+    row = row[:, [1, 0, 2]]       # the row now runs along y
+    scene = Scene(points=row)
+    scene.meta["yaw"] = 0.0
+    # realistic detector fragments: the row covered by SEVERAL hint
+    # pieces (the framing footprint is the boxes' union, so a single
+    # tiny centre hint would clip the row out of the nadir frame)
+    scene.boxes = [_hint(0.0, 1.0, size=(0.45, 1.2, 2.1)),
+                   _hint(0.0, 3.0, size=(0.45, 1.2, 2.1)),
+                   _hint(0.0, 5.0, size=(0.45, 1.2, 2.1))]
+    _, cam, W, H = ground._render_topdown(scene, scene.boxes, 0.0)
+    # true rect: depth on x, length on y
+    uv = cam.project_cv(np.column_stack(
+        [[-0.8, 0.8, 0.8, -0.8], [-0.5, -0.5, 6.5, 6.5], np.full(4, 1.0)]))
+    px = (np.clip(uv[:, 0].min(), 0, W), np.clip(uv[:, 1].min(), 0, H),
+          np.clip(uv[:, 0].max(), 0, W), np.clip(uv[:, 1].max(), 0, H))
+    reply = ('[{"bbox_2d": [%d, %d, %d, %d], "label": "row"}]'
+             % (round(px[0] / W * 1000), round(px[1] / H * 1000),
+                round(px[2] / W * 1000), round(px[3] / H * 1000)))
+    judge = VLMJudge(backend="qwen")
+    judge._qwen_image_call = lambda png, prompt, *a, **k: reply
+    with tempfile.TemporaryDirectory() as td:
+        ok = ground.ground_stage(scene, judge, out_dir=td)
+        assert ok, "grounding must succeed on a y-running row"
+    assert len(scene.boxes) == 1
+    b = scene.boxes[0]
+    assert abs(b.yaw - math.pi / 2.0) < 1e-6, \
+        f"world yaw must be pi/2, got {b.yaw:.3f}"
+    assert 5.5 < b.size[0] < 6.4, \
+        f"size[0] must be the row length, got {b.size[0]:.2f}"
+    assert 0.85 < b.size[1] < 1.35, \
+        f"size[1] must be the depth, got {b.size[1]:.2f}"
+    assert abs(b.center[1] - 3.0) < 0.2, "centre must sit on the row"
+    print(f"PASS ground stage y-row "
+          f"(yaw=pi/2, L={b.size[0]:.2f}, D={b.size[1]:.2f})")
+
+
 def test_parse_ground_regions_official_format():
     """The official Qwen3-VL grounding reply format (per the 2d_grounding
     cookbook) parses correctly: bare JSON array of {"bbox_2d": [x1,y1,
@@ -273,7 +350,9 @@ def test_ground_mock_returns_false():
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
+    test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()
+    test_ground_stage_row_along_y()
     test_parse_ground_regions_official_format()
     test_parse_ground_regions_salvage()
     test_ground_mock_returns_false()

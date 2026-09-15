@@ -500,86 +500,109 @@ def test_local_refine_splits_joined_row_end_to_end():
     SAM that segments them -- after _local_mask_refine the scene must
     hold TWO boxes, one per cabinet, each keeping the seed's trusted
     depth/height (user report: boxes_only.ply still showed the joined
-    row as ONE box despite the local grounding splitting it)."""
+    row as ONE box despite the local grounding splitting it).
+
+    Parametrized over the row DIRECTION: along x (seed yaw=0) and along
+    y (seed yaw=pi/2 -- the user report where the yaw axis landed on
+    the THICKNESS and the row split across its depth)."""
+    import math
+
     from agentic_gts.agent import mask_refine as mr
     from agentic_gts.agent.judge import Verdict, VLMJudge
-    from agentic_gts.agent.loop import LayoutAgent
+    from agentic_gts.agent.loop import AgentReport, LayoutAgent
     from agentic_gts.output.gs_render import Cam
 
-    rng = np.random.default_rng(7)
-    # two cabinets side by side along x (a joined row), 1.0m each
-    cabA = np.column_stack([rng.uniform(-1.0, -0.05, 800),
-                            rng.uniform(-0.5, 0.5, 800),
-                            rng.uniform(0.05, 1.95, 800)])
-    cabB = np.column_stack([rng.uniform(0.05, 1.0, 800),
-                            rng.uniform(-0.5, 0.5, 800),
-                            rng.uniform(0.05, 1.95, 800)])
-    scene = Scene(points=np.vstack([cabA, cabB]))
-    seed = OrientedBox(center=(0.0, 0.0, 1.0), size=(2.0, 1.0, 1.9),
-                       yaw=0.0)
-    scene.boxes = [seed]
+    for along_y in (False, True):
+        rng = np.random.default_rng(7)
+        # two cabinets side by side (a joined row), 1.0m each
+        cabA = np.column_stack([rng.uniform(-1.0, -0.05, 800),
+                                rng.uniform(-0.5, 0.5, 800),
+                                rng.uniform(0.05, 1.95, 800)])
+        cabB = np.column_stack([rng.uniform(0.05, 1.0, 800),
+                                rng.uniform(-0.5, 0.5, 800),
+                                rng.uniform(0.05, 1.95, 800)])
+        pts = np.vstack([cabA, cabB])
+        if along_y:              # the row runs along y: transpose x/y
+            pts = pts[:, [1, 0, 2]]
+        scene = Scene(points=pts)
+        # seed: yaw axis rides the ROW axis (what _fit_region_box now
+        # guarantees for y-rows: yaw=pi/2, size=(length, depth))
+        seed = OrientedBox(center=(0.0, 0.0, 1.0), size=(2.0, 1.0, 1.9),
+                           yaw=math.pi / 2.0 if along_y else 0.0)
+        scene.boxes = [seed]
 
-    front_cam = Cam(eye=np.array([0.0, 4.0, 1.2]),
-                    target=np.array([0.0, 0.0, 1.0]),
-                    up=np.array([0.0, 0.0, 1.0]), fovy_deg=60.0,
-                    W=768, H=768)
-    side_cam = Cam(eye=np.array([4.0, 0.0, 1.2]),
-                   target=np.array([0.0, 0.0, 1.0]),
-                   up=np.array([0.0, 0.0, 1.0]), fovy_deg=60.0,
-                   W=768, H=768)
-    img = np.zeros((768, 768, 3), np.float32)
-    views = [{"name": "front", "cam": front_cam, "path": None,
-              "prompt_path": None, "image": img},
-             {"name": "side", "cam": side_cam, "path": None,
-              "prompt_path": None, "image": img}]
-    _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
-             mr.SamPredictorAdapter.predict)
-    mr.render_local_views = lambda scene, box, out_dir: views
+        # front: perpendicular to the row (across its long side);
+        # side: along the row axis (the thickness profile)
+        front_cam = Cam(eye=np.array([4.0, 0.0, 1.2]) if along_y
+                        else np.array([0.0, 4.0, 1.2]),
+                       target=np.array([0.0, 0.0, 1.0]),
+                       up=np.array([0.0, 0.0, 1.0]), fovy_deg=60.0,
+                       W=768, H=768)
+        side_cam = Cam(eye=np.array([0.0, 4.0, 1.2]) if along_y
+                       else np.array([4.0, 0.0, 1.2]),
+                      target=np.array([0.0, 0.0, 1.0]),
+                      up=np.array([0.0, 0.0, 1.0]), fovy_deg=60.0,
+                      W=768, H=768)
+        img = np.zeros((768, 768, 3), np.float32)
+        views = [{"name": "front", "cam": front_cam, "path": None,
+                  "prompt_path": None, "image": img},
+                 {"name": "side", "cam": side_cam, "path": None,
+                  "prompt_path": None, "image": img}]
+        _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
+                 mr.SamPredictorAdapter.predict)
+        mr.render_local_views = lambda scene, box, out_dir: views
 
-    # VLM grounding: TWO device instances on the front view, ONE on the
-    # side profile; SAM segments exactly the prompted rectangle
-    j = VLMJudge(backend="mock")
+        # VLM grounding: TWO device instances on the front view, ONE on
+        # the side profile; SAM segments exactly the prompted rectangle
+        j = VLMJudge(backend="mock")
 
-    def fake_ground(image, box, view_name, png_path=None):
-        groups = ([{"bbox": (10, 10, 490, 990), "hypothesis": "rack",
-                    "confidence": 0.9},
-                   {"bbox": (510, 10, 990, 990), "hypothesis": "rack",
-                    "confidence": 0.9}] if view_name == "front"
-                  else [{"bbox": (10, 10, 990, 990),
-                         "hypothesis": "rack", "confidence": 0.9}])
-        return Verdict(action="segment", params={"groups": groups},
-                       confidence=0.9, detail="fake")
+        def fake_ground(image, box, view_name, png_path=None):
+            groups = ([{"bbox": (10, 10, 490, 990), "hypothesis": "rack",
+                        "confidence": 0.9},
+                       {"bbox": (510, 10, 990, 990), "hypothesis": "rack",
+                        "confidence": 0.9}] if view_name == "front"
+                      else [{"bbox": (10, 10, 990, 990),
+                             "hypothesis": "rack", "confidence": 0.9}])
+            return Verdict(action="segment", params={"groups": groups},
+                           confidence=0.9, detail="fake")
 
-    j.adjudicate_sam_boxes = fake_ground
+        j.adjudicate_sam_boxes = fake_ground
 
-    def fake_predict(self, image, box_pix):
-        m = np.zeros(image.shape[:2], bool)
-        x1, y1, x2, y2 = (int(round(float(v))) for v in box_pix)
-        m[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)] = True
-        return [m], [0.95]
+        def fake_predict(self, image, box_pix):
+            m = np.zeros(image.shape[:2], bool)
+            x1, y1, x2, y2 = (int(round(float(v))) for v in box_pix)
+            m[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)] = True
+            return [m], [0.95]
 
-    mr.SamPredictorAdapter._load = lambda self: None
-    mr.SamPredictorAdapter.predict = fake_predict
+        mr.SamPredictorAdapter._load = lambda self: None
+        mr.SamPredictorAdapter.predict = fake_predict
 
-    agent = LayoutAgent(judge=j, opts={"sam_checkpoint": "fake.pt"},
-                        out_dir=None)
-    from agentic_gts.agent.loop import AgentReport
-    try:
-        agent._local_mask_refine(scene, AgentReport())
-    finally:                      # restore the module-level patches so
-        (mr.render_local_views, mr.SamPredictorAdapter._load,
-         mr.SamPredictorAdapter.predict) = _real
+        agent = LayoutAgent(judge=j, opts={"sam_checkpoint": "fake.pt"},
+                            out_dir=None)
+        try:
+            agent._local_mask_refine(scene, AgentReport())
+        finally:              # restore the module-level patches so
+            (mr.render_local_views, mr.SamPredictorAdapter._load,
+             mr.SamPredictorAdapter.predict) = _real
 
-    assert len(scene.boxes) == 2, \
-        (f"the joined row must split into 2 boxes, got {len(scene.boxes)}: "
-         + str([b.to_dict().get("center") for b in scene.boxes]))
-    for b in scene.boxes:
-        assert abs(b.size[1] - 1.0) < 1e-6, "depth stays seed-trusted"
-        assert abs(b.size[2] - 1.9) < 1e-6, "height stays seed-trusted"
-    centers = sorted(b.center[0] for b in scene.boxes)
-    assert centers[0] < -0.2 < 0.2 < centers[1], \
-        f"the two pieces must sit on their own cabinets: {centers}"
-    print("PASS local refine splits a joined row end-to-end")
+        axis_i = 1 if along_y else 0
+        assert len(scene.boxes) == 2, \
+            (f"the {'y' if along_y else 'x'}-running joined row must split "
+             f"into 2 boxes, got {len(scene.boxes)}: "
+             + str([b.to_dict().get("center") for b in scene.boxes]))
+        for b in scene.boxes:
+            assert abs(b.size[1] - 1.0) < 1e-6, "depth stays seed-trusted"
+            assert abs(b.size[2] - 1.9) < 1e-6, "height stays seed-trusted"
+        centers = sorted(b.center[axis_i] for b in scene.boxes)
+        assert centers[0] < -0.2 < 0.2 < centers[1], \
+            f"the two pieces must sit on their own cabinets: {centers}"
+        # the OTHER axis (thickness) must NOT have been split apart
+        for b in scene.boxes:
+            assert abs(b.center[1 - axis_i]) < 0.1, \
+                ("the pieces must stay centred on the row -- a split "
+                 "across the THICKNESS is the yaw-axis bug")
+        print(f"PASS local refine splits a {'y' if along_y else 'x'}-running"
+              " joined row end-to-end")
 
 
 def test_apply_depth_from_side_excludes_open_door():

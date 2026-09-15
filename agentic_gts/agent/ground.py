@@ -278,6 +278,17 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     if dx < 0.30 or dy < 0.20:
         return None                  # sliver, not a structure
     c = (lo + hi) / 2.0
+    # Ride the LONG side on the yaw axis (size[0]): a row that runs
+    # along the rotated-y axis still fits here as (dx, dy) with
+    # yaw=0 -- but then the box's yaw axis is its THICKNESS, and
+    # refine_box (which projects along-row spans on the seed's yaw
+    # axis) splits the row ACROSS its depth (user report: a joined
+    # row split into 3 pieces along the thickness, not the row).
+    if dy > dx:
+        return OrientedBox(center=(float(c[0]), float(c[1]), z_top / 2.0),
+                           size=(dy, dx, z_top), yaw=math.pi / 2.0,
+                           device_type=DeviceType.RACK,
+                           meta={"n_pts": len(dev)})
     return OrientedBox(center=(float(c[0]), float(c[1]), z_top / 2.0),
                        size=(dx, dy, z_top), yaw=0.0,
                        device_type=DeviceType.RACK,
@@ -370,8 +381,10 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         if bb is None:
             continue
         c = _rot_xy(np.array([[bb.center[0], bb.center[1], 0.0]]), yaw)[0]
+        # bb.yaw is 0 (row along the rotated-x axis) or pi/2 (row along
+        # rotated-y): both rotate into the world by ADDING the frame yaw
         box = OrientedBox(center=(float(c[0]), float(c[1]), bb.center[2]),
-                          size=bb.size, yaw=yaw,
+                          size=bb.size, yaw=yaw + float(bb.yaw),
                           device_type=DeviceType.RACK,
                           meta={"grounded": True,
                                 "n_pts": bb.meta.get("n_pts", 0)})
