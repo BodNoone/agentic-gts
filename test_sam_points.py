@@ -60,7 +60,7 @@ def _render_view(gs_ply: str, center, size, yaw_deg: float) -> np.ndarray:
     open_vec, corridor = (np.array([0.0, 1.0]), 1.5)
     try:
         from agentic_gts.agent.mask_refine import _open_side
-        open_vec, corridor, _closed = _open_side(gs, box)
+        open_vec, corridor = _open_side(gs, box)
     except Exception as e:
         print(f"[warn] _open_side failed ({e}); defaulting to +y")
     yaw = float(box.yaw)

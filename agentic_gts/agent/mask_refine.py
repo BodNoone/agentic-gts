@@ -305,11 +305,8 @@ def _open_side(gs, box: OrientedBox, reach: float = 3.0):
     outright, whatever its measured corridor. Symmetric far mass
     (back-to-back rows mid-room) falls back to the corridor pick.
 
-    Returns (open_vec, open_corridor, closed_corridor): the CLOSED
-    side's corridor width too -- the back view's gate (a wall-adjacent
-    box's back has no room for a camera, user report: it renders a
-    fog; the caller skips the back view when the closed side cannot
-    hold even the minimum standoff).
+    Returns (open_vec, corridor): the open direction (unit world 2D
+    vector) and the corridor width in metres (capped at `reach`).
     """
     pts = np.asarray(gs.means, dtype=float)
     op = 1.0 / (1.0 + np.exp(-np.asarray(gs.raw_opacity, dtype=float)))
@@ -357,8 +354,7 @@ def _open_side(gs, box: OrientedBox, reach: float = 3.0):
         s = -1.0
     else:
         s = 1.0 if side_corridor[1.0] >= side_corridor[-1.0] else -1.0
-    return (s * face_axis, min(side_corridor[s], reach),
-            min(side_corridor[-s], reach))
+    return s * face_axis, min(side_corridor[s], reach)
 
 
 def _box_only_mask(gs, box: OrientedBox, pad: float = 0.15) -> np.ndarray:
@@ -435,7 +431,7 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # PCA, otherwise makes azim=0 look along the LONG edge -- the visible
     # SIDE, an earlier user report). _front_azim compares the open side
     # against the side the camera would actually STAND ON.
-    open_vec, corridor, corridor_back = _open_side(gs, box)
+    open_vec, corridor = _open_side(gs, box)
     azim_front = _front_azim(box, open_vec)
     # view set, all at GROUND level (elev 18 deg, rack height -- no
     # top-down component: the local views must show the device's
@@ -448,25 +444,20 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # + SIDE (along the row axis: the depth/height PROFILE, where an
     # open door sticks out horizontally beyond the cabinet body and
     # the true thickness is measurable -- the front view cannot
-    # separate a door, user report).
-    # BACK GATE: a wall-adjacent box has NO room behind it -- the back
-    # camera would stand through the wall and render a fog (user
-    # report). The back view only exists when the CLOSED side can
-    # hold at least the minimum standoff; each face's camera uses its
-    # OWN corridor for standoff (the front's wide aisle must not push
-    # the back camera through a 0.3m wall gap).
-    slots = [("front", 18.0, azim_front, corridor)]
-    if corridor_back >= 0.6:
-        slots.append(("back", 18.0, azim_front + 180.0, corridor_back))
-    else:
-        print(f"[mask-refine] back view skipped: closed-side corridor "
-              f"{corridor_back:.2f}m < 0.6m (wall behind the box)")
-    slots.append(("side", 18.0, azim_front + 90.0, corridor))
+    # separate a door, user report). NO geometric pre-gating (the
+    # corridor-based back skip was reverted, user direction): every
+    # view is rendered, then judged on its RENDER -- a view too poor
+    # to judge does not participate in the refinement, whichever
+    # view it is (a wall-adjacent box can fog up its BACK or its SIDE
+    # render just the same).
+    slots = (("front", 18.0, azim_front),
+             ("back", 18.0, azim_front + 180.0),
+             ("side", 18.0, azim_front + 90.0))
+    # standoff: ~80% into the corridor, never further than 2.2m; the
+    # camera widens its lens to frame, it does not back off
+    standoff = float(np.clip(0.8 * corridor, 0.6, 2.2))
     out = []
-    for name, elev, azim, corr in slots:
-        # standoff: ~80% into THIS view's corridor, never further than
-        # 2.2m; the camera widens its lens to frame, it does not back off
-        standoff = float(np.clip(0.8 * corr, 0.6, 2.2))
+    for name, elev, azim in slots:
         cam = make_local_cam([box], W=768, H=768, elev_deg=elev,
                              azim_deg=azim, standoff=standoff)
         # render ONLY the device: every gaussian outside the box's OBB
@@ -484,6 +475,21 @@ def render_local_views(scene: Scene, box: OrientedBox,
         else:
             prompt_img = render_gs_view(
                 sub, [box], cam, overlay="wire3d")
+        # QUALITY GATE (user rule): judge the RENDER, not the geometry.
+        # A wall-adjacent box fogs up whichever camera lands in
+        # structure; a poor view that slipped through would feed the
+        # VLM a haze and poison the split. The image is still saved
+        # (audit: the user SEES which view was dropped and why).
+        ok, why = _view_quality(raw)
+        if not ok:
+            print(f"[mask-refine] {name} view dropped: {why}")
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+                path = os.path.join(
+                    out_dir, f"mask_{box.box_id}_{name}_dropped.png")
+                with open(path, "wb") as f:
+                    f.write(png_bytes(raw))
+            continue
         path = None
         prompt_path = None
         if out_dir:
@@ -500,6 +506,42 @@ def render_local_views(scene: Scene, box: OrientedBox,
                     "prompt_image": prompt_img if prompt_img is not None else raw,
                     "cam": cam, "path": path, "prompt_path": prompt_path})
     return out
+
+
+def _view_quality(img: np.ndarray) -> tuple[bool, str]:
+    """Gross quality judgement of one local-view render (user rule: a
+    view too poor to judge must not participate in the refinement).
+
+    The renders are ONE device on a dark background (everything
+    outside the OBB is hidden), so the failure modes are readable from
+    the luminance histogram alone:
+      * HAZE -- the camera stood inside structure (a flush wall's
+        diffuse gaussians surviving the OBB margin, the narrow-gap
+        side of a wall-adjacent box): the whole frame fills with
+        semi-bright fog -- near-total coverage and NO contrast;
+      * EMPTY -- nothing rendered (a broken placement): near-zero
+        coverage.
+    A clean render is BIMODAL -- dark background, bright device --
+    so it carries high contrast whatever share of the frame the device
+    occupies (a close-up filling most of the frame is still clean).
+
+    Returns (ok, reason); reason is "" when ok.
+    """
+    if img is None or not np.asarray(img).size:
+        return False, "no image"
+    lum = np.clip(np.asarray(img, dtype=float)[..., :3], 0.0, 1.0)
+    lum = lum.mean(axis=2)
+    cov = float((lum > 0.10).mean())
+    std = float(lum.std())
+    if cov < 0.02:
+        return False, f"empty frame (device coverage {cov:.1%})"
+    if std < 0.07:
+        return False, (f"flat haze, no contrast (std {std:.3f}, "
+                      f"coverage {cov:.1%})")
+    if cov > 0.90 and std < 0.15:
+        return False, (f"frame-filling haze (coverage {cov:.1%}, "
+                       f"std {std:.3f})")
+    return True, ""
 
 
 def _mask_to_points(scene: Scene, box: OrientedBox, mask: np.ndarray, cam,
@@ -1307,8 +1349,10 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         audit["reason"] = "no local GS views or SAM checkpoint"
         return [], audit
     voters = [v for v in views if v["name"] in ("front", "back")]
-    if not voters:
-        voters = views[:1]
+    # NO side-view fallback as a span voter: the side camera looks
+    # ALONG the row, so its masks span the CROSS axis -- spans from it
+    # would split the row by THICKNESS (an earlier bug). With both
+    # faces dropped by the quality gate there is simply no span vote.
     side = next((v for v in views if v["name"] == "side"), None)
     yaw = float(box.yaw)
     axis = np.array([math.cos(yaw), math.sin(yaw)])
