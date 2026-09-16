@@ -301,15 +301,20 @@ def _region_axis_span(v: np.ndarray, cell: float = 0.05):
     devices lost their boxes): the strong-bin threshold is relative
     to the GLOBAL peak, and 3DGS reconstructs the two rack faces at
     very different densities -- the wall-facing / occluded side is
-    starved, its bins fall below 40% of the front-face peak, the
-    depth span collapses to ONE face (~5cm) and the sliver guard
-    rejects the whole region. Peeling fixes it: accept the strongest
-    bin's cluster (connected bins >= 40% of that pass's peak), zero
-    it out, repeat while the next pass's peak >= 15% of the first
-    peak -- a starved back face (>= ~15% of the front per bin) still
-    survives, while haze bins (~1% of the face peak) never do.
+    starved, its bins fall below the front-face peak, the depth span
+    collapses to ONE face (~5cm) and the sliver guard rejects the
+    whole region. Peeling fixes it: accept the strongest bin's
+    cluster (connected bins >= 20% of that pass's peak), zero it
+    out, repeat while the next pass's peak >= 6% of the first peak
+    -- starved faces and thin real sections survive, while haze
+    bins (~1% of the face peak) never do. The connect/keep cuts are
+    deliberately GENEROUS (user report: fitted red boxes came out
+    far SMALLER than the VLM rects -- moderate-density real extent
+    was being trimmed): the stageG box is a SEED, the local refine
+    tightens it later; a seed that under-covers the device has no
+    recovery path.
 
-    Safety floor: when the peeled span still covers < 50% of the
+    Safety floor: when the peeled span still covers < 65% of the
     P0.5-P99.5 extent, the structure is more heterogeneous than the
     bins can see (or the slice was too thin) -- return the percentile
     extent instead of letting the fit collapse: a slightly loose box
@@ -326,14 +331,14 @@ def _region_axis_span(v: np.ndarray, cell: float = 0.05):
     first_peak = float(hist.max())
     if first_peak < 3.0:
         return p_lo, p_hi
-    keep_thr = 0.15 * first_peak
+    keep_thr = 0.06 * first_peak
     remaining = hist.astype(float).copy()
     kept = np.zeros(len(hist), dtype=bool)
     while True:
         peak = float(remaining.max())
         if peak < max(keep_thr, 3.0):
             break
-        thr = 0.40 * peak
+        thr = 0.20 * peak
         i0 = int(np.argmax(remaining))
         kept[i0] = True
         remaining[i0] = 0.0
@@ -351,7 +356,7 @@ def _region_axis_span(v: np.ndarray, cell: float = 0.05):
     if not len(idx):
         return p_lo, p_hi
     s_lo, s_hi = float(edges[idx[0]]), float(edges[idx[-1] + 1])
-    if s_hi - s_lo < 0.50 * (p_hi - p_lo):
+    if s_hi - s_lo < 0.65 * (p_hi - p_lo):
         return p_lo, p_hi
     return s_lo, s_hi
 
