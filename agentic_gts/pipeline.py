@@ -354,6 +354,17 @@ def run_pipeline(scene: Scene,
         _eval("stageD")
         _render_stage(scene, "stageD_complete", out_dir, gt_boxes)
 
+    # --- final filter: drop LOW-confidence boxes (user directive) ---
+    # The only LOW boxes are the stageD geometry-only row completions
+    # (no VLM confirmation); too unreliable to keep in the result.
+    from agentic_gts.core.models import Confidence
+    n_low = sum(1 for b in scene.boxes if b.confidence == Confidence.LOW)
+    if n_low:
+        scene.boxes = [b for b in scene.boxes
+                       if b.confidence != Confidence.LOW]
+        print(f"[out] dropped {n_low} LOW-confidence box(es) "
+              f"(geometry-only completions, no VLM confirmation)")
+
     # --- outputs ---
     scene.save_boxes(os.path.join(out_dir, "boxes.json"))
     # also persist the final layout in the detector-style 'objects' schema
