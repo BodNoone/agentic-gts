@@ -508,6 +508,105 @@ def test_ground_mock_returns_false():
     print("PASS grounding fails soft (mock, scene stays empty)")
 
 
+def test_merge_adjacent_boxes():
+    """Tightly-adjacent over-split pieces of ONE row merge into their
+    point-support-refitted union; separate rows with an EMPTY lateral
+    gap and corner-kiss boxes stay separate."""
+    from agentic_gts.agent.ground import _merge_adjacent_boxes
+    from agentic_gts.core.models import OrientedBox
+    rng = np.random.default_rng(11)
+    row = _row_points(0.0, 6.0, rng=rng)
+    pts_fit = row[row[:, 2] > 0.30]
+    # two pieces of one CONTINUOUS row, fitted with a 0.2m seam where
+    # the VLM drew the rect boundary (a regular layout reads as
+    # several bands) -- the device band fills the seam -> merge
+    a = OrientedBox(center=(1.45, 0.0, 1.05), size=(2.9, 1.1, 2.1),
+                    yaw=0.0)
+    b = OrientedBox(center=(4.55, 0.0, 1.05), size=(2.9, 1.1, 2.1),
+                    yaw=0.0)
+    out = _merge_adjacent_boxes([a, b], pts_fit, 0.0)
+    assert len(out) == 1, \
+        f"continuous-row pieces must merge, got {len(out)}"
+    m = out[0]
+    assert 5.5 < m.size[0] < 6.4, f"merged length {m.size[0]:.2f} (want ~6.0)"
+    assert 0.85 < m.size[1] < 1.35, f"merged depth {m.size[1]:.2f}"
+    assert m.meta.get("merged_from") == 2
+    # separate rows, 0.4m lateral gap, NOTHING between: the facing
+    # SURFACES sit exactly at the gap edges and must NOT count as
+    # bridge points -> no merge (old B0 convention)
+    r1 = OrientedBox(center=(3.0, 0.0, 1.05), size=(6.0, 1.1, 2.1),
+                    yaw=0.0)
+    r2 = OrientedBox(center=(3.0, 1.5, 1.05), size=(6.0, 1.1, 2.1),
+                    yaw=0.0)
+    row2 = _row_points(0.0, 6.0, y=1.5, rng=rng)
+    pf2 = np.vstack([pts_fit, row2[row2[:, 2] > 0.30]])
+    out2 = _merge_adjacent_boxes([r1, r2], pf2, 0.0)
+    assert len(out2) == 2, "empty-gap rows must stay separate"
+    # corner kiss: gap ok on both axes but NO shared band -> no merge
+    c1 = OrientedBox(center=(0.5, 0.5, 1.05), size=(1.0, 1.0, 2.1),
+                     yaw=0.0)
+    c2 = OrientedBox(center=(1.7, 1.7, 1.05), size=(1.0, 1.0, 2.1),
+                     yaw=0.0)
+    out3 = _merge_adjacent_boxes([c1, c2], pf2, 0.0)
+    assert len(out3) == 2, "corner-kiss boxes must not merge"
+    print(f"PASS adjacency merge ({m.size[0]:.2f}m union; "
+          f"empty-gap and corner-kiss kept separate)")
+
+
+def test_ground_stage_merges_over_split_regions():
+    """End-to-end: the VLM over-split ONE row into two TIGHT rects
+    (regular layout mis-read); the two fitted pieces must merge back
+    into a single full-row box while the separate row keeps its own."""
+    import json as _json
+    import tempfile
+    from agentic_gts.agent import ground
+    from agentic_gts.agent.judge import VLMJudge
+
+    rng = np.random.default_rng(3)
+    pts = np.vstack([_row_points(0.0, 6.0, y=0.0, rng=rng),
+                     _row_points(-1.0, 5.0, y=3.0, rng=rng)])
+    ceil = np.column_stack([rng.uniform(-2.0, 7.0, 3000),
+                            rng.uniform(-2.0, 5.0, 3000),
+                            np.full(3000, 2.9)])
+    scene = Scene(points=np.vstack([pts, ceil]))
+    scene.meta["yaw"] = 0.0
+    _bootstrap_meta(scene, (-1.5, -0.8, 6.5, 3.8))
+    scene.boxes = []
+    _, cam, W, H = ground._render_topdown(scene, 0.0)
+    # row 1 over-split into two rects TOUCHING at x=3.0; row 2 whole
+    true_rects = [((-0.5, 3.0), (-0.8, 0.8)),
+                  ((3.0, 6.5), (-0.8, 0.8)),
+                  ((-1.5, 5.5), (2.2, 3.8))]
+    regions = []
+    for (xa, xb), (ya, yb) in true_rects:
+        uv = cam.project_cv(np.column_stack([
+            [xa, xb, xb, xa], [ya, ya, yb, yb], np.full(4, 1.0)]))
+        px = (np.clip(uv[:, 0].min(), 0, W), np.clip(uv[:, 1].min(), 0, H),
+              np.clip(uv[:, 0].max(), 0, W), np.clip(uv[:, 1].max(), 0, H))
+        regions.append({"bbox_2d": [
+            int(round(px[0] / W * 1000)), int(round(px[1] / H * 1000)),
+            int(round(px[2] / W * 1000)), int(round(px[3] / H * 1000))],
+            "label": "server rack"})
+    reply = _json.dumps(regions)
+    judge = VLMJudge(backend="qwen")
+    judge._qwen_image_call = lambda png, prompt, *a, **k: reply
+    with tempfile.TemporaryDirectory() as td:
+        ok = ground.ground_stage(scene, judge, out_dir=td)
+        assert ok
+    assert len(scene.boxes) == 2, \
+        f"over-split row must merge to ONE box (+1 for row 2), " \
+        f"got {len(scene.boxes)}"
+    rows = sorted(scene.boxes, key=lambda b: b.center[1])
+    assert 5.0 < rows[0].size[0] < 6.5, \
+        f"merged row length {rows[0].size[0]:.2f} (want ~6.0)"
+    assert 0.85 < rows[0].size[1] < 1.35
+    assert abs(rows[0].center[1]) < 0.2
+    assert 5.0 < rows[1].size[0] < 6.5, "row 2 untouched by the merge"
+    assert abs(rows[1].center[1] - 3.0) < 0.2
+    print(f"PASS ground-stage adjacency merge "
+          f"(over-split row healed to {rows[0].size[0]:.2f}m)")
+
+
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
@@ -520,4 +619,6 @@ if __name__ == "__main__":
     test_parse_ground_regions_official_format()
     test_parse_ground_regions_salvage()
     test_ground_mock_returns_false()
+    test_merge_adjacent_boxes()
+    test_ground_stage_merges_over_split_regions()
     print("ALL GROUND TESTS PASSED")

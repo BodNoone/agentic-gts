@@ -351,6 +351,105 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
                        meta={"n_pts": len(dev)})
 
 
+def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
+                          touch_tol: float = 0.10,
+                          bridge_tol: float = 0.50,
+                          min_gap_pts: int = 15) -> list:
+    """Merge tightly-ADJACENT grounded boxes; splitting is stageC's job.
+
+    The VLM sometimes over-splits ONE physical structure into several
+    tight rects (a regular layout reads as several bright bands); each
+    rect fits its own box and the seam never heals later -- stageC only
+    SPLITS, never merges. Adjacent boxes (same orientation bucket, real
+    band overlap on the perpendicular axis) merge when they either
+    TOUCH (gap <= touch_tol) or sit across a small gap that the device
+    band FILLS: bridge points strictly inside the gap mean the
+    structure is continuous, an empty gap is a real cut (the old B0
+    convention that kept 0.3-0.5m lateral gaps between separate rows
+    unmerged -- surface points hug the box edges, so the interior is
+    probed 5cm inside each side). Each union is REFITTED to point
+    support (never boundary-united: noise would inflate the edges);
+    the local refine then does the true splitting.
+    """
+    n = len(boxes)
+    if n < 2:
+        return boxes
+    # row-frame AABB + orientation bucket (long side on x or on y)
+    rects, buckets = [], []
+    for b in boxes:
+        cs = _rot_xy(np.column_stack([b.corners_2d(),
+                                      np.zeros(4)]), -yaw)
+        rects.append((float(cs[:, 0].min()), float(cs[:, 1].min()),
+                      float(cs[:, 0].max()), float(cs[:, 1].max())))
+        buckets.append(int(round((b.yaw - yaw) / (math.pi / 2.0))) % 2)
+    parent = list(range(n))
+
+    def _find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if buckets[i] != buckets[j]:
+                continue          # an L-junction is two structures
+            a, b = rects[i], rects[j]
+            for axis in (0, 1):
+                o = 1 - axis
+                gap = max(a[axis] - b[axis + 2], b[axis] - a[axis + 2])
+                if gap > bridge_tol:
+                    continue      # not adjacent on this axis
+                p_lo = max(a[o], b[o])
+                p_hi = min(a[o + 2], b[o + 2])
+                if p_hi - p_lo < 0.20:
+                    continue      # corner kiss, no shared band
+                if gap <= touch_tol:
+                    parent[_find(i)] = _find(j)
+                    break
+                # small gap: merge only when the device band fills it
+                # (probe strictly inside -- 5cm off each box edge, so
+                # the two FACING SURFACES never count as a bridge)
+                lo_slab = min(a[axis + 2], b[axis + 2]) + 0.05
+                hi_slab = max(a[axis], b[axis]) - 0.05
+                if hi_slab <= lo_slab:
+                    continue
+                m = ((pts_fit[:, axis] >= lo_slab) &
+                     (pts_fit[:, axis] <= hi_slab) &
+                     (pts_fit[:, o] >= p_lo) & (pts_fit[:, o] <= p_hi))
+                if int(m.sum()) >= min_gap_pts:
+                    parent[_find(i)] = _find(j)
+                    break
+    comps: dict[int, list[int]] = {}
+    for i in range(n):
+        comps.setdefault(_find(i), []).append(i)
+    out, n_union = [], 0
+    for members in comps.values():
+        if len(members) == 1:
+            out.append(boxes[members[0]])
+            continue
+        rs = [rects[i] for i in members]
+        u = (min(r[0] for r in rs), min(r[1] for r in rs),
+             max(r[2] for r in rs), max(r[3] for r in rs))
+        bb = _fit_region_box(pts_fit, u)
+        if bb is None:
+            out.extend(boxes[i] for i in members)   # keep the pieces
+            continue
+        c = _rot_xy(np.array([[bb.center[0], bb.center[1], 0.0]]), yaw)[0]
+        out.append(OrientedBox(
+            center=(float(c[0]), float(c[1]), bb.center[2]),
+            size=bb.size, yaw=yaw + float(bb.yaw),
+            device_type=DeviceType.RACK,
+            meta={"grounded": True, "n_pts": bb.meta.get("n_pts", 0),
+                  "merged_from": len(members)}))
+        n_union += 1
+    if n_union:
+        print(f"[ground] adjacency merge: {n} -> {len(out)} boxes "
+              f"({n_union} union(s) refitted to point support; "
+              f"splitting is the local refine's job)")
+    return out
+
+
 # ---------- grounding stage ----------
 
 
@@ -430,10 +529,11 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         return (float(corners_r[:, 0].min()), float(corners_r[:, 1].min()),
                 float(corners_r[:, 0].max()), float(corners_r[:, 1].max()))
 
-    # NO merging: each grounded rect is fitted as its OWN box (user
-    # directive). The per-box local refinement (SAM) runs next and the
-    # joined rows are split after it -- pre-merging decided structure
-    # membership before the refinement evidence got a vote.
+    # Each grounded rect is fitted as its OWN box; tightly-ADJACENT
+    # over-split pieces of one structure merge right after the dedup
+    # (below) -- the local refine then splits the merged unions, so
+    # structure membership is decided on refinement evidence, never
+    # pre-merged beyond touching pieces.
     boxes = []
     for r in rects:
         rect_r = _frame_rect(cam, r, 1.0)
@@ -471,6 +571,13 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         print(f"[ground] dropped {len(boxes) - len(dedup)} duplicate "
               f"box(es) (IoU >= 0.5 with a better-supported fit)")
     boxes = dedup
+    # MERGE tightly-adjacent over-split pieces (user request): the VLM
+    # sometimes outlines one physical structure as several tight rects;
+    # each fits its own box and the seam never heals (stageC only
+    # splits, never merges). Touching / point-bridged boxes merge into
+    # a point-support-refitted union; the true splitting is the local
+    # refine's job.
+    boxes = _merge_adjacent_boxes(boxes, pts_fit, yaw)
     scene.boxes = boxes
     # result audit: the grounded.png shows the view's own raw VLM rects
     # (colored) plus the final fitted boxes (red) projected through the
