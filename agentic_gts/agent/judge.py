@@ -426,11 +426,12 @@ class VLMJudge:
         "This is a local {view_name} view of one target device in a "
         "data-center room, rendered clean on a dark background: the "
         "bright structure filling most of the frame IS the target.\n"
-        "First judge the IMAGE QUALITY: begin your reply with the "
-        "single line 'quality: good' when the device structure is "
-        "clearly visible and judgeable, or 'quality: poor' when the "
-        "image is too hazy, foggy, blurred, washed out or degraded "
-        "to judge devices reliably.\n"
+        "First judge whether the view is USABLE: begin your reply with "
+        "the single line 'quality: good' when the device structure is "
+        "visible and recognizable, or 'quality: poor' ONLY when you "
+        "cannot see the device or cannot tell what it is (haze or "
+        "blur fully hiding the structure, an empty or unrecognizable "
+        "frame). Minor rendering imperfections are NOT poor.\n"
         "Locate every instance that belongs to the following categories: "
         '"server rack / IT cabinet, air-conditioning unit, '
         'open cabinet door".\n'
