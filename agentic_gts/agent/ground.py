@@ -293,6 +293,69 @@ def _save_grounded_fail_png(base_img, out_dir: str, why: str) -> None:
         print(f"[ground] failure render failed ({type(e).__name__}: {e})")
 
 
+def _region_axis_span(v: np.ndarray, cell: float = 0.05):
+    """Axis extent for region fitting: peak-peeling strong clusters
+    with a percentile sanity floor.
+
+    Why not plain _robust_span here (user report: rects over real
+    devices lost their boxes): the strong-bin threshold is relative
+    to the GLOBAL peak, and 3DGS reconstructs the two rack faces at
+    very different densities -- the wall-facing / occluded side is
+    starved, its bins fall below 40% of the front-face peak, the
+    depth span collapses to ONE face (~5cm) and the sliver guard
+    rejects the whole region. Peeling fixes it: accept the strongest
+    bin's cluster (connected bins >= 40% of that pass's peak), zero
+    it out, repeat while the next pass's peak >= 15% of the first
+    peak -- a starved back face (>= ~15% of the front per bin) still
+    survives, while haze bins (~1% of the face peak) never do.
+
+    Safety floor: when the peeled span still covers < 50% of the
+    P0.5-P99.5 extent, the structure is more heterogeneous than the
+    bins can see (or the slice was too thin) -- return the percentile
+    extent instead of letting the fit collapse: a slightly loose box
+    is correctable by the local refine, a rejected region is lost
+    recall. Returns None only when there is nothing to bin."""
+    v = np.asarray(v, dtype=float)
+    if len(v) < 30:
+        return None
+    p_lo, p_hi = (float(x) for x in np.percentile(v, [0.5, 99.5]))
+    lo, hi = float(v.min()), float(v.max())
+    nb = int(np.floor((hi - lo) / cell)) + 2
+    edges = lo + cell * np.arange(nb + 1)
+    hist, _ = np.histogram(v, bins=edges)
+    first_peak = float(hist.max())
+    if first_peak < 3.0:
+        return p_lo, p_hi
+    keep_thr = 0.15 * first_peak
+    remaining = hist.astype(float).copy()
+    kept = np.zeros(len(hist), dtype=bool)
+    while True:
+        peak = float(remaining.max())
+        if peak < max(keep_thr, 3.0):
+            break
+        thr = 0.40 * peak
+        i0 = int(np.argmax(remaining))
+        kept[i0] = True
+        remaining[i0] = 0.0
+        i = i0 - 1
+        while i >= 0 and remaining[i] >= thr:
+            kept[i] = True
+            remaining[i] = 0.0
+            i -= 1
+        j = i0 + 1
+        while j < len(remaining) and remaining[j] >= thr:
+            kept[j] = True
+            remaining[j] = 0.0
+            j += 1
+    idx = np.where(kept)[0]
+    if not len(idx):
+        return p_lo, p_hi
+    s_lo, s_hi = float(edges[idx[0]]), float(edges[idx[-1] + 1])
+    if s_hi - s_lo < 0.50 * (p_hi - p_lo):
+        return p_lo, p_hi
+    return s_lo, s_hi
+
+
 def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     """Fit a full-depth OBB (yaw=0; points already in the row-aligned
     frame) to the points inside a grounded 2D rect.
@@ -302,11 +365,13 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     the structure (user insight: face sheets are vertical, so any
     knee-height band cuts the exact same footprint as the whole cloud):
     the slice dodges floor creep and top floaters entirely, and the
-    strong-bin estimator (_robust_span) drops aisle haze -- a low
-    plateau that percentile trimming cannot cut (haze is often > the
-    0.5% a P0.5-P99.5 removes). z comes from the device band (floor
-    excluded: devices stand ON the ground at z~0, so the box bottom
-    is 0 and the top is the anchored density-connected run's top).
+    peak-peeling estimator (_region_axis_span) drops aisle haze -- a
+    low plateau that percentile trimming cannot cut (haze is often >
+    the 0.5% a P0.5-P99.5 removes) while keeping starved occluded
+    faces that a global-peak threshold would cut. z comes from the
+    device band (floor excluded: devices stand ON the ground at z~0,
+    so the box bottom is 0 and the top is the anchored
+    density-connected run's top).
 
     Guards reject hallucinated regions (no support) and floor patches
     (no height): a VLM box drawn over empty floor never becomes a real
@@ -337,7 +402,7 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     # so the density-connected run's top is the row's true tallest --
     # a percentile lets floating overhead clutter inside the rect drag
     # it higher (same failure the hint-free bootstrap z_top had)
-    from agentic_gts.agent.mask_refine import _anchored_top, _robust_span
+    from agentic_gts.agent.mask_refine import _anchored_top
     _at = _anchored_top(dev[:, 2])
     z_top = float(_at) if _at is not None \
         else float(np.percentile(dev[:, 2], 99.5))
@@ -351,8 +416,8 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     core = dev[(dev[:, 2] >= zc0) & (dev[:, 2] <= zc1)]
     if len(core) < 30:
         core = dev                   # thin structure: whole band
-    sx = _robust_span(core[:, 0])
-    sy = _robust_span(core[:, 1])
+    sx = _region_axis_span(core[:, 0])
+    sy = _region_axis_span(core[:, 1])
     if sx is not None and sy is not None:
         (x_lo, x_hi), (y_lo, y_hi) = sx, sy
     else:                            # too sparse to bin: percentile fit

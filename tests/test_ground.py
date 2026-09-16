@@ -103,6 +103,54 @@ def test_fit_region_box_haze_immune():
           f"(L={bb.size[0]:.2f} D={bb.size[1]:.2f})")
 
 
+def test_fit_region_box_starved_back_face():
+    """A rack row whose BACK face is much sparser than the front (the
+    wall-facing side of a 3DGS reconstruction) must keep its FULL
+    depth. The plain strong-bin estimator thresholded at 40% of the
+    GLOBAL peak: a 10-20%-density back face fell below it, the depth
+    span collapsed to the front face (~5cm) and the sliver guard
+    rejected the whole region -- real devices lost their boxes
+    (user report: colored rects with obvious depth, no red box).
+    _region_axis_span peels peaks per-cluster (back face survives at
+    >= 15% of the front) and falls back to the percentile extent when
+    the peel still collapses (< 50% of P0.5-P99.5)."""
+    from agentic_gts.agent.ground import _fit_region_box, _region_axis_span
+
+    # direct estimator checks on the depth axis
+    for n_back in (1200, 600):        # 20% and 10% of the front face
+        v = np.concatenate([np.full(6000, 2.45), np.full(n_back, 3.55)])
+        span = _region_axis_span(v)
+        assert span is not None
+        assert span[1] - span[0] > 0.9, \
+            f"span {span} collapsed with back face at {n_back} pts"
+    # two healthy faces + haze: the peel succeeds and haze is trimmed
+    # (a single face + haze cannot be told apart from a starved second
+    # face by shape alone -- there the percentile floor deliberately
+    # errs wide: a fat box beats a missing box)
+    rng = np.random.default_rng(21)
+    v = np.concatenate([np.full(6000, 2.45), np.full(3000, 3.55),
+                        rng.uniform(3.2, 4.2, 400)])
+    span = _region_axis_span(v)
+    assert span is not None and 3.4 < span[1] < 3.7, \
+        f"haze extended the span to {span}"
+
+    # end-to-end: a row with a starved back face keeps a full-depth box
+    for n_back in (1200, 300):
+        front = np.column_stack([rng.uniform(0.0, 6.0, 6000),
+                                 np.full(6000, 0.55),
+                                 rng.uniform(0.0, 2.1, 6000)])
+        back = np.column_stack([rng.uniform(0.0, 6.0, n_back),
+                                np.full(n_back, -0.55),
+                                rng.uniform(0.0, 2.1, n_back)])
+        bb = _fit_region_box(np.vstack([front, back]),
+                             (-0.2, -0.8, 6.2, 0.8))
+        assert bb is not None, \
+            f"starved back face ({n_back} pts) must not kill the box"
+        assert 0.85 < bb.size[1] < 1.35, \
+            f"depth {bb.size[1]:.2f} (want ~1.1, back face dropped?)"
+    print("PASS region fit starved-back-face (full depth kept)")
+
+
 def test_robust_span_bin_boundary():
     """_robust_span must not drop the topmost values: a mass sitting
     EXACTLY on a bin boundary (3.55) once fell beyond arange's last
@@ -751,6 +799,7 @@ if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
     test_fit_region_box_haze_immune()
+    test_fit_region_box_starved_back_face()
     test_robust_span_bin_boundary()
     test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()
