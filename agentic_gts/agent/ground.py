@@ -352,22 +352,30 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
 
 
 def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
-                          touch_tol: float = 0.10,
                           bridge_tol: float = 0.50,
-                          min_gap_pts: int = 15) -> list:
+                          min_gap_pts: int = 15,
+                          density_ratio: float = 0.30) -> list:
     """Merge tightly-ADJACENT grounded boxes; splitting is stageC's job.
 
     The VLM sometimes over-splits ONE physical structure into several
-    tight rects (a regular layout reads as several bright bands); each
+    tight rects (a regular layout reads as several bands); each
     rect fits its own box and the seam never heals later -- stageC only
-    SPLITS, never merges. Adjacent boxes (same orientation bucket, real
-    band overlap on the perpendicular axis) merge when they either
-    TOUCH (gap <= touch_tol) or sit across a small gap that the device
-    band FILLS: bridge points strictly inside the gap mean the
-    structure is continuous, an empty gap is a real cut (the old B0
-    convention that kept 0.3-0.5m lateral gaps between separate rows
-    unmerged -- surface points hug the box edges, so the interior is
-    probed 5cm inside each side). Each union is REFITTED to point
+    SPLITS, never merges. Candidate pairs (same orientation bucket,
+    real band overlap on the perpendicular axis, gap <= bridge_tol)
+    merge when the device band DENSELY fills the junction.
+
+    Density, not bare counts (user report: two rows a clear aisle
+    apart got merged): the fitted AABBs are percentile-snug to their
+    own rect's points, and 3DGS aisle haze inflates both facing
+    edges, so two SEPARATE rows can arrive TOUCHING or overlapping in
+    the fitted frame. A probe slab is placed strictly between the two
+    boxes' facing surfaces -- inside the gap when apart, inside the
+    overlap band when the fits cross, around the junction when they
+    kiss -- and must carry >= min_gap_pts points at a density >=
+    density_ratio x the sparser box's own device-band density. A real
+    over-split seam IS device interior (same density as the boxes);
+    haze is orders of magnitude sparser and fails the ratio even when
+    it outnumbers the count threshold. Each union is REFITTED to point
     support (never boundary-united: noise would inflate the edges);
     the local refine then does the true splitting.
     """
@@ -382,6 +390,14 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
         rects.append((float(cs[:, 0].min()), float(cs[:, 1].min()),
                       float(cs[:, 0].max()), float(cs[:, 1].max())))
         buckets.append(int(round((b.yaw - yaw) / (math.pi / 2.0))) % 2)
+    # per-box device-band density from the SAME pool the probe uses
+    # (surfaces are dense, an inflated fit barely dilutes it)
+    dens = []
+    for r in rects:
+        m = ((pts_fit[:, 0] >= r[0]) & (pts_fit[:, 0] <= r[2]) &
+             (pts_fit[:, 1] >= r[1]) & (pts_fit[:, 1] <= r[3]))
+        area = max((r[2] - r[0]) * (r[3] - r[1]), 1e-6)
+        dens.append(float(m.sum()) / area)
     parent = list(range(n))
 
     def _find(i: int) -> int:
@@ -404,20 +420,36 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
                 p_hi = min(a[o + 2], b[o + 2])
                 if p_hi - p_lo < 0.20:
                     continue      # corner kiss, no shared band
-                if gap <= touch_tol:
-                    parent[_find(i)] = _find(j)
-                    break
-                # small gap: merge only when the device band fills it
-                # (probe strictly inside -- 5cm off each box edge, so
-                # the two FACING SURFACES never count as a bridge)
-                lo_slab = min(a[axis + 2], b[axis + 2]) + 0.05
-                hi_slab = max(a[axis], b[axis]) - 0.05
-                if hi_slab <= lo_slab:
-                    continue
-                m = ((pts_fit[:, axis] >= lo_slab) &
-                     (pts_fit[:, axis] <= hi_slab) &
+                # probe slab strictly BETWEEN the two facing surfaces:
+                # inside the gap when apart, inside the overlap band
+                # when the (haze-inflated) fits cross, around the
+                # junction when they kiss. A real over-split seam holds
+                # device interior there; a haze-inflated "seam" holds
+                # only the haze that inflated the fits in the first
+                # place -- the density test tells them apart.
+                c0 = max(a[axis], b[axis])          # right-most left edge
+                c1 = min(a[axis + 2], b[axis + 2])  # left-most right edge
+                if c1 > c0 + 0.10:                  # fits overlap
+                    s_lo, s_hi = c0 + 0.05, c1 - 0.05
+                elif c1 >= c0 - 0.10:
+                    # kiss / tiny overlap / tiny gap (percentile-trimmed
+                    # fits of rects that TOUCH leave a ~cm seam): band
+                    # around the junction -- a real seam holds the
+                    # continuous device sheets through it
+                    mid = 0.5 * (c0 + c1)
+                    s_lo, s_hi = mid - 0.10, mid + 0.10
+                else:                               # real gap
+                    s_lo, s_hi = c1 + 0.05, c0 - 0.05
+                if s_hi - s_lo < 0.05:
+                    continue          # degenerate probe, no evidence
+                m = ((pts_fit[:, axis] >= s_lo) &
+                     (pts_fit[:, axis] <= s_hi) &
                      (pts_fit[:, o] >= p_lo) & (pts_fit[:, o] <= p_hi))
-                if int(m.sum()) >= min_gap_pts:
+                n_br = int(m.sum())
+                if n_br < min_gap_pts:
+                    continue          # nothing bridging at all
+                d_br = n_br / ((s_hi - s_lo) * (p_hi - p_lo))
+                if d_br >= density_ratio * min(dens[i], dens[j]):
                     parent[_find(i)] = _find(j)
                     break
     comps: dict[int, list[int]] = {}

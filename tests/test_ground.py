@@ -549,8 +549,33 @@ def test_merge_adjacent_boxes():
                      yaw=0.0)
     out3 = _merge_adjacent_boxes([c1, c2], pf2, 0.0)
     assert len(out3) == 2, "corner-kiss boxes must not merge"
-    print(f"PASS adjacency merge ({m.size[0]:.2f}m union; "
-          f"empty-gap and corner-kiss kept separate)")
+    # FALSE-BRIDGE regression (user report: two parallel rows a clear
+    # aisle apart got merged): the fitted AABBs are inflated by 3DGS
+    # aisle haze until only a narrow haze-filled gap remains. The haze
+    # points OUTNUMBER the count threshold (old code: touch shortcut or
+    # bare count -> merged); the density test must reject them -- haze
+    # is orders of magnitude sparser than a cabinet surface
+    r1f = OrientedBox(center=(3.0, 0.0, 1.05), size=(6.0, 1.3, 2.1),
+                     yaw=0.0)                       # inflated to y<=0.65
+    r2f = OrientedBox(center=(3.0, 1.55, 1.05), size=(6.0, 1.3, 2.1),
+                     yaw=0.0)                      # inflated to y>=0.90
+    haze = np.column_stack([rng.uniform(0.0, 6.0, 60),
+                            rng.uniform(0.70, 0.85, 60),
+                            rng.uniform(0.5, 2.0, 60)])
+    pf3 = np.vstack([pts_fit, row2[row2[:, 2] > 0.30], haze])
+    out4 = _merge_adjacent_boxes([r1f, r2f], pf3, 0.0)
+    assert len(out4) == 2, \
+        "haze-filled gap between separate rows must NOT merge (density)"
+    # and the same geometry with a DENSE bridge (the row really is
+    # continuous through the gap) must still merge
+    bridge = np.column_stack([rng.uniform(0.0, 6.0, 4000),
+                              rng.uniform(0.60, 0.95, 4000),
+                              rng.uniform(0.0, 2.1, 4000)])
+    out5 = _merge_adjacent_boxes([r1f, r2f],
+                                 np.vstack([pf3, bridge]), 0.0)
+    assert len(out5) == 1, "dense device bridge must merge"
+    print(f"PASS adjacency merge ({m.size[0]:.2f}m union; empty-gap, "
+          f"corner-kiss and haze-gap kept separate; dense bridge merged)")
 
 
 def test_containment_2d_nested():
