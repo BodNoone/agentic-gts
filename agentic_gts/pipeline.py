@@ -339,6 +339,21 @@ def run_pipeline(scene: Scene,
     _eval("stageC")
     _render_stage(scene, "stageC_agent", out_dir, gt_boxes)
 
+    # --- stage D: row completion (geometry-only recall fallback) ---
+    # VLM grounding is the only box producer; a cabinet it missed
+    # (occluded in the nadir view, dim, dropped with a poor-quality
+    # view) is lost for good without this pass. Walks the fitted
+    # rows' interiors and ends with point-support probes -- the old
+    # rules' find_gaps/add_box_at job, seeded from grounded boxes.
+    from agentic_gts.tools.geometry import complete_row_gaps
+    added = complete_row_gaps(scene)
+    if added:
+        print(f"[stageD] row completion: +{len(added)} point-supported "
+              f"fill(s), Confidence.LOW (human review)")
+        _diag_support(scene)
+        _eval("stageD")
+        _render_stage(scene, "stageD_complete", out_dir, gt_boxes)
+
     # --- outputs ---
     scene.save_boxes(os.path.join(out_dir, "boxes.json"))
     # also persist the final layout in the detector-style 'objects' schema

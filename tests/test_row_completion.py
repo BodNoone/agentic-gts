@@ -1,0 +1,143 @@
+"""Tests for the row-completion recall fallback (complete_row_gaps).
+
+Covers:
+  - interior gap fill: a cabinet the VLM never grounded, standing
+    between two fitted boxes, is recovered by the point-support probe
+  - row-end walk: point support continuing past the last box extends
+    the row
+  - no fill without support: an empty gap stays empty
+  - wall guard: a thin partition running past the row end is NOT
+    filled (fills only one probe axis; a cabinet fills both)
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from agentic_gts.core.models import (BoxSource, Confidence, OrientedBox,
+                                      Scene)
+from agentic_gts.tools.geometry import complete_row_gaps
+
+
+def _cabinet(cx, cy=0.0, rng=None, w=0.6, d=1.1, h=2.1, n=1500):
+    """Surface points of one closed cabinet at (cx, cy)."""
+    rng = rng or np.random.default_rng(0)
+    half_d = d / 2.0
+    pts = []
+    for face in (+half_d, -half_d):     # front / back bands
+        pts.append(np.column_stack([rng.uniform(cx - w / 2, cx + w / 2, n),
+                                    np.full(n, cy + face),
+                                    rng.uniform(0.0, h, n)]))
+    # side walls
+    for side in (cx - w / 2, cx + w / 2):
+        pts.append(np.column_stack([np.full(n, side),
+                                    rng.uniform(cy - half_d, cy + half_d, n),
+                                    rng.uniform(0.0, h, n)]))
+    return np.vstack(pts)
+
+
+def _scene(boxes, points, yaw=0.0):
+    scene = Scene(points=points)
+    scene.meta["yaw"] = yaw
+    scene.boxes = list(boxes)
+    return scene
+
+
+def _box(cx, cy=0.0, w=0.6, d=1.1, h=2.1):
+    return OrientedBox(center=(cx, cy, h / 2.0), size=(w, d, h), yaw=0.0)
+
+
+def test_interior_gap_filled():
+    """Cabinets at x=0 and x=1.2, a THIRD one (points present) at x=0.6
+    that grounding missed -> the probe recovers it."""
+    rng = np.random.default_rng(1)
+    pts = np.vstack([_cabinet(0.0, rng=rng), _cabinet(0.6, rng=rng),
+                     _cabinet(1.2, rng=rng)])
+    scene = _scene([_box(0.0), _box(1.2)], pts)
+    added = complete_row_gaps(scene)
+    assert len(added) == 1, f"expected the missed middle cabinet, got {len(added)}"
+    b = added[0]
+    assert abs(b.center[0] - 0.6) < 0.15, f"fill at {b.center[0]:.2f}, want ~0.6"
+    assert abs(b.center[1]) < 0.15
+    assert b.source == BoxSource.ROW_COMPLETION
+    assert b.confidence == Confidence.LOW
+    assert len(scene.boxes) == 3
+    print("PASS interior gap fill (missed middle cabinet recovered)")
+
+
+def test_row_end_walk():
+    """One fitted cabinet at x=0, point support continues to x=0.6 ->
+    the end walk adds it (and stops: nothing beyond)."""
+    rng = np.random.default_rng(2)
+    pts = np.vstack([_cabinet(0.0, rng=rng), _cabinet(0.6, rng=rng)])
+    scene = _scene([_box(0.0)], pts)
+    added = complete_row_gaps(scene)
+    assert len(added) == 1, f"expected +1 at the row end, got {len(added)}"
+    assert abs(added[0].center[0] - 0.6) < 0.15
+    print("PASS row end walk (support beyond the last box extends the row)")
+
+
+def test_empty_gap_not_filled():
+    """Cabinets at x=0 and x=2.4 with NOTHING in between (a real
+    aisle cut through the row) -> no fill."""
+    rng = np.random.default_rng(3)
+    pts = np.vstack([_cabinet(0.0, rng=rng), _cabinet(2.4, rng=rng)])
+    scene = _scene([_box(0.0), _box(2.4)], pts)
+    added = complete_row_gaps(scene)
+    assert added == [], f"empty gap must stay empty, got {len(added)} fill(s)"
+    print("PASS empty gap not filled (no support -> no box)")
+
+
+def test_wall_past_row_end_not_filled():
+    """A thin partition (0.2m) running along the row, past its end: it
+    has height and plenty of points, but only fills the probe's CROSS
+    axis (thin in along) -- the span guard must reject it."""
+    rng = np.random.default_rng(4)
+    cabinet_pts = _cabinet(0.0, rng=rng)
+    # wall band from x=0.5 to x=2.5 at y=0, 0.2m thick, 2.6m tall
+    wall = np.column_stack([rng.uniform(0.5, 2.5, 4000),
+                            rng.uniform(-0.1, 0.1, 4000),
+                            rng.uniform(0.0, 2.6, 4000)])
+    scene = _scene([_box(0.0)], np.vstack([cabinet_pts, wall]))
+    added = complete_row_gaps(scene)
+    assert added == [], \
+        f"a thin wall slice must not become a cabinet, got {len(added)}"
+    print("PASS wall past row end not filled (footprint span guard)")
+
+
+def test_rotated_frame():
+    """Same interior-gap scenario, whole layout rotated 30 deg in world
+    frame (yaw in meta): the fill lands in the rotated position."""
+    import math
+    yaw = math.radians(30.0)
+    rng = np.random.default_rng(5)
+    c, s = math.cos(yaw), math.sin(yaw)
+
+    def rot(p):
+        return np.column_stack([c * p[:, 0] - s * p[:, 1],
+                                s * p[:, 0] + c * p[:, 1], p[:, 2]])
+
+    pts = rot(np.vstack([_cabinet(0.0, rng=rng), _cabinet(0.6, rng=rng),
+                         _cabinet(1.2, rng=rng)]))
+    # boxes: long axis along the rotated x = yaw
+    b0 = OrientedBox(center=(0.0, 0.0, 1.05), size=(0.6, 1.1, 2.1), yaw=yaw)
+    b2 = OrientedBox(center=(c * 1.2, s * 1.2, 1.05), size=(0.6, 1.1, 2.1),
+                     yaw=yaw)
+    scene = _scene([b0, b2], pts, yaw=yaw)
+    added = complete_row_gaps(scene)
+    assert len(added) == 1, f"expected the rotated middle cabinet, got {len(added)}"
+    ex, ey = c * 0.6, s * 0.6
+    assert math.hypot(added[0].center[0] - ex, added[0].center[1] - ey) < 0.15
+    print("PASS rotated frame (fill follows the row axis)")
+
+
+if __name__ == "__main__":
+    test_interior_gap_filled()
+    test_row_end_walk()
+    test_empty_gap_not_filled()
+    test_wall_past_row_end_not_filled()
+    test_rotated_frame()
