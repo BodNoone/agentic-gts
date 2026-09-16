@@ -560,16 +560,24 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # once (overlapping rects in one reply). Each rect fits its own
     # near-identical box with a DIFFERENT box_id, and the per-box local
     # refinement then renders mask_prompt_<id>_front.png per box --
-    # one device, several duplicate renders (user report). Keep the
-    # best-point-supported fit per IoU >= 0.5 cluster.
+    # one device, several duplicate renders (user report). Drop a box
+    # when it overlaps a better-supported kept fit (IoU >= 0.5) OR is
+    # >= 85% CONTAINED in one: a small box nested inside a big row box
+    # has IoU = area ratio (< 0.5) but containment ~1.0 -- pure IoU let
+    # the nesting through (user report: big box with small boxes
+    # inside on the audit render). Containment also catches the
+    # cross-yaw nesting the adjacency merge cannot (different
+    # orientation buckets never enter it).
     dedup = []
     for b in sorted(boxes, key=lambda x: -int(x.meta.get("n_pts", 0))):
-        if any(b.iou_2d(d) >= 0.5 for d in dedup):
+        if any(b.iou_2d(d) >= 0.5 or b.containment_2d(d) >= 0.85
+               for d in dedup):
             continue
         dedup.append(b)
     if len(dedup) < len(boxes):
-        print(f"[ground] dropped {len(boxes) - len(dedup)} duplicate "
-              f"box(es) (IoU >= 0.5 with a better-supported fit)")
+        print(f"[ground] dropped {len(boxes) - len(dedup)} duplicate/contained "
+              f"box(es) (IoU >= 0.5 or >= 85% contained in a "
+              f"better-supported fit)")
     boxes = dedup
     # MERGE tightly-adjacent over-split pieces (user request): the VLM
     # sometimes outlines one physical structure as several tight rects;

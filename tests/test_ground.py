@@ -553,6 +553,82 @@ def test_merge_adjacent_boxes():
           f"empty-gap and corner-kiss kept separate)")
 
 
+def test_containment_2d_nested():
+    """containment_2d sees what iou_2d cannot: a small box nested in a
+    big one has IoU = area ratio (< 0.5) but containment ~1.0."""
+    from agentic_gts.core.models import OrientedBox
+    import math
+    big = OrientedBox(center=(3.0, 0.0, 1.05), size=(6.0, 1.1, 2.1),
+                     yaw=0.0)
+    # cross-ways small box INSIDE the row footprint (size[0] rides the
+    # world y axis at yaw=pi/2 -> world extent 1.6 x 1.0): iou < 0.5
+    small = OrientedBox(center=(3.0, 0.0, 1.05), size=(1.0, 1.6, 2.1),
+                        yaw=math.pi / 2.0)
+    assert small.iou_2d(big) < 0.5, "precondition: IoU blind to nesting"
+    assert small.containment_2d(big) >= 0.99, \
+        f"nested box containment {small.containment_2d(big):.2f} (want ~1.0)"
+    # reverse direction: the big box is NOT contained in the small one
+    # (only its area ratio, 24% here -- far under any drop threshold)
+    assert big.containment_2d(small) < 0.5
+    # disjoint boxes: no containment either way
+    far = OrientedBox(center=(3.0, 5.0, 1.05), size=(1.0, 1.0, 2.1),
+                     yaw=0.0)
+    assert far.containment_2d(big) == 0.0 and big.containment_2d(far) == 0.0
+    print("PASS containment_2d (nested cross-yaw seen, disjoint zero)")
+
+
+def test_ground_stage_nested_region_dropped():
+    """End-to-end: the VLM outlines the WHOLE row and ALSO a sub-section
+    of it cross-ways (rect taller than wide in the row frame -> fitted
+    yaw=pi/2). The nested small box must be DROPPED by the containment
+    guard, not survive as a box-inside-box on the audit render."""
+    import json as _json
+    import tempfile
+    from agentic_gts.agent import ground
+    from agentic_gts.agent.judge import VLMJudge
+
+    rng = np.random.default_rng(3)
+    pts = np.vstack([_row_points(0.0, 6.0, y=0.0, rng=rng),
+                     _row_points(-1.0, 5.0, y=3.0, rng=rng)])
+    ceil = np.column_stack([rng.uniform(-2.0, 7.0, 3000),
+                            rng.uniform(-2.0, 5.0, 3000),
+                            np.full(3000, 2.9)])
+    scene = Scene(points=np.vstack([pts, ceil]))
+    scene.meta["yaw"] = 0.0
+    _bootstrap_meta(scene, (-1.5, -0.8, 6.5, 3.8))
+    scene.boxes = []
+    _, cam, W, H = ground._render_topdown(scene, 0.0)
+    # whole row 1, a cross-ways SUB-rect of row 1 (nested), whole row 2
+    true_rects = [((-0.5, 6.5), (-0.8, 0.8)),
+                  ((2.4, 3.6), (-0.8, 0.8)),
+                  ((-1.5, 5.5), (2.2, 3.8))]
+    regions = []
+    for (xa, xb), (ya, yb) in true_rects:
+        uv = cam.project_cv(np.column_stack([
+            [xa, xb, xb, xa], [ya, ya, yb, yb], np.full(4, 1.0)]))
+        px = (np.clip(uv[:, 0].min(), 0, W), np.clip(uv[:, 1].min(), 0, H),
+              np.clip(uv[:, 0].max(), 0, W), np.clip(uv[:, 1].max(), 0, H))
+        regions.append({"bbox_2d": [
+            int(round(px[0] / W * 1000)), int(round(px[1] / H * 1000)),
+            int(round(px[2] / W * 1000)), int(round(px[3] / H * 1000))],
+            "label": "server rack"})
+    judge = VLMJudge(backend="qwen")
+    judge._qwen_image_call = lambda png, prompt, *a, **k: \
+        _json.dumps(regions)
+    with tempfile.TemporaryDirectory() as td:
+        ok = ground.ground_stage(scene, judge, out_dir=td)
+        assert ok
+    assert len(scene.boxes) == 2, \
+        f"nested sub-box must be dropped (row box + row 2), " \
+        f"got {len(scene.boxes)}"
+    rows = sorted(scene.boxes, key=lambda b: b.center[1])
+    assert 5.5 < rows[0].size[0] < 6.5, \
+        f"row 1 must stay the full-row box, got {rows[0].size[0]:.2f}m"
+    assert abs(rows[0].center[1]) < 0.2
+    assert abs(rows[1].center[1] - 3.0) < 0.2, "row 2 untouched"
+    print("PASS nested region dropped by the containment guard")
+
+
 def test_ground_stage_merges_over_split_regions():
     """End-to-end: the VLM over-split ONE row into two TIGHT rects
     (regular layout mis-read); the two fitted pieces must merge back
@@ -620,5 +696,7 @@ if __name__ == "__main__":
     test_parse_ground_regions_salvage()
     test_ground_mock_returns_false()
     test_merge_adjacent_boxes()
+    test_containment_2d_nested()
+    test_ground_stage_nested_region_dropped()
     test_ground_stage_merges_over_split_regions()
     print("ALL GROUND TESTS PASSED")

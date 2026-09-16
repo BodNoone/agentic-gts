@@ -107,6 +107,29 @@ class OrientedBox:
         union = np.count_nonzero(ma | mb)
         return float(inter) / union if union else 0.0
 
+    def containment_2d(self, other: "OrientedBox", grid: float = 0.02) -> float:
+        """Fraction of THIS box's footprint lying inside `other` (1.0 =
+        fully contained). Companion to iou_2d: a small box nested in a
+        big one has IoU = area ratio (< 0.5 when the small box is under
+        half the big one's area) but containment 1.0 -- the nesting
+        the IoU dedup cannot see. Rasterized over SELF's extent only,
+        so the cost tracks the (usually small) contained box."""
+        lo = self.corners_2d().min(axis=0) - grid
+        hi = self.corners_2d().max(axis=0) + grid
+        xs = np.arange(lo[0], hi[0], grid)
+        ys = np.arange(lo[1], hi[1], grid)
+        if len(xs) == 0 or len(ys) == 0 or len(xs) * len(ys) > 4_000_000:
+            return 0.0
+        gx, gy = np.meshgrid(xs, ys)
+        pts = np.stack([gx.ravel(), gy.ravel(), np.zeros(gx.size)], axis=1)
+        a = OrientedBox(center=(self.center[0], self.center[1], 0), size=(self.size[0], self.size[1], 10), yaw=self.yaw)
+        b = OrientedBox(center=(other.center[0], other.center[1], 0), size=(other.size[0], other.size[1], 10), yaw=other.yaw)
+        ma = a.contains(pts)
+        n_self = int(np.count_nonzero(ma))
+        if n_self == 0:
+            return 0.0
+        return float(np.count_nonzero(ma & b.contains(pts))) / n_self
+
     def to_dict(self) -> dict:
         d = asdict(self)
         d["device_type"] = self.device_type.value
