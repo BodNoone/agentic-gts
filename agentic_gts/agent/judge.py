@@ -339,13 +339,13 @@ class VLMJudge:
         "bands, aisles are dark, walls are thin lines at the room "
         "boundary.\n"
         "Locate every instance that belongs to the following categories: "
-        '"server rack row, single cabinet". A continuous row of joined '
-        "cabinets is ONE instance whose box covers the WHOLE row (do "
-        "not split it into individual cabinets); structures separated "
+        '"cabinet, server rack, air conditioning". A continuous row of '
+        "joined cabinets is ONE instance whose box covers the WHOLE row "
+        "(do not split it into individual cabinets); structures separated "
         "by an aisle or a clear gap are separate instances. Do not "
         "include walls, pillars, columns, or floor clutter.\n"
         "Report bbox coordinates in JSON format like this: "
-        '{"bbox_2d": [x1, y1, x2, y2], "label": "rack row"}'
+        '{"bbox_2d": [x1, y1, x2, y2], "label": "server rack"}'
     )
 
     def ground_regions(self, png: bytes, W: int, H: int,
