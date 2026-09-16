@@ -284,6 +284,8 @@ def run_pipeline(scene: Scene,
         scene.meta["z_top"] = info["z_top"]
     if info.get("device_footprint") is not None:
         scene.meta["device_footprint"] = info["device_footprint"]
+    if info.get("device_cells") is not None:
+        scene.meta["device_cells"] = info["device_cells"]
     try:
         from agentic_gts.output.visualize import render_yaw_diagnosis
         png = os.path.join(out_dir, "yaw_check.png")

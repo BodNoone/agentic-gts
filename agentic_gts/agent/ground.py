@@ -97,20 +97,31 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024):
         # exists to remove
         band = points[points[:, 2] > 0.30]
     pts_rot = _rot_xy(band, -yaw)
-    # frame over the BOOTSTRAP footprint, not the raw cloud bbox (user
+    # frame over the BOOTSTRAP layout, not the raw cloud bbox (user
     # directive: the cloud-framed version raised the camera to fit
-    # walls too, and the racks rendered small). The stage0
-    # device_footprint (world frame) is rotated into this row frame
-    # and AABB'd -- walls were already dropped as boundary cells, so
-    # the framing hugs the layout.
+    # walls too, and the racks rendered small). Walls were already
+    # dropped as boundary cells, so the framing hugs the layout.
+    # The kept CELLS are rotated by the ACTUAL yaw and AABB'd ONCE:
+    # rotating the world-frame device_footprint AABB instead double-
+    # inflates for rotated layouts (AABB of a 45-deg row, then AABB
+    # of rotating that box) -- the camera rose and the view came back
+    # mostly empty.
     boxes_rot = []
-    fp = scene.meta.get("device_footprint")
-    if fp:
-        corners_w = np.array([[fp[0], fp[1]], [fp[2], fp[1]],
-                              [fp[2], fp[3]], [fp[0], fp[3]]])
-        cr = _rot_xy(np.column_stack([corners_w,
-                                      np.zeros(4)]), -yaw)
+    lo = hi = None
+    cells = scene.meta.get("device_cells")
+    if cells is not None and len(cells):
+        cr = _rot_xy(np.column_stack([cells,
+                                       np.zeros(len(cells))]), -yaw)
         lo, hi = cr.min(axis=0), cr.max(axis=0)
+    else:
+        fp = scene.meta.get("device_footprint")
+        if fp:
+            corners_w = np.array([[fp[0], fp[1]], [fp[2], fp[1]],
+                                  [fp[2], fp[3]], [fp[0], fp[3]]])
+            cr = _rot_xy(np.column_stack([corners_w,
+                                          np.zeros(4)]), -yaw)
+            lo, hi = cr.min(axis=0), cr.max(axis=0)
+    if lo is not None:
         c = (lo + hi) / 2.0
         boxes_rot.append(OrientedBox(
             center=(float(c[0]), float(c[1]), 1.0),

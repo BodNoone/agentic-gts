@@ -146,8 +146,6 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
         # look straight down (-z), up hint = +y in world (screen-up = +y)
         z_floor = float(points[:, 2].min())
         up = np.array([0.0, 1.0, 0.0])  # screen up aligned with world +y
-        # Analytic first guess for the height, then nudge up until the whole
-        # footprint (including its rack-top corners) projects inside the frame.
         fov_half = math.radians(60.0 / 2.0)     # fovy is the VERTICAL half-angle
         span_x = float(hi[0] - lo[0])
         span_y = float(hi[1] - lo[1])
@@ -157,34 +155,21 @@ def make_godview_cam(points: np.ndarray, boxes=(), W: int = 1280, H: int = 1024,
         # on-screen x <- world x needs fx_half; on-screen y <- world y needs fov_half
         need_h = max(span_x / 2.0 / math.tan(fx_half),
                      span_y / 2.0 / math.tan(fov_half))
-        # Base height frames the footprint *exactly* at hf=1.0, then keep a
-        # little extra so the rack-TOP corners (projected at z_ref, which
-        # spread outward under perspective) stay inside the frame too. The
-        # rack footprint sits inside the padded framing box, so exact-fit on
-        # the padded box is guaranteed in-frame; the z_ref term is what
-        # clears the outward-spreading rack tops.
-        base_z = max(float(cam_z) if (cam_z is not None and np.isfinite(cam_z)) else 0.0,
-                     need_h + z_ref * 1.25)
-        # 8 framing corners at BOTH floor and rack-top heights: the 3D
-        # wireframe's bottom ring sits at floor level, and under perspective
-        # the (closer, lower) floor corners lean OUTWARD vs the top ring --
-        # frame them too or the wireframe's lower edge clips the border.
-        corners = np.array([[x, y, z] for x in (lo[0], hi[0])
-                            for y in (lo[1], hi[1])
-                            for z in (z_floor, z_ref)])
-        for hf in (1.0, 1.02, 1.05, 1.08, 1.12, 1.18, 1.25, 1.35, 1.5):
-            eye_z = base_z * hf
-            c = Cam(eye=np.array([center[0], center[1], eye_z]),
-                    target=np.array([center[0], center[1], z_floor]),
-                    up=up, fovy_deg=60.0, W=W, H=H)
-            pc = np.hstack([corners, np.ones((len(corners), 1))]) @ c.view_cv().T
-            if not np.all(pc[:, 2] > 0.1):
-                continue
-            uv = c.project_cv(corners)
-            if (uv[:, 0].min() > 0.005 * W and uv[:, 0].max() < 0.995 * W and
-                    uv[:, 1].min() > 0.005 * H and uv[:, 1].max() < 0.995 * H):
-                return c
-        return Cam(eye=np.array([center[0], center[1], base_z * 1.0]),
+        # PERSPECTIVE nadir (not orthographic): the framing ring CLOSEST
+        # to the eye -- the footprint at rack-top height -- spreads
+        # outward and binds the fit exactly:
+        #     (eye_z - z_top) * tan(half_fov) >= span / 2
+        #     ->  eye_z = need_h + z_top
+        # The old hf ladder (1.02..1.5 steps over need_h + z_top*1.25)
+        # overshot by up to 1.5x when its margin check kept failing --
+        # the camera rose and the grounding view came back with big
+        # empty borders (user report). 5% slack = frame margin plus
+        # content that sits slightly outside the framing footprint.
+        z_top_ring = max(z_ref if np.isfinite(z_ref) else 0.0,
+                         float(points[:, 2].max()))
+        eye_z = max(float(cam_z) if (cam_z is not None and np.isfinite(cam_z)) else 0.0,
+                    (need_h + z_top_ring) * 1.05)
+        return Cam(eye=np.array([center[0], center[1], eye_z]),
                    target=np.array([center[0], center[1], z_floor]),
                    up=up, fovy_deg=60.0, W=W, H=H)
 

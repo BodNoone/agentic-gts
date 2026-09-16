@@ -91,11 +91,19 @@ def estimate_yaw_detailed(points: np.ndarray, z_range: tuple[float, float] = (0.
     #                     band points inside those cells) -- the ceiling-
     #                     cut and framing reference ground_stage needs
     #                     (there is no box input to take them from).
-    boot = {"z_top": None, "device_footprint": None}
+    boot = {"z_top": None, "device_footprint": None, "device_cells": None}
     keep = boundary_keep_mask(cells)
     print(f"[diag][yaw] boundary (wall) cell removal: {len(cells)} -> {int(keep.sum())}")
     if keep.any():
         kc = cells[keep]
+        # the CELLS themselves are exported for framing: a world-frame
+        # AABB of a ROTATED layout is inflated (a 20x1m row at 45 deg
+        # bounds to ~14x14m), and AABB-then-rotate inflates again in
+        # _render_topdown -- the camera rose and the nadir view came
+        # back mostly empty. Rotating the cells by the ACTUAL yaw and
+        # AABBing once keeps the framing tight (and stays correct when
+        # the caller pins a different yaw).
+        boot["device_cells"] = kc
         boot["device_footprint"] = (
             float(kc[:, 0].min()), float(kc[:, 1].min()),
             float(kc[:, 0].max()), float(kc[:, 1].max()))

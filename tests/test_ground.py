@@ -344,6 +344,55 @@ def test_ground_stage_bootstrap_driven():
           f"row2 {rows[1].size[0]:.2f}x{rows[1].size[1]:.2f})")
 
 
+def test_nadir_framing_tight_for_rotated_layout():
+    """Regression: rotated layouts must not DOUBLE-inflate the nadir
+    framing. The old path AABB'd the kept cells in WORLD frame (a 45-deg
+    row layout bounds to a big square) and then AABB'd again after
+    rotating that square by -yaw -- the camera rose and groundview came
+    back mostly empty. The fix rotates the CELLS by the actual yaw and
+    AABBs once, so the devices fill the frame again."""
+    import math
+    from agentic_gts.agent import ground
+    yaw = math.radians(45.0)
+    rng = np.random.default_rng(3)
+    # 4 rows of 6m, 2m apart, all running at 45 deg in world frame
+    rows = []
+    for k in range(4):
+        t = rng.uniform(0.0, 6.0, 300)
+        off = k * 2.0
+        x = t * math.cos(yaw) - off * math.sin(yaw)
+        y = t * math.sin(yaw) + off * math.cos(yaw)
+        rows.append(np.column_stack([x, y]))
+    cells = np.vstack(rows)
+    # cloud: thin vertical walls along the same rows (scatter path)
+    pts = []
+    for k in range(4):
+        t = rng.uniform(0.0, 6.0, 1500)
+        off = k * 2.0
+        pts.append(np.column_stack([
+            t * math.cos(yaw) - off * math.sin(yaw),
+            t * math.sin(yaw) + off * math.cos(yaw),
+            rng.uniform(0.4, 1.9, 1500)]))
+    scene = Scene(points=np.vstack(pts))
+    scene.meta["z_top"] = 2.1
+    scene.meta["device_cells"] = cells
+    scene.meta["device_footprint"] = (
+        float(cells[:, 0].min()), float(cells[:, 1].min()),
+        float(cells[:, 0].max()), float(cells[:, 1].max()))
+    _, cam, W, H = ground._render_topdown(scene, yaw)
+    # measure at the TOP of the band: the perspective nadir camera is
+    # fitted so the rack-top ring fills the frame (it is closest to the
+    # eye and spreads most); the floor ring is necessarily smaller
+    uv = cam.project_cv(np.column_stack([cells, np.full(len(cells), 1.9)]))
+    fill_w = (uv[:, 0].max() - uv[:, 0].min()) / W
+    fill_h = (uv[:, 1].max() - uv[:, 1].min()) / H
+    # tight framing: with the fix the top ring fills most of the frame;
+    # the double-inflated framing showed it at ~39% width / ~48% height
+    assert fill_w > 0.6, f"cells fill only {fill_w:.0%} of the width"
+    assert fill_h > 0.85, f"cells fill only {fill_h:.0%} of the height"
+    print(f"PASS rotated-layout framing tight (fill {fill_w:.0%} x {fill_h:.0%})")
+
+
 def test_render_cut_relative_not_conservative():
     """The nadir render cut is RELATIVE (user decision: the view only
     needs each device's basic features, not a complete structure, and
