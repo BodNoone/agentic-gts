@@ -312,15 +312,26 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     (no height): a VLM box drawn over empty floor never becomes a real
     device box.
     """
+    def _reject(reason: str, n_dev: int = 0) -> None:
+        # every drop is visible in the console -- a rect that silently
+        # vanishes between grounded.png and stageG_ground.png is
+        # undebuggable otherwise (user report: "way fewer boxes than
+        # raw regions, many wrongly deleted")
+        print(f"[ground] region rejected ({reason}): "
+              f"rect=({x0:.2f},{y0:.2f})-({x1:.2f},{y1:.2f}) "
+              f"n_pts={len(pts)} n_dev={n_dev}")
+
     x0, y0, x1, y1 = rect
     m = ((points[:, 0] >= x0) & (points[:, 0] <= x1) &
          (points[:, 1] >= y0) & (points[:, 1] <= y1))
     pts = points[m]
     if len(pts) < min_pts:
+        _reject(f"no point support (<{min_pts})")
         return None
     dev = pts[pts[:, 2] > 0.30]      # device band: exclude floor texture
     if len(dev) < max(30, min_pts // 2):
-        return None                  # floor patch, no structure
+        _reject("floor patch, no structure above 0.30m", n_dev=len(dev))
+        return None
     # anchored column top, P99.5 fallback: the rect's points form one
     # union column (mixed-height cabinets, all standing on the ground),
     # so the density-connected run's top is the row's true tallest --
@@ -331,7 +342,8 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     z_top = float(_at) if _at is not None \
         else float(np.percentile(dev[:, 2], 99.5))
     if z_top < 0.50:
-        return None                  # too short for a device
+        _reject(f"too short for a device (z_top={z_top:.2f}m)")
+        return None
     # middle z-slice: [0.35, 0.75] x z_top -- cuts every vertical face
     # of a tall rack, stays above floor texture, below trays/floaters
     zc0 = max(0.30, 0.35 * z_top)
@@ -348,6 +360,9 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
         x_hi, y_hi = np.percentile(dev[:, :2], 99.5, axis=0)
     dx, dy = float(x_hi - x_lo), float(y_hi - y_lo)
     if dx < 0.30 or dy < 0.20:
+        _reject(f"sliver (span {dx:.2f} x {dy:.2f}m; "
+                f"core={len(core)} pts, slice z "
+                f"[{zc0:.2f},{zc1:.2f}])")
         return None                  # sliver, not a structure
     c = np.array([(x_lo + x_hi) / 2.0, (y_lo + y_hi) / 2.0])
     # Ride the LONG side on the yaw axis (size[0]): a row that runs
