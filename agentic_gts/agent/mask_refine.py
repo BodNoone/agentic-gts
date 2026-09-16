@@ -834,7 +834,16 @@ def _anchored_top(v: np.ndarray, cell: float = 0.05, dens_frac: float = 0.20,
     if len(v) < floor:
         return None
     lo, hi = float(v.min()), float(v.max())
-    edges = np.arange(lo, hi + cell / 2, cell)
+    # explicit bin COUNT, not arange(stop): arange's ceil((stop-start)/
+    # step) also drifts in fp ((3.6-2.45)/0.05 -> 22.999... -> 23
+    # edges), and an edge landing a hair BELOW hi makes np.histogram
+    # silently DROP every v == hi -- a face sheet sitting exactly on a
+    # bin boundary vanishes (_robust_span's span collapses to the far
+    # face, _anchored_top's top under-measures). Two extra bins of
+    # margin: the last edge is always >= hi + cell; trailing bins are
+    # empty-or-real, empty ones never count as strong/dense.
+    nb = int(np.floor((hi - lo) / cell)) + 2
+    edges = lo + cell * np.arange(nb + 1)
     if len(edges) < 3:
         return None
     hist, _ = np.histogram(v, bins=edges)
@@ -870,7 +879,16 @@ def _robust_span(v: np.ndarray, cell: float = 0.05,
     if len(v) < floor:
         return None
     lo, hi = float(v.min()), float(v.max())
-    edges = np.arange(lo, hi + cell / 2, cell)
+    # explicit bin COUNT, not arange(stop): arange's ceil((stop-start)/
+    # step) also drifts in fp ((3.6-2.45)/0.05 -> 22.999... -> 23
+    # edges), and an edge landing a hair BELOW hi makes np.histogram
+    # silently DROP every v == hi -- a face sheet sitting exactly on a
+    # bin boundary vanishes (_robust_span's span collapses to the far
+    # face, _anchored_top's top under-measures). Two extra bins of
+    # margin: the last edge is always >= hi + cell; trailing bins are
+    # empty-or-real, empty ones never count as strong/dense.
+    nb = int(np.floor((hi - lo) / cell)) + 2
+    edges = lo + cell * np.arange(nb + 1)
     if len(edges) < 3:
         return None
     hist, _ = np.histogram(v, bins=edges)

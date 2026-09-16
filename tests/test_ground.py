@@ -79,6 +79,45 @@ def test_fit_region_box_full_depth():
           f"(L={bb.size[0]:.2f} D={bb.size[1]:.2f} H={bb.size[2]:.2f})")
 
 
+def test_fit_region_box_haze_immune():
+    """The middle-slice strong-bin fit does not flinch at 3DGS aisle
+    haze inside a loose rect: the sheets are tall narrow bins, haze is
+    a low plateau, and the peak-relative threshold keeps the body.
+    The old whole-band percentile fit let a few-percent haze tail
+    inflate every edge (user report: boxes not snug to devices)."""
+    from agentic_gts.agent.ground import _fit_region_box
+    rng = np.random.default_rng(13)
+    row = _row_points(0.0, 6.0, rng=rng)
+    # haze: uniform scatter through the whole loose rect, ~3% of the
+    # device mass -- ABOVE the 0.5% a P0.5-P99.5 cut trims
+    haze = np.column_stack([rng.uniform(-0.3, 6.3, 400),
+                            rng.uniform(-1.0, 1.0, 400),
+                            rng.uniform(0.4, 2.0, 400)])
+    bb = _fit_region_box(np.vstack([row, haze]), (-0.3, -1.0, 6.3, 1.0))
+    assert bb is not None, "haze must not kill the fit"
+    assert 5.5 < bb.size[0] < 6.4, \
+        f"length {bb.size[0]:.2f} (haze inflated the row ends?)"
+    assert 0.85 < bb.size[1] < 1.35, \
+        f"depth {bb.size[1]:.2f} (haze inflated the faces?)"
+    print(f"PASS region fit haze-immune "
+          f"(L={bb.size[0]:.2f} D={bb.size[1]:.2f})")
+
+
+def test_robust_span_bin_boundary():
+    """_robust_span must not drop the topmost values: a mass sitting
+    EXACTLY on a bin boundary (3.55) once fell beyond arange's last
+    fp-drifted edge and np.histogram silently discarded it -- the span
+    collapsed to the far face and the fitted box went thin. Fixed by
+    the explicit bin-count edge construction."""
+    from agentic_gts.agent.mask_refine import _robust_span
+    v = np.concatenate([np.full(100, 2.45), np.full(100, 3.55)])
+    span = _robust_span(v)
+    assert span is not None
+    assert span[1] - span[0] > 1.0, \
+        f"span {span} collapsed (top-of-range mass dropped)"
+    print(f"PASS robust span bin boundary ({span[0]:.2f}..{span[1]:.2f})")
+
+
 def test_ground_stage_with_patched_vlm():
     """End-to-end grounding on the scatter path: the VLM answer is
     fabricated by projecting the TRUE row rects through the same cam the
@@ -711,6 +750,8 @@ def test_ground_stage_merges_over_split_regions():
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
+    test_fit_region_box_haze_immune()
+    test_robust_span_bin_boundary()
     test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()
     test_ground_stage_row_along_y()

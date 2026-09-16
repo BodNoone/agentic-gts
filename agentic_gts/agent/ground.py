@@ -298,11 +298,15 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     frame) to the points inside a grounded 2D rect.
 
     The rect is the VLM's coarse outline; the DEVICE-BAND point support
-    snaps the edges (percentiles -- floor points sit outside the device
-    footprint only where the rect is loose, walls are excluded by height
-    structure downstream). z comes from the device band (floor excluded:
-    devices stand ON the ground at z~0, so the box bottom is 0 and the
-    top is the band's 99.5th percentile).
+    snaps the edges. Horizontal extent is fitted on a MIDDLE z-slice of
+    the structure (user insight: face sheets are vertical, so any
+    knee-height band cuts the exact same footprint as the whole cloud):
+    the slice dodges floor creep and top floaters entirely, and the
+    strong-bin estimator (_robust_span) drops aisle haze -- a low
+    plateau that percentile trimming cannot cut (haze is often > the
+    0.5% a P0.5-P99.5 removes). z comes from the device band (floor
+    excluded: devices stand ON the ground at z~0, so the box bottom
+    is 0 and the top is the anchored density-connected run's top).
 
     Guards reject hallucinated regions (no support) and floor patches
     (no height): a VLM box drawn over empty floor never becomes a real
@@ -322,18 +326,30 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     # so the density-connected run's top is the row's true tallest --
     # a percentile lets floating overhead clutter inside the rect drag
     # it higher (same failure the hint-free bootstrap z_top had)
-    from agentic_gts.agent.mask_refine import _anchored_top
+    from agentic_gts.agent.mask_refine import _anchored_top, _robust_span
     _at = _anchored_top(dev[:, 2])
     z_top = float(_at) if _at is not None \
         else float(np.percentile(dev[:, 2], 99.5))
     if z_top < 0.50:
         return None                  # too short for a device
-    lo = np.percentile(dev[:, :2], 0.5, axis=0)
-    hi = np.percentile(dev[:, :2], 99.5, axis=0)
-    dx, dy = float(hi[0] - lo[0]), float(hi[1] - lo[1])
+    # middle z-slice: [0.35, 0.75] x z_top -- cuts every vertical face
+    # of a tall rack, stays above floor texture, below trays/floaters
+    zc0 = max(0.30, 0.35 * z_top)
+    zc1 = max(zc0 + 0.10, 0.75 * z_top)
+    core = dev[(dev[:, 2] >= zc0) & (dev[:, 2] <= zc1)]
+    if len(core) < 30:
+        core = dev                   # thin structure: whole band
+    sx = _robust_span(core[:, 0])
+    sy = _robust_span(core[:, 1])
+    if sx is not None and sy is not None:
+        (x_lo, x_hi), (y_lo, y_hi) = sx, sy
+    else:                            # too sparse to bin: percentile fit
+        x_lo, y_lo = np.percentile(dev[:, :2], 0.5, axis=0)
+        x_hi, y_hi = np.percentile(dev[:, :2], 99.5, axis=0)
+    dx, dy = float(x_hi - x_lo), float(y_hi - y_lo)
     if dx < 0.30 or dy < 0.20:
         return None                  # sliver, not a structure
-    c = (lo + hi) / 2.0
+    c = np.array([(x_lo + x_hi) / 2.0, (y_lo + y_hi) / 2.0])
     # Ride the LONG side on the yaw axis (size[0]): a row that runs
     # along the rotated-y axis still fits here as (dx, dy) with
     # yaw=0 -- but then the box's yaw axis is its THICKNESS, and
