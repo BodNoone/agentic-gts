@@ -70,8 +70,13 @@ def parse_box_groups(text: str) -> list[BoxGroup]:
 
     Accepted shapes:
       {"candidate_groups": [{"bbox_2d": [x1,y1,x2,y2], ...}]}
-      [{"bbox_2d" | "bbox" | "box": [...]}]
-      {"bbox_2d": [...]}
+      [{"bbox_2d" | "bbox" | "box": [...]}]   (official cookbook array)
+      {"bbox_2d": [...]}                       (single box)
+      JSONL of single boxes -- one {"bbox_2d": ...} object per line.
+      The prompt's example is a single bare dict, so models often
+      emit one object per instance; the old pick-ONE-structure logic
+      kept only the first line's box (user report: the answer held
+      many instances, groups had one).
 
     Box grounding is Qwen3-VL's NATIVE task format (bbox_2d), unlike
     point placement which the model does poorly -- the reason the
@@ -79,52 +84,56 @@ def parse_box_groups(text: str) -> list[BoxGroup]:
     """
     if not text:
         return []
-    data = None
-    # Qwen may prepend reasoning. Scan every object/array opener with the
-    # standard JSON decoder and keep the LAST complete value (the final answer).
+    # scan every object/array opener with the standard JSON decoder;
+    # thinking is already stripped upstream, prose fragments mostly
+    # fail to decode
     dec = json.JSONDecoder()
-    values = []
+    frags = []
     for m in re.finditer(r"[\[{]", text):
         try:
-            value, _ = dec.raw_decode(text[m.start():])
-            values.append(value)
+            value, n = dec.raw_decode(text[m.start():])
         except json.JSONDecodeError:
             continue
-    if values:
-        # Pick the strongest structure, not the LAST-scanned fragment:
-        # the scan above also enters every INNER object, so a reversed
-        # first-hit would return the final single item of a multi-box
-        # reply (truncating 1-3 candidates to the last one). Priority:
-        # candidate_groups dict > official cookbook ARRAY of
-        # {"bbox_2d", "label"} items > one bare box dict.
-        def _has_bbox(v) -> bool:
-            return (isinstance(v, dict)
-                    and any(k in v for k in ("bbox_2d", "bbox", "box")))
+        frags.append((m.start(), m.start() + n, value))
+    if not frags:
+        return []
+    # keep only TOP-LEVEL fragments: the scan also enters every INNER
+    # object/array of a valid reply, and those nested decodes are
+    # partial copies of the same items
+    tops = [v for s, e, v in frags
+            if not any((s2, e2) != (s, e) and s2 <= s and e <= e2
+                       for s2, e2, _ in frags)]
 
-        best, best_rank = None, -1
-        for value in values:
-            if (isinstance(value, dict)
-                    and ("candidate_groups" in value or "groups" in value)):
-                rank = 3
-            elif (isinstance(value, list) and value
-                    and all(isinstance(x, dict) for x in value)
-                    and any(_has_bbox(x) for x in value)):
-                rank = 2
-            elif _has_bbox(value):
-                rank = 1
-            else:
-                continue
-            if rank > best_rank:
-                best, best_rank = value, rank
-        data = best
-    if data is None:
+    def _items(v):
+        if isinstance(v, dict):
+            if "candidate_groups" in v or "groups" in v:
+                inner = v.get("candidate_groups") or v.get("groups")
+                if isinstance(inner, list):
+                    return [i for i in inner if isinstance(i, dict)]
+                return []
+            return [v]
+        if isinstance(v, list):
+            return [x for x in v if isinstance(x, dict)]
         return []
-    if isinstance(data, dict):
-        items = data.get("candidate_groups") or data.get("groups") or [data]
-    elif isinstance(data, list):
-        items = data
-    else:
+
+    # three candidate pools; the fullest wins (a thin draft loses to
+    # the full final answer, and JSONL lines merge into one pool)
+    pools = []
+    wrapped = [v for v in tops if isinstance(v, dict)
+               and ("candidate_groups" in v or "groups" in v)]
+    if wrapped:
+        pools.append(max((_items(v) for v in wrapped), key=len))
+    arr_items = [i for v in tops if isinstance(v, list) for i in _items(v)]
+    if arr_items:
+        pools.append(arr_items)
+    dict_items = [i for v in tops
+                  if isinstance(v, dict) and "candidate_groups" not in v
+                  and "groups" not in v for i in _items(v)]
+    if dict_items:
+        pools.append(dict_items)
+    if not pools:
         return []
+    items = max(pools, key=len)
 
     def _bbox(raw):
         if raw is None:

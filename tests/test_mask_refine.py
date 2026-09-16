@@ -153,6 +153,31 @@ def test_box_groups_official_cookbook_array():
     print("PASS box groups (official cookbook array, no truncation)")
 
 
+def test_box_groups_jsonl_one_dict_per_line():
+    """JSONL reply: one bare {"bbox_2d": ...} object per line -- the
+    shape models emit when they follow the prompt's single-dict
+    example literally (user report: the answer held many instances,
+    groups had one). Every line's box must survive."""
+    reply = ('quality: good\n'
+             '{"bbox_2d": [100, 200, 500, 600], "label": "rack"}\n'
+             '{"bbox_2d": [300, 150, 480, 620], "label": "rack"}\n'
+             '{"bbox_2d": [50, 700, 120, 900], '
+             '"label": "open cabinet door"}')
+    groups = parse_box_groups(reply)
+    assert len(groups) == 3, \
+        f"a 3-line JSONL reply must parse in full, got {len(groups)}"
+    assert groups[0].bbox_norm == (100.0, 200.0, 500.0, 600.0)
+    assert groups[2].hypothesis == "open cabinet door"
+    # a draft single box followed by the final ARRAY: the array (5)
+    # must win over the stray draft dict (1)
+    draft = '{"bbox_2d": [10, 10, 20, 20], "label": "rack"}\n'
+    final = '[{"bbox_2d": [1, 2, 3, 4]}, {"bbox_2d": [5, 6, 7, 8]}, ' \
+            '{"bbox_2d": [9, 10, 11, 12]}, {"bbox_2d": [13, 14, 15, 16]}, ' \
+            '{"bbox_2d": [17, 18, 19, 20]}]'
+    assert len(parse_box_groups(draft + final)) == 5
+    print("PASS box groups (JSONL one-per-line merged in full)")
+
+
 def test_box_groups_long_row_budget():
     """The SAM-box call's token budget must hold a LONG joined row:
     dozens of cabinets, each its own bbox_2d item (plus door
