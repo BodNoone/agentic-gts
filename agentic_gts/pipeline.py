@@ -274,11 +274,49 @@ def run_pipeline(scene: Scene,
         yaw = float(opts["yaw"])
         print(f"[stage0] yaw pinned by caller: {math.degrees(yaw):.1f} deg "
               f"(estimation used for layout bootstrap only)")
-    elif "yaw" in scene.meta:
-        yaw = float(scene.meta["yaw"])
     else:
-        yaw = info["yaw"]
-        print(f"[stage0] estimated dominant yaw = {math.degrees(yaw):.1f} deg")
+        if "yaw" in scene.meta:
+            yaw = float(scene.meta["yaw"])
+        else:
+            yaw = info["yaw"]
+            print(f"[stage0] estimated dominant yaw = {math.degrees(yaw):.1f} deg")
+        # --- residual self-check: closed-loop hijack detector ---
+        # Rotate the cloud by -yaw and re-run the SAME estimator: a
+        # correct yaw leaves the rows axis-aligned (residual ~0); a
+        # hijacked one (wall / sloped floor pulling the histogram
+        # peak) leaves the TRUE rows tilted by the error angle, and
+        # the re-estimate returns it. The grounded nadir view is the
+        # pipeline's only box producer -- a tilted render makes the
+        # VLM draw AABBs over skewed rows, one rect swallowing
+        # several neighbouring devices (user report from a scene
+        # whose groundview rows were visibly not axis-aligned).
+        # Curved OUTER walls do not trip this: their energy spreads
+        # evenly over the angle histogram (a floor, not a competing
+        # peak). A residual that still exceeds the gate after ONE
+        # correction means a genuinely multi-directional layout --
+        # warned about, not looped on.
+        from agentic_gts.segment.orientation import estimate_residual_yaw
+        res = estimate_residual_yaw(scene.points, yaw)
+        if abs(res) > math.radians(5.0):
+            fixed = math.remainder(yaw + res, math.pi / 2)
+            if fixed >= math.pi / 4:
+                fixed -= math.pi / 2
+            elif fixed < -math.pi / 4:
+                fixed += math.pi / 2
+            print(f"[stage0] residual self-check FAILED "
+                  f"(residual {math.degrees(res):.1f} deg) -> "
+                  f"yaw corrected {math.degrees(yaw):.1f} -> "
+                  f"{math.degrees(fixed):.1f} deg")
+            yaw = fixed
+            res2 = estimate_residual_yaw(scene.points, yaw)
+            if abs(res2) > math.radians(5.0):
+                print(f"[stage0] WARNING: residual still "
+                      f"{math.degrees(res2):.1f} deg after correction -- "
+                      f"multi-directional layout? verify yaw_check.png "
+                      f"(kept the corrected yaw, no further loops)")
+        else:
+            print(f"[stage0] residual self-check passed "
+                  f"(residual {math.degrees(res):.1f} deg)")
     scene.meta["yaw"] = yaw
     if info.get("z_top") is not None:
         scene.meta["z_top"] = info["z_top"]
@@ -328,6 +366,50 @@ def run_pipeline(scene: Scene,
         _diag_support(scene)
         _eval("stageG")
         _render_stage(scene, "stageG_ground", out_dir, gt_boxes)
+
+        # --- grounding feedback: re-estimate yaw from the rect pool ---
+        # The pre-render residual self-check only sees what stage0's
+        # estimator sees (the WHOLE device band -- hijack soil). The
+        # grounded rects are a naturally PURER pool: the VLM kept only
+        # device structures, isolating walls/floor/trays outside. If
+        # the direction measured on that pool disagrees with the
+        # render yaw, the groundview was tilted and the VLM's AABBs
+        # over skewed rows are unreliable (one rect swallowing
+        # neighbouring devices) -> correct the yaw and re-ground
+        # ONCE. Never fires when the render was already straight.
+        if "yaw" not in opts and len(scene.boxes) >= 2:
+            band = scene.points[(scene.points[:, 2] > 0.30)
+                                & (scene.points[:, 2] < 2.5)]
+            pool = []
+            for b in scene.boxes:
+                inside = band[b.contains(band)]
+                if len(inside):
+                    pool.append(inside)
+            pool = np.vstack(pool) if pool else np.zeros((0, 3))
+            if len(pool) > 2_000:
+                from agentic_gts.segment.orientation import estimate_yaw
+                yaw_fb = estimate_yaw(pool)
+                delta = math.remainder(yaw_fb - float(scene.meta["yaw"]),
+                                       math.pi / 2)
+                if abs(delta) > math.radians(3.0):
+                    new_yaw = math.remainder(
+                        float(scene.meta["yaw"]) + delta, math.pi / 2)
+                    if new_yaw >= math.pi / 4:
+                        new_yaw -= math.pi / 2
+                    elif new_yaw < -math.pi / 4:
+                        new_yaw += math.pi / 2
+                    print(f"[stageG] grounding feedback: yaw "
+                          f"{math.degrees(float(scene.meta['yaw'])):.1f} -> "
+                          f"{math.degrees(new_yaw):.1f} deg "
+                          f"(delta {math.degrees(delta):.1f}, pool "
+                          f"{len(pool)} pts) -> re-rendering + re-grounding")
+                    scene.meta["yaw"] = new_yaw
+                    opts["yaw"] = new_yaw
+                    if ground_stage(scene, judge, out_dir):
+                        _diag_support(scene)
+                        _eval("stageG_reground")
+                        _render_stage(scene, "stageG_ground", out_dir,
+                                      gt_boxes)
 
     # --- stage C: agent loop (per-box local refine) ---
     agent = LayoutAgent(judge=judge, opts=opts, out_dir=out_dir)

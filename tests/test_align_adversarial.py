@@ -71,6 +71,32 @@ def test_align_and_yaw_on_adversarial_cloud():
     assert err < 3.0, f"yaw error {err:.1f} deg"
 
 
+def test_estimate_residual_yaw():
+    """Closed-loop residual: re-estimating on the -yaw-rotated cloud.
+
+    1. residual of the estimator's OWN answer must be ~0 (rotated
+       rows are axis-aligned -- the self-consistency the hijacked
+       first pass cannot fake);
+    2. a WRONG yaw claim (0 on a 20-deg layout) must be exposed: the
+       rotated rows sit at the error angle and the re-estimate
+       returns it as the residual."""
+    from agentic_gts.segment.orientation import estimate_residual_yaw
+    scene, _, _ = generate(SynthConfig(seed=7, room_yaw_deg=20))
+    pts = scene.points
+
+    y = estimate_yaw(pts)
+    r_self = estimate_residual_yaw(pts, y)
+    assert abs(math.degrees(r_self)) < 2.0, \
+        f"self-consistent yaw showed residual {math.degrees(r_self):.1f} deg"
+
+    r_wrong = estimate_residual_yaw(pts, 0.0)
+    assert 12.0 < math.degrees(r_wrong) < 28.0, \
+        f"20-deg layout claimed as 0 must expose ~20 deg residual, " \
+        f"got {math.degrees(r_wrong):.1f}"
+    print(f"PASS residual yaw (self={math.degrees(r_self):.1f} deg, "
+          f"wrong-claim={math.degrees(r_wrong):.1f} deg)")
+
+
 def test_align_with_subfloor_noise():
     """Regression: marginal noise spike BELOW the floor must not win.
 

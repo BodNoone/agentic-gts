@@ -28,6 +28,29 @@ def estimate_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
     return float(estimate_yaw_detailed(points, z_range, voxel)["yaw"])
 
 
+def estimate_residual_yaw(points: np.ndarray, yaw: float) -> float:
+    """Self-consistency residual of a yaw estimate (radians, folded to
+    [-pi/4, pi/4)).
+
+    Rotates the cloud by -yaw and re-runs the SAME estimator on the
+    result: if the yaw is right, the rotated rows are axis-aligned and
+    the re-estimate returns ~0; if the first pass was hijacked (a wall
+    or sloped floor pulling the histogram peak), the rotated rows sit
+    at the ERROR angle and the re-estimate returns it as the residual.
+    A closed-loop check the raw score cannot fake -- consistency, not
+    confidence. Curved walls do NOT trip it (their energy spreads
+    evenly over the angle histogram, adding a flat floor rather than
+    a competing peak); a large residual that PERSISTS after one
+    correction means a genuinely multi-directional layout.
+    """
+    c, s = math.cos(yaw), math.sin(yaw)
+    rot = np.array(points, dtype=np.float64, copy=True)
+    x, y = rot[:, 0].copy(), rot[:, 1].copy()
+    rot[:, 0] = c * x + s * y          # rotation by -yaw about +z
+    rot[:, 1] = -s * x + c * y
+    return float(estimate_yaw_detailed(rot)["yaw"])
+
+
 def estimate_yaw_detailed(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
                           voxel: float = 0.25) -> dict:
     """Same as estimate_yaw but returns intermediate results for diagnosis.
