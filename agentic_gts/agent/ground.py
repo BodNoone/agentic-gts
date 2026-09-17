@@ -217,14 +217,22 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
     # remnants across part of the groundview in stepped rooms).
     fl = _floor_map(points)
     h = points[:, 2] - fl(points[:, 0], points[:, 1])
+    # FLOOR cut for the RENDER: high on purpose (user directive --
+    # devices are tall and the nadir view only needs WHERE they are,
+    # not their full bodies). 3DGS floor gaussians are diffuse, their
+    # means float tens of cm above the slab, and the old 0.30m cut let
+    # them smear the whole view as a bright wash that buried the rows
+    # (user report: the floor rendering into the groundview). The FIT
+    # pool is cut independently in ground_stage (0.30m, keeps the whole
+    # device body), so fitting is unaffected.
     if np.isfinite(cut):
-        band = points[(h > 0.30) & (h < cut)]
+        band = points[(h > 0.80) & (h < cut)]
     else:
-        band = points[h > 0.30]
+        band = points[h > 0.80]
     if len(band) < 100:
-        # thin band (very low structures): drop ONLY the top cut, keep
-        # the floor cut -- falling back to the raw cloud would pull the
-        # ceiling back into the view, which is exactly what the cut
+        # thin band (very low structures: AC banks etc.): relax toward
+        # the old floor cut -- falling back to the RAW cloud would pull
+        # the ceiling back into the view, which is exactly what the cut
         # exists to remove
         band = points[h > 0.30]
     pts_rot = _rot_xy(band, -yaw)
@@ -268,12 +276,18 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
             gs = read_gaussian_ply(gs_ply)
             # same height-relative band over the gaussians (their means
             # drive the cut): the rasterizer's SCALAR cut_z / cut_z_low
-            # cannot express a per-section floor
+            # cannot express a per-section floor. Same high floor cut
+            # as the scatter band (0.80m): diffuse floor gaussians
+            # must not wash out the view.
             gm = np.asarray(gs.means, dtype=np.float64)
             hg = gm[:, 2] - fl(gm[:, 0], gm[:, 1])
-            keep = hg > 0.30
+            keep = hg > 0.80
             if np.isfinite(cut):
                 keep &= hg < cut
+            if keep.sum() < 100:       # very low structures: relax
+                keep = hg > 0.30
+                if np.isfinite(cut):
+                    keep &= hg < cut
             img = render_gs_view(gs, (), cam,
                                  cut_z=float("inf"),
                                  cut_z_low=float("-inf"),
