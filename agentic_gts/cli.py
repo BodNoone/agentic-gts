@@ -2,7 +2,7 @@
 
 Usage:
   python -m agentic_gts.cli synth --seed 42 --out runs/synth1
-  python -m agentic_gts.cli run   --point-cloud path.ply [--out runs/x]
+  python -m agentic_gts.cli run   --point-cloud gs.ply [--mesh-cloud mesh.ply] [--out runs/x]
 """
 from __future__ import annotations
 
@@ -28,7 +28,19 @@ def cmd_synth(args):
 
 
 def cmd_run(args):
-    pts = load_point_cloud(args.point_cloud)
+    # geometry source: the mesh-discretized cloud when given, else the
+    # --point-cloud input itself (GS centers for a gaussian ply). The
+    # mesh is coordinate-aligned with the 3DGS by contract, and 3DGS
+    # renders well but measures poorly (haze, floaters, sparse zones)
+    # while a mesh sampling is geometrically exact -- so every stage
+    # that MEASURES (yaw/bootstrap, region fits, column heights,
+    # thickness fallbacks) runs on the mesh, and every stage that
+    # RENDERS (groundview, local evidence views) still splats the GS.
+    mesh = getattr(args, "mesh_cloud", None)
+    pts = load_point_cloud(mesh) if mesh else load_point_cloud(args.point_cloud)
+    if mesh:
+        print(f"[cli] mesh cloud given ({len(pts)} pts): geometry stages "
+              f"run on the mesh, rendering stays 3DGS")
     if args.gt:
         # ground-truth boxes share the cloud's coordinate frame; transforming
         # the cloud alone would desynchronize them. Caller must pre-align.
@@ -167,6 +179,13 @@ def main():
 
     r = sub.add_parser("run", help="run pipeline on point cloud")
     r.add_argument("--point-cloud", required=True)
+    r.add_argument("--mesh-cloud", default=None, metavar="PATH",
+                   help="optional mesh-discretized point cloud, coordinate-"
+                        "aligned with the 3DGS: given, every geometry stage "
+                        "(yaw/bootstrap, region fits, heights, thickness "
+                        "fallbacks) runs on the mesh while rendering stays "
+                        "3DGS; omitted, the point cloud itself is the "
+                        "geometry source")
     r.add_argument("--gs-cams", default=None, metavar="PATH",
                    help="COLMAP training poses for render-trust scoring: "
                         "the sparse dir (e.g. sparse/0 containing "
