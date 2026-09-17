@@ -538,6 +538,109 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
                        meta={"n_pts": len(dev)})
 
 
+# a rect the VLM drew around TWO opposing rows (front + back, aisle
+# between) fits as one box with the UNION depth; no later stage can
+# split across the thickness (stageC spans project on the ROW axis)
+_MAX_DEVICE_DEPTH = 1.8
+_MIN_DEVICE_DEPTH = 0.40
+_SPLIT_MIN_GAP = 0.30
+
+
+def _cross_gap_split(v: np.ndarray, peak_frac: float = 0.25) -> float | None:
+    """Split coordinate of the most BALANCED interior weak run in a 1-D
+    cross-axis density profile, or None.
+
+    A gap qualifies when it is >= _SPLIT_MIN_GAP wide, interior (not
+    touching the profile edges) and BOTH sides keep a >=
+    _MIN_DEVICE_DEPTH strong span: a run with a single face-sheet on
+    one side is a rack INTERIOR (hollow row), not an aisle -- splitting
+    there shreds one row into its two faces. Among qualifying gaps the
+    most balanced split wins (minimises the wider side's strong span);
+    the caller recurses on any side still deeper than
+    _MAX_DEVICE_DEPTH, which handles 3+ rows in one rect.
+    """
+    if len(v) < 60:
+        return None
+    cell = 0.05
+    lo, hi = float(v.min()), float(v.max())
+    n = int(np.ceil((hi - lo) / cell)) + 1
+    if n < 5:
+        return None
+    edges = lo + cell * np.arange(n + 1)
+    hist, _ = np.histogram(v, bins=edges)
+    peak = int(hist.max())
+    if peak == 0:
+        return None
+    strong = hist >= peak_frac * peak
+    si = np.nonzero(strong)[0]
+    if len(si) == 0:
+        return None
+    first, last = int(si[0]), int(si[-1])
+    best = None                     # (wider_side_span, gap_lo, gap_hi)
+    i = first
+    while i <= last:
+        if strong[i]:
+            i += 1
+            continue
+        j = i
+        while j <= last and not strong[j]:
+            j += 1
+        # weak run bins [i, j-1] with strong bins at i-1 and j
+        g_lo, g_hi = float(edges[i]), float(edges[j])
+        if g_hi - g_lo >= _SPLIT_MIN_GAP:
+            l_span = g_lo - float(edges[first])
+            r_span = float(edges[last + 1]) - g_hi
+            if l_span >= _MIN_DEVICE_DEPTH and r_span >= _MIN_DEVICE_DEPTH:
+                wider = max(l_span, r_span)
+                if best is None or wider < best[0]:
+                    best = (wider, g_lo, g_hi)
+        i = j
+    if best is None:
+        return None
+    return 0.5 * (best[1] + best[2])
+
+
+def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
+                      floor_z: float = 0.0) -> list:
+    """Fit one rect, then split DEEP fits: a rect the VLM drew around
+    TWO opposing rows (front + back, an aisle between) fits as ONE box
+    with the union depth, and nothing downstream can split across the
+    thickness -- stageC's spans project on the ROW axis, so the two
+    rows stay glued forever (user report). No device category
+    (rack / cabinet / AC) is deeper than _MAX_DEVICE_DEPTH, so a deeper
+    fit is by construction multiple structures: split at the cross
+    profile's most balanced weak run (the aisle; hollow-rack interiors
+    fail the min-side-depth rule in _cross_gap_split) and refit each
+    side, recursively. Sides whose refit fails the guards (a wall
+    strip, a sliver) are dropped by _fit_region_box itself; if NO side
+    survives the original whole box is kept (recall first)."""
+    bb = _fit_region_box(points, rect, min_pts, floor_z)
+    if bb is None:
+        return []
+    axis = 1 if abs(float(bb.yaw)) < 1e-6 else 0   # cross axis of the fit
+    if bb.size[1] <= _MAX_DEVICE_DEPTH:
+        return [bb]
+    x0, y0, x1, y1 = rect
+    m = ((points[:, 0] >= x0) & (points[:, 0] <= x1) &
+         (points[:, 1] >= y0) & (points[:, 1] <= y1))
+    dev = points[m]
+    dev = dev[dev[:, 2] > floor_z + 0.30]
+    s = _cross_gap_split(dev[:, axis])
+    if s is None:
+        print(f"[ground] deep fit (depth {bb.size[1]:.2f}m) with no "
+              f"splittable aisle gap -> kept whole (back-to-back rows "
+              f"have no gap; the local refine still splits along-row)")
+        return [bb]
+    print(f"[ground] deep fit (depth {bb.size[1]:.2f}m) -> split at "
+          f"{'y' if axis else 'x'}={s:.2f} (two rows in one rect)")
+    subs = ((x0, y0, x1, s), (x0, s, x1, y1)) if axis == 1 \
+        else ((x0, y0, s, y1), (s, y0, x1, y1))
+    out = []
+    for sub in subs:
+        out.extend(_fit_region_boxes(points, sub, min_pts, floor_z))
+    return out or [bb]
+
+
 def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
                           bridge_tol: float = 0.50,
                           min_gap_pts: int = 15,
@@ -654,6 +757,11 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
         uw = _rot_xy(np.array([[(u[0] + u[2]) / 2.0,
                                 (u[1] + u[3]) / 2.0, 0.0]]), yaw)[0]
         fz = float(floor_at(uw[0], uw[1])) if floor_at is not None else 0.0
+        # SINGULAR fit on purpose: these members were bridged by a
+        # dense device band -- one verified continuous structure -- so
+        # the union refit must NOT re-split it across that bridge (the
+        # deep-split belongs to the per-RECT path, where the rect
+        # itself is the only evidence)
         bb = _fit_region_box(pts_fit, u, floor_z=fz)
         if bb is None:
             out.extend(boxes[i] for i in members)   # keep the pieces
@@ -768,19 +876,24 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         cw = _rot_xy(np.array([[(rect_r[0] + rect_r[2]) / 2.0,
                                 (rect_r[1] + rect_r[3]) / 2.0, 0.0]]),
                      yaw)[0]
-        bb = _fit_region_box(pts_fit, rect_r,
-                             floor_z=float(fl(cw[0], cw[1])))
-        if bb is None:
-            continue
-        c = _rot_xy(np.array([[bb.center[0], bb.center[1], 0.0]]), yaw)[0]
-        # bb.yaw is 0 (row along the rotated-x axis) or pi/2 (row along
-        # rotated-y): both rotate into the world by ADDING the frame yaw
-        box = OrientedBox(center=(float(c[0]), float(c[1]), bb.center[2]),
-                          size=bb.size, yaw=yaw + float(bb.yaw),
-                          device_type=DeviceType.RACK,
-                          meta={"grounded": True,
-                                "n_pts": bb.meta.get("n_pts", 0)})
-        boxes.append(box)
+        # _fit_region_boxes (plural): a deep fit -- the VLM drew ONE
+        # rect around two opposing rows -- splits at the aisle here,
+        # before the box enters the pipeline (stageC can only split
+        # along the row axis)
+        for bb in _fit_region_boxes(pts_fit, rect_r,
+                                    floor_z=float(fl(cw[0], cw[1]))):
+            c = _rot_xy(np.array([[bb.center[0], bb.center[1], 0.0]]),
+                        yaw)[0]
+            # bb.yaw is 0 (row along the rotated-x axis) or pi/2 (row
+            # along rotated-y): both rotate into the world by ADDING
+            # the frame yaw
+            box = OrientedBox(center=(float(c[0]), float(c[1]),
+                                      bb.center[2]),
+                              size=bb.size, yaw=yaw + float(bb.yaw),
+                              device_type=DeviceType.RACK,
+                              meta={"grounded": True,
+                                    "n_pts": bb.meta.get("n_pts", 0)})
+            boxes.append(box)
     if not boxes:
         print("[ground] no region survived the point-support guards")
         if out_dir:

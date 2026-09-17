@@ -350,6 +350,46 @@ def test_fit_region_box_stepped_floor():
           f"(bottom {bottom:.2f}, height {bb.size[2]:.2f})")
 
 
+def test_fit_region_boxes_two_rows_in_one_rect():
+    """One VLM rect drawn around TWO opposing rows (front + back, an
+    aisle between): the union-depth fit must SPLIT across the thickness
+    at the aisle -- stageC can never do it (its spans project on the
+    ROW axis). Hollow-rack interiors must NOT attract the split (the
+    min-side-depth rule rejects them: one face sheet on a side is a
+    row interior, not an aisle)."""
+    from agentic_gts.agent.ground import _fit_region_boxes
+    rng = np.random.default_rng(23)
+    row_a = _row_points(0.0, 6.0, y=-0.9, rng=rng)   # faces at -1.45/-0.35
+    row_b = _row_points(0.0, 6.0, y=+0.9, rng=rng)   # faces at +0.35/+1.45
+    pts = np.vstack([row_a, row_b])
+    rect = (-0.2, -1.7, 6.2, 1.7)                    # ONE rect, both rows
+    bbs = _fit_region_boxes(pts, rect)
+    assert len(bbs) == 2, \
+        f"two opposing rows in one rect must split, got {len(bbs)}"
+    for bb in bbs:
+        assert 0.85 < bb.size[1] < 1.35, \
+            f"split piece depth {bb.size[1]:.2f} (must be ONE row, ~1.1)"
+    ys = sorted(float(b.center[1]) for b in bbs)
+    assert abs(ys[0] + 0.9) < 0.15 and abs(ys[1] - 0.9) < 0.15, \
+        f"piece centres {ys} (must sit on the two rows, ~ +/-0.9)"
+    print(f"PASS deep rect split (2 rows, centres y={ys[0]:.2f}/{ys[1]:.2f}, "
+          f"depth {bbs[0].size[1]:.2f}/{bbs[1].size[1]:.2f})")
+
+
+def test_fit_region_boxes_solid_deep_structure_kept():
+    """A genuinely deep SOLID block with no aisle gap: no split is
+    possible (no weak run), and the fit must stay whole rather than
+    be shredded at a spurious location."""
+    from agentic_gts.agent.ground import _fit_region_boxes
+    rng = np.random.default_rng(24)
+    solid = rng.uniform([0.0, 0.0, 0.0], [4.0, 2.2, 2.1], (12000, 3))
+    bbs = _fit_region_boxes(solid, (-0.2, -0.2, 4.2, 2.4))
+    assert len(bbs) == 1, \
+        f"a solid deep block has no gap to split at, got {len(bbs)}"
+    assert 2.0 < bbs[0].size[1] < 2.45, "depth must stay the whole extent"
+    print(f"PASS solid deep block kept whole (depth {bbs[0].size[1]:.2f})")
+
+
 def test_ground_stage_row_along_y():
     """End-to-end grounding of a joined row running along the y-axis:
     the emitted box must carry yaw = pi/2, or the downstream local
@@ -858,6 +898,8 @@ if __name__ == "__main__":
     test_fit_region_box_starved_back_face()
     test_floor_map_stepped()
     test_fit_region_box_stepped_floor()
+    test_fit_region_boxes_two_rows_in_one_rect()
+    test_fit_region_boxes_solid_deep_structure_kept()
     test_robust_span_bin_boundary()
     test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()
