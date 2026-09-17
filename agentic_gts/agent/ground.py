@@ -38,7 +38,7 @@ def _rot_xy(pts: np.ndarray, yaw: float) -> np.ndarray:
 
 # ---------- grounding evidence render ----------
 
-def _render_cut(top: float | None) -> float:
+def _render_cut(top: float | None, mesh_mode: bool = False) -> float:
     """Nadir RENDER cut height, relative to the device top.
 
     min(top - 0.10, max(0.70 * top, 1.0)):
@@ -50,11 +50,20 @@ def _render_cut(top: float | None) -> float:
         top - 0.10 cap: a 0.9m-high device bank cuts at 0.8m, keeping
         nearly everything -- only tall structures get the relative trim;
       * no reference at all -> inf (render the full height band).
+
+    mesh_mode: a mesh sampling makes overhead cable trays REAL dense
+    gapless geometry that connects to the rack tops -- the anchored
+    density walk runs right up them, so z_top itself is dragged to the
+    tray top and the 0.70 trim no longer clears them (user report:
+    trays visible in the groundview, confusing the VLM). Cut at HALF
+    height instead: a nadir view only needs WHERE the tall devices
+    are, and no device category is invisible at half its height.
     """
     if not top:
         return float("inf")
     top = float(top)
-    return min(top - 0.10, max(0.70 * top, 1.0))
+    frac = 0.50 if mesh_mode else 0.70
+    return min(top - 0.10, max(frac * top, 1.0))
 
 
 def _floor_map(points: np.ndarray, grid: float = 1.5, band: float = 1.0,
@@ -220,7 +229,7 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
     # (top + 0.10 in ground_stage), so fitted box heights keep the true
     # rack top no matter how deep this renders.
     top = float(scene.meta["z_top"]) if scene.meta.get("z_top") else None
-    cut = _render_cut(top)
+    cut = _render_cut(top, mesh_mode=bool(scene.meta.get("geometry_is_mesh")))
     # stepped-floor support: the heightmap restores a per-SECTION zero
     # (align_to_ground levels only the dominant floor). h = z - local
     # floor turns both cuts into HEIGHTS, valid over raised / sunken

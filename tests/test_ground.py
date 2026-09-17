@@ -390,6 +390,23 @@ def test_fit_region_boxes_solid_deep_structure_kept():
     print(f"PASS solid deep block kept whole (depth {bbs[0].size[1]:.2f})")
 
 
+def test_render_cut_mesh_mode():
+    """mesh_mode trims the nadir render at HALF height: mesh cable
+    trays are real gapless geometry that drags z_top up with them, so
+    the 0.70 trim no longer clears them (user report)."""
+    from agentic_gts.agent.ground import _render_cut
+    gs = _render_cut(2.5)
+    mesh = _render_cut(2.5, mesh_mode=True)
+    assert gs == min(2.5 - 0.10, max(0.70 * 2.5, 1.0)) == 1.75
+    assert mesh == min(2.5 - 0.10, max(0.50 * 2.5, 1.0)) == 1.25
+    # a tray-inflated top (3.2m) still cuts BELOW the tray band (~2.2m)
+    assert _render_cut(3.2, mesh_mode=True) <= 1.6, \
+        "half-height cut must clear tray geometry dragged into z_top"
+    # low structures keep the 1.0m floor in both modes
+    assert _render_cut(0.9, mesh_mode=True) == 0.8
+    print(f"PASS render cut mesh mode (gs {gs}, mesh {mesh})")
+
+
 def test_floor_map_mesh_mode():
     """mesh_mode: a mesh sampling has no under-floor haze, so a tile's
     floor is its plain MINIMUM z -- even when the slab is sparsely
@@ -991,6 +1008,7 @@ if __name__ == "__main__":
     test_fit_region_box_starved_back_face()
     test_floor_map_stepped()
     test_fit_region_box_stepped_floor()
+    test_render_cut_mesh_mode()
     test_floor_map_mesh_mode()
     test_fit_region_boxes_two_rows_in_one_rect()
     test_fit_region_boxes_solid_deep_structure_kept()
