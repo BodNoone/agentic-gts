@@ -114,7 +114,69 @@ def _floor_map(points: np.ndarray, grid: float = 1.5, band: float = 1.0,
     return _fl
 
 
-def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024):
+def _layout_frame(scene, yaw: float):
+    """Rotated-frame AABB of the bootstrap layout (device cells /
+    footprint), or None. The kept CELLS are rotated by the ACTUAL yaw
+    and AABB'd ONCE: rotating the world-frame device_footprint AABB
+    instead double-inflates for rotated layouts (AABB of a 45-deg
+    row, then AABB of rotating that box)."""
+    cells = scene.meta.get("device_cells")
+    if cells is not None and len(cells):
+        cr = _rot_xy(np.column_stack([cells,
+                                      np.zeros(len(cells))]), -yaw)
+        return cr.min(axis=0), cr.max(axis=0)
+    fp = scene.meta.get("device_footprint")
+    if fp:
+        corners_w = np.array([[fp[0], fp[1]], [fp[2], fp[1]],
+                              [fp[2], fp[3]], [fp[0], fp[3]]])
+        cr = _rot_xy(np.column_stack([corners_w,
+                                      np.zeros(4)]), -yaw)
+        return cr.min(axis=0), cr.max(axis=0)
+    return None
+
+
+# a single nadir view's usable ground span: past this the camera
+# climbs so high that a 0.6m cabinet renders a dozen pixels wide and
+# grounding degrades into whole-room bands (user report: walls boxed
+# as long rows). Below it, one view one VLM call, exactly as before.
+_MAX_SINGLE_SPAN = 25.0
+_TILE_OVERLAP = 2.5
+
+
+def _tile_frames(layout):
+    """Overlapping tile frames covering the rotated-frame layout AABB,
+    or None when a SINGLE nadir view suffices.
+
+    Tiling trades VLM calls for ground resolution (user directive:
+    small rooms must NOT be tiled). Tiles overlap by _TILE_OVERLAP so
+    every structure on a boundary appears WHOLE in at least one tile;
+    the cross-tile duplicates and seams heal downstream in the shared
+    world frame -- overlapping rects of one structure die in the
+    IoU/containment dedup, tile-cut row pieces rejoin in the
+    density-bridged adjacency merge.
+    """
+    if layout is None:
+        return None
+    lo, hi = layout
+
+    def _axis(a0, a1):
+        span = float(a1 - a0)
+        if span <= _MAX_SINGLE_SPAN:
+            return [(float(a0), float(a1))]
+        n = int(np.ceil((span - _TILE_OVERLAP)
+                        / (_MAX_SINGLE_SPAN - _TILE_OVERLAP)))
+        w = (span + (n - 1) * _TILE_OVERLAP) / n   # exact cover
+        step = w - _TILE_OVERLAP
+        return [(a0 + i * step, a0 + i * step + w) for i in range(n)]
+
+    xs, ys = _axis(lo[0], hi[0]), _axis(lo[1], hi[1])
+    if len(xs) == 1 and len(ys) == 1:
+        return None
+    return [(x[0], y[0], x[1], y[1]) for x in xs for y in ys]
+
+
+def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
+                    frame=None):
     """Base top-down render, no overlays. Camera fitted over the
     yaw-rotated cloud (rows parallel to the image axes), then rotated
     back into world so the GS render and the pixel back-projection
@@ -127,7 +189,8 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024):
 
     Framing and ceiling cut both come from the stage0 bootstrap
     byproducts (scene.meta z_top + device_footprint): there is no
-    hint-box input anymore.
+    hint-box input anymore. `frame` (rotated-frame AABB) overrides the
+    framing for TILED views over a big layout (ground resolution).
 
     Returns (img_float, cam, W, H).
     """
@@ -169,26 +232,16 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024):
     # directive: the cloud-framed version raised the camera to fit
     # walls too, and the racks rendered small). Walls were already
     # dropped as boundary cells, so the framing hugs the layout.
-    # The kept CELLS are rotated by the ACTUAL yaw and AABB'd ONCE:
-    # rotating the world-frame device_footprint AABB instead double-
-    # inflates for rotated layouts (AABB of a 45-deg row, then AABB
-    # of rotating that box) -- the camera rose and the view came back
-    # mostly empty.
+    # `frame` (tiled views over a big layout) overrides it.
     boxes_rot = []
     lo = hi = None
-    cells = scene.meta.get("device_cells")
-    if cells is not None and len(cells):
-        cr = _rot_xy(np.column_stack([cells,
-                                       np.zeros(len(cells))]), -yaw)
-        lo, hi = cr.min(axis=0), cr.max(axis=0)
+    if frame is not None:
+        lo, hi = np.asarray(frame[:2], dtype=float), \
+            np.asarray(frame[2:], dtype=float)
     else:
-        fp = scene.meta.get("device_footprint")
-        if fp:
-            corners_w = np.array([[fp[0], fp[1]], [fp[2], fp[1]],
-                                  [fp[2], fp[3]], [fp[0], fp[3]]])
-            cr = _rot_xy(np.column_stack([corners_w,
-                                          np.zeros(4)]), -yaw)
-            lo, hi = cr.min(axis=0), cr.max(axis=0)
+        lh = _layout_frame(scene, yaw)
+        if lh is not None:
+            lo, hi = lh
     if lo is not None:
         c = (lo + hi) / 2.0
         boxes_rot.append(OrientedBox(
@@ -812,27 +865,51 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
               "-> nothing to ground")
         return False
     yaw = float(scene.meta.get("yaw", 0.0) or 0.0)
+    # ---- views: one nadir view, or TILES over a big layout ----
+    # A single view must fit the whole layout; past ~25m of span the
+    # camera climbs so high that cabinets render a dozen pixels wide
+    # and grounding degrades into whole-room bands (user report:
+    # walls boxed as long rows). Tiles overlap so boundary structures
+    # appear whole in at least one; duplicates/seams heal in the
+    # shared world frame (dedup + density-bridged merge). Every tile
+    # is one extra VLM call, so a layout that fits stays single-view
+    # (user directive: small rooms must not be tiled).
     try:
-        img, cam, W, H = _render_topdown(scene, yaw)
-        png = png_bytes(img)           # CLEAN view: no overlays
-    except Exception as e:
-        print(f"[ground] nadir render failed ({type(e).__name__}: {e})")
-        return False
-    png_path = None
-    if out_dir:
-        png_path = os.path.join(out_dir, "groundview.png")
+        tiles = _tile_frames(_layout_frame(scene, yaw))
+    except Exception:
+        tiles = None
+    views = []                       # (img, cam, W, H, fname, rects)
+    view_specs = [("groundview.png", None)] if tiles is None else \
+        [(f"groundview_t{i}.png", fr) for i, fr in enumerate(tiles)]
+    if tiles is not None:
+        print(f"[ground] layout exceeds a single nadir view "
+              f"(>{_MAX_SINGLE_SPAN:.0f}m span) -> {len(tiles)} tiled "
+              f"views ({len(tiles)} VLM calls)")
+    for fname, fr in view_specs:
         try:
-            with open(png_path, "wb") as f:
-                f.write(png)
+            img, cam, W, H = _render_topdown(scene, yaw, frame=fr)
+            png = png_bytes(img)     # CLEAN view: no overlays
         except Exception as e:
-            print(f"[ground] png save failed ({type(e).__name__})")
-            png_path = None
-    rects = judge.ground_regions(png, W, H, png_path=png_path)
-    print(f"[ground] nadir view: {len(rects)} regions")
-    if not rects:
+            print(f"[ground] nadir render failed ({type(e).__name__}: {e})")
+            continue
+        png_path = None
+        if out_dir:
+            png_path = os.path.join(out_dir, fname)
+            try:
+                with open(png_path, "wb") as f:
+                    f.write(png)
+            except Exception as e:
+                print(f"[ground] png save failed ({type(e).__name__})")
+                png_path = None
+        rects = judge.ground_regions(png, W, H, png_path=png_path)
+        print(f"[ground] view {fname}: {len(rects)} regions")
+        views.append((img, cam, W, H, fname, rects))
+    if not views:
+        return False                 # every render failed (logged above)
+    if not any(v[5] for v in views):
         print("[ground] VLM returned no usable regions")
         if out_dir:
-            _save_grounded_fail_png(img, out_dir,
+            _save_grounded_fail_png(views[0][0], out_dir,
                                     "VLM returned no usable regions")
         return False
     # FIT points: the device band only. The render band cuts lower
@@ -869,10 +946,12 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # over-split pieces of one structure merge right after the dedup
     # (below) -- the local refine then splits the merged unions, so
     # structure membership is decided on refinement evidence, never
-    # pre-merged beyond touching pieces.
+    # pre-merged beyond touching pieces. Rects from ALL views (single
+    # or tiled) fit through their OWN camera -- pixel coords only mean
+    # something relative to the view they were drawn on.
     boxes = []
-    for r in rects:
-        rect_r = _frame_rect(cam, r, 1.0)
+    for cam_v, r in [(v[1], r) for v in views for r in v[5]]:
+        rect_r = _frame_rect(cam_v, r, 1.0)
         # the rect's own LOCAL floor (stepped rooms): the section's
         # slab height, looked up at the rect's world centre
         cw = _rot_xy(np.array([[(rect_r[0] + rect_r[2]) / 2.0,
@@ -899,10 +978,12 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     if not boxes:
         print("[ground] no region survived the point-support guards")
         if out_dir:
-            _save_grounded_fail_png(img, out_dir,
+            _save_grounded_fail_png(views[0][0], out_dir,
                                     "no region survived point-support guards")
         return False
-    print(f"[ground] {len(rects)} VLM regions -> {len(boxes)} fitted boxes")
+    n_rects_total = sum(len(v[5]) for v in views)
+    print(f"[ground] {n_rects_total} VLM regions "
+          f"({len(views)} view(s)) -> {len(boxes)} fitted boxes")
     # DEDUPLICATE: the VLM often outlines the SAME device more than
     # once (overlapping rects in one reply). Each rect fits its own
     # near-identical box with a DIFFERENT box_id, and the per-box local
@@ -934,10 +1015,14 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # refine's job.
     boxes = _merge_adjacent_boxes(boxes, pts_fit, yaw, floor_at=fl)
     scene.boxes = boxes
-    # result audit: the grounded.png shows the view's own raw VLM rects
+    # result audit: one image per view -- the view's own raw VLM rects
     # (colored) plus the final fitted boxes (red) projected through the
-    # same camera
+    # same camera. Tiled views draw ALL boxes (cross-tile ones project
+    # outside the frame), so each tile's audit stays self-contained.
     if out_dir:
-        _save_grounded_png(img, cam, boxes, rects, out_dir,
-                           fname="grounded.png")
+        for img_v, cam_v, _, _, fname_v, rects_v in views:
+            _save_grounded_png(
+                img_v, cam_v, boxes, rects_v, out_dir,
+                fname=("grounded.png" if tiles is None else
+                       fname_v.replace("groundview", "grounded")))
     return True

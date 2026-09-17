@@ -390,6 +390,79 @@ def test_fit_region_boxes_solid_deep_structure_kept():
     print(f"PASS solid deep block kept whole (depth {bbs[0].size[1]:.2f})")
 
 
+def test_tile_frames():
+    """Tiling decision: a layout that fits ONE nadir view stays
+    single-view (no extra VLM calls); a big layout tiles with exact
+    cover, bounded span and >= overlap so boundary structures appear
+    whole in at least one tile."""
+    from agentic_gts.agent.ground import (_MAX_SINGLE_SPAN, _TILE_OVERLAP,
+                                           _tile_frames)
+    assert _tile_frames(None) is None, "no layout -> single view"
+    assert _tile_frames((np.array([0.0, 0.0]), np.array([20.0, 12.0]))) \
+        is None, "20x12m fits one view -> single view"
+    tiles = _tile_frames((np.array([0.0, 0.0]), np.array([60.0, 12.0])))
+    assert tiles is not None, "60m span must tile"
+    assert all(len(t) == 4 for t in tiles)
+    xs = sorted(set((t[0], t[2]) for t in tiles))
+    # exact cover of the split axis, span bounded, seams >= overlap
+    assert xs[0][0] <= 0.0 and xs[-1][1] >= 60.0
+    for (a0, a1), (b0, b1) in zip(xs, xs[1:]):
+        assert b1 - b0 <= _MAX_SINGLE_SPAN + 1e-9
+        assert a1 - b0 >= _TILE_OVERLAP - 1e-9, \
+            f"adjacent tiles must overlap >= {_TILE_OVERLAP}m"
+    for t in tiles:
+        assert t[2] - t[0] <= _MAX_SINGLE_SPAN + 1e-9
+    print(f"PASS tile frames (60m -> {len(tiles)} tiles, seams ok)")
+
+
+def test_ground_stage_tiled_views():
+    """End-to-end TILED grounding: a 40m layout exceeds one nadir view,
+    so the stage renders per-tile cameras and calls the VLM once per
+    tile; per-tile rects back-project through their OWN camera and the
+    cross-tile row pieces must heal (adjacency merge) into the one
+    40m row. Small layouts stay single-view (previous tests)."""
+    import json as _json
+    import os as _os
+    import tempfile
+    from agentic_gts.agent import ground
+    from agentic_gts.agent.judge import VLMJudge
+
+    rng = np.random.default_rng(31)
+    pts = _row_points(0.0, 40.0, y=0.0, rng=rng, n=20000)
+    scene = Scene(points=pts)
+    scene.meta["yaw"] = 0.0
+    _bootstrap_meta(scene, (-0.5, -0.8, 40.5, 0.8))
+    scene.boxes = []
+    # the VLM outlines the WHOLE tile (full-image rect) on every call
+    reply = ("One long joined row.\n" + _json.dumps(
+        [{"bbox_2d": [0, 0, 1000, 1000], "label": "row"}]))
+    judge = VLMJudge(backend="qwen")
+    judge._qwen_image_call = lambda png, prompt, *a, **k: reply
+    with tempfile.TemporaryDirectory() as td:
+        calls = []
+        orig = judge._qwen_image_call
+
+        def _count(png, prompt, *a, **k):
+            calls.append(1)
+            return orig(png, prompt, *a, **k)
+        judge._qwen_image_call = _count
+        ok = ground.ground_stage(scene, judge, out_dir=td)
+        assert ok, "tiled grounding must succeed"
+        assert len(calls) >= 2, \
+            f"a 40m layout must be tiled (>=2 VLM calls), got {len(calls)}"
+        assert _os.path.exists(_os.path.join(td, "groundview_t0.png")) \
+            and _os.path.exists(_os.path.join(td, "grounded_t0.png")), \
+            "tiled audit renders must be saved per tile"
+        assert len(scene.boxes) == 1, \
+            f"cross-tile row pieces must merge into one, " \
+            f"got {len(scene.boxes)}"
+        b = scene.boxes[0]
+        assert 38.0 < b.size[0] < 41.5, \
+            f"merged row length {b.size[0]:.2f} (want ~40m)"
+        print(f"PASS tiled grounding ({len(calls)} VLM calls -> "
+              f"{len(scene.boxes)} merged row of {b.size[0]:.1f}m)")
+
+
 def test_ground_stage_row_along_y():
     """End-to-end grounding of a joined row running along the y-axis:
     the emitted box must carry yaw = pi/2, or the downstream local
@@ -900,6 +973,8 @@ if __name__ == "__main__":
     test_fit_region_box_stepped_floor()
     test_fit_region_boxes_two_rows_in_one_rect()
     test_fit_region_boxes_solid_deep_structure_kept()
+    test_tile_frames()
+    test_ground_stage_tiled_views()
     test_robust_span_bin_boundary()
     test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()
