@@ -41,6 +41,7 @@ def cmd_run(args):
     if mesh:
         print(f"[cli] mesh cloud given ({len(pts)} pts): geometry stages "
               f"run on the mesh, rendering stays 3DGS")
+        scene_is_mesh = True
     if args.gt:
         # ground-truth boxes share the cloud's coordinate frame; transforming
         # the cloud alone would desynchronize them. Caller must pre-align.
@@ -50,6 +51,11 @@ def cmd_run(args):
         pts = denoise_cloud(pts)
         pts = align_to_ground(pts)
     scene = Scene(points=pts)
+    # geometry-source flag: a mesh sampling has no haze / floaters /
+    # under-floor diffusion -- every "robust" estimator downstream can
+    # take its simple (min / percentile) form when this is set
+    if mesh:
+        scene.meta["geometry_is_mesh"] = True
     # remember the 3DGS source so VLM evidence renders are TRUE splat renders
     # (needs gsplat / diff_gaussian_rasterization at render time; scatter
     # fallback otherwise)

@@ -390,6 +390,26 @@ def test_fit_region_boxes_solid_deep_structure_kept():
     print(f"PASS solid deep block kept whole (depth {bbs[0].size[1]:.2f})")
 
 
+def test_floor_map_mesh_mode():
+    """mesh_mode: a mesh sampling has no under-floor haze, so a tile's
+    floor is its plain MINIMUM z -- even when the slab is sparsely
+    sampled (min_pts relaxed) and there are no points below the floor
+    to trick a percentile."""
+    from agentic_gts.agent.ground import _floor_map
+    rng = np.random.default_rng(25)
+    slab_lo = rng.uniform([-6, -4, 0.0], [0, 4, 0.02], (400, 3))
+    slab_hi = rng.uniform([0, -4, 0.40], [6, 4, 0.42], (400, 3))
+    racks = np.vstack([
+        rng.uniform([-4.5, -3.0, 0.0], [-3.5, 3.0, 2.1], (3000, 3)),
+        rng.uniform([1.0, -3.0, 0.40], [2.0, 3.0, 2.50], (3000, 3))])
+    pts = np.vstack([slab_lo, slab_hi, racks])
+    fl = _floor_map(pts, mesh_mode=True)
+    f_lo, f_hi = float(fl(-3.0, 0.0)), float(fl(3.0, 0.0))
+    assert -0.05 < f_lo <= 0.02, f"lower floor {f_lo:.3f} (want the min)"
+    assert 0.38 < f_hi <= 0.42, f"raised floor {f_hi:.3f} (want the min)"
+    print(f"PASS floor map mesh mode (lower {f_lo:.3f}, raised {f_hi:.3f})")
+
+
 def test_tile_frames():
     """Tiling decision: a layout that fits ONE nadir view stays
     single-view (no extra VLM calls); a big layout tiles with exact
@@ -971,6 +991,7 @@ if __name__ == "__main__":
     test_fit_region_box_starved_back_face()
     test_floor_map_stepped()
     test_fit_region_box_stepped_floor()
+    test_floor_map_mesh_mode()
     test_fit_region_boxes_two_rows_in_one_rect()
     test_fit_region_boxes_solid_deep_structure_kept()
     test_tile_frames()

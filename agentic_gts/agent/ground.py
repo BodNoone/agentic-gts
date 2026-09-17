@@ -58,7 +58,7 @@ def _render_cut(top: float | None) -> float:
 
 
 def _floor_map(points: np.ndarray, grid: float = 1.5, band: float = 1.0,
-               min_pts: int = 30):
+               min_pts: int = 30, mesh_mode: bool = False):
     """Per-tile LOCAL floor z for stepped rooms (small level changes).
 
     align_to_ground levels the DOMINANT floor to z=0; a raised (or
@@ -80,6 +80,11 @@ def _floor_map(points: np.ndarray, grid: float = 1.5, band: float = 1.0,
     without enough support fall back to the global dominant level
     (P2 of the whole cloud, ~= 0 after alignment).
 
+    mesh_mode (geometry from a discretized MESH): no haze / floaters
+    / under-floor diffusion exist, so a tile's floor is simply its
+    MINIMUM z -- no near-ground band, no percentile, no support
+    threshold (user simplification).
+
     Returns a callable f(x, y) -> floor z (scalar or array input).
     """
     P = np.asarray(points, dtype=np.float64)
@@ -87,8 +92,16 @@ def _floor_map(points: np.ndarray, grid: float = 1.5, band: float = 1.0,
         base = float(np.percentile(P[:, 2], 2)) if len(P) else 0.0
         return lambda x, y: base
     base = float(np.percentile(P[:, 2], 2))
-    near = P[P[:, 2] < base + band]
-    if len(near) < 100:
+    # MESH geometry (user simplification): a mesh sampling carries no
+    # under-floor diffusion / floaters, so a tile's floor is simply its
+    # minimum z -- no near-ground band, no P2, no fallbacks. The GS
+    # branch below keeps all of that: gaussian means smear below and
+    # around the slab, and a bare min would chase haze.
+    near = P if mesh_mode else P[P[:, 2] < base + band]
+    min_pts_eff = 3 if mesh_mode else min_pts
+    stat = (lambda z: float(np.min(z))) if mesh_mode \
+        else (lambda z: float(np.percentile(z, 2)))
+    if len(near) < (10 if mesh_mode else 100):
         return lambda x, y: base
     ix = np.floor(near[:, 0] / grid).astype(np.int64)
     iy = np.floor(near[:, 1] / grid).astype(np.int64)
@@ -98,7 +111,7 @@ def _floor_map(points: np.ndarray, grid: float = 1.5, band: float = 1.0,
     inv_s, z_s = inv[order], near[order][:, 2]
     starts = np.searchsorted(inv_s, np.arange(len(keys)))
     ends = np.searchsorted(inv_s, np.arange(len(keys)), side="right")
-    fz = np.array([np.percentile(z_s[s:e], 2) if e - s >= min_pts
+    fz = np.array([stat(z_s[s:e]) if e - s >= min_pts_eff
                    else base for s, e in zip(starts, ends)])
     i0, j0 = keys[:, 0].min(), keys[:, 1].min()
     G = np.full((keys[:, 0].max() - i0 + 1, keys[:, 1].max() - j0 + 1),
@@ -215,7 +228,8 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
     # that section's FLOOR, not a device) and the ceiling cut no
     # longer sits a step too high over it (user report: ceiling
     # remnants across part of the groundview in stepped rooms).
-    fl = _floor_map(points)
+    fl = _floor_map(points,
+                    mesh_mode=bool(scene.meta.get("geometry_is_mesh")))
     h = points[:, 2] - fl(points[:, 0], points[:, 1])
     # FLOOR cut for the RENDER: high on purpose (user directive --
     # devices are tall and the nadir view only needs WHERE they are,
@@ -937,7 +951,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # to the local floor (stepped rooms: a raised section's slab is
     # that section's floor, and its racks are NOT a step taller).
     P = np.asarray(scene.points, dtype=np.float64)
-    fl = _floor_map(P)
+    fl = _floor_map(P, mesh_mode=bool(scene.meta.get("geometry_is_mesh")))
     h_fit = P[:, 2] - fl(P[:, 0], P[:, 1])
     fit_top = float(scene.meta.get("z_top", 2.5) or 2.5)
     pts_fit = _rot_xy(P[(h_fit > 0.30) & (h_fit <= fit_top + 0.10)], -yaw)
