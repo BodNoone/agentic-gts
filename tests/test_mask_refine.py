@@ -13,9 +13,62 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agentic_gts.agent.mask_refine import (
     BoxGroup, SamPredictorAdapter, parse_box_groups,
-    refine_box,
+    refine_box, _anchored_top,
 )
 from agentic_gts.core.models import OrientedBox, Scene
+
+
+def _column(bins: list[tuple[float, float, int]], seed: int = 0):
+    """Build a synthetic z-column: [(z0, z1, per-bin count)] -> points
+    uniformly spread inside each band (rng-jittered so bins stay
+    non-degenerate)."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for z0, z1, n in bins:
+        if n <= 0:
+            continue
+        out.append(rng.uniform(z0, z1, n))
+    return np.concatenate(out) if out else np.zeros(0)
+
+
+def test_anchored_top_haze_tail_does_not_extend_body():
+    """3DGS haze diffuses through the whole column: bins ABOVE the
+    cabinet stay non-empty at a fraction of the body density. The old
+    static threshold (whole-column median) sank below the haze density
+    and the walk connected to the floater layer -- heights far above
+    the device tops (user report). The body-anchored running threshold
+    must stop at the body top."""
+    # body 0.05..2.00 @300/bin, haze 2.00..3.00 @90/bin (30% of body)
+    pts = _column([(0.05 + 0.05 * i, 0.10 + 0.05 * i, 300)
+                   for i in range(39)]
+                  + [(2.00 + 0.05 * i, 2.05 + 0.05 * i, 90)
+                     for i in range(20)])
+    top = _anchored_top(pts)
+    assert top is not None
+    assert top <= 2.15, f"haze tail extended the top to {top:.2f} m"
+
+
+def test_anchored_top_clean_column_and_thin_gap():
+    """Clean body: top lands on the upper body edge (a weakened top
+    bin at 50% of the body still passes body_frac=0.35), and a thin
+    mid-body gap (<= 2 empty bins) is bridged, not terminal."""
+    # body to 2.0, topmost bin weakened to 150 (50% of 300)
+    pts = _column([(0.05 + 0.05 * i, 0.10 + 0.05 * i, 300)
+                   for i in range(38)]
+                  + [(1.95, 2.00, 150)])
+    top = _anchored_top(pts)
+    assert top is not None and abs(top - 2.00) < 0.03, \
+        f"clean body top {top:.2f}, expected ~2.00"
+
+    # thin 5cm gap at 1.00-1.05 (1 empty bin; max_gap=2 breaks at 2)
+    # -> run continues to 2.0
+    pts2 = _column([(0.05 + 0.05 * i, 0.10 + 0.05 * i, 300)
+                    for i in range(20)]
+                   + [(1.10 + 0.05 * i, 1.15 + 0.05 * i, 300)
+                      for i in range(18)])
+    top2 = _anchored_top(pts2)
+    assert top2 is not None and top2 >= 1.95, \
+        f"5cm mid-body gap terminated the walk at {top2:.2f}"
 
 
 def test_box_groups_qwen_1000_to_pixels_once():

@@ -812,7 +812,7 @@ def _merge_spans(spans: list) -> list:
 
 
 def _anchored_top(v: np.ndarray, cell: float = 0.05, dens_frac: float = 0.20,
-                  max_gap: int = 2, floor: int = 5):
+                  body_frac: float = 0.35, max_gap: int = 2, floor: int = 5):
     """Top of the density-CONNECTED column anchored at the bottom.
 
     Why not a percentile (or _robust_span): a device body is a column
@@ -826,6 +826,17 @@ def _anchored_top(v: np.ndarray, cell: float = 0.05, dens_frac: float = 0.20,
     upward from the anchor, keeping the run alive only through thin
     gaps (<= max_gap bins), stops at the first real void -- the body's
     top -- wherever the floating layer sits.
+
+    The walk threshold is anchored to the CONFIRMED BODY, not to the
+    whole column's median (user report: some heights far above the
+    device tops). 3DGS haze DIFFUSES through the whole column -- every
+    bin above the cabinet is non-empty, often at 20-40% of the body
+    density. Those haze bins drag the all-bin median down, the old
+    static threshold fell below the haze density, and the walk
+    connected straight through to the floater layer. The body-relative
+    threshold (running median of the bins already confirmed as body)
+    keeps the bar at the TRUE body density: a haze tail at 30% of the
+    body cannot pass `body_frac`, wherever the column median sits.
 
     Returns the z of the run's upper edge, or None (too few points /
     no dense run).
@@ -850,11 +861,18 @@ def _anchored_top(v: np.ndarray, cell: float = 0.05, dens_frac: float = 0.20,
     occ = hist[hist > 0]
     if not len(occ):
         return None
-    thr = max(dens_frac * float(np.median(occ)), 1.0)
+    thr0 = max(dens_frac * float(np.median(occ)), 1.0)
     top, gap = None, 0
+    body: list[int] = []
     for i, c in enumerate(hist):
+        # body-anchored threshold once the walk has confirmed body
+        # bins; the static median only STARTS the anchor (bottom bins
+        # are body + floor, never haze)
+        thr = (max(body_frac * float(np.median(body)), 1.0)
+               if body else thr0)
         if c >= thr:
             top, gap = float(edges[i + 1]), 0
+            body.append(int(c))
         elif top is not None:
             gap += 1
             if gap >= max_gap:
