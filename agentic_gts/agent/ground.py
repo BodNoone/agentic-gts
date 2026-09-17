@@ -221,7 +221,9 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024):
             keep = hg > 0.30
             if np.isfinite(cut):
                 keep &= hg < cut
-            img = render_gs_view(gs, (), cam, cut_z=None, cut_z_low=None,
+            img = render_gs_view(gs, (), cam,
+                                 cut_z=float("inf"),
+                                 cut_z_low=float("-inf"),
                                  keep_mask=keep)
         except Exception as e:
             print(f"[ground] GS render failed ({type(e).__name__}: {e}) "
