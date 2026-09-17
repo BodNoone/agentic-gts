@@ -57,6 +57,63 @@ def _render_cut(top: float | None) -> float:
     return min(top - 0.10, max(0.70 * top, 1.0))
 
 
+def _floor_map(points: np.ndarray, grid: float = 1.5, band: float = 1.0,
+               min_pts: int = 30):
+    """Per-tile LOCAL floor z for stepped rooms (small level changes).
+
+    align_to_ground levels the DOMINANT floor to z=0; a raised (or
+    sunken) section keeps its offset, and every absolute-z band cut
+    downstream (render band, fit pool) then slices the wrong heights
+    over that section: the raised slab passes the 0.30 device-band
+    floor and renders as a bright sheet, and the ceiling cut sits a
+    step too high over the section (user report: ceiling remnants in
+    part of the groundview). The heightmap restores a per-SECTION
+    zero: h = z - floor(x, y) makes every downstream threshold
+    height-relative again -- exactly as if each section had been
+    aligned independently.
+
+    Per grid tile: P2 of the points in the near-ground band (P2 of
+    the cloud + 1.0m). Devices STAND on the floor, so the bottom of
+    any tile's z-range is that tile's floor -- and a raised slab's
+    top coincides with the device bottoms standing on it, making the
+    estimate robust to how much of the slab was reconstructed. Tiles
+    without enough support fall back to the global dominant level
+    (P2 of the whole cloud, ~= 0 after alignment).
+
+    Returns a callable f(x, y) -> floor z (scalar or array input).
+    """
+    P = np.asarray(points, dtype=np.float64)
+    if len(P) < 200:
+        base = float(np.percentile(P[:, 2], 2)) if len(P) else 0.0
+        return lambda x, y: base
+    base = float(np.percentile(P[:, 2], 2))
+    near = P[P[:, 2] < base + band]
+    if len(near) < 100:
+        return lambda x, y: base
+    ix = np.floor(near[:, 0] / grid).astype(np.int64)
+    iy = np.floor(near[:, 1] / grid).astype(np.int64)
+    keys, inv = np.unique(np.column_stack([ix, iy]), axis=0,
+                          return_inverse=True)
+    order = np.lexsort((near[:, 2], inv))
+    inv_s, z_s = inv[order], near[order][:, 2]
+    starts = np.searchsorted(inv_s, np.arange(len(keys)))
+    ends = np.searchsorted(inv_s, np.arange(len(keys)), side="right")
+    fz = np.array([np.percentile(z_s[s:e], 2) if e - s >= min_pts
+                   else base for s, e in zip(starts, ends)])
+    i0, j0 = keys[:, 0].min(), keys[:, 1].min()
+    G = np.full((keys[:, 0].max() - i0 + 1, keys[:, 1].max() - j0 + 1),
+                base, dtype=np.float64)
+    G[keys[:, 0] - i0, keys[:, 1] - j0] = fz
+
+    def _fl(x, y):
+        i = np.clip(np.floor(np.asarray(x, dtype=np.float64) / grid
+                             ).astype(np.int64) - i0, 0, G.shape[0] - 1)
+        j = np.clip(np.floor(np.asarray(y, dtype=np.float64) / grid
+                             ).astype(np.int64) - j0, 0, G.shape[1] - 1)
+        return G[i, j]
+    return _fl
+
+
 def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024):
     """Base top-down render, no overlays. Camera fitted over the
     yaw-rotated cloud (rows parallel to the image axes), then rotated
@@ -88,14 +145,25 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024):
     # rack top no matter how deep this renders.
     top = float(scene.meta["z_top"]) if scene.meta.get("z_top") else None
     cut = _render_cut(top)
-    band = points[points[:, 2] < cut] if np.isfinite(cut) else points
-    band = band[band[:, 2] > 0.30]
+    # stepped-floor support: the heightmap restores a per-SECTION zero
+    # (align_to_ground levels only the dominant floor). h = z - local
+    # floor turns both cuts into HEIGHTS, valid over raised / sunken
+    # sections alike: the raised slab drops out of the band (it is
+    # that section's FLOOR, not a device) and the ceiling cut no
+    # longer sits a step too high over it (user report: ceiling
+    # remnants across part of the groundview in stepped rooms).
+    fl = _floor_map(points)
+    h = points[:, 2] - fl(points[:, 0], points[:, 1])
+    if np.isfinite(cut):
+        band = points[(h > 0.30) & (h < cut)]
+    else:
+        band = points[h > 0.30]
     if len(band) < 100:
         # thin band (very low structures): drop ONLY the top cut, keep
         # the floor cut -- falling back to the raw cloud would pull the
         # ceiling back into the view, which is exactly what the cut
         # exists to remove
-        band = points[points[:, 2] > 0.30]
+        band = points[h > 0.30]
     pts_rot = _rot_xy(band, -yaw)
     # frame over the BOOTSTRAP layout, not the raw cloud bbox (user
     # directive: the cloud-framed version raised the camera to fit
@@ -145,8 +213,16 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024):
         try:
             from agentic_gts.tools.gs_io import read_gaussian_ply
             gs = read_gaussian_ply(gs_ply)
-            img = render_gs_view(gs, (), cam, cut_z=cut
-                                if np.isfinite(cut) else None, cut_z_low=0.30)
+            # same height-relative band over the gaussians (their means
+            # drive the cut): the rasterizer's SCALAR cut_z / cut_z_low
+            # cannot express a per-section floor
+            gm = np.asarray(gs.means, dtype=np.float64)
+            hg = gm[:, 2] - fl(gm[:, 0], gm[:, 1])
+            keep = hg > 0.30
+            if np.isfinite(cut):
+                keep &= hg < cut
+            img = render_gs_view(gs, (), cam, cut_z=None, cut_z_low=None,
+                                 keep_mask=keep)
         except Exception as e:
             print(f"[ground] GS render failed ({type(e).__name__}: {e}) "
                   f"-> scatter")
@@ -361,7 +437,8 @@ def _region_axis_span(v: np.ndarray, cell: float = 0.05):
     return s_lo, s_hi
 
 
-def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
+def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
+                    floor_z: float = 0.0):
     """Fit a full-depth OBB (yaw=0; points already in the row-aligned
     frame) to the points inside a grounded 2D rect.
 
@@ -374,9 +451,12 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     low plateau that percentile trimming cannot cut (haze is often >
     the 0.5% a P0.5-P99.5 removes) while keeping starved occluded
     faces that a global-peak threshold would cut. z comes from the
-    device band (floor excluded: devices stand ON the ground at z~0,
-    so the box bottom is 0 and the top is the anchored
-    density-connected run's top).
+    device band: devices stand ON the ground, so the box BOTTOM is
+    the local floor (floor_z; 0 = the dominant level, the raised-slab
+    height over a stepped section) and the top is the anchored
+    density-connected run's top; the box HEIGHT is the difference --
+    without floor_z a stepped-section box would run a step too deep
+    and a step too tall.
 
     Guards reject hallucinated regions (no support) and floor patches
     (no height): a VLM box drawn over empty floor never becomes a real
@@ -398,7 +478,8 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     if len(pts) < min_pts:
         _reject(f"no point support (<{min_pts})")
         return None
-    dev = pts[pts[:, 2] > 0.30]      # device band: exclude floor texture
+    # device band, floor-relative: exclude that section's floor texture
+    dev = pts[pts[:, 2] > floor_z + 0.30]
     if len(dev) < max(30, min_pts // 2):
         _reject("floor patch, no structure above 0.30m", n_dev=len(dev))
         return None
@@ -411,13 +492,16 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     _at = _anchored_top(dev[:, 2])
     z_top = float(_at) if _at is not None \
         else float(np.percentile(dev[:, 2], 99.5))
-    if z_top < 0.50:
-        _reject(f"too short for a device (z_top={z_top:.2f}m)")
+    height = z_top - floor_z
+    if height < 0.50:
+        _reject(f"too short for a device (height={height:.2f}m "
+                f"over floor {floor_z:.2f})")
         return None
-    # middle z-slice: [0.35, 0.75] x z_top -- cuts every vertical face
-    # of a tall rack, stays above floor texture, below trays/floaters
-    zc0 = max(0.30, 0.35 * z_top)
-    zc1 = max(zc0 + 0.10, 0.75 * z_top)
+    # middle z-slice: [0.35, 0.75] x height above the LOCAL floor --
+    # cuts every vertical face of a tall rack, stays above floor
+    # texture, below trays/floaters
+    zc0 = floor_z + max(0.30, 0.35 * height)
+    zc1 = max(zc0 + 0.10, floor_z + 0.75 * height)
     core = dev[(dev[:, 2] >= zc0) & (dev[:, 2] <= zc1)]
     if len(core) < 30:
         core = dev                   # thin structure: whole band
@@ -442,12 +526,14 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
     # axis) splits the row ACROSS its depth (user report: a joined
     # row split into 3 pieces along the thickness, not the row).
     if dy > dx:
-        return OrientedBox(center=(float(c[0]), float(c[1]), z_top / 2.0),
-                           size=(dy, dx, z_top), yaw=math.pi / 2.0,
-                           device_type=DeviceType.RACK,
-                           meta={"n_pts": len(dev)})
-    return OrientedBox(center=(float(c[0]), float(c[1]), z_top / 2.0),
-                       size=(dx, dy, z_top), yaw=0.0,
+        return OrientedBox(
+            center=(float(c[0]), float(c[1]), floor_z + height / 2.0),
+            size=(dy, dx, height), yaw=math.pi / 2.0,
+            device_type=DeviceType.RACK,
+            meta={"n_pts": len(dev)})
+    return OrientedBox(center=(float(c[0]), float(c[1]),
+                               floor_z + height / 2.0),
+                       size=(dx, dy, height), yaw=0.0,
                        device_type=DeviceType.RACK,
                        meta={"n_pts": len(dev)})
 
@@ -455,7 +541,8 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60):
 def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
                           bridge_tol: float = 0.50,
                           min_gap_pts: int = 15,
-                          density_ratio: float = 0.30) -> list:
+                          density_ratio: float = 0.30,
+                          floor_at=None) -> list:
     """Merge tightly-ADJACENT grounded boxes; splitting is stageC's job.
 
     The VLM sometimes over-splits ONE physical structure into several
@@ -564,7 +651,10 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
         rs = [rects[i] for i in members]
         u = (min(r[0] for r in rs), min(r[1] for r in rs),
              max(r[2] for r in rs), max(r[3] for r in rs))
-        bb = _fit_region_box(pts_fit, u)
+        uw = _rot_xy(np.array([[(u[0] + u[2]) / 2.0,
+                                (u[1] + u[3]) / 2.0, 0.0]]), yaw)[0]
+        fz = float(floor_at(uw[0], uw[1])) if floor_at is not None else 0.0
+        bb = _fit_region_box(pts_fit, u, floor_z=fz)
         if bb is None:
             out.extend(boxes[i] for i in members)   # keep the pieces
             continue
@@ -635,7 +725,6 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
             _save_grounded_fail_png(img, out_dir,
                                     "VLM returned no usable regions")
         return False
-    pts_rot = _rot_xy(np.asarray(scene.points, dtype=np.float64), -yaw)
     # FIT points: the device band only. The render band cuts lower
     # (relative to the device top), but the FIT must keep the rack
     # top, so cut at z_top + 0.1: everything above (ceiling / cable
@@ -643,12 +732,16 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # points span the WHOLE room in XY, so even a correct rect whose
     # fit included them produced a tray-height box hugging the loose
     # rect edges (user report: red boxes all too large and wrong while
-    # the raw colored rects were right).
+    # the raw colored rects were right). Both cuts are HEIGHT-relative
+    # to the local floor (stepped rooms: a raised section's slab is
+    # that section's floor, and its racks are NOT a step taller).
+    P = np.asarray(scene.points, dtype=np.float64)
+    fl = _floor_map(P)
+    h_fit = P[:, 2] - fl(P[:, 0], P[:, 1])
     fit_top = float(scene.meta.get("z_top", 2.5) or 2.5)
-    pts_fit = pts_rot[(pts_rot[:, 2] > 0.30) &
-                      (pts_rot[:, 2] <= fit_top + 0.10)]
+    pts_fit = _rot_xy(P[(h_fit > 0.30) & (h_fit <= fit_top + 0.10)], -yaw)
     if len(pts_fit) < 100:
-        pts_fit = pts_rot[pts_rot[:, 2] > 0.30]
+        pts_fit = _rot_xy(P[h_fit > 0.30], -yaw)
 
     def _frame_rect(cam, r, z_plane):
         uv = np.array([[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]],
@@ -670,7 +763,13 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     boxes = []
     for r in rects:
         rect_r = _frame_rect(cam, r, 1.0)
-        bb = _fit_region_box(pts_fit, rect_r)
+        # the rect's own LOCAL floor (stepped rooms): the section's
+        # slab height, looked up at the rect's world centre
+        cw = _rot_xy(np.array([[(rect_r[0] + rect_r[2]) / 2.0,
+                                (rect_r[1] + rect_r[3]) / 2.0, 0.0]]),
+                     yaw)[0]
+        bb = _fit_region_box(pts_fit, rect_r,
+                             floor_z=float(fl(cw[0], cw[1])))
         if bb is None:
             continue
         c = _rot_xy(np.array([[bb.center[0], bb.center[1], 0.0]]), yaw)[0]
@@ -718,7 +817,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # splits, never merges). Touching / point-bridged boxes merge into
     # a point-support-refitted union; the true splitting is the local
     # refine's job.
-    boxes = _merge_adjacent_boxes(boxes, pts_fit, yaw)
+    boxes = _merge_adjacent_boxes(boxes, pts_fit, yaw, floor_at=fl)
     scene.boxes = boxes
     # result audit: the grounded.png shows the view's own raw VLM rects
     # (colored) plus the final fitted boxes (red) projected through the

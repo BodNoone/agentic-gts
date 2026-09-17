@@ -294,6 +294,62 @@ def test_fit_region_box_row_along_y():
           f"(y-row: yaw=pi/2, L={bb.size[0]:.2f}, D={bb.size[1]:.2f})")
 
 
+def test_floor_map_stepped():
+    """Stepped room (small level change): _floor_map must recover each
+    section's own floor so height-relative band cuts work again over
+    the raised section (user report: ceiling remnants in part of the
+    groundview; the raised slab entering the device band)."""
+    from agentic_gts.agent.ground import _floor_map
+    rng = np.random.default_rng(21)
+    # lower section x in [-6, 0): floor slab 0-0.05 + racks 0..2.1
+    # raised section x in [0, 6): slab 0.40-0.45 + racks 0.40..2.50
+    slab_lo = rng.uniform([-6, -4, 0.0], [0, 4, 0.05], (8000, 3))
+    slab_hi = rng.uniform([0, -4, 0.40], [6, 4, 0.45], (8000, 3))
+    racks = np.vstack([
+        rng.uniform([-4.5, -3.0, 0.0], [-3.5, 3.0, 2.1], (3000, 3)),
+        rng.uniform([-1.5, -3.0, 0.0], [-0.5, 3.0, 2.1], (3000, 3)),
+        rng.uniform([1.0, -3.0, 0.40], [2.0, 3.0, 2.50], (3000, 3)),
+        rng.uniform([4.0, -3.0, 0.40], [5.0, 3.0, 2.50], (3000, 3)),
+    ])
+    pts = np.vstack([slab_lo, slab_hi, racks])
+    fl = _floor_map(pts)
+    f_lo, f_hi = float(fl(-3.0, 0.0)), float(fl(3.0, 0.0))
+    assert -0.05 < f_lo < 0.10, f"lower floor {f_lo:.3f} (want ~0)"
+    assert 0.35 < f_hi < 0.50, f"raised floor {f_hi:.3f} (want ~0.4)"
+    # height semantics: slab points are the RAISED section's floor
+    hh = slab_hi[:, 2] - fl(slab_hi[:, 0], slab_hi[:, 1])
+    assert hh.max() < 0.30, "slab must fall below the device band"
+    # raised racks keep their true 2.1m height above THEIR floor
+    top = racks[racks[:, 0] > 0.5]
+    hh_top = top[:, 2] - fl(top[:, 0], top[:, 1])
+    assert 1.9 < hh_top.max() < 2.3, \
+        f"raised rack height {hh_top.max():.2f} (want ~2.1)"
+    print(f"PASS floor map stepped (lower {f_lo:.3f}, raised {f_hi:.3f})")
+
+
+def test_fit_region_box_stepped_floor():
+    """A rack standing on a raised slab (floor_z = 0.4): the fitted box
+    must BOTTOM on the slab and carry the TRUE rack height -- without
+    floor_z the box runs a step too deep (bottom 0) and a step too
+    tall (slab-to-top)."""
+    from agentic_gts.agent.ground import _fit_region_box
+    rng = np.random.default_rng(22)
+    body = rng.uniform([0.0, 0.0, 0.40], [3.0, 0.6, 2.50], (4000, 3))
+    slab = rng.uniform([0.0, 0.0, 0.40], [3.0, 0.6, 0.45], (800, 3))
+    pts = np.vstack([body, slab])
+    rect = (-0.2, -0.2, 3.2, 0.8)
+    bb = _fit_region_box(pts, rect, floor_z=0.40)
+    assert bb is not None, "stepped-floor region must produce a box"
+    bottom = bb.center[2] - bb.size[2] / 2.0
+    assert 0.30 < bottom < 0.50, \
+        f"bottom {bottom:.2f} (must sit ON the raised slab, ~0.40)"
+    assert 1.9 < bb.size[2] < 2.3, \
+        f"height {bb.size[2]:.2f} (must be the true rack height, not " \
+        f"slab-to-top)"
+    print(f"PASS region fit over raised floor "
+          f"(bottom {bottom:.2f}, height {bb.size[2]:.2f})")
+
+
 def test_ground_stage_row_along_y():
     """End-to-end grounding of a joined row running along the y-axis:
     the emitted box must carry yaw = pi/2, or the downstream local
@@ -800,6 +856,8 @@ if __name__ == "__main__":
     test_fit_region_box_full_depth()
     test_fit_region_box_haze_immune()
     test_fit_region_box_starved_back_face()
+    test_floor_map_stepped()
+    test_fit_region_box_stepped_floor()
     test_robust_span_bin_boundary()
     test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()

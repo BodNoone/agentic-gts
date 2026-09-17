@@ -538,15 +538,19 @@ def render_gs_view(gs: GaussianData, boxes, cam: Cam,
                    cut_z_low: float = float("-inf"),
                    overlay: str = "footprint",
                    isolate_boxes: bool = False,
-                   isolate_margin: float = 0.6):
+                   isolate_margin: float = 0.6,
+                   keep_mask: np.ndarray | None = None):
     """Full render: gaussians + numbered box overlay. None if no backend.
 
     isolate_boxes: keep ONLY the gaussians near `boxes` (their inflated
     OBBs) -- for the local evidence view, so unrelated structure (other
     racks in front, walls) cannot occlude the box being adjudicated.
+    keep_mask: caller-supplied boolean over gs -- the scalar cut_z /
+    cut_z_low cannot express a per-SECTION band (stepped floors: the
+    ceiling cut must follow the local floor level).
     """
     keep = _near_boxes_mask(gs, boxes, margin=isolate_margin) \
-        if (isolate_boxes and boxes) else None
+        if (isolate_boxes and boxes) else keep_mask
     img = rasterize_gs(gs, cam, cut_z=cut_z, cut_z_low=cut_z_low,
                        keep_mask=keep)
     if img is None:
