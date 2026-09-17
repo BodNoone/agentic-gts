@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agentic_gts.agent.mask_refine import (
     BoxGroup, SamPredictorAdapter, parse_box_groups,
-    refine_box, _anchored_top,
+    refine_box, _anchored_top, _pick_piece_top,
 )
 from agentic_gts.core.models import OrientedBox, Scene
 
@@ -69,6 +69,35 @@ def test_anchored_top_clean_column_and_thin_gap():
     top2 = _anchored_top(pts2)
     assert top2 is not None and top2 >= 1.95, \
         f"5cm mid-body gap terminated the walk at {top2:.2f}"
+
+
+def test_pick_piece_top_mask_primary_column_guards_truncation():
+    """Height-source arbitration: SAM-mask z leads, the raw column
+    only rescues the historical mask-TRUNCATION failure (mask z
+    grossly below the row's tall cabinet + a sane column above)."""
+    seed_top = 2.2
+    # 1) clean mask reading -> mask wins even when the column reads
+    #    higher (semantic cleanliness beats the contaminated column)
+    assert _pick_piece_top(1.95, 2.10, seed_top) == (1.95, "mask")
+    # 2) mask rescues a LOW column (mid-body sparsity broke the walk):
+    #    no seed-relative ceiling for the mask source
+    assert _pick_piece_top(2.05, 1.30, seed_top) == (2.05, "mask")
+    # 3) truncation guard: mask at 0.9 with a SANE column at 2.05 ->
+    #    column wins (VLM box covered part of the cabinet)
+    assert _pick_piece_top(0.90, 2.05, seed_top) == (2.05, "col-guard")
+    # 4) legit short cabinet (mixed row): mask low, column INSANE
+    #    (missing) -> mask stands, no column to override
+    assert _pick_piece_top(0.95, None, seed_top) == (0.95, "mask")
+    # 5) legit short cabinet vs CONTAMINATED column (above seed+0.60
+    #    -> col not ok) -> mask stands
+    assert _pick_piece_top(1.00, 3.40, seed_top) == (1.00, "mask")
+    # 6) no mask pts (fallback span) -> column fallback as before
+    assert _pick_piece_top(None, 2.00, seed_top) == (2.00, "col")
+    # 7) implausible mask (above 4.5m) with sane column -> column
+    assert _pick_piece_top(4.80, 2.00, seed_top) == (2.00, "col")
+    # 8) nothing usable -> seed height stands
+    assert _pick_piece_top(4.80, 5.00, seed_top) == (None, None)
+    print("PASS piece-top arbitration (mask primary, col truncation guard)")
 
 
 def test_box_groups_qwen_1000_to_pixels_once():

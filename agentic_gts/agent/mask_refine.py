@@ -1153,6 +1153,42 @@ def _apply_depth_from_side(instances: list, pts: np.ndarray,
     return recs
 
 
+def _pick_piece_top(z_mask: float | None, z_col: float | None,
+                    seed_top: float) -> tuple[float | None, str | None]:
+    """Height-source arbitration per split piece: the SAM-mask z
+    (primary) vs the raw-column anchored top (guard + fallback).
+
+    Mask points are the only semantically CLEAN z source (user
+    directive after column readings kept scattering high/low): SAM
+    isolated this device -- neighbour rows, haze and overhead trays
+    are outside the mask, and cloud sparsity inside the body does not
+    shorten pixels. Its one historical failure is TRUNCATION (a view
+    cut at the frame, a VLM box covering only part of the cabinet,
+    the side pass's vertically-short slice -- "very low boxes").
+    Column guards exactly that: a mask z grossly below the row's tall
+    cabinet (>45% under the seed top) while a SANE column sits well
+    above it is far more likely a cut mask than a real half-height
+    cabinet standing under a clean column -- the column wins the
+    piece. Everything else: mask wins, including short cabinets the
+    VLM split out of a mixed row and pieces TALLER than an
+    under-measured seed (a broken density walk can never drag a
+    column up past its gap).
+
+    Returns (z_top, source) -- source in {"mask", "col-guard", "col"}
+    for the audit trail, or (None, None).
+    """
+    col_ok = (z_col is not None and 0.50 <= z_col <= 4.50
+              and 0.45 * seed_top <= z_col <= seed_top + 0.60)
+    if z_mask is not None and 0.50 <= z_mask <= 4.50:
+        if (z_mask < 0.55 * seed_top and col_ok
+                and z_col > z_mask + 0.30):
+            return z_col, "col-guard"
+        return z_mask, "mask"
+    if col_ok:
+        return z_col, "col"
+    return None, None
+
+
 def _apply_height_and_geom_depth(instances: list, seed: "OrientedBox",
                                  scene: Scene) -> int:
     """Per-piece HEIGHT correction + geometry THICKNESS fallback.
@@ -1235,10 +1271,27 @@ def _apply_height_and_geom_depth(instances: list, seed: "OrientedBox",
                             inst["depth_ok"] = "geometry"
                             inst["depth"] = round(depth, 3)
                             n_geom += 1
-        # ---- height: the piece's own column in the raw cloud ----
-        # NOT the mask points (truncated z, user report: very low
-        # boxes) -- the raw column under the piece's final footprint
-        # carries the cabinet's full height.
+        # ---- height: the piece's own SAM mask points are PRIMARY ----
+        # (user directive: after the haze fix the column still reads
+        # some pieces high / some low). The mask is the only
+        # SEMANTICALLY clean z source: SAM isolated this device, so
+        # no neighbour seep (the column's cross+0.15 slice bleeds the
+        # taller facing row), no haze above the top, no trays resting
+        # ON the top (density-connected, the walk cannot cut them),
+        # and no mid-body sparsity gap (a sparse zone terminates a
+        # density walk early -- mask pixels do not care about cloud
+        # density). The historical mask failure ("very low boxes":
+        # truncated z from a view cut / a VLM box covering only part
+        # of the cabinet / the vertically-short side slice) is
+        # GUARDED, not ignored: a mask z grossly below the row's tall
+        # cabinet together with a SANE raw column above it flags
+        # truncation and the column wins that piece (_pick_piece_top).
+        pts_m = inst.get("pts")
+        z_mask = (float(np.percentile(np.asarray(pts_m)[:, 2], 97.5))
+                  if pts_m is not None and len(pts_m) >= 20 else None)
+        inst["z_mask_top"] = (round(z_mask, 3)
+                             if z_mask is not None else None)
+        # raw column: the cross-check + fallback + sparse-cloud rescue
         fc = np.asarray(f.center, dtype=float)
         along_c = float(fc[:2] @ axis)
         cross_c = float(fc[:2] @ cross)
@@ -1248,40 +1301,31 @@ def _apply_height_and_geom_depth(instances: list, seed: "OrientedBox",
                     & (np.abs(band[:, :2] @ cross - cross_c) <= half_d)]
                if len(band) >= 100 else band)
         if len(col) < 40:
-            col = inst.get("pts")        # sparse cloud: mask points
-            col = col if col is not None and len(col) >= 20 else None
-        if col is not None and len(col):
+            col = pts_m if pts_m is not None and len(pts_m) >= 20 else None
+            col = col if col is not None else []
+        z_col = None
+        if len(col):
             # ANCHORED column top, not a percentile / strong-bin span:
             # the column's edges bleed a few NEIGHBOUR points past the
             # span seam, and overhead clutter (trays and their supports
             # -- dense enough for a strong bin) floats above the body
             # separated by a near-empty gap. The anchored walk from the
             # ground keeps the density-connected run and stops at the
-            # first real void, whichever sits above it (user report:
-            # runs left every piece at the seed height -- the clutter
-            # made every column measure the same contaminated top).
+            # first real void, whichever sits above it.
             zspan = _anchored_top(np.asarray(col)[:, 2])
-            z_top = float(zspan) if zspan is not None else None
-            inst["z_col_top"] = (round(z_top, 3)
-                                 if z_top is not None else None)
-            # guards: plausible device height, not a partial column
-            # (>= 45% of the seed top -- the raw column rarely
-            # under-measures, this catches a bad slice), not above the
-            # row's tallest cabinet by more than fit slop + recovery
-            # headroom (an under-measured seed must not chain its
-            # error: the anchored
-            # measurement already rejects floating overhead layers, so
-            # the +0.60 headroom is safe)
-            if (z_top is not None and 0.50 <= z_top <= 4.50
-                    and 0.45 * seed_top <= z_top <= seed_top + 0.60):
-                h = z_top - seed_bottom
-                if abs(h - float(f.size[2])) > 0.05:
-                    inst["fitted"] = _rebuild(
-                        f,
-                        center=(float(f.center[0]), float(f.center[1]),
-                                seed_bottom + h / 2.0),
-                        size=(float(f.size[0]), float(f.size[1]), h))
-                    inst["height"] = round(h, 3)
+            z_col = float(zspan) if zspan is not None else None
+        inst["z_col_top"] = round(z_col, 3) if z_col is not None else None
+        z_top, z_src = _pick_piece_top(z_mask, z_col, seed_top)
+        if z_top is not None:
+            h = z_top - seed_bottom
+            if abs(h - float(f.size[2])) > 0.05:
+                inst["fitted"] = _rebuild(
+                    f,
+                    center=(float(f.center[0]), float(f.center[1]),
+                            seed_bottom + h / 2.0),
+                    size=(float(f.size[0]), float(f.size[1]), h))
+                inst["height"] = round(h, 3)
+                inst["z_src"] = z_src
     return n_geom
 
 
