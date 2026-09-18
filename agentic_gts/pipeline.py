@@ -278,7 +278,8 @@ def run_pipeline(scene: Scene,
     # caller-pinned yaw overrides only the ANGLE; the byproducts are
     # yaw-independent.
     from agentic_gts.segment.orientation import estimate_yaw_detailed
-    info = estimate_yaw_detailed(scene.points)
+    info = estimate_yaw_detailed(
+        scene.points, mesh=bool(scene.meta.get("geometry_is_mesh")))
     yaw_suspect = False
     if "yaw" in opts:
         yaw = float(opts["yaw"])
@@ -290,50 +291,61 @@ def run_pipeline(scene: Scene,
         else:
             yaw = info["yaw"]
             print(f"[stage0] estimated dominant yaw = {math.degrees(yaw):.1f} deg")
-        # --- residual self-check: closed-loop hijack detector ---
-        # Rotate the cloud by -yaw and re-run the SAME estimator: a
-        # correct yaw leaves the rows axis-aligned (residual ~0); a
-        # hijacked one (wall / sloped floor pulling the histogram
-        # peak) leaves the TRUE rows tilted by the error angle, and
-        # the re-estimate returns it. The grounded nadir view is the
-        # pipeline's only box producer -- a tilted render makes the
-        # VLM draw AABBs over skewed rows, one rect swallowing
-        # several neighbouring devices (user report from a scene
-        # whose groundview rows were visibly not axis-aligned).
-        # Curved OUTER walls do not trip this: their energy spreads
-        # evenly over the angle histogram (a floor, not a competing
-        # peak). A residual that still exceeds the gate after ONE
-        # correction means a genuinely multi-directional layout --
-        # warned about, not looped on.
-        from agentic_gts.segment.orientation import estimate_residual_yaw
-        yaw_suspect = False
-        res = estimate_residual_yaw(scene.points, yaw)
-        if abs(res) > math.radians(5.0):
-            fixed = math.remainder(yaw + res, math.pi / 2)
-            if fixed >= math.pi / 4:
-                fixed -= math.pi / 2
-            elif fixed < -math.pi / 4:
-                fixed += math.pi / 2
-            print(f"[stage0] residual self-check FAILED "
-                  f"(residual {math.degrees(res):.1f} deg) -> "
-                  f"yaw corrected {math.degrees(yaw):.1f} -> "
-                  f"{math.degrees(fixed):.1f} deg")
-            yaw = fixed
-            res2 = estimate_residual_yaw(scene.points, yaw)
-            if abs(res2) > math.radians(5.0):
-                print(f"[stage0] WARNING: residual still "
-                      f"{math.degrees(res2):.1f} deg after correction -- "
-                      f"multi-directional layout? verify yaw_check.png "
-                      f"(kept the corrected yaw; stageG will arbitrate "
-                      f"the top candidates by grounding yield)")
-                # knife-edged scene flag: the estimator's candidate
-                # scores are near-tied and the residual chain
-                # oscillates between basins (user logs: correction
-                # landed on the truth once, 8 deg off the other time)
-                yaw_suspect = True
+        if info.get("yaw_source") == "wall":
+            # mesh fast path: the outer wall lines gave the direction
+            # directly (devices sit parallel to the walls) -- the
+            # residual self-check and the grounding arbitration are
+            # vote-chain machinery this path exists to REPLACE. The
+            # stageG seed feedback below still runs as the safety net
+            # (it only fires when the grounded seeds' own directions
+            # disagree with the wall yaw by >3 deg).
+            print("[stage0] mesh wall-line yaw trusted -> residual "
+                  "self-check and grounding arbitration skipped")
         else:
-            print(f"[stage0] residual self-check passed "
-                  f"(residual {math.degrees(res):.1f} deg)")
+            # --- residual self-check: closed-loop hijack detector ---
+            # Rotate the cloud by -yaw and re-run the SAME estimator: a
+            # correct yaw leaves the rows axis-aligned (residual ~0); a
+            # hijacked one (wall / sloped floor pulling the histogram
+            # peak) leaves the TRUE rows tilted by the error angle, and
+            # the re-estimate returns it. The grounded nadir view is the
+            # pipeline's only box producer -- a tilted render makes the
+            # VLM draw AABBs over skewed rows, one rect swallowing
+            # several neighbouring devices (user report from a scene
+            # whose groundview rows were visibly not axis-aligned).
+            # Curved OUTER walls do not trip this: their energy spreads
+            # evenly over the angle histogram (a floor, not a competing
+            # peak). A residual that still exceeds the gate after ONE
+            # correction means a genuinely multi-directional layout --
+            # warned about, not looped on.
+            from agentic_gts.segment.orientation import estimate_residual_yaw
+            yaw_suspect = False
+            res = estimate_residual_yaw(scene.points, yaw)
+            if abs(res) > math.radians(5.0):
+                fixed = math.remainder(yaw + res, math.pi / 2)
+                if fixed >= math.pi / 4:
+                    fixed -= math.pi / 2
+                elif fixed < -math.pi / 4:
+                    fixed += math.pi / 2
+                print(f"[stage0] residual self-check FAILED "
+                      f"(residual {math.degrees(res):.1f} deg) -> "
+                      f"yaw corrected {math.degrees(yaw):.1f} -> "
+                      f"{math.degrees(fixed):.1f} deg")
+                yaw = fixed
+                res2 = estimate_residual_yaw(scene.points, yaw)
+                if abs(res2) > math.radians(5.0):
+                    print(f"[stage0] WARNING: residual still "
+                          f"{math.degrees(res2):.1f} deg after correction -- "
+                          f"multi-directional layout? verify yaw_check.png "
+                          f"(kept the corrected yaw; stageG will arbitrate "
+                          f"the top candidates by grounding yield)")
+                    # knife-edged scene flag: the estimator's candidate
+                    # scores are near-tied and the residual chain
+                    # oscillates between basins (user logs: correction
+                    # landed on the truth once, 8 deg off the other time)
+                    yaw_suspect = True
+            else:
+                print(f"[stage0] residual self-check passed "
+                      f"(residual {math.degrees(res):.1f} deg)")
     scene.meta["yaw"] = yaw
     if info.get("z_top") is not None:
         scene.meta["z_top"] = info["z_top"]
@@ -401,6 +413,7 @@ def run_pipeline(scene: Scene,
     from agentic_gts.segment.orientation import yaw_arbitration_needed
     arbitrated = False
     if ("yaw" not in opts and info.get("candidates")
+            and info.get("yaw_source") != "wall"
             and yaw_arbitration_needed(info, yaw_suspect)):
         import shutil
         from agentic_gts.segment.orientation import (pick_yaw_trial,

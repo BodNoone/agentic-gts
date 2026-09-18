@@ -205,16 +205,151 @@ def seed_axis_delta(boxes, points: np.ndarray, cur_yaw: float,
     return float(votes[-1][0])
 
 
+def fit_wall_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
+                 support_r: float = 0.30, min_edge: float = 1.0,
+                 bin_deg: float = 5.0, min_conf: float = 0.5
+                 ) -> tuple[float, float] | None:
+    """Dominant yaw from the OUTER WALL lines -- the mesh fast path.
+
+    (user request) With a mesh cloud the histogram-vote + arbitration
+    machinery is unnecessary: devices sit PARALLEL to the walls, and
+    the walls are the outermost straight structures. Slice the device
+    height band (floor and ceiling cut), project to xy, take the convex
+    hull: every long hull edge is a wall line -- corner chamfers and
+    diagonal cutoffs across concave notches carry no point support.
+    An orthogonal room's walls all fold into ONE mod-90 family, so
+    the dominant family IS the layout direction. Each family edge is
+    then refined by PCA on its supporting points (a device standing
+    against the wall pushes hull vertices out and tilts the raw edge).
+    Returns (yaw, support_share) or None when no family dominates
+    (e.g. curved outer walls) -- the caller falls back to the
+    device-vote estimator.
+    """
+    z = points[:, 2]
+    band = points[(z > z_range[0]) & (z < z_range[1])]
+    if len(band) < 500:
+        return None
+    if len(band) > 150_000:
+        sel = np.random.default_rng(0).choice(len(band), 150_000,
+                                              replace=False)
+        band = band[sel]
+    pts = band[:, :2]
+    try:
+        from scipy.spatial import ConvexHull
+        hull = ConvexHull(pts)
+    except Exception:
+        return None
+    verts = pts[hull.vertices]
+
+    # each long hull edge: direction + the band points supporting it
+    edges = []
+    for i in range(len(verts)):
+        a = verts[i]
+        b = verts[(i + 1) % len(verts)]
+        ab = b - a
+        L = float(np.hypot(*ab))
+        if L < min_edge:
+            continue
+        u = ab / L
+        t = np.clip((pts - a) @ u, 0.0, L)
+        d = np.linalg.norm(pts - (a + t[:, None] * u), axis=1)
+        sup = d < support_r
+        if int(sup.sum()) < 50:
+            continue            # chamfer / notch cutoff: not a wall
+        edges.append({"a": a, "u": u, "L": L, "mask": sup,
+                      "ang": math.atan2(u[1], u[0])})
+    if not edges:
+        return None
+
+    # fold mod-90: an orthogonal room's walls form ONE family
+    fam: dict[int, float] = {}
+    for e in edges:
+        w = math.remainder(e["ang"], math.pi / 2)
+        key = int(round(math.degrees(w) / bin_deg))
+        fam[key] = fam.get(key, 0.0) + float(e["mask"].sum())
+    total = sum(fam.values())
+    best_key = max(fam, key=lambda k: fam[k])
+    conf = fam[best_key] / total
+    if conf < min_conf:
+        return None
+
+    # refine: PCA on each family edge's supporting points
+    # Votes are averaged in the FOLDED mod-90 space: a room's walls
+    # sit at BOTH a and a+90/a+180, and plain complex averaging of
+    # those directions CANCELS (the mean of a 4-direction cross is
+    # arbitrary). Quadrupling the angle makes mod-90-equivalent
+    # directions equal mod-360, so the circular mean is well-defined.
+    votes: list[tuple[complex, float]] = []
+    for e in edges:
+        w = math.remainder(e["ang"], math.pi / 2)
+        if int(round(math.degrees(w) / bin_deg)) != best_key:
+            continue
+        p = pts[e["mask"]]
+        if len(p) < 30:
+            continue
+        c = p - p.mean(axis=0)
+        _, _, V = np.linalg.svd(c, full_matrices=False)
+        v = V[0]
+        theta = math.atan2(v[1], v[0])
+        # fold the PCA axis onto the edge's own direction (the axis is
+        # sign/90-deg ambiguous); a blob-ish support set has a random
+        # PCA direction -- only trust axes that actually land near
+        # the hull edge
+        d = (theta - e["ang"] + math.pi / 2) % math.pi - math.pi / 2
+        if abs(d) > math.radians(25.0):
+            continue
+        votes.append((np.exp(4j * (e["ang"] + d)), float(len(p))))
+    if not votes:
+        return None
+    tot = sum(w for _, w in votes)
+    zs = sum(c * w for c, w in votes) / tot
+    yaw = math.atan2(zs.imag, zs.real) / 4.0    # undo the quadrupling
+    yaw = math.remainder(yaw, math.pi / 2)
+    if yaw >= math.pi / 4:
+        yaw -= math.pi / 2
+    elif yaw < -math.pi / 4:
+        yaw += math.pi / 2
+    return float(yaw), float(conf)
+
+
 def estimate_yaw_detailed(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
-                          voxel: float = 0.25) -> dict:
+                          voxel: float = 0.25, mesh: bool = False) -> dict:
     """Same as estimate_yaw but returns intermediate results for diagnosis.
+
+    With `mesh=True` the wall-line fast path runs first (devices sit
+    parallel to the walls in a mesh reconstruction): on success the
+    wall yaw OVERRIDES the device-vote yaw and the result carries
+    yaw_source="wall" -- the caller skips the residual self-check and
+    the grounding arbitration (the whole point of the fast path: one
+    measurement instead of a vote chain).
 
     Returns dict with:
       yaw        float          chosen yaw in [-pi/4, pi/4)
+      yaw_source str            "wall" (mesh fast path) or "vote"
       candidates list           [(deg, score)] scored Manhattan candidates
       cells      ndarray | None occupancy cells after boundary removal
       device_pts ndarray        2D points in the device height band
     """
+    info = _estimate_yaw_vote(points, z_range, voxel)
+    if mesh:
+        wall = fit_wall_yaw(points, z_range)
+        if wall is not None:
+            yaw, conf = wall
+            print(f"[diag][yaw] MESH wall-line fit: yaw="
+                  f"{math.degrees(yaw):.1f} deg (support share "
+                  f"{conf:.0%}; overrides device-vote "
+                  f"{math.degrees(info['yaw']):.1f} deg)")
+            info["yaw"] = yaw
+            info["yaw_source"] = "wall"
+    return info
+
+
+def _estimate_yaw_vote(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
+                       voxel: float = 0.25) -> dict:
+    """Device-vote yaw estimator (histogram of vertical-face directions
+    + row-band scoring). The original estimate_yaw_detailed body; kept
+    as the fallback for mesh scenes where the wall fit fails and the
+    only path for 3DGS inputs."""
     z = points[:, 2]
     m = (z > z_range[0]) & (z < z_range[1])
     band = points[m]

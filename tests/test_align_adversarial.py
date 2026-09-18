@@ -308,6 +308,109 @@ def test_seed_axis_delta():
           f"~8 deg recovered on slanted, trays ignored)")
 
 
+def _wall_room(theta_deg: float = 17.5, seed: int = 0):
+    """A mesh-like rectangular room: dense straight wall lines, device
+    rows PARALLEL to the long wall, plus floor/ceiling layers the
+    z-band slice must ignore. Returned in the rotated frame."""
+    rng = np.random.default_rng(seed)
+    a = math.radians(theta_deg)
+    R = np.array([[math.cos(a), -math.sin(a)],
+                  [math.sin(a), math.cos(a)]])
+    W, H = 16.0, 10.0
+
+    def _wall(p0, p1, n):
+        u = np.array([p1[0] - p0[0], p1[1] - p0[1]])
+        L = float(np.hypot(*u))
+        u = u / L
+        v = np.array([-u[1], u[0]])
+        t = rng.uniform(0.0, 1.0, (n, 1))
+        w = rng.normal(0.0, 0.05, (n, 1))
+        return np.asarray(p0) + t * u + w * v
+
+    xys = [_wall((0, 0), (W, 0), 4000), _wall((W, 0), (W, H), 2500),
+           _wall((W, H), (0, H), 4000), _wall((0, H), (0, 0), 2500)]
+    # device rows parallel to the long (x) walls
+    for y in np.arange(2.0, 9.0, 2.0):
+        t = rng.uniform(2.0, 14.0, (1500, 1))
+        w = rng.uniform(-0.3, 0.3, (1500, 1))
+        xys.append(np.column_stack([t, np.full_like(t, y) + w]))
+    xy = np.vstack(xys) @ R.T
+    z = rng.uniform(0.2, 3.2, len(xy))
+    pts = np.column_stack([xy, z])
+    # floor and ceiling layers: outside the device z-band, must be cut
+    nf = 8000
+    fxy = rng.uniform(0.0, W, (nf, 2)) * [1.0, H / W]
+    fxy = fxy @ R.T
+    floor = np.column_stack([fxy, rng.uniform(0.0, 0.1, nf)])
+    ceil = np.column_stack([fxy, rng.uniform(2.8, 3.5, nf)])
+    return np.vstack([pts, floor, ceil])
+
+
+def test_fit_wall_yaw():
+    """Mesh fast path: the outer wall lines give the layout direction
+    directly -- devices sit parallel to the walls, so the dominant
+    hull-edge family IS the yaw (an orthogonal room's walls all fold
+    into one mod-90 family). Floor/ceiling layers must be ignored
+    (z-band slice)."""
+    from agentic_gts.segment.orientation import fit_wall_yaw
+
+    pts = _wall_room(theta_deg=17.5)
+    r = fit_wall_yaw(pts)
+    assert r is not None, "rectangular room must yield a wall yaw"
+    yaw, conf = r
+    err = abs(17.5 - math.degrees(yaw))
+    assert err < 1.0, f"wall yaw off by {err:.1f} deg"
+    assert conf >= 0.9, f"orthogonal room: one family, got share {conf:.2f}"
+
+    # negative rotation folds to [-45, 45)
+    r = fit_wall_yaw(_wall_room(theta_deg=-26.0, seed=1))
+    assert r is not None and abs(math.degrees(r[0]) + 26.0) < 1.0
+
+    # slanted device rows inside a straight room: the WALL direction
+    # wins by design (mesh premise: devices parallel to walls)
+    pts = _wall_room(theta_deg=0.0, seed=2)
+    rng = np.random.default_rng(3)
+    sa = math.radians(35.0)
+    u = np.array([math.cos(sa), math.sin(sa)])
+    t = rng.uniform(2.0, 12.0, (3000, 1))
+    w = rng.uniform(-0.3, 0.3, (3000, 1))
+    slant = np.column_stack([4.0 + t * u[0] - w * u[1],
+                             5.0 + t * u[1] + w * u[0],
+                             rng.uniform(0.3, 2.4, (3000, 1))])
+    r = fit_wall_yaw(np.vstack([pts, slant]))
+    assert r is not None and abs(math.degrees(r[0])) < 1.0, \
+        "wall lines must beat slanted interior rows"
+
+    # curved outer wall: no dominant straight family -> None (caller
+    # falls back to the device-vote estimator)
+    rng = np.random.default_rng(4)
+    th = rng.uniform(0, 2 * math.pi, 12000)
+    rr = 8.0 + rng.normal(0, 0.05, 12000)
+    disk = np.column_stack([rr * np.cos(th), rr * np.sin(th),
+                            rng.uniform(0.2, 3.0, 12000)])
+    assert fit_wall_yaw(disk) is None, "curved wall must not yield a yaw"
+    print("PASS fit wall yaw (mesh fast path)")
+
+
+def test_estimate_yaw_detailed_mesh_flag():
+    """mesh=True runs the wall fast path FIRST and marks the source;
+    mesh=False (3DGS inputs) keeps the pure device-vote path."""
+    from agentic_gts.segment.orientation import estimate_yaw_detailed
+
+    pts = _wall_room(theta_deg=17.5)
+    info = estimate_yaw_detailed(pts, mesh=True)
+    assert info.get("yaw_source") == "wall", \
+        f"mesh input must be wall-sourced, got {info.get('yaw_source')}"
+    assert abs(17.5 - math.degrees(info["yaw"])) < 1.5
+    # byproducts (layout bootstrap) survive the fast path
+    assert info.get("device_cells") is not None
+    assert info.get("z_top") is not None
+
+    info = estimate_yaw_detailed(pts, mesh=False)
+    assert "yaw_source" not in info or info["yaw_source"] != "wall"
+    print("PASS estimate yaw detailed mesh flag (wall source marked)")
+
+
 def test_align_with_subfloor_noise():
     """Regression: marginal noise spike BELOW the floor must not win.
 
