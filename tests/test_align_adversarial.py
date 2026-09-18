@@ -94,6 +94,39 @@ def test_pick_yaw_trial():
     print("PASS pick yaw trial (agreement > yield, yield > delta)")
 
 
+def test_yaw_arbitration_needed():
+    """Trigger condition: near-tied top-2 folded candidates must fire
+    the arbitration EVEN WHEN the residual self-check passed -- the
+    check measures CONSISTENCY, not correctness (user run 3: a wrong
+    yaw of -26.7 deg over a GENUINE -26.5 structure re-aligned that
+    structure, residual 0.7 'passed', and the run produced 2 boxes
+    instead of the true yaw's 5). Run 3's folded top-2: -26.5 @468 vs
+    -17.5 @410 -> ratio 0.876 -> arbitrate. All three user runs'
+    candidate sets must trigger; a clear-cut scene must not."""
+    from agentic_gts.segment.orientation import yaw_arbitration_needed
+
+    # run 3 (verbatim from the log, residual check PASSED)
+    run3 = [(72.5, 197), (-17.5, 410), (80.5, 405), (-9.5, 142),
+            (63.5, 468), (-26.5, 304), (45.5, 336)]
+    assert yaw_arbitration_needed({"candidates": run3}, yaw_suspect=False)
+    # runs 1 and 2 (also near-tied, from the earlier logs)
+    run1 = [(72.5, 201), (-17.5, 468), (80.5, 504), (-9.5, 143),
+            (63.5, 472), (-26.5, 305), (45.5, 336)]
+    run2 = [(72.5, 242), (-17.5, 430), (80.5, 412), (-9.5, 168),
+            (63.5, 399), (-26.5, 440), (47.5, 261)]
+    assert yaw_arbitration_needed({"candidates": run1}, yaw_suspect=False)
+    assert yaw_arbitration_needed({"candidates": run2}, yaw_suspect=True)
+    # clear-cut scene: one dominant direction -> no arbitration
+    clear = [(0.5, 514), (-89.5, 380), (18.5, 223), (-71.5, 210)]
+    assert not yaw_arbitration_needed({"candidates": clear},
+                                      yaw_suspect=False)
+    # suspect alone always fires; no candidates never does
+    assert yaw_arbitration_needed({"candidates": []}, yaw_suspect=True)
+    assert not yaw_arbitration_needed({"candidates": []},
+                                      yaw_suspect=False)
+    print("PASS yaw arbitration trigger (near-tied fires without suspect)")
+
+
 def _rot_axis(axis, deg):
     axis = np.asarray(axis, dtype=float)
     axis /= np.linalg.norm(axis)

@@ -391,11 +391,17 @@ def run_pipeline(scene: Scene,
     #   2. most boxes wins among agreeing trials (a straight view
     #      detects more structures than a skewed one: 5 vs 2 in the
     #      user's logs).
-    # Fires ONLY on yaw_suspect scenes (residual chain failed twice)
-    # with an unpinned yaw -- stable scenes pay nothing.
+    # Fires when the residual chain failed twice OR the top-2 folded
+    # candidates are NEAR-TIED (ratio >= 0.85): the self-check measures
+    # consistency, not correctness -- a wrong yaw backed by a REAL
+    # structure at that direction (a wall, a sub-layout) re-aligns
+    # that structure and PASSES (user run 3: yaw -26.7 over a genuine
+    # -26.5 structure, residual 0.7, 2 boxes instead of the true
+    # yaw's 5). Unpinned yaw only -- stable scenes pay nothing.
+    from agentic_gts.segment.orientation import yaw_arbitration_needed
     arbitrated = False
-    if (yaw_suspect and "yaw" not in opts
-            and info.get("candidates")):
+    if ("yaw" not in opts and info.get("candidates")
+            and yaw_arbitration_needed(info, yaw_suspect)):
         import shutil
         from agentic_gts.segment.orientation import (pick_yaw_trial,
                                                      seed_axis_delta,

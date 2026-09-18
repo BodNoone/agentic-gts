@@ -103,6 +103,30 @@ def pick_yaw_trial(trials: list[dict],
     return max(trials, key=_key)
 
 
+def yaw_arbitration_needed(info: dict, yaw_suspect: bool,
+                           ratio: float = 0.85) -> bool:
+    """Whether the stageG grounding-yield yaw arbitration should run.
+
+    Two triggers:
+      * yaw_suspect -- the residual self-check failed twice (the
+        correction oscillates between basins);
+      * NEAR-TIED top-2 folded candidates (score ratio >= `ratio`):
+        the residual self-check measures CONSISTENCY, not correctness
+        -- rotating by a wrong-but-REAL structure direction (a wall,
+        a sub-layout) re-aligns that structure and the re-estimate
+        returns ~0, so the check PASSES at a wrong yaw (user run 3:
+        yaw -26.7 deg over a genuine -26.5 structure, residual 0.7
+        "passed", 2 boxes instead of the true yaw's 5). On such
+        scenes the argmax winner is a coin flip between near-equal
+        structures and the truth has sat at #2-3 by score across
+        every user run -- only grounding evidence can break the tie.
+    """
+    if yaw_suspect:
+        return True
+    top = top_yaw_candidates(info, k=2)
+    return len(top) == 2 and top[1][1] >= ratio * top[0][1]
+
+
 def seed_axis_delta(boxes, points: np.ndarray, cur_yaw: float,
                     min_len: float = 2.0, min_pts: int = 150,
                     top_cut: float | None = None):
