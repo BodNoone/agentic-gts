@@ -208,6 +208,139 @@ def test_align_with_subfloor_noise():
     assert abs(zc) < 0.15, f"floor mode at z={zc:.2f}, expected ~0"
 
 
+def _mesh_room(rows_yaw_deg: float, part_delta_deg: float | None,
+               rng, n_face=9000, n_top=9000, n_part=20000,
+               beyond: bool = False):
+    """A discretized-MESH-like machine room: perfect planes, no noise.
+
+    Rows at `rows_yaw_deg` as HOLLOW SHELLS (two vertical face sheets
+    + a top plane -- what a mesh sampling of closed racks actually
+    gives); floor / ceiling slabs; four outer walls (rectangular room,
+    on the hull boundary); optionally one INTERIOR partition wall
+    (fire / glass partition) rotated `part_delta_deg` from the rows and
+    kept fully inside the room -- interior walls are NOT on the convex
+    hull, so the boundary strip cannot remove them, and a mesh renders
+    them as perfect dense planes (with 3DGS they were haze and lost
+    every vote)."""
+    a = math.radians(rows_yaw_deg)
+    u = np.array([math.cos(a), math.sin(a)])          # along the row
+    v = np.array([-math.sin(a), math.cos(a)])         # across
+    pts = []
+    room_x = 16.0                                      # along-row extent
+    for cy in (-4.0, -1.2, 2.4):                       # three rows 1.1m deep
+        base = np.array([2.0, 0.0])
+        for face in (-0.55, 0.55):                     # the two face sheets
+            t = rng.uniform(0.0, room_x, (n_face, 1))
+            xy = base + t * u + (cy + face) * v
+            pts.append(np.column_stack([xy, rng.uniform(
+                0.05, 2.05, (n_face, 1))]))
+        # rack tops: dense PERFECT horizontal planes (mesh-exact)
+        t = rng.uniform(0.0, room_x, (n_top, 1))
+        w = rng.uniform(-0.55, 0.55, (n_top, 1))
+        xy = base + t * u + (cy + w) * v
+        pts.append(np.column_stack([xy, np.full((n_top, 1), 2.05)]))
+    # floor / ceiling slabs
+    fx = rng.uniform(-2.0, 20.0, (60000, 1))
+    fy = rng.uniform(-7.0, 5.0, (60000, 1))
+    pts.append(np.column_stack([fx, fy, np.zeros((60000, 1))]))
+    pts.append(np.column_stack([fx, fy, np.full((60000, 1), 3.0)]))
+    # four outer walls (axis-aligned room frame, on the hull boundary)
+    for wx in (-2.0, 20.0):
+        pts.append(np.column_stack([
+            np.full((n_face, 1), wx),
+            rng.uniform(-7.0, 5.0, (n_face, 1)),
+            rng.uniform(0.05, 2.95, (n_face, 1))]))
+    for wy in (-7.0, 5.0):
+        pts.append(np.column_stack([
+            rng.uniform(-2.0, 20.0, (n_face, 1)),
+            np.full((n_face, 1), wy),
+            rng.uniform(0.05, 2.95, (n_face, 1))]))
+    if part_delta_deg is not None:
+        # interior partition wall: perfect 0.2m-thick vertical plane,
+        # kept fully INSIDE the room (off the hull), exactly the
+        # structure the boundary strip cannot touch
+        pa = math.radians(rows_yaw_deg + part_delta_deg)
+        pu = np.array([math.cos(pa), math.sin(pa)])
+        pv = np.array([-math.sin(pa), math.cos(pa)])
+        s = rng.uniform(-4.0, 5.0, (n_part, 1))
+        w = rng.uniform(-0.10, 0.10, (n_part, 1))
+        c = np.array([8.0, -1.0]) + s * pu + w * pv
+        pts.append(np.column_stack([c, rng.uniform(0.05, 2.95, (n_part, 1))]))
+    if beyond:
+        # the reconstruction extends PAST the machine room (captured
+        # corridor / neighboring space): the hull moves outward and
+        # the room's OUTER WALLS -- perfect dense planes in a mesh --
+        # are interior now, exactly what the boundary strip CANNOT
+        # remove. The walls vote at the ROOM frame angle (0 deg) while
+        # the rows sit at rows_yaw_deg.
+        ex = rng.uniform(-4.0, 22.0, (40000, 1))
+        ey = rng.uniform(-9.0, 7.0, (40000, 1))
+        pts.append(np.column_stack([ex, ey, np.zeros((40000, 1))]))
+        pts.append(np.column_stack([ex, ey, np.full((40000, 1), 3.4)]))
+        for wx in (-4.0, 22.0):
+            pts.append(np.column_stack([
+                np.full((n_face, 1), wx),
+                rng.uniform(-9.0, 7.0, (n_face, 1)),
+                rng.uniform(0.05, 3.35, (n_face, 1))]))
+        for wy in (-9.0, 7.0):
+            pts.append(np.column_stack([
+                rng.uniform(-4.0, 22.0, (n_face, 1)),
+                np.full((n_face, 1), wy),
+                rng.uniform(0.05, 3.35, (n_face, 1))]))
+    return np.vstack(pts)
+
+
+def test_yaw_clean_mesh_interior_partition():
+    """MESH geometry (user report: yaw far off with --mesh-cloud, which
+    'should not happen -- mesh noise is small'): a mesh renders an
+    interior partition wall as a PERFECT dense plane. The boundary
+    strip only removes hull-adjacent cells, and _row_band_score
+    accepted bands as thin as 0.1m -- one long wall concentrates its
+    whole mass into a single sub-0.3m band and OUT-SCORES the real
+    rows (whose mass splits across several 0.6-1.2m bands). The
+    residual self-check re-runs the same estimator, the same wall
+    wins again, residual ~0: the hijack passes as consistency. The
+    fix: no device category is thinner than ~0.5m -- bands under
+    0.45m score nothing."""
+    rng = np.random.default_rng(9)
+    pts = _mesh_room(rows_yaw_deg=8.0, part_delta_deg=47.0, rng=rng)
+    yaw = estimate_yaw(pts)
+    err = abs(8.0 - math.degrees(yaw)) % 90.0
+    err = min(err, 90.0 - err)
+    assert err < 3.0, \
+        f"mesh room yaw {math.degrees(yaw):.1f} deg (rows at 8 deg) -- " \
+        f"interior partition hijacked the estimate"
+    # no-partition control: the same room without the wall must also pass
+    pts2 = _mesh_room(rows_yaw_deg=8.0, part_delta_deg=None, rng=rng)
+    yaw2 = estimate_yaw(pts2)
+    err2 = abs(8.0 - math.degrees(yaw2)) % 90.0
+    err2 = min(err2, 90.0 - err2)
+    assert err2 < 3.0, f"control (no wall) yaw {math.degrees(yaw2):.1f} deg"
+    print(f"PASS clean-mesh yaw (with 47-deg partition: "
+          f"{math.degrees(yaw):.1f} deg, control {math.degrees(yaw2):.1f} deg)")
+
+
+def test_yaw_mesh_reconstruction_beyond_room():
+    """The other mesh-specific hijack (user report: yaw far off ONLY
+    with --mesh-cloud): a reconstruction that extends PAST the machine
+    room (captured corridor / neighboring space). The hull moves
+    outward, the room's own walls -- PERFECT dense planes in a mesh,
+    axis-aligned to the building frame -- become interior cells the
+    boundary strip cannot remove, and they out-vote the rows whenever
+    the room frame differs from the row direction. With 3DGS the same
+    walls were haze and lost every vote."""
+    rng = np.random.default_rng(11)
+    pts = _mesh_room(rows_yaw_deg=8.0, part_delta_deg=None, rng=rng,
+                     beyond=True)
+    yaw = estimate_yaw(pts)
+    err = abs(8.0 - math.degrees(yaw)) % 90.0
+    err = min(err, 90.0 - err)
+    assert err < 3.0, \
+        f"mesh-beyond-room yaw {math.degrees(yaw):.1f} deg (rows at 8) -- " \
+        f"the room-frame walls hijacked the estimate"
+    print(f"PASS mesh beyond room (yaw {math.degrees(yaw):.1f} deg, rows at 8)")
+
+
 if __name__ == "__main__":
     test_align_and_yaw_on_adversarial_cloud()
     print("PASS  test_align_and_yaw_on_adversarial_cloud")

@@ -359,8 +359,21 @@ def _row_band_score(cells: np.ndarray, yaw: float, bin_w: float = 0.15) -> float
     with several narrow, dense bands separated by empty aisles. Walls are
     assumed removed beforehand (boundary-cell stripping). Score = sum over
     bands of (band mass) restricted to bands with plausible row width
-    (0.2..2m). The perpendicular direction only yields thin side-face
+    (0.5..2m). The perpendicular direction only yields thin side-face
     spikes with little total mass, so mass discriminates directions well.
+
+    MESH hijack guard (user report: yaw far off with --mesh-cloud): a
+    mesh renders walls as PERFECT dense planes, and when the
+    reconstruction extends past the machine room (captured corridor /
+    neighboring space) the room walls are INTERIOR to the hull -- the
+    boundary strip cannot remove them, and their single-line bands
+    carry full mass: wall mass ~ row-face mass and the score flips on
+    noise. A wall band and a rack FACE band are geometrically
+    identical thin vertical planes -- the discriminator is PAIRING: a
+    rack face always has its front/back sibling one rack-depth away
+    (0.5..2.4m, incl. back-to-back doubles), a wall stands alone.
+    Thin bands score full mass only when PAIRED; solitary thin lines
+    (walls, starved single faces) score 10%.
     """
     cross = np.array([-math.sin(yaw), math.cos(yaw)])
     v = cells @ cross
@@ -370,6 +383,7 @@ def _row_band_score(cells: np.ndarray, yaw: float, bin_w: float = 0.15) -> float
     thr = max(2, 0.2 * hist.max())
     dense = hist >= thr
     score = 0.0
+    thins: list[tuple[float, float]] = []   # (center, mass)
     i = 0
     while i < len(dense):
         if dense[i]:
@@ -378,13 +392,28 @@ def _row_band_score(cells: np.ndarray, yaw: float, bin_w: float = 0.15) -> float
                 j += 1
             width = (j - i + 1) * bin_w
             mass = float(hist[i:j + 1].sum())
-            if 0.1 <= width <= 2.0:      # plausible single-row band
+            if 0.5 <= width <= 2.0:      # solid single-row band
                 score += mass
             elif width > 2.0:            # blob: wrong direction merges rows
                 score += mass * 0.2
+            else:                        # thin: face sheet OR wall line
+                thins.append((0.5 * (edges[i] + edges[j + 1]), mass))
             i = j + 1
         else:
             i += 1
+    # thin bands: a rack FACE always has its front/back sibling one
+    # rack-depth away (network racks 0.45m to back-to-back doubles
+    # 2.2m); a wall stands alone or in pairs metres apart. Sibling
+    # support is NON-EXCLUSIVE (greedy exclusive pairing mis-couples
+    # an interior artifact band with one face and starves the other):
+    # any thin band with another thin band within 0.40..2.4m scores
+    # full mass; solitary thin lines (walls, lone starved faces)
+    # score 10%.
+    tc = [c for c, _ in thins]
+    for k, (c, m) in enumerate(thins):
+        sib = any(0.40 <= abs(c - c2) <= 2.4
+                  for k2, c2 in enumerate(tc) if k2 != k)
+        score += m if sib else 0.1 * m
     return score
 
 
