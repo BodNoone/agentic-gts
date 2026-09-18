@@ -407,6 +407,34 @@ def test_render_cut_mesh_mode():
     print(f"PASS render cut mesh mode (gs {gs}, mesh {mesh})")
 
 
+def test_render_keep_mask_opacity_dual_band():
+    """Opacity-aware dual-band floor cut: a SOLID gaussian (opacity
+    >= 0.5) is real geometry and keeps the band from 0.30m -- a 0.7m
+    AC bank shows its full body -- while LOW-opacity ones (3DGS haze)
+    stay under the 1.00m trim. A blanket 1.00m trim cut sub-1m
+    devices entirely; a blanket 0.30 washed the view in floor haze
+    (user reports: both, in sequence)."""
+    from agentic_gts.agent.ground import _render_keep_mask
+    cut = 1.75
+    # (h, opacity, expected_keep)
+    cases = [
+        (0.70, 0.90, True),    # SOLID low device (AC bank): KEPT
+        (0.50, 0.55, True),    # solid, just over the 0.30 band
+        (0.20, 0.95, False),   # solid floor slab: below the band
+        (0.80, 0.10, False),   # haze floater under 1m: cut (the leak)
+        (1.30, 0.15, True),    # haze above 1m still kept (rare, dim)
+        (1.90, 0.95, False),   # solid tray ABOVE the ceiling cut
+        (2.00, 0.20, False),   # low-opacity above the ceiling cut too
+    ]
+    hg = np.array([c[0] for c in cases])
+    op = np.array([c[1] for c in cases])
+    keep = _render_keep_mask(hg, op, cut)
+    for (h, o, want), got in zip(cases, keep):
+        assert bool(got) is want, \
+            f"h={h:.2f} op={o:.2f}: keep={bool(got)}, want {want}"
+    print("PASS render keep mask (opacity dual band)")
+
+
 def test_floor_map_mesh_mode():
     """mesh_mode: a mesh sampling has no under-floor haze, so a tile's
     floor is its plain MINIMUM z -- even when the slab is sparsely

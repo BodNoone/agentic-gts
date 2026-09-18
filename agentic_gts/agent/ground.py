@@ -197,6 +197,26 @@ def _tile_frames(layout):
     return [(x[0], y[0], x[1], y[1]) for x in xs for y in ys]
 
 
+def _render_keep_mask(hg: np.ndarray, op: np.ndarray,
+                      cut: float) -> np.ndarray:
+    """Opacity-aware dual-band floor cut for the groundview GS render.
+
+    SOLID gaussians (opacity >= 0.5) keep the fit-pool band from
+    0.30m -- a low AC unit shows its FULL body -- while low-opacity
+    ones (3DGS haze: diffuse floor floaters, the regional leak) stay
+    under the 1.00m haze trim. A blanket 1.00m trim would cut sub-1m
+    devices entirely; a blanket 0.30 would wash the view in floor
+    haze (user reports: both, in sequence). The well-reconstructed
+    floor slab is solid but sits at h ~ 0 (< 0.30) under the local
+    floor map, so it stays out regardless.
+    """
+    solid = op >= 0.50
+    keep = (solid & (hg > 0.30)) | (~solid & (hg > 1.00))
+    if np.isfinite(cut):
+        keep &= hg < cut
+    return keep
+
+
 def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
                     frame=None):
     """Base top-down render, no overlays. Camera fitted over the
@@ -303,17 +323,16 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
         try:
             from agentic_gts.tools.gs_io import read_gaussian_ply
             gs = read_gaussian_ply(gs_ply)
-            # same height-relative band over the gaussians (their means
-            # drive the cut): the rasterizer's SCALAR cut_z / cut_z_low
-            # cannot express a per-section floor. Same high floor cut
-            # as the scatter band (1.00m): diffuse floor gaussians --
-            # including the tall floaters in badly reconstructed
-            # regions -- must not wash out the view.
+            # OPACITY-AWARE dual-band floor cut (user report: part of
+            # the floor back in the groundview, yet sub-1m devices --
+            # AC banks, low cabinets -- must not be cut by a blanket
+            # 1.00m trim). The rasterizer's SCALAR cut_z / cut_z_low
+            # cannot express any of this -- keep_mask only.
             gm = np.asarray(gs.means, dtype=np.float64)
             hg = gm[:, 2] - fl(gm[:, 0], gm[:, 1])
-            keep = hg > 1.00
-            if np.isfinite(cut):
-                keep &= hg < cut
+            op = 1.0 / (1.0 + np.exp(
+                -np.asarray(gs.raw_opacity, dtype=np.float64)))
+            keep = _render_keep_mask(hg, op, cut)
             if keep.sum() < 100:       # very low structures: relax
                 keep = hg > 0.30
                 if np.isfinite(cut):
