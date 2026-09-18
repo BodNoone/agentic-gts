@@ -259,14 +259,18 @@ class VLMJudge:
         "room from 55 degrees. Each yellow numbered rectangle marks a "
         "candidate region found by geometric clustering of the point "
         "cloud.\n"
+        "A candidate standing AGAINST a wall may include the wall in "
+        "the same rectangle -- judge what the region CONTAINS, not only "
+        "its outline: any region that contains server racks or IT "
+        "cabinets is a rack row even when a wall touches it.\n"
         "For EVERY numbered region, decide what it is, using BOTH "
         "views:\n"
         '- "rack row": server racks or IT cabinets (one or several, '
         "joined or standing alone) -- thick boxy structures with "
         "vertical faces\n"
         '- "ac": air-conditioning unit / precision cooling unit\n'
-        '- "wall": a wall or room boundary -- THIN and tall in the '
-        "oblique view\n"
+        '- "wall": a wall or room boundary with NO devices inside -- '
+        "THIN and tall in the oblique view\n"
         '- "pillar": a structural column\n'
         '- "clutter": cables, junk, small non-device objects\n'
         '- "empty": no real structure\n'

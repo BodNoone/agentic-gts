@@ -762,19 +762,27 @@ _MIN_DEVICE_DEPTH = 0.40
 _SPLIT_MIN_GAP = 0.30
 
 
-def _cross_gap_split(v: np.ndarray, peak_frac: float = 0.25) -> float | None:
+def _cross_gap_split(v: np.ndarray, peak_frac: float = 0.25,
+                     min_side: float = _MIN_DEVICE_DEPTH) -> float | None:
     """Split coordinate of the most BALANCED interior weak run in a 1-D
     cross-axis density profile, or None.
 
     A gap qualifies when it is >= _SPLIT_MIN_GAP wide, interior (not
-    touching the profile edges) and BOTH sides keep a >=
-    _MIN_DEVICE_DEPTH strong span: a run with a single face-sheet on
-    one side is a rack INTERIOR (hollow row), not an aisle -- splitting
-    there shreds one row into its two faces. Among qualifying gaps the
-    most balanced split wins (minimises the wider side's strong span);
-    the caller recurses on any side still deeper than
-    _MAX_DEVICE_DEPTH, which handles 3+ rows in one rect.
-    """
+    touching the profile edges) and BOTH sides keep a >= min_side
+    strong span: with the default _MIN_DEVICE_DEPTH a run with a
+    single face-sheet on one side is a rack INTERIOR (hollow row), not
+    an aisle -- splitting there shreds one row into its two faces.
+    Among qualifying gaps the most balanced split wins (minimises the
+    wider side's strong span); the caller recurses on any side still
+    deeper than _MAX_DEVICE_DEPTH, which handles 3+ rows in one rect.
+
+    min_side: the CLUSTER net lowers it (0.15) -- a wall-adjacent
+    device's blob holds a THIN wall sheet on one side (0.2m < the 0.40
+    device rule), and the strict default would reject the wall/device
+    gap as if it were a hollow-row interior. With the relaxed side the
+    gap qualifies, and each side's own refit does the real filtering:
+    the wall strip dies in _fit_region_box's sliver guard, the device
+    keeps its clean box."""
     if len(v) < 60:
         return None
     cell = 0.05
@@ -806,7 +814,7 @@ def _cross_gap_split(v: np.ndarray, peak_frac: float = 0.25) -> float | None:
         if g_hi - g_lo >= _SPLIT_MIN_GAP:
             l_span = g_lo - float(edges[first])
             r_span = float(edges[last + 1]) - g_hi
-            if l_span >= _MIN_DEVICE_DEPTH and r_span >= _MIN_DEVICE_DEPTH:
+            if l_span >= min_side and r_span >= min_side:
                 wider = max(l_span, r_span)
                 if best is None or wider < best[0]:
                     best = (wider, g_lo, g_hi)
@@ -817,7 +825,9 @@ def _cross_gap_split(v: np.ndarray, peak_frac: float = 0.25) -> float | None:
 
 
 def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
-                      floor_z: float = 0.0) -> list:
+                      floor_z: float = 0.0,
+                      max_depth: float = _MAX_DEVICE_DEPTH,
+                      min_side: float = _MIN_DEVICE_DEPTH) -> list:
     """Fit one rect, then split DEEP fits: a rect the VLM drew around
     TWO opposing rows (front + back, an aisle between) fits as ONE box
     with the union depth, and nothing downstream can split across the
@@ -829,19 +839,25 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
     fail the min-side-depth rule in _cross_gap_split) and refit each
     side, recursively. Sides whose refit fails the guards (a wall
     strip, a sliver) are dropped by _fit_region_box itself; if NO side
-    survives the original whole box is kept (recall first)."""
+    survives the original whole box is kept (recall first).
+
+    max_depth: the CLUSTER net lowers it to 1.35 -- a device standing
+    against a wall merges with it into one blob of depth 0.2 (wall) +
+    gap + 1.1 (device) ~= 1.6m, under the 1.8 default yet NOT a single
+    device; the split's min-side rule (_MIN_DEVICE_DEPTH 0.40) then
+    discards the wall side and keeps the clean device box."""
     bb = _fit_region_box(points, rect, min_pts, floor_z)
     if bb is None:
         return []
     axis = 1 if abs(float(bb.yaw)) < 1e-6 else 0   # cross axis of the fit
-    if bb.size[1] <= _MAX_DEVICE_DEPTH:
+    if bb.size[1] <= max_depth:
         return [bb]
     x0, y0, x1, y1 = rect
     m = ((points[:, 0] >= x0) & (points[:, 0] <= x1) &
          (points[:, 1] >= y0) & (points[:, 1] <= y1))
     dev = points[m]
     dev = dev[dev[:, 2] > floor_z + 0.30]
-    s = _cross_gap_split(dev[:, axis])
+    s = _cross_gap_split(dev[:, axis], min_side=min_side)
     if s is None:
         print(f"[ground] deep fit (depth {bb.size[1]:.2f}m) with no "
               f"splittable aisle gap -> kept whole (back-to-back rows "
@@ -853,7 +869,9 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
         else ((x0, y0, s, y1), (s, y0, x1, y1))
     out = []
     for sub in subs:
-        out.extend(_fit_region_boxes(points, sub, min_pts, floor_z))
+        out.extend(_fit_region_boxes(points, sub, min_pts, floor_z,
+                                     max_depth=max_depth,
+                                     min_side=min_side))
     return out or [bb]
 
 
@@ -936,11 +954,22 @@ def _cluster_candidates(points: np.ndarray, cell: float = 0.30,
 
 
 def _rect_covered(a, b, iou_thr: float = 0.10,
-                  contain_thr: float = 0.60) -> bool:
+                  contain_thr: float = 0.60,
+                  rev_contain_thr: float = 0.75) -> bool:
     """Is row-frame rect `a` already accounted for by VLM rect `b`?
     Loose on purpose: a cluster overlapping any real part of a VLM
     rect is NOT a missed device -- only fully-uncovered clumps go to
-    adjudication (recall of the NET, precision of the VLM)."""
+    adjudication (recall of the NET, precision of the VLM).
+
+    The REVERSE containment matters for devices standing AGAINST a
+    wall: the wall merges the device's cluster into a wall+device
+    BLOB whose area dwarfs the VLM rect (that outlined only the
+    device), so the forward containment fails -- yet re-proposing
+    that blob fits a wall-inflated box that out-supports (wall
+    points!) and EATS the correct VLM box in the dedup (user
+    question: wall-adjacent devices). A VLM rect sitting ~WHOLLY
+    inside the cluster means the VLM already handled the structure
+    that rect covers: covered."""
     ax0, ay0, ax1, ay1 = a
     bx0, by0, bx1, by1 = b
     ix = max(0.0, min(ax1, bx1) - max(ax0, bx0))
@@ -949,9 +978,10 @@ def _rect_covered(a, b, iou_thr: float = 0.10,
     if inter <= 0:
         return False
     area_a = max((ax1 - ax0) * (ay1 - ay0), 1e-9)
+    area_b = max((bx1 - bx0) * (by1 - by0), 1e-9)
     return inter / area_a >= contain_thr or \
-        inter / max((ax1 - ax0) * (ay1 - ay0)
-                    + (bx1 - bx0) * (by1 - by0) - inter, 1e-9) >= iou_thr
+        inter / area_b >= rev_contain_thr or \
+        inter / max(area_a + area_b - inter, 1e-9) >= iou_thr
 
 
 def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
@@ -1299,7 +1329,8 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                     [[(rect[0] + rect[2]) / 2.0,
                       (rect[1] + rect[3]) / 2.0, 0.0]]), yaw)[0]
                 for bb in _fit_region_boxes(
-                        pts_fit, rect, floor_z=float(fl(cw[0], cw[1]))):
+                        pts_fit, rect, floor_z=float(fl(cw[0], cw[1])),
+                        max_depth=1.35, min_side=0.15):
                     c = _rot_xy(np.array(
                         [[bb.center[0], bb.center[1], 0.0]]), yaw)[0]
                     boxes.append(OrientedBox(

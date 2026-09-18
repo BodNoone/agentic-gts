@@ -480,6 +480,61 @@ def test_cluster_candidates_basic():
           "haze-immune)")
 
 
+def test_wall_adjacent_devices():
+    """Devices standing AGAINST a wall (user question): the wall
+    merges into the device's density cluster, so the net must not
+    (a) re-propose a VLM-covered wall-adjacent device -- the reverse
+    containment reads the VLM rect ~wholly inside the blob as covered
+    (a wall-inflated refit would OUT-SUPPORT the correct box on wall
+    points and eat it in the dedup), and (b) let the wall inflate a
+    MISSED device's fitted box -- the cluster fit splits at the
+    wall/device gap (relaxed min_side) and the wall strip dies in the
+    sliver guard."""
+    from agentic_gts.agent.ground import (_cross_gap_split,
+                                          _fit_region_boxes,
+                                          _rect_covered)
+
+    # (a) reverse containment: VLM rect = the device only, cluster =
+    # wall + gap + device (much bigger area -> forward containment
+    # fails, reverse must hold)
+    cluster = (0.0, 0.0, 6.0, 3.0)
+    vlm_rect = (0.0, 0.0, 6.0, 1.1)
+    assert _rect_covered(cluster, vlm_rect), \
+        "wall+device blob must read as covered by the device-only rect"
+
+    # (b) missed device against a wall: row y in [-0.55, 0.55], wall
+    # sheet at y = 1.05 (0.2m thick) -> gap 0.5m, blob depth 1.8m.
+    # The strict min_side (0.40) rejects the wall/device gap (the wall
+    # side is only 0.2m strong); the relaxed cluster fit must split
+    # there and the wall strip must die in the sliver guard.
+    rng = np.random.default_rng(51)
+    row = _row_points(0.0, 6.0, y=0.0, rng=rng)
+    # wall sheet at face-comparable density (real reconstructions
+    # render strong vertical surfaces dense): under the 25%-of-peak
+    # strong threshold it reads as a strong side of the gap
+    wall = np.column_stack([rng.uniform(-0.5, 6.5, 16000),
+                            rng.uniform(1.05, 1.25, 16000),
+                            rng.uniform(0.1, 2.4, 16000)])
+    blob = np.vstack([row, wall])
+    boxes = _fit_region_boxes(blob, (-0.4, -0.8, 6.4, 1.45),
+                              max_depth=1.35, min_side=0.15)
+    assert len(boxes) == 1, \
+        f"wall strip must die in the sliver guard, got {len(boxes)}"
+    b = boxes[0]
+    assert 0.85 < b.size[1] < 1.35, \
+        f"depth {b.size[1]:.2f} inflated by the wall (want ~1.1)"
+    assert abs(b.center[1]) < 0.15, \
+        f"center y {b.center[1]:.2f} dragged toward the wall"
+    # the strict default still refuses: a hollow row's interior gap is
+    # NOT a split candidate (regression guard for min_side plumbing)
+    interior = _cross_gap_split(
+        np.concatenate([np.full(3000, 0.0), np.full(3000, 1.1)]))
+    assert interior is None, \
+        "hollow-row faces must stay glued under the default min_side"
+    print(f"PASS wall-adjacent devices (covered reverse-containment, "
+          f"fit depth {b.size[1]:.2f}m wall-free)")
+
+
 def test_ground_stage_cluster_recall():
     """The VLM MISSED a whole row on the nadir view (user report: a
     clean view cannot always be split into the wanted categories and
