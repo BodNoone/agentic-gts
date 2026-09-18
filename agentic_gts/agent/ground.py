@@ -1285,7 +1285,23 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # must only ever ADD recall, never question the rects. A failed
     # classification adds nothing -- recall nets never invent boxes.
     try:
-        cands = _cluster_candidates(pts_fit)
+        # cluster OCCUPANCY pool: cut at the RENDER cut, NOT the fit
+        # top. With a mesh the anchored z_top walk runs right up the
+        # TRAYS (dense gapless planes connected to the rack tops),
+        # so the fit pool (0.30 .. z_top + 0.10) carries tray planes
+        # SPANNING EVERY AISLE -- the one-cell dilation stitches the
+        # whole room into ONE cluster, every VLM rect lands inside it
+        # (reverse containment) -> "covered", the recall net goes
+        # silent and every device the VLM missed stays missed (user
+        # report: mesh runs still full of misses despite the net).
+        # The render cut clears the trays and every device category
+        # stays below it (AC ~1m < 0.5 x any real z_top).
+        cc = _render_cut(
+            fit_top, mesh_mode=bool(scene.meta.get("geometry_is_mesh")))
+        pts_clu = _rot_xy(
+            P[(h_fit > 0.30) & (h_fit <= (cc if np.isfinite(cc)
+                                          else fit_top + 0.10))], -yaw)
+        cands = _cluster_candidates(pts_clu)
     except Exception as e:
         print(f"[ground] clustering failed ({type(e).__name__}: {e})")
         cands = []

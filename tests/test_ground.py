@@ -412,6 +412,42 @@ def test_render_cut_mesh_mode():
     print(f"PASS render cut mesh mode (gs {gs}, mesh {mesh})")
 
 
+def test_cluster_pool_tray_stitch():
+    """MESH recall-net blind spot (user report: with --mesh-cloud the
+    grounding still misses many devices DESPITE the cluster recall
+    net). A mesh renders cable trays as dense gapless planes
+    connected to the rack tops; the anchored z_top walk runs right up
+    them, so z_top IS the tray top and the FIT pool (0.30 .. z_top +
+    0.10) carries tray planes spanning every aisle. Occupancy over
+    that pool + the 0.3m dilation stitches the whole room into ONE
+    cluster -- every VLM rect lands inside it (reverse containment),
+    the net calls everything covered and goes SILENT. Cluster
+    occupancy must use the RENDER-cut pool (trays live above it, every
+    device category below it)."""
+    from agentic_gts.agent.ground import _cluster_candidates, _render_cut
+    rng = np.random.default_rng(17)
+    rows = np.vstack([_row_points(0.0, 6.0, y=0.0, rng=rng),
+                      _row_points(0.0, 6.0, y=3.0, rng=rng)])
+    z_top = 2.6                            # dragged to the tray top
+    trays = np.column_stack([rng.uniform(-0.5, 6.5, 8000),
+                             rng.uniform(-1.5, 4.5, 8000),
+                             np.full(8000, 2.55)])
+    pts = np.vstack([rows, trays])
+    # the bug, documented: fit-pool occupancy merges the whole room
+    fit_pool = pts[(pts[:, 2] > 0.30) & (pts[:, 2] <= z_top + 0.10)]
+    merged = _cluster_candidates(fit_pool)
+    assert len(merged) == 1, \
+        "trays spanning the aisles must (bug) stitch the rows into one"
+    # the fix: render-cut occupancy separates the two rows, trays gone
+    cut = _render_cut(z_top, mesh_mode=True)
+    clu = pts[(pts[:, 2] > 0.30) & (pts[:, 2] <= cut)]
+    cands = _cluster_candidates(clu)
+    assert len(cands) == 2, \
+        f"render-cut pool must give 2 row clusters (got {len(cands)})"
+    print(f"PASS cluster tray stitch (fit-pool {len(merged)} cluster, "
+          f"render-cut pool {len(cands)} clusters)")
+
+
 def test_render_keep_mask_opacity_dual_band():
     """Opacity-aware dual-band floor cut: a SOLID gaussian (opacity
     >= 0.5) is real geometry and keeps the band from 0.30m -- a 0.7m
