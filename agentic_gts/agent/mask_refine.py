@@ -1154,7 +1154,8 @@ def _apply_depth_from_side(instances: list, pts: np.ndarray,
 
 
 def _pick_piece_top(z_mask: float | None, z_col: float | None,
-                    seed_top: float) -> tuple[float | None, str | None]:
+                    seed_top: float,
+                    strict_mask: bool = False) -> tuple[float | None, str | None]:
     """Height-source arbitration per split piece: the SAM-mask z
     (primary) vs the raw-column anchored top (guard + fallback).
 
@@ -1180,13 +1181,23 @@ def _pick_piece_top(z_mask: float | None, z_col: float | None,
     The column is ANCHORED (trays/ceiling rejected by the first real
     void), so the extra headroom does not let clutter back in.
 
+    strict_mask (MESH geometry, user directive: box heights must
+    strictly follow the SAM mask back-projected MESH points): the
+    column guard is DISABLED. In a mesh the trays are physically
+    connected to the rack tops -- the anchored walk has NO void to
+    stop at and z_col reads the TRAY top, so the very guard meant to
+    rescue truncated masks instead OVERRIDES the correct mask value
+    with the tray height (mesh runs: heights still wrong). The mask
+    over exact mesh points is both semantically and geometrically
+    clean -- it wins unconditionally when valid.
+
     Returns (z_top, source) -- source in {"mask", "col-guard", "col"}
     for the audit trail, or (None, None).
     """
     col_ok = (z_col is not None and 0.50 <= z_col <= 4.50
               and 0.45 * seed_top <= z_col <= seed_top + 1.20)
     if z_mask is not None and 0.50 <= z_mask <= 4.50:
-        if (z_mask < 0.70 * seed_top and col_ok
+        if (not strict_mask and z_mask < 0.70 * seed_top and col_ok
                 and z_col > z_mask + 0.25):
             return z_col, "col-guard"
         return z_mask, "mask"
@@ -1334,7 +1345,11 @@ def _apply_height_and_geom_depth(instances: list, seed: "OrientedBox",
             zspan = _anchored_top(np.asarray(col)[:, 2])
             z_col = float(zspan) if zspan is not None else None
         inst["z_col_top"] = round(z_col, 3) if z_col is not None else None
-        z_top, z_src = _pick_piece_top(z_mask, z_col, seed_top)
+        # MESH geometry: strict mask (user directive) -- see
+        # _pick_piece_top. GS keeps the column truncation guard.
+        z_top, z_src = _pick_piece_top(
+            z_mask, z_col, seed_top,
+            strict_mask=bool(scene.meta.get("geometry_is_mesh")))
         if z_top is not None:
             h = z_top - seed_bottom
             if abs(h - float(f.size[2])) > 0.05:

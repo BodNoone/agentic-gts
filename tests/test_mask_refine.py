@@ -110,7 +110,25 @@ def test_pick_piece_top_mask_primary_column_guards_truncation():
     assert _pick_piece_top(4.80, 2.00, seed_top) == (2.00, "col")
     # 8) nothing usable -> seed height stands
     assert _pick_piece_top(4.80, 5.00, seed_top) == (None, None)
-    print("PASS piece-top arbitration (mask primary, col truncation guard)")
+
+    # MESH strict-mask mode (user directive: heights strictly follow the
+    # SAM mask back-projected MESH points): in a mesh the trays are
+    # PHYSICALLY connected to the rack tops, the anchored column walk
+    # has no void to stop at and reads the TRAY top -- the col-guard,
+    # meant to rescue truncated masks, would override the CORRECT mask
+    # value with the tray height. Same numbers as case 3b: guard fires
+    # in GS mode, must NOT fire in strict mode.
+    assert _pick_piece_top(1.40, 2.10, seed_top) == (2.10, "col-guard")
+    assert _pick_piece_top(1.40, 2.10, seed_top,
+                           strict_mask=True) == (1.40, "mask")
+    # a VALID mask always wins outright in strict mode
+    assert _pick_piece_top(1.95, 2.10, seed_top,
+                           strict_mask=True) == (1.95, "mask")
+    # no mask points -> column still the fallback (best available)
+    assert _pick_piece_top(None, 2.00, seed_top,
+                           strict_mask=True) == (2.00, "col")
+    print("PASS piece-top arbitration (mask primary, col truncation guard, "
+          "mesh strict-mask)")
 
 
 def test_box_groups_qwen_1000_to_pixels_once():
