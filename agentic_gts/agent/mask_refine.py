@@ -1172,16 +1172,22 @@ def _pick_piece_top(z_mask: float | None, z_col: float | None,
     piece. Everything else: mask wins, including short cabinets the
     VLM split out of a mixed row and pieces TALLER than an
     under-measured seed (a broken density walk can never drag a
-    column up past its gap).
+    column up past its gap). The guard's sane-column ceiling is
+    seed_top + 1.20 (was +0.60): the seed itself under-measuring was
+    untouchable before -- the column band was cut at seed + 0.60, so
+    z_col could never even SEE the true top, let alone pass the cap
+    (user report: boxes far below the real height with no rescue).
+    The column is ANCHORED (trays/ceiling rejected by the first real
+    void), so the extra headroom does not let clutter back in.
 
     Returns (z_top, source) -- source in {"mask", "col-guard", "col"}
     for the audit trail, or (None, None).
     """
     col_ok = (z_col is not None and 0.50 <= z_col <= 4.50
-              and 0.45 * seed_top <= z_col <= seed_top + 0.60)
+              and 0.45 * seed_top <= z_col <= seed_top + 1.20)
     if z_mask is not None and 0.50 <= z_mask <= 4.50:
-        if (z_mask < 0.55 * seed_top and col_ok
-                and z_col > z_mask + 0.30):
+        if (z_mask < 0.70 * seed_top and col_ok
+                and z_col > z_mask + 0.25):
             return z_col, "col-guard"
         return z_mask, "mask"
     if col_ok:
@@ -1238,6 +1244,19 @@ def _apply_height_and_geom_depth(instances: list, seed: "OrientedBox",
     # ceiling) anyway, so the headroom is safe.
     P = np.asarray(scene.points, dtype=float)
     band = P[(P[:, 2] > 0.30) & (P[:, 2] <= seed_top + 0.60)] \
+        if len(P) else P
+    # HEIGHT column band, cut HIGHER than the thickness band: the
+    # column must be able to SEE past a LOW seed (the seed top is the
+    # row's tallest per the REGION fit -- a broken density walk can
+    # hand stageC an under-measured seed, and a band capped at
+    # seed + 0.60 then blinds the column exactly when the rescue is
+    # needed: z_col can never read the true top, _pick_piece_top's
+    # col ceiling (+1.20) is unreachable, and the box stays far below
+    # the real height (user report). The extra headroom is safe for
+    # HEIGHT: the anchored walk rejects floating overhead layers by
+    # the first real void. The THICKNESS band stays at +0.60 -- its
+    # strong-bin span must not see trays.
+    hband = P[(P[:, 2] > 0.30) & (P[:, 2] <= seed_top + 1.50)] \
         if len(P) else P
     n_geom = 0
     for inst in instances:
@@ -1297,9 +1316,9 @@ def _apply_height_and_geom_depth(instances: list, seed: "OrientedBox",
         cross_c = float(fc[:2] @ cross)
         half = float(f.size[0]) / 2.0 + 0.05
         half_d = float(f.size[1]) / 2.0 + 0.15
-        col = (band[(np.abs(band[:, :2] @ axis - along_c) <= half)
-                    & (np.abs(band[:, :2] @ cross - cross_c) <= half_d)]
-               if len(band) >= 100 else band)
+        col = (hband[(np.abs(hband[:, :2] @ axis - along_c) <= half)
+                     & (np.abs(hband[:, :2] @ cross - cross_c) <= half_d)]
+               if len(hband) >= 100 else hband)
         if len(col) < 40:
             col = pts_m if pts_m is not None and len(pts_m) >= 20 else None
             col = col if col is not None else []

@@ -85,12 +85,25 @@ def test_pick_piece_top_mask_primary_column_guards_truncation():
     # 3) truncation guard: mask at 0.9 with a SANE column at 2.05 ->
     #    column wins (VLM box covered part of the cabinet)
     assert _pick_piece_top(0.90, 2.05, seed_top) == (2.05, "col-guard")
+    # 3b) MODERATE truncation (user report: boxes far below real
+    #     height, no rescue): mask at 0.64 of the seed -- inside the
+    #     old 0.55 blind zone -- with a sane column above -> column
+    #     wins now
+    assert _pick_piece_top(1.40, 2.10, seed_top) == (2.10, "col-guard")
+    # 3c) real short cabinet (mixed row) at 0.64 of the seed: its own
+    #     column reads ITS top (anchored, trays rejected) -- not high
+    #     enough to trigger -> mask stands (the loosened guard must
+    #     not inflate real short cabinets)
+    assert _pick_piece_top(1.40, 1.45, seed_top) == (1.40, "mask")
     # 4) legit short cabinet (mixed row): mask low, column INSANE
     #    (missing) -> mask stands, no column to override
     assert _pick_piece_top(0.95, None, seed_top) == (0.95, "mask")
-    # 5) legit short cabinet vs CONTAMINATED column (above seed+0.60
+    # 5) legit short cabinet vs CONTAMINATED column (above seed+1.20
     #    -> col not ok) -> mask stands
-    assert _pick_piece_top(1.00, 3.40, seed_top) == (1.00, "mask")
+    assert _pick_piece_top(1.00, 3.60, seed_top) == (1.00, "mask")
+    # 5b) a column ABOVE seed+0.60 but within seed+1.20 is sane now
+    #     (low-seed rescue): no mask -> column wins
+    assert _pick_piece_top(None, 3.30, seed_top) == (3.30, "col")
     # 6) no mask pts (fallback span) -> column fallback as before
     assert _pick_piece_top(None, 2.00, seed_top) == (2.00, "col")
     # 7) implausible mask (above 4.5m) with sane column -> column
