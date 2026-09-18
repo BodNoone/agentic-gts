@@ -721,6 +721,13 @@ class VLMJudge:
                 }],
                 "max_tokens": max_tokens,
                 "temperature": 0.0,
+                # vLLM honours a per-request seed: even greedy decoding
+                # varies run-to-run under continuous batching (kernel
+                # order), and downstream geometry (yaw feedback votes,
+                # cluster verdicts) is knife-edged on those flips
+                # (user report: mesh yaw right on some runs, wrong on
+                # others with identical input)
+                "seed": 0,
             },
             timeout=timeout,
         )

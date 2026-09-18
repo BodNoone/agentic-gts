@@ -172,6 +172,31 @@ def test_seed_axis_delta():
     d = seed_axis_delta(boxes, P, cur_yaw=0.0, top_cut=2.0 + 0.10)
     assert d is not None and abs(math.degrees(d) - 8.0) < 1.0, \
         f"top-cut pool + middle slice must ignore tray remnants, got {d}"
+
+    # THIN wall boxes cannot vote (user report: with mesh the yaw is
+    # right on some runs, wrong on others). A mesh wall slips the
+    # sliver guard at ~0.25m, is LONG (passes min_len) and DENSE
+    # (heaviest weight); when the VLM randomly calls it a rack row the
+    # vote drags the median and CORRUPTS a correct yaw. No device
+    # category is thinner than 0.35m; walls are 0.1-0.3m.
+    def _thin_wall_box(yaw_deg, cy, length=10.0, thick=0.25):
+        a = math.radians(yaw_deg)
+        return OrientedBox(
+            center=(0.0, cy, 1.1), size=(length, thick, 2.2), yaw=0.0)
+
+    r1, r2 = _row(8.0, 0.0, seed=1), _row(8.0, 4.0, seed=2)
+    P = np.vstack([r1, r2])
+    wall_box = _thin_wall_box(0.0, 8.0)
+    # the wall's own points, 0-deg, dense (mesh-exact)
+    wt = rng2 = np.random.default_rng(5)
+    t = wt.uniform(-5.0, 5.0, (4000, 1))
+    w = wt.uniform(-0.12, 0.12, (4000, 1))
+    Pw = np.vstack([P, np.column_stack([t, np.full((4000, 1), 8.0) + w,
+                                        wt.uniform(0.1, 2.0, (4000, 1))])])
+    d = seed_axis_delta([_aabb_box(r1), _aabb_box(r2), wall_box],
+                        Pw, cur_yaw=0.0)
+    assert d is not None and abs(math.degrees(d) - 8.0) < 1.0, \
+        f"thin wall box must not vote, got {math.degrees(d):.1f} deg"
     print(f"PASS seed axis delta ({math.degrees(d):+.2f} deg on straight, "
           f"~8 deg recovered on slanted, trays ignored)")
 

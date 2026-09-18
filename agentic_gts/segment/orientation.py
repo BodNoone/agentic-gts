@@ -77,9 +77,14 @@ def seed_axis_delta(boxes, points: np.ndarray, cur_yaw: float,
     cannot drag the aggregate.
 
     Votes: only boxes long enough for a trustworthy axis (a stubby AC
-    unit's PCA direction is noise) with enough point support, folded
-    mod-90 (perpendicular rows agree), weighted by point count, taken
-    as the weighted MEDIAN.
+    unit's PCA direction is noise), THICK enough to be a device (a
+    WALL box is long and -- in a mesh -- dense, exactly the heaviest
+    possible voter at the WRONG angle: the cluster recall net proposes
+    wall blobs, the VLM sometimes calls them rack rows, and the vote
+    then drags the median and corrupts a CORRECT yaw, run-to-run
+    randomly with the VLM's own nondeterminism -- user report), and
+    with enough point support; folded mod-90 (perpendicular rows
+    agree), weighted by point count, taken as the weighted MEDIAN.
     """
     hi = float(top_cut) if top_cut else 2.5
     band = points[(points[:, 2] > 0.30) & (points[:, 2] < hi)]
@@ -87,7 +92,7 @@ def seed_axis_delta(boxes, points: np.ndarray, cur_yaw: float,
         return None
     votes = []
     for b in boxes:
-        if b.size[0] < min_len:
+        if b.size[0] < min_len or b.size[1] < 0.35:
             continue
         inside = band[b.contains(band)]
         if len(inside) < min_pts:
