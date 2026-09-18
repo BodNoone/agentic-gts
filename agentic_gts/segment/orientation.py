@@ -51,6 +51,61 @@ def estimate_residual_yaw(points: np.ndarray, yaw: float) -> float:
     return float(estimate_yaw_detailed(rot)["yaw"])
 
 
+def seed_axis_delta(boxes, points: np.ndarray, cur_yaw: float,
+                    min_len: float = 2.0, min_pts: int = 150):
+    """Yaw offset (radians, folded to [-pi/4, pi/4)) of the grounded
+    seeds' OWN directions against the render yaw, or None with too
+    few votes.
+
+    The stageG feedback signal. The seeds fit in the row frame (their
+    box.yaw is 0 / pi/2 BY CONSTRUCTION -- it carries no direction
+    information), so each seed's direction is MEASURED here: PCA on
+    the device-band points INSIDE the box. This is deliberately NOT
+    the old pool feedback, which re-ran the GLOBAL histogram
+    estimator on the union of the boxes' points -- a pool CARVED by
+    box geometry cut along the ASSUMED yaw, so slanted rows left an
+    asymmetric remainder that re-confirmed the assumed yaw, and any
+    haze inside rects kept the stage0 hijack surface (user reports:
+    imperfect / wrong yaw surviving the feedback). Per-box PCA keeps
+    each vote LOCAL to one structure -- a stray wall-ish fit cannot
+    drag the aggregate, and no histogram exists to hijack.
+
+    Votes: only boxes long enough for a trustworthy axis (a stubby AC
+    unit's PCA direction is noise) with enough point support, folded
+    mod-90 (perpendicular rows agree), weighted by point count, taken
+    as the weighted MEDIAN.
+    """
+    band = points[(points[:, 2] > 0.30) & (points[:, 2] < 2.5)]
+    if len(band) < 500:
+        return None
+    votes = []
+    for b in boxes:
+        if b.size[0] < min_len:
+            continue
+        inside = band[b.contains(band)]
+        if len(inside) < min_pts:
+            continue
+        d = inside[:, :2] - inside[:, :2].mean(axis=0)
+        cov = d.T @ d / len(d)
+        _, V = np.linalg.eigh(cov)       # ascending eigenvalues
+        v_row = V[:, 1]                  # the structure's long axis
+        votes.append((math.remainder(
+            math.atan2(v_row[1], v_row[0]) - cur_yaw, math.pi / 2),
+            float(len(inside))))
+    if len(votes) < 2:
+        return None
+    votes.sort()
+    w_tot = sum(w for _, w in votes)
+    if w_tot <= 0:
+        return None
+    acc = 0.0
+    for d, w in votes:
+        acc += w
+        if acc >= 0.5 * w_tot:
+            return float(d)
+    return float(votes[-1][0])
+
+
 def estimate_yaw_detailed(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
                           voxel: float = 0.25) -> dict:
     """Same as estimate_yaw but returns intermediate results for diagnosis.

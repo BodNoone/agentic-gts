@@ -97,6 +97,70 @@ def test_estimate_residual_yaw():
           f"wrong-claim={math.degrees(r_wrong):.1f} deg)")
 
 
+def test_seed_axis_delta():
+    """StageG feedback signal: each grounded box's direction is
+    MEASURED by PCA on the device-band points inside it (the boxes
+    are axis-aligned in the row frame -- their own yaw carries no
+    information), votes folded mod-90, weighted median. The old pool
+    feedback re-ran the GLOBAL estimator on the union of the boxes'
+    points -- a pool carved along the ASSUMED yaw, so slanted rows
+    re-confirmed the assumed yaw (user report: wrong yaw surviving
+    the feedback)."""
+    from agentic_gts.core.models import OrientedBox
+    from agentic_gts.segment.orientation import seed_axis_delta
+
+    def _row(yaw_deg, cy, n=3000, seed=5):
+        rng = np.random.default_rng(seed)
+        a = math.radians(yaw_deg)
+        u = np.array([math.cos(a), math.sin(a)])
+        v = np.array([-math.sin(a), math.cos(a)])
+        t = rng.uniform(0.0, 8.0, (n, 1))
+        w = rng.uniform(-0.5, 0.5, (n, 1))
+        xy = np.array([0.0, cy]) + t * u + w * v
+        return np.column_stack([xy, rng.uniform(0.1, 2.0, (n, 1))])
+
+    def _aabb_box(pts):
+        lo, hi = pts[:, :2].min(axis=0) - 0.1, pts[:, :2].max(axis=0) + 0.1
+        return OrientedBox(center=(float((lo[0] + hi[0]) / 2),
+                                   float((lo[1] + hi[1]) / 2), 1.1),
+                           size=(float(hi[0] - lo[0]), float(hi[1] - lo[1]),
+                                 2.2), yaw=0.0)
+
+    # two rows slanted 8 deg: per-box PCA recovers the slant
+    r1, r2 = _row(8.0, 0.0, seed=1), _row(8.2, 4.0, seed=2)
+    P = np.vstack([r1, r2])
+    boxes = [_aabb_box(r1), _aabb_box(r2)]
+    d = seed_axis_delta(boxes, P, cur_yaw=0.0)
+    assert d is not None and abs(math.degrees(d) - 8.0) < 1.0, \
+        f"slanted rows must vote their own axis, got {d}"
+
+    # perpendicular rows agree (mod-90 fold): 98 deg == 8 deg
+    r1, r2 = _row(8.0, 0.0, seed=1), _row(98.0, 4.0, seed=2)
+    P = np.vstack([r1, r2])
+    boxes = [_aabb_box(r1), _aabb_box(r2)]
+    d = seed_axis_delta(boxes, P, cur_yaw=0.0)
+    assert d is not None and abs(math.degrees(d) - 8.0) < 1.0, \
+        f"perpendicular rows must fold to one direction, got {d}"
+
+    # a heavier stray wall-ish blob cannot drag the weighted median
+    r1, r2, wall = _row(8.0, 0.0, seed=1), _row(8.0, 4.0, seed=2), \
+        _row(-20.0, 8.0, n=4000, seed=3)
+    P = np.vstack([r1, r2, wall])
+    boxes = [_aabb_box(r1), _aabb_box(r2), _aabb_box(wall)]
+    d = seed_axis_delta(boxes, P, cur_yaw=0.0)
+    assert d is not None and abs(math.degrees(d) - 8.0) < 1.0, \
+        f"weighted median must resist one stray fit, got {math.degrees(d):.1f}"
+
+    # straight rows: delta ~ 0 (the feedback never fires)
+    r1, r2 = _row(0.3, 0.0, seed=1), _row(-0.2, 4.0, seed=2)
+    P = np.vstack([r1, r2])
+    boxes = [_aabb_box(r1), _aabb_box(r2)]
+    d = seed_axis_delta(boxes, P, cur_yaw=0.0)
+    assert d is not None and abs(math.degrees(d)) < 1.0
+    print(f"PASS seed axis delta ({math.degrees(d):+.2f} deg on straight, "
+          f"~8 deg recovered on slanted)")
+
+
 def test_align_with_subfloor_noise():
     """Regression: marginal noise spike BELOW the floor must not win.
 
