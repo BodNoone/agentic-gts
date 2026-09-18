@@ -51,6 +51,39 @@ def estimate_residual_yaw(points: np.ndarray, yaw: float) -> float:
     return float(estimate_yaw_detailed(rot)["yaw"])
 
 
+def seed_axis_delta(boxes, cur_yaw: float, min_len: float = 2.0):
+    """Yaw offset (radians, folded to [-pi/4, pi/4)) of the seeds' OWN
+    PCA axes against the render yaw, or None with too few votes.
+
+    The stageG feedback signal: after the local-PCA seed fit every
+    box's yaw IS its structure's own direction, measured on its
+    middle slice -- pure device evidence with no histogram to hijack
+    and no pool carved along the assumed yaw. The old feedback re-ran
+    the GLOBAL estimator on points inside the fitted boxes: the pool
+    was cut by box geometry aligned to the ASSUMED yaw, so slanted
+    rows left an asymmetric remainder that re-confirmed the assumed
+    yaw (user report: imperfect yaw surviving the feedback).
+
+    Votes: only boxes long enough for a trustworthy axis (a stubby AC
+    unit's PCA direction is noise), weighted by point support, folded
+    mod-90 (perpendicular rows agree). Weighted MEDIAN -- one stray
+    wall-ish fit cannot drag it.
+    """
+    votes = sorted(
+        (math.remainder(float(b.yaw) - cur_yaw, math.pi / 2),
+         float((b.meta or {}).get("n_pts", 0)))
+        for b in boxes if b.size[0] >= min_len)
+    w_tot = sum(w for _, w in votes)
+    if len(votes) < 2 or w_tot <= 0:
+        return None
+    acc = 0.0
+    for d, w in votes:
+        acc += w
+        if acc >= 0.5 * w_tot:
+            return float(d)
+    return float(votes[-1][0])
+
+
 def estimate_yaw_detailed(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
                           voxel: float = 0.25) -> dict:
     """Same as estimate_yaw but returns intermediate results for diagnosis.
