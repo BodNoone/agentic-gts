@@ -20,6 +20,80 @@ from agentic_gts.segment.orientation import estimate_yaw
 from agentic_gts.synth.generator import SynthConfig, generate
 
 
+def test_top_yaw_candidates_user_scene():
+    """Fold + rank on the USER'S REAL candidate scores (two mesh runs
+    of one scene, from the logs): the truth (-17.5 deg) scored 468/430
+    -- strong but NEVER the argmax (winners 504/440 were both wrong,
+    8-10 deg off). Both orientations of each histogram peak appear in
+    the list with different band scores (80.5 and -9.5 are the SAME
+    direction mod 90); folding must merge them, keep the best score,
+    and the top-3 must CONTAIN the truth in both runs -- that list is
+    what the grounding-yield arbitration tries."""
+    from agentic_gts.segment.orientation import top_yaw_candidates
+
+    def _near(got, want_deg):
+        return any(abs(math.degrees(w) - want_deg) < 2.0 for w, _ in got)
+
+    # run 1 pass-1 candidate scores (verbatim from the log)
+    run1 = [(72.5, 201), (-17.5, 468), (80.5, 504), (-9.5, 143),
+            (63.5, 472), (-26.5, 305), (45.5, 336)]
+    top1 = top_yaw_candidates({"candidates": run1}, k=3)
+    assert len(top1) == 3
+    assert _near(top1, -17.5), \
+        f"run-1 truth -17.5 deg must be in the top-3, got {top1}"
+    # 80.5 and -9.5 fold together -> ONE -9.5 entry at the max score
+    d95 = [s for w, s in top1 if abs(math.degrees(w) + 9.5) < 2.0]
+    assert d95 and d95[0] == 504, "both orientations must merge at max"
+
+    # run 2 pass-1 candidate scores (verbatim from the log)
+    run2 = [(72.5, 242), (-17.5, 430), (80.5, 412), (-9.5, 168),
+            (63.5, 399), (-26.5, 440), (47.5, 261)]
+    top2 = top_yaw_candidates({"candidates": run2}, k=3)
+    assert _near(top2, -17.5), \
+        f"run-2 truth -17.5 deg must be in the top-3, got {top2}"
+    # 63.5 folds to -26.5: the two entries merge at 440, not 399
+    d265 = [s for w, s in top2 if abs(math.degrees(w) + 26.5) < 2.0]
+    assert d265 and d265[0] == 440, "63.5 must merge into -26.5 at max"
+    print("PASS top yaw candidates (user scene: truth in top-3 both runs)")
+
+
+def test_pick_yaw_trial():
+    """Arbitration preference: agreement (the fitted boxes' own
+    directions match the render yaw) is unique to the TRUE direction
+    -- at every wrong yaw the box PCA votes carry the ERROR angle --
+    so an agreeing trial beats a higher-yield disagreeing one; among
+    agreeing trials the most boxes wins (a straight view detects
+    more: 5 vs 2 in the user's logs); with no agreement anywhere the
+    yield alone decides."""
+    from agentic_gts.segment.orientation import pick_yaw_trial
+
+    R = math.radians
+    # the wrong yaw found 2 boxes that voted 8.5 deg off; the true
+    # yaw found 5 boxes that agree -- truth must win
+    win = pick_yaw_trial([
+        {"yaw": R(-26.5), "n": 3, "delta": R(9.0)},
+        {"yaw": R(-9.5), "n": 2, "delta": R(-8.5)},
+        {"yaw": R(-17.5), "n": 5, "delta": R(0.4)},
+    ])
+    assert abs(math.degrees(win["yaw"]) + 17.5) < 0.5 and win["n"] == 5
+    # yield breaks ties among agreeing trials
+    win = pick_yaw_trial([
+        {"yaw": R(-17.5), "n": 5, "delta": R(0.4)},
+        {"yaw": R(-16.9), "n": 5, "delta": R(0.1)},
+    ])
+    assert abs(math.degrees(win["yaw"]) + 16.9) < 0.5, \
+        "equal yield, tighter agreement wins"
+    # no agreement at all -> most boxes, delta ignored
+    win = pick_yaw_trial([
+        {"yaw": R(-9.5), "n": 4, "delta": None},
+        {"yaw": R(-26.5), "n": 2, "delta": R(12.0)},
+    ])
+    assert abs(math.degrees(win["yaw"]) + 9.5) < 0.5
+    # empty -> None
+    assert pick_yaw_trial([]) is None
+    print("PASS pick yaw trial (agreement > yield, yield > delta)")
+
+
 def _rot_axis(axis, deg):
     axis = np.asarray(axis, dtype=float)
     axis /= np.linalg.norm(axis)

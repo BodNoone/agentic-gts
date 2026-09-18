@@ -51,6 +51,58 @@ def estimate_residual_yaw(points: np.ndarray, yaw: float) -> float:
     return float(estimate_yaw_detailed(rot)["yaw"])
 
 
+def top_yaw_candidates(info: dict, k: int = 3,
+                       bin_deg: float = 2.0) -> list[tuple[float, float]]:
+    """Distinct mod-90 layout directions from an estimate's candidate
+    scores, ranked by best mass score: [(yaw_rad, score), ...].
+
+    The candidate list carries BOTH Manhattan orientations of each
+    histogram peak (a and a - pi/2, the row-side and the cross-side
+    band) with different scores -- they are the SAME layout direction
+    once folded to [-pi/4, pi/4). Fold, keep the best score per
+    direction, return the top-k.
+
+    Why: on knife-edged scenes (several near-equal structures, the
+    argmax flipping with tiny upstream perturbations) the TRUE row
+    direction sits at #2-3 by score, never winning outright -- user
+    logs: truth -17.5 deg scored 468/430 while the WRONG winners took
+    504/440. Downstream arbitration by grounding yield needs this
+    short list that is guaranteed to CONTAIN the truth.
+    """
+    best: dict[int, tuple[float, float]] = {}
+    for deg, score in (info.get("candidates") or []):
+        w = math.remainder(math.radians(float(deg)), math.pi / 2)
+        key = int(round(math.degrees(w) / bin_deg))
+        if key not in best or score > best[key][1]:
+            best[key] = (w, float(score))
+    ranked = sorted(best.values(), key=lambda t: -t[1])
+    return ranked[:k]
+
+
+def pick_yaw_trial(trials: list[dict],
+                   agree: float = math.radians(3.0)) -> dict | None:
+    """Best yaw trial from arbitration: {"yaw", "n", "delta"}, ... .
+
+    Preference: trials whose fitted boxes' OWN directions AGREE with
+    the render yaw (|delta| <= agree) first -- agreement is unique to
+    the true direction, because at every wrong yaw the boxes' interior
+    PCA votes the ERROR angle (the rows are still physically wherever
+    they are; only the RENDER was tilted) -- then the most boxes (a
+    straight view detects more structures than a skewed one). None
+    when no trials.
+    """
+    if not trials:
+        return None
+
+    def _key(t: dict):
+        d = t.get("delta")
+        ok = d is not None and abs(d) <= agree
+        return (1 if ok else 0, t.get("n", 0),
+                -(abs(d) if d is not None else 9.0))
+
+    return max(trials, key=_key)
+
+
 def seed_axis_delta(boxes, points: np.ndarray, cur_yaw: float,
                     min_len: float = 2.0, min_pts: int = 150,
                     top_cut: float | None = None):

@@ -103,6 +103,15 @@ def align_to_ground(points: np.ndarray) -> np.ndarray:
     if len(points) < 100:
         return points
     import open3d as o3d
+    # Pin open3d's global RNG before the RANSAC loop: segment_plane
+    # draws random triplets, and on a knife-edged scene (floor partly
+    # occluded by racks, several near-coplanar surfaces) different
+    # samples find slightly different consensus planes -- a hundredth
+    # of a degree of tilt flips a few hundred points across stage0's
+    # z-band edges, and the yaw candidate scores are near-tied, so the
+    # WINNER flips run to run on the SAME input (user logs: two mesh
+    # runs, z-band 1953905 vs 1954303, yaw right once / wrong once).
+    o3d.utility.random.seed(0)
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
 
@@ -270,6 +279,7 @@ def run_pipeline(scene: Scene,
     # yaw-independent.
     from agentic_gts.segment.orientation import estimate_yaw_detailed
     info = estimate_yaw_detailed(scene.points)
+    yaw_suspect = False
     if "yaw" in opts:
         yaw = float(opts["yaw"])
         print(f"[stage0] yaw pinned by caller: {math.degrees(yaw):.1f} deg "
@@ -296,6 +306,7 @@ def run_pipeline(scene: Scene,
         # correction means a genuinely multi-directional layout --
         # warned about, not looped on.
         from agentic_gts.segment.orientation import estimate_residual_yaw
+        yaw_suspect = False
         res = estimate_residual_yaw(scene.points, yaw)
         if abs(res) > math.radians(5.0):
             fixed = math.remainder(yaw + res, math.pi / 2)
@@ -313,7 +324,13 @@ def run_pipeline(scene: Scene,
                 print(f"[stage0] WARNING: residual still "
                       f"{math.degrees(res2):.1f} deg after correction -- "
                       f"multi-directional layout? verify yaw_check.png "
-                      f"(kept the corrected yaw, no further loops)")
+                      f"(kept the corrected yaw; stageG will arbitrate "
+                      f"the top candidates by grounding yield)")
+                # knife-edged scene flag: the estimator's candidate
+                # scores are near-tied and the residual chain
+                # oscillates between basins (user logs: correction
+                # landed on the truth once, 8 deg off the other time)
+                yaw_suspect = True
         else:
             print(f"[stage0] residual self-check passed "
                   f"(residual {math.degrees(res):.1f} deg)")
@@ -357,7 +374,84 @@ def run_pipeline(scene: Scene,
     except Exception as e:
         print(f"[warn] record path set failed ({type(e).__name__}: {e}")
     from agentic_gts.agent.ground import ground_stage
-    if ground_stage(scene, judge, out_dir):
+    # --- knife-edged yaw: arbitrate the top candidates by GROUNDING
+    # YIELD (user logs: same mesh, one run 5 regions at the true yaw,
+    # the next 2 regions at a wrong one; the candidate scores were
+    # near-tied, the truth sat at #2-3 by score and never won the
+    # argmax, and the blind residual correction landed on the truth
+    # once and 8 deg off the other time). The estimator alone cannot
+    # break the tie -- but the grounding CAN: render + ground at each
+    # top candidate direction, and let the EVIDENCE pick --
+    #   1. the fitted boxes' OWN directions (per-seed PCA, the
+    #      seed_axis_delta measurement) must AGREE with the render
+    #      yaw: at the true yaw the rows come out axis-aligned and the
+    #      votes cluster AT it; at every wrong yaw the boxes still
+    #      physically point wherever the rows are, so the votes carry
+    #      the ERROR angle -- agreement is unique to the truth;
+    #   2. most boxes wins among agreeing trials (a straight view
+    #      detects more structures than a skewed one: 5 vs 2 in the
+    #      user's logs).
+    # Fires ONLY on yaw_suspect scenes (residual chain failed twice)
+    # with an unpinned yaw -- stable scenes pay nothing.
+    arbitrated = False
+    if (yaw_suspect and "yaw" not in opts
+            and info.get("candidates")):
+        import shutil
+        from agentic_gts.segment.orientation import (pick_yaw_trial,
+                                                     seed_axis_delta,
+                                                     top_yaw_candidates)
+        trials = []
+        tried = []
+        for cy in [w for w, _s in top_yaw_candidates(info, k=3)] \
+                + [float(scene.meta["yaw"])]:
+            if any(abs(cy - t) < math.radians(2.0) for t in tried):
+                continue                      # same direction, tried
+            tried.append(cy)
+            scene.meta["yaw"] = cy
+            tdir = os.path.join(out_dir,
+                                "yaw_trial_%+d" % round(math.degrees(cy)))
+            os.makedirs(tdir, exist_ok=True)
+            ok = ground_stage(scene, judge, tdir)
+            n_boxes = len(scene.boxes) if ok else 0
+            d = None
+            if ok and len(scene.boxes) >= 2:
+                d = seed_axis_delta(
+                    scene.boxes, scene.points, cy,
+                    top_cut=(float(scene.meta.get("z_top", 2.5) or 2.5)
+                             + 0.10))
+            print(f"[stageG] yaw trial {math.degrees(cy):+.1f} deg: "
+                  f"{n_boxes} boxes, seed-axis delta "
+                  + ("none" if d is None
+                     else f"{math.degrees(d):+.1f} deg"))
+            trials.append({"yaw": cy, "n": n_boxes, "delta": d,
+                           "boxes": list(scene.boxes) if ok else []})
+        win = pick_yaw_trial(trials)
+        if win is not None and win["n"] > 0:
+            arbitrated = True
+            scene.meta["yaw"] = win["yaw"]
+            scene.boxes = win["boxes"]
+            print(f"[stageG] yaw arbitration -> "
+                  f"{math.degrees(win['yaw']):+.1f} deg "
+                  f"({win['n']} boxes)")
+            # promote the winner's audit renders to the run root --
+            # the trials each wrote their own subdir (no clobbering),
+            # and the before/after comparison the user reads expects
+            # groundview.png / grounded.png at the root
+            for fn in ("groundview.png", "grounded.png",
+                       "cluster_check.png"):
+                src = os.path.join(
+                    out_dir,
+                    "yaw_trial_%+d" % round(math.degrees(win["yaw"])),
+                    fn)
+                if os.path.exists(src):
+                    try:
+                        shutil.copy2(src, os.path.join(out_dir, fn))
+                    except OSError:
+                        pass
+            _diag_support(scene)
+            _eval("stageG")
+            _render_stage(scene, "stageG_ground", out_dir, gt_boxes)
+    if not arbitrated and ground_stage(scene, judge, out_dir):
         # NOTE: the row SPLIT no longer runs here -- it moved into
         # the agent loop, AFTER the per-box local refinement (SAM).
         # User-directed order: grounding -> refine each region ->
