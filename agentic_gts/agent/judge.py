@@ -244,6 +244,88 @@ class VLMJudge:
                     self.thinking_model, self.thinking_timeout)
         return (self.api_base, self.api_key, self.model, self.timeout)
 
+    # The cluster recall net's adjudication prompt: the image carries
+    # LEFT (top-down) + RIGHT (oblique) renders of the SAME room with
+    # every geometry-found candidate pre-marked as a yellow numbered
+    # box. The VLM's job is pure CLASSIFICATION of pre-marked regions
+    # (the user's insight: on a clean nadir the VLM cannot reliably
+    # DETECT what to split into categories -- it misses devices; but
+    # pre-marked clumps it can NAME reliably, and the oblique view
+    # shows thickness and vertical faces that separate thick racks
+    # from thin walls and small clutter).
+    _CLUSTER_PROMPT = (
+        "This image shows the same data-center room twice: LEFT is a "
+        "top-down view, RIGHT is an angled (oblique) view of the same "
+        "room from 55 degrees. Each yellow numbered rectangle marks a "
+        "candidate region found by geometric clustering of the point "
+        "cloud.\n"
+        "For EVERY numbered region, decide what it is, using BOTH "
+        "views:\n"
+        '- "rack row": server racks or IT cabinets (one or several, '
+        "joined or standing alone) -- thick boxy structures with "
+        "vertical faces\n"
+        '- "ac": air-conditioning unit / precision cooling unit\n'
+        '- "wall": a wall or room boundary -- THIN and tall in the '
+        "oblique view\n"
+        '- "pillar": a structural column\n'
+        '- "clutter": cables, junk, small non-device objects\n'
+        '- "empty": no real structure\n'
+        "Reply ONLY with a JSON array, one entry for every id you can "
+        'see, like: [{"id": 1, "type": "rack row"}, '
+        '{"id": 2, "type": "wall"}]'
+    )
+
+    def classify_clusters(self, png: bytes, n_ids: int,
+                          png_path: str | None = None) -> dict:
+        """Batch-classify the numbered cluster candidates -> {id: type}.
+
+        One call for the whole recall net (never per-candidate). Any
+        parse failure or backend error returns {}: the missed clusters
+        are then simply NOT added -- a recall net must never invent
+        boxes on a bad reply."""
+        if self.backend == "mock" or n_ids <= 0:
+            return {}
+        prompt = self._CLUSTER_PROMPT
+        use_thinking = bool(self.thinking_model)
+        try:
+            for thinking in ((True, False) if use_thinking else (False,)):
+                try:
+                    if self.backend == "local":
+                        text = self._local_image_call(
+                            png, prompt, max_new_tokens=4000,
+                            thinking=thinking)
+                    else:
+                        text = self._qwen_image_call(
+                            png, prompt, max_tokens=4000, thinking=thinking)
+                    break
+                except Exception as e:
+                    if not thinking:
+                        raise
+                    print(f"[vlm][cluster][thinking] failed "
+                          f"({type(e).__name__}: {e}) -> fast model")
+        except Exception as e:
+            print(f"[vlm][cluster] failed ({type(e).__name__}: {e}) "
+                  f"-> no cluster verdicts")
+            return {}
+        out = {}
+        try:
+            arr = _extract_json_array(text or "")
+            for item in arr:
+                if isinstance(item, dict) and "id" in item:
+                    cid, t = item.get("id"), item.get("type", "")
+                    if isinstance(cid, (int, float, str)) and t:
+                        try:
+                            out[int(cid)] = str(t).strip().lower()
+                        except (ValueError, TypeError):
+                            pass
+        except Exception as e:
+            print(f"[vlm][cluster] unparseable reply "
+                  f"({type(e).__name__}: {e}) -> no cluster verdicts")
+        self._record("cluster", prompt, text or "",
+                     f"{len(out)}/{n_ids} classified", 0.5, "",
+                     png_path=png_path)
+        return out
+
     # built via concatenation so the literal tags survive any tooling that
     # strips angle-bracket markup from source edits
     _THINK_O = "<" + "think>"

@@ -19,8 +19,10 @@ from agentic_gts.core.models import Scene
 
 
 def _row_points(x0, x1, y=0.0, depth=1.1, height=2.1, rng=None, n=6000):
-    """A closed-cabinet row: two face bands + hollow interior (surface
-    points only, like a real 3DGS of a closed rack row)."""
+    """A closed-cabinet row: two face bands + TOP face + hollow
+    interior (surface points only, like a real 3DGS / mesh sampling of
+    a closed rack row -- the top band is what real clouds carry and
+    what lets interior footprint cells count as occupied)."""
     rng = rng or np.random.default_rng(0)
     half = depth / 2.0
     pts = []
@@ -28,6 +30,9 @@ def _row_points(x0, x1, y=0.0, depth=1.1, height=2.1, rng=None, n=6000):
         pts.append(np.column_stack([rng.uniform(x0, x1, n),
                                     np.full(n, y + face),
                                     rng.uniform(0.0, height, n)]))
+    pts.append(np.column_stack([rng.uniform(x0, x1, n // 2),
+                                rng.uniform(y - half, y + half, n // 2),
+                                np.full(n // 2, height - 0.05)]))
     return np.vstack(pts)
 
 
@@ -433,6 +438,106 @@ def test_render_keep_mask_opacity_dual_band():
         assert bool(got) is want, \
             f"h={h:.2f} op={o:.2f}: keep={bool(got)}, want {want}"
     print("PASS render keep mask (opacity dual band)")
+
+
+def test_cluster_candidates_basic():
+    """The cluster recall net: after the ground / top cuts the fit
+    pool holds nothing but walls, devices and junk (user insight) --
+    every structure is a density clump. Two rows + a wall = three
+    connected components; the coverage filter separates VLM-covered
+    rows from an UNCOVERED wall clump."""
+    from agentic_gts.agent.ground import (_cluster_candidates,
+                                          _rect_covered)
+    rng = np.random.default_rng(31)
+    row1 = _row_points(0.0, 6.0, y=0.0, rng=rng)
+    row2 = _row_points(0.0, 5.0, y=4.0, rng=rng)
+    wall = np.column_stack([rng.uniform(-8.0, 8.0, 3000),
+                            np.full(3000, 8.5),
+                            rng.uniform(0.1, 2.0, 3000)])
+    cands = _cluster_candidates(np.vstack([row1, row2, wall]))
+    assert len(cands) == 3, \
+        f"want 3 clusters (2 rows + wall), got {len(cands)}"
+    rects = [r for r, _n in cands]
+    # a VLM rect over row 1 covers row 1's cluster (containment), and
+    # the wall cluster is NOT covered by either row rect
+    near_row1 = min(rects, key=lambda r: abs((r[1] + r[3]) / 2.0))
+    assert _rect_covered(near_row1, (-0.2, -0.8, 6.2, 0.8)), \
+        "row 1 cluster must read as covered by its VLM rect"
+    wall_rect = max(rects, key=lambda r: r[3])
+    assert not _rect_covered(wall_rect, (-0.2, -0.8, 6.2, 0.8)), \
+        "wall cluster must NOT be covered by the row-1 rect"
+    assert not _rect_covered(wall_rect, (-0.2, 3.2, 5.2, 4.8)), \
+        "wall cluster must NOT be covered by the row-2 rect"
+    # sparse haze: a uniform scatter of a few points per cell stays
+    # below the occupancy threshold -> no phantom clusters
+    haze = np.column_stack([rng.uniform(-5.0, 5.0, 3000),
+                            rng.uniform(-2.0, 7.0, 3000),
+                            rng.uniform(0.4, 2.0, 3000)])
+    cands_h = _cluster_candidates(np.vstack([row1, row2, wall, haze]),
+                                  min_cell_pts=25)
+    assert len(cands_h) == 3, "haze cells must not become clusters"
+    print("PASS cluster candidates (3 blobs, coverage filter, "
+          "haze-immune)")
+
+
+def test_ground_stage_cluster_recall():
+    """The VLM MISSED a whole row on the nadir view (user report: a
+    clean view cannot always be split into the wanted categories and
+    devices get missed): the cluster recall net must recover it --
+    connected density components PROPOSE the uncovered clump, the VLM
+    CLASSIFIES the pre-marked candidates (nadir + oblique pair, one
+    batch call), and the ruled-device cluster fits into a box."""
+    from agentic_gts.agent import ground
+    from agentic_gts.agent.judge import VLMJudge
+
+    rng = np.random.default_rng(3)
+    pts = np.vstack([_row_points(0.0, 6.0, y=0.0, rng=rng),
+                     _row_points(-1.0, 5.0, y=3.0, rng=rng)])
+    ceil = np.column_stack([rng.uniform(-2.0, 7.0, 3000),
+                            rng.uniform(-2.0, 5.0, 3000),
+                            rng.uniform(2.9, 3.0, 3000)])
+    scene = Scene(points=np.vstack([pts, ceil]))
+    scene.meta["yaw"] = 0.0
+    _bootstrap_meta(scene, (-1.5, -0.8, 6.5, 3.8))
+    scene.boxes = []
+    _, cam, W, H = ground._render_topdown(scene, 0.0)
+    # the VLM grounds ONLY row 1 -- row 2 is the missed device
+    uv = cam.project_cv(np.column_stack(
+        [[-0.5, 6.5, 6.5, -0.5], [-0.8, -0.8, 0.8, 0.8],
+         np.full(4, 1.0)]))
+    px = (max(float(uv[:, 0].min()), 0.0), max(float(uv[:, 1].min()), 0.0),
+          min(float(uv[:, 0].max()), W), min(float(uv[:, 1].max()), H))
+    import json as _json
+    reply = ("One row visible.\n" + _json.dumps(
+        [{"bbox_2d": [int(round(px[0] / W * 1000)),
+                      int(round(px[1] / H * 1000)),
+                      int(round(px[2] / W * 1000)),
+                      int(round(px[3] / H * 1000))],
+          "label": "row"}]))
+
+    judge = VLMJudge(backend="qwen")
+
+    def _fake_call(png, prompt, *a, **k):
+        if "yellow numbered" in prompt:      # cluster adjudication
+            return _json.dumps([{"id": 1, "type": "rack row"}])
+        return reply                         # grounding: row 1 only
+    judge._qwen_image_call = _fake_call
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        ok = ground.ground_stage(scene, judge, out_dir=td)
+        assert ok, "grounding must succeed (row 1 grounded)"
+        assert os.path.exists(os.path.join(td, "cluster_check.png")), \
+            "cluster adjudication image was not saved"
+    assert len(scene.boxes) == 2, \
+        f"missed row must be recovered by the cluster net, " \
+        f"got {len(scene.boxes)} boxes"
+    ys = sorted(b.center[1] for b in scene.boxes)
+    assert abs(ys[0]) < 0.25, f"row1 y {ys[0]:.2f}"
+    assert abs(ys[1] - 3.0) < 0.25, \
+        f"recovered row must sit at y~3.0, got {ys[1]:.2f}"
+    assert 5.0 < scene.boxes[-1].size[0] < 6.5, \
+        "recovered row keeps its length"
+    print("PASS ground stage cluster recall (missed row recovered)")
 
 
 def test_floor_map_mesh_mode():
