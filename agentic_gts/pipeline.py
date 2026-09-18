@@ -367,38 +367,49 @@ def run_pipeline(scene: Scene,
         _eval("stageG")
         _render_stage(scene, "stageG_ground", out_dir, gt_boxes)
 
-        # --- grounding feedback: yaw from the seeds' OWN PCA axes ---
+        # --- grounding feedback: re-estimate yaw from the rect pool ---
         # The pre-render residual self-check only sees what stage0's
         # estimator sees (the WHOLE device band -- hijack soil). The
-        # fitted seeds are the purer evidence: after the local-PCA
-        # fit every seed's yaw IS its structure's own direction. If
-        # the seed axes' weighted median disagrees with the render
-        # yaw, the groundview was tilted and the VLM's AABBs over
-        # skewed rows are unreliable (one rect swallowing neighbouring
-        # devices) -> correct the yaw and re-ground ONCE. Never fires
-        # when the render was already straight.
+        # grounded rects are a naturally PURER pool: the VLM kept only
+        # device structures, isolating walls/floor/trays outside. If
+        # the direction measured on that pool disagrees with the
+        # render yaw, the groundview was tilted and the VLM's AABBs
+        # over skewed rows are unreliable (one rect swallowing
+        # neighbouring devices) -> correct the yaw and re-ground
+        # ONCE. Never fires when the render was already straight.
         if "yaw" not in opts and len(scene.boxes) >= 2:
-            from agentic_gts.segment.orientation import seed_axis_delta
-            delta = seed_axis_delta(scene.boxes,
-                                    float(scene.meta["yaw"]))
-            if delta is not None and abs(delta) > math.radians(3.0):
-                new_yaw = math.remainder(
-                    float(scene.meta["yaw"]) + delta, math.pi / 2)
-                if new_yaw >= math.pi / 4:
-                    new_yaw -= math.pi / 2
-                elif new_yaw < -math.pi / 4:
-                    new_yaw += math.pi / 2
-                print(f"[stageG] grounding feedback: yaw "
-                      f"{math.degrees(float(scene.meta['yaw'])):.1f} -> "
-                      f"{math.degrees(new_yaw):.1f} deg "
-                      f"(delta {math.degrees(delta):.1f}, seed-axis "
-                      f"weighted median) -> re-rendering + re-grounding")
-                scene.meta["yaw"] = new_yaw
-                opts["yaw"] = new_yaw
-                if ground_stage(scene, judge, out_dir):
-                    _diag_support(scene)
-                    _eval("stageG_reground")
-                    _render_stage(scene, "stageG_ground", out_dir, gt_boxes)
+            band = scene.points[(scene.points[:, 2] > 0.30)
+                                & (scene.points[:, 2] < 2.5)]
+            pool = []
+            for b in scene.boxes:
+                inside = band[b.contains(band)]
+                if len(inside):
+                    pool.append(inside)
+            pool = np.vstack(pool) if pool else np.zeros((0, 3))
+            if len(pool) > 2_000:
+                from agentic_gts.segment.orientation import estimate_yaw
+                yaw_fb = estimate_yaw(pool)
+                delta = math.remainder(yaw_fb - float(scene.meta["yaw"]),
+                                       math.pi / 2)
+                if abs(delta) > math.radians(3.0):
+                    new_yaw = math.remainder(
+                        float(scene.meta["yaw"]) + delta, math.pi / 2)
+                    if new_yaw >= math.pi / 4:
+                        new_yaw -= math.pi / 2
+                    elif new_yaw < -math.pi / 4:
+                        new_yaw += math.pi / 2
+                    print(f"[stageG] grounding feedback: yaw "
+                          f"{math.degrees(float(scene.meta['yaw'])):.1f} -> "
+                          f"{math.degrees(new_yaw):.1f} deg "
+                          f"(delta {math.degrees(delta):.1f}, pool "
+                          f"{len(pool)} pts) -> re-rendering + re-grounding")
+                    scene.meta["yaw"] = new_yaw
+                    opts["yaw"] = new_yaw
+                    if ground_stage(scene, judge, out_dir):
+                        _diag_support(scene)
+                        _eval("stageG_reground")
+                        _render_stage(scene, "stageG_ground", out_dir,
+                                      gt_boxes)
 
     # --- stage C: agent loop (per-box local refine) ---
     agent = LayoutAgent(judge=judge, opts=opts, out_dir=out_dir)

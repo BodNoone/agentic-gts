@@ -597,52 +597,37 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
     core = dev[(dev[:, 2] >= zc0) & (dev[:, 2] <= zc1)]
     if len(core) < 30:
         core = dev                   # thin structure: whole band
-    # LOCAL PCA frame (user report: skewed seeds dropping a chunk of
-    # the device points): the row frame is axis-aligned to the GLOBAL
-    # dominant yaw, but a rect can hold a structure slightly off it
-    # (residual yaw error, multi-direction layouts). Fitting an AABB
-    # over a slanted row inflates AND shifts the box, and the two
-    # axes' independent strong-bin peels then trim different ends --
-    # the seed comes out skewed and under-covering. PCA on the middle
-    # slice gives the structure's OWN axes; spans are measured in
-    # that frame and the seed is a true OBB with its own yaw.
-    mu = core[:, :2].mean(axis=0)
-    d = core[:, :2] - mu
-    cov = d.T @ d / max(len(d), 1)
-    _, V = np.linalg.eigh(cov)       # ascending eigenvalues
-    v_row, v_cross = V[:, 1], V[:, 0]          # long / short axes
-    u = d @ np.column_stack([v_row, v_cross])
-    s_row = _region_axis_span(u[:, 0])
-    s_cross = _region_axis_span(u[:, 1])
-    if s_row is not None and s_cross is not None:
-        (l_r, h_r), (l_c, h_c) = s_row, s_cross
+    sx = _region_axis_span(core[:, 0])
+    sy = _region_axis_span(core[:, 1])
+    if sx is not None and sy is not None:
+        (x_lo, x_hi), (y_lo, y_hi) = sx, sy
     else:                            # too sparse to bin: percentile fit
-        du = dev[:, :2] - mu
-        l_r, h_r = (float(x) for x in np.percentile(du @ v_row, [0.5, 99.5]))
-        l_c, h_c = (float(x) for x in
-                    np.percentile(du @ v_cross, [0.5, 99.5]))
-    span_r, span_c = h_r - l_r, h_c - l_c
-    # Ride the LONG side on the yaw axis (size[0]): refine_box projects
-    # along-row spans on the seed's yaw axis -- a box whose yaw axis is
-    # its THICKNESS gets split ACROSS its depth (user report: a joined
-    # row split into 3 pieces along the thickness, not the row).
-    if span_r < span_c:
-        v_row, v_cross = v_cross, v_row
-        (l_r, h_r), (l_c, h_c) = (l_c, h_c), (l_r, h_r)
-        span_r, span_c = span_c, span_r
-    if span_r < 0.30 or span_c < 0.20:
-        _reject(f"sliver (span {span_r:.2f} x {span_c:.2f}m; "
+        x_lo, y_lo = np.percentile(dev[:, :2], 0.5, axis=0)
+        x_hi, y_hi = np.percentile(dev[:, :2], 99.5, axis=0)
+    dx, dy = float(x_hi - x_lo), float(y_hi - y_lo)
+    if dx < 0.30 or dy < 0.20:
+        _reject(f"sliver (span {dx:.2f} x {dy:.2f}m; "
                 f"core={len(core)} pts, slice z "
                 f"[{zc0:.2f},{zc1:.2f}])")
         return None                  # sliver, not a structure
-    c = mu + (0.5 * (l_r + h_r)) * v_row + (0.5 * (l_c + h_c)) * v_cross
+    c = np.array([(x_lo + x_hi) / 2.0, (y_lo + y_hi) / 2.0])
+    # Ride the LONG side on the yaw axis (size[0]): a row that runs
+    # along the rotated-y axis still fits here as (dx, dy) with
+    # yaw=0 -- but then the box's yaw axis is its THICKNESS, and
+    # refine_box (which projects along-row spans on the seed's yaw
+    # axis) splits the row ACROSS its depth (user report: a joined
+    # row split into 3 pieces along the thickness, not the row).
+    if dy > dx:
+        return OrientedBox(
+            center=(float(c[0]), float(c[1]), floor_z + height / 2.0),
+            size=(dy, dx, height), yaw=math.pi / 2.0,
+            device_type=DeviceType.RACK,
+            meta={"n_pts": len(dev)})
     return OrientedBox(center=(float(c[0]), float(c[1]),
                                floor_z + height / 2.0),
-                       size=(span_r, span_c, height),
-                       yaw=math.atan2(v_row[1], v_row[0]),
+                       size=(dx, dy, height), yaw=0.0,
                        device_type=DeviceType.RACK,
-                       meta={"n_pts": len(dev),
-                             "axis_row": v_row, "axis_cross": v_cross})
+                       meta={"n_pts": len(dev)})
 
 
 # a rect the VLM drew around TWO opposing rows (front + back, aisle
@@ -724,35 +709,27 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
     bb = _fit_region_box(points, rect, min_pts, floor_z)
     if bb is None:
         return []
-    v_cross = bb.meta.get("axis_cross")
-    if bb.size[1] <= _MAX_DEVICE_DEPTH or v_cross is None:
+    axis = 1 if abs(float(bb.yaw)) < 1e-6 else 0   # cross axis of the fit
+    if bb.size[1] <= _MAX_DEVICE_DEPTH:
         return [bb]
     x0, y0, x1, y1 = rect
     m = ((points[:, 0] >= x0) & (points[:, 0] <= x1) &
          (points[:, 1] >= y0) & (points[:, 1] <= y1))
     dev = points[m]
     dev = dev[dev[:, 2] > floor_z + 0.30]
-    # split on the box's LOCAL cross axis (slanted rows included): a
-    # row-frame y-cut misses the aisle when the rows run off-yaw
-    proj = (dev[:, :2] - np.asarray(bb.center[:2])) @ v_cross
-    s = _cross_gap_split(proj)
+    s = _cross_gap_split(dev[:, axis])
     if s is None:
         print(f"[ground] deep fit (depth {bb.size[1]:.2f}m) with no "
               f"splittable aisle gap -> kept whole (back-to-back rows "
               f"have no gap; the local refine still splits along-row)")
         return [bb]
-    print(f"[ground] deep fit (depth {bb.size[1]:.2f}m) -> split on "
-          f"local cross at {s:.2f} (two rows in one rect)")
+    print(f"[ground] deep fit (depth {bb.size[1]:.2f}m) -> split at "
+          f"{'y' if axis else 'x'}={s:.2f} (two rows in one rect)")
+    subs = ((x0, y0, x1, s), (x0, s, x1, y1)) if axis == 1 \
+        else ((x0, y0, s, y1), (s, y0, x1, y1))
     out = []
-    for half in (dev[proj <= s], dev[proj > s]):
-        if len(half) < min_pts:
-            continue
-        # sub-rect: the half's own AABB (+margin) -- the recursion
-        # refits from point support, the rect is only a selection
-        lo, hi = half[:, :2].min(axis=0) - 0.10, half[:, :2].max(axis=0) + 0.10
-        out.extend(_fit_region_boxes(
-            points, (float(lo[0]), float(lo[1]),
-                     float(hi[0]), float(hi[1])), min_pts, floor_z))
+    for sub in subs:
+        out.extend(_fit_region_boxes(points, sub, min_pts, floor_z))
     return out or [bb]
 
 

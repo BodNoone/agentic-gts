@@ -8,7 +8,6 @@ Covers:
 """
 from __future__ import annotations
 
-import math
 import os
 import sys
 
@@ -279,10 +278,7 @@ def test_fit_region_box_row_along_y():
     row = row[:, [1, 0, 2]]       # transpose: the row now runs along y
     bb = _fit_region_box(row, (-0.8, -0.2, 0.8, 6.2))
     assert bb is not None, "a y-running row must produce a box"
-    # PCA recovers the row direction with sampling noise (~0.1 deg);
-    # yaw and yaw +/- pi describe the SAME box
-    d = (bb.yaw - math.pi / 2.0) % math.pi
-    assert min(d, math.pi - d) < math.radians(1.0), \
+    assert abs(bb.yaw - math.pi / 2.0) < 1e-9, \
         f"yaw must be pi/2 (long side on the yaw axis), got {bb.yaw}"
     assert 5.5 < bb.size[0] < 6.4, \
         f"size[0] must be the ROW LENGTH, got {bb.size[0]:.2f}"
@@ -392,40 +388,6 @@ def test_fit_region_boxes_solid_deep_structure_kept():
         f"a solid deep block has no gap to split at, got {len(bbs)}"
     assert 2.0 < bbs[0].size[1] < 2.45, "depth must stay the whole extent"
     print(f"PASS solid deep block kept whole (depth {bbs[0].size[1]:.2f})")
-
-
-def test_fit_region_box_slanted_row():
-    """LOCAL PCA yaw: a row slanted 12 deg inside the (axis-aligned)
-    row frame used to fit as an inflated, SHIFTED AABB whose two-axis
-    strong-bin peels trimmed different ends -- a skewed seed dropping
-    a chunk of the device points (user report). PCA must recover the
-    row's own axes: yaw ~= 12 deg, spans snug, full point coverage."""
-    from agentic_gts.agent.ground import _fit_region_box
-    rng = np.random.default_rng(41)
-    a = math.radians(12.0)
-    u, v = np.array([math.cos(a), math.sin(a)]), \
-        np.array([-math.sin(a), math.cos(a)])
-    t = rng.uniform(0.0, 8.0, (4000, 1))          # along the row
-    w = rng.uniform(-0.5, 0.5, (4000, 1))         # across (1m thick)
-    # center offset (6, 0): broadcasting a bare 6.0 puts the row at
-    # y in [5.5, 12.1] -- mostly OUTSIDE the rect below, and the fit
-    # runs on a stray 268-point corner instead of the whole row
-    xy = np.array([6.0, 0.0]) + t * u + w * v
-    z = rng.uniform(0.1, 2.0, (4000, 1))
-    pts = np.column_stack([xy, z])
-    bb = _fit_region_box(pts, (2.0, -6.0, 14.0, 6.0))
-    assert bb is not None, "slanted row must fit"
-    # PCA axis sign is arbitrary and the row/cross swap is allowed:
-    # compare modulo 180 deg against 12 (row) and 78 (swapped)
-    yaw_d = math.degrees(bb.yaw) % 180.0
-    assert min(abs(yaw_d - 12.0), abs(yaw_d - 78.0)) < 1.5, \
-        f"yaw {math.degrees(bb.yaw):.1f} deg must follow the row (12 deg)"
-    # coverage: the fitted box must hold the WHOLE row
-    inside = bb.contains(pts[pts[:, 2] > 0.35])
-    assert inside.mean() > 0.985, \
-        f"skewed fit: only {inside.mean():.1%} of device points covered"
-    print(f"PASS slanted row (yaw {math.degrees(bb.yaw):.1f} deg, "
-          f"cover {inside.mean():.1%})")
 
 
 def test_render_cut_mesh_mode():
@@ -570,9 +532,7 @@ def test_ground_stage_row_along_y():
         assert ok, "grounding must succeed on a y-running row"
     assert len(scene.boxes) == 1
     b = scene.boxes[0]
-    # PCA noise ~0.1 deg; yaw and yaw +/- pi are the same box
-    d = (b.yaw - math.pi / 2.0) % math.pi
-    assert min(d, math.pi - d) < math.radians(1.0), \
+    assert abs(b.yaw - math.pi / 2.0) < 1e-6, \
         f"world yaw must be pi/2, got {b.yaw:.3f}"
     assert 5.5 < b.size[0] < 6.4, \
         f"size[0] must be the row length, got {b.size[0]:.2f}"
@@ -1052,7 +1012,6 @@ if __name__ == "__main__":
     test_floor_map_mesh_mode()
     test_fit_region_boxes_two_rows_in_one_rect()
     test_fit_region_boxes_solid_deep_structure_kept()
-    test_fit_region_box_slanted_row()
     test_tile_frames()
     test_ground_stage_tiled_views()
     test_robust_span_bin_boundary()

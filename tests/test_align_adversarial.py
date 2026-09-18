@@ -97,52 +97,6 @@ def test_estimate_residual_yaw():
           f"wrong-claim={math.degrees(r_wrong):.1f} deg)")
 
 
-def test_seed_axis_delta():
-    """StageG feedback signal: the seeds' OWN PCA yaws vote directly
-    (weighted median, folded mod-90). The old feedback re-ran the
-    global histogram estimator on points inside the fitted boxes --
-    a pool carved along the ASSUMED yaw, so slanted rows re-confirmed
-    the assumed yaw (user report: imperfect yaw surviving feedback).
-    """
-    from agentic_gts.core.models import OrientedBox
-    from agentic_gts.segment.orientation import seed_axis_delta
-
-    def _box(yaw_deg, n_pts, length=6.0):
-        return OrientedBox(center=(0.0, 0.0, 1.0), size=(length, 1.0, 2.0),
-                           yaw=math.radians(yaw_deg), meta={"n_pts": n_pts})
-
-    # three rows slanted 8 deg off the render yaw: median ~ +8 deg
-    boxes = [_box(8.0, 900), _box(8.2, 800), _box(7.8, 700)]
-    d = seed_axis_delta(boxes, cur_yaw=0.0)
-    assert d is not None and abs(math.degrees(d) - 8.0) < 0.5, \
-        f"three agreeing seeds must vote their own axis, got {d}"
-
-    # perpendicular rows agree (mod-90 fold): +98 deg == +8 deg
-    boxes = [_box(8.0, 900), _box(98.0, 800)]
-    d = seed_axis_delta(boxes, cur_yaw=0.0)
-    assert d is not None and abs(math.degrees(d) - 8.0) < 0.5, \
-        f"perpendicular rows must fold to the same direction, got {d}"
-
-    # a heavy stray fit cannot drag the median: two big rows at +8,
-    # one heavier wall-ish box at -20 -> still ~+8
-    boxes = [_box(8.0, 900), _box(8.0, 800), _box(-20.0, 1200)]
-    d = seed_axis_delta(boxes, cur_yaw=0.0)
-    assert d is not None and abs(math.degrees(d) - 8.0) < 1.0, \
-        f"weighted median must resist one stray fit, got {math.degrees(d):.1f}"
-
-    # stubby boxes (AC units) do not vote: their PCA axis is noise
-    boxes = [_box(37.0, 400, length=0.8), _box(-11.0, 300, length=1.2)]
-    assert seed_axis_delta(boxes, cur_yaw=0.0) is None, \
-        "no box >= 2m long -> no trustworthy vote -> None"
-
-    # already-straight rows: delta ~ 0 (feedback never fires)
-    boxes = [_box(0.4, 900), _box(-0.3, 800)]
-    d = seed_axis_delta(boxes, cur_yaw=0.0)
-    assert d is not None and abs(math.degrees(d)) < 1.0
-    print(f"PASS seed axis delta ({math.degrees(d):+.1f} deg on straight, "
-          f"+8 recovered on slanted)")
-
-
 def test_align_with_subfloor_noise():
     """Regression: marginal noise spike BELOW the floor must not win.
 
