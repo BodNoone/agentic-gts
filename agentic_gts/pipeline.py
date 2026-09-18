@@ -387,8 +387,13 @@ def run_pipeline(scene: Scene,
         # render was already straight.
         if "yaw" not in opts and len(scene.boxes) >= 2:
             from agentic_gts.segment.orientation import seed_axis_delta
-            delta = seed_axis_delta(scene.boxes, scene.points,
-                                    float(scene.meta["yaw"]))
+            # top cut = the FIT pool's own (z_top + 0.10): the vote
+            # pool must match what the seed fit measured against, or
+            # tray / ceiling remnants above the devices pull the PCA
+            delta = seed_axis_delta(
+                scene.boxes, scene.points, float(scene.meta["yaw"]),
+                top_cut=(float(scene.meta.get("z_top", 2.5) or 2.5)
+                         + 0.10))
             if delta is not None and abs(delta) > math.radians(3.0):
                 new_yaw = math.remainder(
                     float(scene.meta["yaw"]) + delta, math.pi / 2)

@@ -157,8 +157,23 @@ def test_seed_axis_delta():
     boxes = [_aabb_box(r1), _aabb_box(r2)]
     d = seed_axis_delta(boxes, P, cur_yaw=0.0)
     assert d is not None and abs(math.degrees(d)) < 1.0
+
+    # dd21246's measurement context: the MIDDLE z-slice with a
+    # z_top+0.10 pool cut -- tray remnants floating ABOVE the rows
+    # (diagonal sprinkles, off-axis) must not drag the votes; with the
+    # whole device band they would
+    rng = np.random.default_rng(9)
+    r1, r2 = _row(8.0, 0.0, seed=1), _row(8.1, 4.0, seed=2)
+    trays = np.column_stack([rng.uniform(-1, 9, 2500),
+                              rng.uniform(-1, 6, 2500),
+                              np.full(2500, 2.3)])   # above the rows
+    P = np.vstack([r1, r2, trays])
+    boxes = [_aabb_box(r1), _aabb_box(r2)]
+    d = seed_axis_delta(boxes, P, cur_yaw=0.0, top_cut=2.0 + 0.10)
+    assert d is not None and abs(math.degrees(d) - 8.0) < 1.0, \
+        f"top-cut pool + middle slice must ignore tray remnants, got {d}"
     print(f"PASS seed axis delta ({math.degrees(d):+.2f} deg on straight, "
-          f"~8 deg recovered on slanted)")
+          f"~8 deg recovered on slanted, trays ignored)")
 
 
 def test_align_with_subfloor_noise():

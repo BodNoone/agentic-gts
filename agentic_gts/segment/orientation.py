@@ -52,30 +52,37 @@ def estimate_residual_yaw(points: np.ndarray, yaw: float) -> float:
 
 
 def seed_axis_delta(boxes, points: np.ndarray, cur_yaw: float,
-                    min_len: float = 2.0, min_pts: int = 150):
+                    min_len: float = 2.0, min_pts: int = 150,
+                    top_cut: float | None = None):
     """Yaw offset (radians, folded to [-pi/4, pi/4)) of the grounded
     seeds' OWN directions against the render yaw, or None with too
     few votes.
 
     The stageG feedback signal. The seeds fit in the row frame (their
     box.yaw is 0 / pi/2 BY CONSTRUCTION -- it carries no direction
-    information), so each seed's direction is MEASURED here: PCA on
-    the device-band points INSIDE the box. This is deliberately NOT
-    the old pool feedback, which re-ran the GLOBAL histogram
-    estimator on the union of the boxes' points -- a pool CARVED by
-    box geometry cut along the ASSUMED yaw, so slanted rows left an
-    asymmetric remainder that re-confirmed the assumed yaw, and any
-    haze inside rects kept the stage0 hijack surface (user reports:
-    imperfect / wrong yaw surviving the feedback). Per-box PCA keeps
-    each vote LOCAL to one structure -- a stray wall-ish fit cannot
-    drag the aggregate, and no histogram exists to hijack.
+    information), so each seed's direction is MEASURED here, in the
+    EXACT context the original local-PCA seed fit used (dd21246, the
+    version that selected the yaw correctly on real scenes): PCA on
+    the MIDDLE z-slice of the structure -- [0.35, 0.75] x height
+    above the box's floor, the band that cuts floor creep AND tray /
+    ceiling remnants alike -- drawn from a pool cut at z_top + 0.10.
+    A whole-device-band PCA (the first reinstatement) let the haze at
+    both ends of the band pull the covariance and the votes came out
+    imperfect (user report). This is deliberately NOT the older pool
+    feedback either, which re-ran the GLOBAL histogram estimator on
+    the union of the boxes' points -- a pool CARVED by box geometry
+    cut along the ASSUMED yaw, so slanted rows re-confirmed the
+    assumed yaw. Per-box middle-slice PCA keeps each vote LOCAL to
+    one structure: no histogram to hijack, one stray wall-ish fit
+    cannot drag the aggregate.
 
     Votes: only boxes long enough for a trustworthy axis (a stubby AC
     unit's PCA direction is noise) with enough point support, folded
     mod-90 (perpendicular rows agree), weighted by point count, taken
     as the weighted MEDIAN.
     """
-    band = points[(points[:, 2] > 0.30) & (points[:, 2] < 2.5)]
+    hi = float(top_cut) if top_cut else 2.5
+    band = points[(points[:, 2] > 0.30) & (points[:, 2] < hi)]
     if len(band) < 500:
         return None
     votes = []
@@ -85,7 +92,18 @@ def seed_axis_delta(boxes, points: np.ndarray, cur_yaw: float,
         inside = band[b.contains(band)]
         if len(inside) < min_pts:
             continue
-        d = inside[:, :2] - inside[:, :2].mean(axis=0)
+        # the seed fit's measurement context (dd21246): the middle
+        # z-slice of the structure, relative to the box's OWN floor
+        # (the fit set the bottom at the local floor) -- NOT the
+        # whole device band, whose haze at both ends drags the PCA
+        bot = float(b.center[2]) - 0.5 * float(b.size[2])
+        h = float(b.size[2])
+        zc0 = bot + max(0.30, 0.35 * h)
+        zc1 = max(zc0 + 0.10, bot + 0.75 * h)
+        core = inside[(inside[:, 2] >= zc0) & (inside[:, 2] <= zc1)]
+        if len(core) < 30:
+            core = inside               # thin structure: whole band
+        d = core[:, :2] - core[:, :2].mean(axis=0)
         cov = d.T @ d / len(d)
         _, V = np.linalg.eigh(cov)       # ascending eigenvalues
         v_row = V[:, 1]                  # the structure's long axis
