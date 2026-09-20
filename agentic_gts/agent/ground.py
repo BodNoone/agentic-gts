@@ -692,6 +692,17 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
 _MAX_DEVICE_DEPTH = 1.8
 _MIN_DEVICE_DEPTH = 0.40
 _SPLIT_MIN_GAP = 0.30
+# Lateral dilation applied to every VLM rect before the point fit.
+# The VLM regularly under-boxes by a fraction of a cabinet (user
+# report: global boxes slightly narrow, the final 3D box loses the
+# edge) -- the fit selects points INSIDE the rect, so a clipped rect
+# clips the box. Dilating by 0.30m lets the device's OWN edge points
+# snap the boundary back out (dilation into an empty aisle adds
+# nothing); the smallest real aisle is 0.6m, so a face-to-face
+# neighbour is never reached. The one hazard -- back-to-back rows
+# with NO gap merging into an unsplittable >1.8m deep fit -- is
+# caught by the caller and retried on the undilated rect.
+_RECT_DILATION = 0.30
 
 
 def _cross_gap_split(v: np.ndarray, peak_frac: float = 0.25,
@@ -914,6 +925,47 @@ def _rect_covered(a, b, iou_thr: float = 0.10,
     return inter / area_a >= contain_thr or \
         inter / area_b >= rev_contain_thr or \
         inter / max(area_a + area_b - inter, 1e-9) >= iou_thr
+
+
+def _rect_inside(outer, inner, thr: float = 0.75) -> bool:
+    """>=thr of INNER's area lies inside OUTER (reverse containment)."""
+    ax0, ay0, ax1, ay1 = outer
+    bx0, by0, bx1, by1 = inner
+    ix = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    iy = max(0.0, min(ay1, by1) - max(ay0, by0))
+    inter = ix * iy
+    if inter <= 0:
+        return False
+    area_b = max((bx1 - bx0) * (by1 - by0), 1e-9)
+    return inter / area_b >= thr
+
+
+def _cluster_pts_covered(rect, pts: np.ndarray, fitted: list,
+                         thresh: float = 0.65, pad: float = 0.10,
+                         min_judge: int = 30) -> bool:
+    """Is this cluster's point mass already inside the FITTED boxes?
+
+    The recall net's real coverage test (replaces rect-overlap
+    heuristics): a cluster counts as covered when >= `thresh` of its
+    OWN points fall inside the union of the fitted box footprints
+    (row-frame AABBs, padded). Rect-AREA overlap was too loose -- a
+    VLM rect that merely grazes a neighbour, or one whose fit snapped
+    to a DIFFERENT peak run of the same pool (the peak-peeling span
+    estimator drops the weaker structure), leaves the clump's points
+    entirely undetected while every rect-overlap rule calls it
+    'covered' (user report: obvious rectangular clumps left unboxed).
+    Point mass cannot lie about what the pipeline actually detected."""
+    x0, y0, x1, y1 = rect
+    m = ((pts[:, 0] >= x0) & (pts[:, 0] <= x1) &
+         (pts[:, 1] >= y0) & (pts[:, 1] <= y1))
+    q = pts[m][:, :2]
+    if len(q) < min_judge:
+        return True                # noise-level clump: nothing to add
+    inside = np.zeros(len(q), dtype=bool)
+    for (ax0, ay0, ax1, ay1) in fitted:
+        inside |= ((q[:, 0] >= ax0 - pad) & (q[:, 0] <= ax1 + pad) &
+                   (q[:, 1] >= ay0 - pad) & (q[:, 1] <= ay1 + pad))
+    return float(inside.mean()) >= thresh
 
 
 def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
@@ -1171,6 +1223,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # something relative to the view they were drawn on.
     boxes = []
     row_rects = []                   # row-frame AABBs, for the recall net
+    fitted_rects = []                # row-frame footprints of FITTED boxes
     for cam_v, r in [(v[1], r) for v in views for r in v[5]]:
         rect_r = _frame_rect(cam_v, r, 1.0)
         row_rects.append(rect_r)
@@ -1179,12 +1232,25 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         cw = _rot_xy(np.array([[(rect_r[0] + rect_r[2]) / 2.0,
                                 (rect_r[1] + rect_r[3]) / 2.0, 0.0]]),
                      yaw)[0]
+        # Dilate the rect before fitting (user report: VLM boxes
+        # slightly narrow, the final 3D box loses the edge): the fit
+        # selects points INSIDE the rect, so a clipped rect clips the
+        # box -- dilation lets the device's own edge points snap the
+        # boundary back out. If the dilation merged back-to-back rows
+        # into an unsplittable >_MAX_DEVICE_DEPTH fit, retry on the
+        # undilated rect (the pre-dilation fit was clean).
+        rect_d = (rect_r[0] - _RECT_DILATION, rect_r[1] - _RECT_DILATION,
+                  rect_r[2] + _RECT_DILATION, rect_r[3] + _RECT_DILATION)
+        bbs = _fit_region_boxes(pts_fit, rect_d,
+                                floor_z=float(fl(cw[0], cw[1])))
+        if any(b.size[1] > _MAX_DEVICE_DEPTH for b in bbs):
+            bbs = _fit_region_boxes(pts_fit, rect_r,
+                                    floor_z=float(fl(cw[0], cw[1])))
         # _fit_region_boxes (plural): a deep fit -- the VLM drew ONE
         # rect around two opposing rows -- splits at the aisle here,
         # before the box enters the pipeline (stageC can only split
         # along the row axis)
-        for bb in _fit_region_boxes(pts_fit, rect_r,
-                                    floor_z=float(fl(cw[0], cw[1]))):
+        for bb in bbs:
             c = _rot_xy(np.array([[bb.center[0], bb.center[1], 0.0]]),
                         yaw)[0]
             # bb.yaw is 0 (row along the rotated-x axis) or pi/2 (row
@@ -1197,6 +1263,16 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                               meta={"grounded": True,
                                     "n_pts": bb.meta.get("n_pts", 0)})
             boxes.append(box)
+            # the recall net judges coverage on what was ACTUALLY
+            # detected: the fitted footprint (row-frame AABB; a pi/2
+            # box swaps its extents), not the raw VLM rect
+            sx, sy = float(bb.size[0]), float(bb.size[1])
+            if abs(float(bb.yaw)) > 1e-6:
+                sx, sy = sy, sx
+            fitted_rects.append((float(bb.center[0]) - 0.5 * sx,
+                                 float(bb.center[1]) - 0.5 * sy,
+                                 float(bb.center[0]) + 0.5 * sx,
+                                 float(bb.center[1]) + 0.5 * sy))
     if not boxes:
         print("[ground] no region survived the point-support guards")
         if out_dir:
@@ -1243,8 +1319,20 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     except Exception as e:
         print(f"[ground] clustering failed ({type(e).__name__}: {e})")
         cands = []
+    # Coverage judged on what was ACTUALLY DETECTED (user report: the
+    # net never fired despite obvious unboxed clumps). The old rect-
+    # overlap rules called a cluster 'covered' on a 10% AREA overlap
+    # with ANY VLM rect -- including rects whose fit snapped to a
+    # different structure and rects rejected by the point guards --
+    # so real devices adjacent to detected ones stayed missed. Now:
+    # covered = >=65% of the cluster's OWN points inside the fitted
+    # footprints, OR a VLM rect ~wholly inside the cluster (the
+    # wall-adjacent protection: re-proposing a wall+device blob fits
+    # a wall-inflated box that out-supports and EATS the correct VLM
+    # box in the dedup).
     missed = [(r, n) for (r, n) in cands
-              if not any(_rect_covered(r, vr) for vr in row_rects)]
+              if not _cluster_pts_covered(r, pts_clu, fitted_rects)
+              and not any(_rect_inside(r, vr) for vr in row_rects)]
     if missed:
         print(f"[ground] cluster recall net: {len(missed)} uncovered "
               f"candidate(s) of {len(cands)} -> proposing ALL "

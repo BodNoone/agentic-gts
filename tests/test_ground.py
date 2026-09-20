@@ -637,6 +637,121 @@ def test_ground_stage_cluster_recall():
     print("PASS ground stage cluster recall (missed row recovered)")
 
 
+def test_ground_stage_rect_dilation():
+    """A slightly-narrow VLM rect (user report: global boxes not quite
+    covering the device, the final 3D box loses the edge) must not
+    clip the fit: the rect is dilated before the point selection, and
+    the device's own edge points snap the boundary back out."""
+    from agentic_gts.agent import ground
+    from agentic_gts.agent.judge import VLMJudge
+
+    rng = np.random.default_rng(11)
+    pts = _row_points(0.0, 6.0, y=0.0, rng=rng)   # depth 1.1, y in [-.55,.55]
+    ceil = np.column_stack([rng.uniform(-2.0, 7.0, 3000),
+                            rng.uniform(-2.0, 2.0, 3000),
+                            rng.uniform(2.9, 3.0, 3000)])
+    scene = Scene(points=np.vstack([pts, ceil]))
+    scene.meta["yaw"] = 0.0
+    _bootstrap_meta(scene, (-1.5, -0.9, 7.5, 0.9))
+    scene.boxes = []
+    _, cam, W, H = ground._render_topdown(scene, 0.0)
+    # the VLM rect CLIPS the depth: covers y in [-0.25, 0.45] only
+    uv = cam.project_cv(np.column_stack(
+        [[-0.5, 6.5, 6.5, -0.5], [-0.25, -0.25, 0.45, 0.45],
+         np.full(4, 1.0)]))
+    px = (max(float(uv[:, 0].min()), 0.0), max(float(uv[:, 1].min()), 0.0),
+          min(float(uv[:, 0].max()), W), min(float(uv[:, 1].max()), H))
+    import json as _json
+    reply = ("One row visible.\n" + _json.dumps(
+        [{"bbox_2d": [int(round(px[0] / W * 1000)),
+                      int(round(px[1] / H * 1000)),
+                      int(round(px[2] / W * 1000)),
+                      int(round(px[3] / H * 1000))],
+          "label": "row"}]))
+
+    judge = VLMJudge(backend="qwen")
+
+    def _fake_call(png, prompt, *a, **k):
+        return reply
+    judge._qwen_image_call = _fake_call
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        ok = ground.ground_stage(scene, judge, out_dir=td)
+        assert ok, "grounding must succeed"
+    assert len(scene.boxes) == 1, \
+        f"one row, one box; got {len(scene.boxes)}"
+    b = scene.boxes[0]
+    assert b.size[1] > 0.95, \
+        f"clipped rect must NOT clip the box: depth {b.size[1]:.2f} " \
+        f"(want ~1.1)"
+    assert abs(b.center[1]) < 0.15, f"centre y {b.center[1]:.2f} skewed"
+    print(f"PASS rect dilation (clipped rect, full depth {b.size[1]:.2f}m)")
+
+
+def test_ground_stage_adjacent_clump_recall():
+    """The recall net's coverage must judge what was ACTUALLY
+    DETECTED (user report: the net never fired, obvious rectangular
+    clumps left unboxed). A generous VLM rect drawn over a row AND an
+    adjacent AC-sized clump fits ONLY the row (the peak-peeling span
+    keeps the dominant run) -- the old rect-overlap rules called the
+    clump 'covered' by the same rect (forward containment on area),
+    but its points sit in NO fitted box: point coverage must
+    re-propose it."""
+    from agentic_gts.agent import ground
+    from agentic_gts.agent.judge import VLMJudge
+
+    rng = np.random.default_rng(17)
+    row = _row_points(0.0, 6.0, y=0.0, rng=rng)
+    # LOW AC-sized clump 1.5m off the row's end (z up to 0.65m): the
+    # rect's own fit NEVER sees it -- the XY fit's middle z-slice
+    # starts at 0.35 x height ~0.74m, entirely above the clump -- so
+    # the fitted box covers the row only, while the clump's area sits
+    # inside the generous rect (the old area-overlap rules called
+    # that 'covered' and the clump stayed missed)
+    ac = rng.uniform([7.5, -0.5, 0.05], [8.5, 0.5, 0.65], (600, 3))
+    ceil = np.column_stack([rng.uniform(-2.0, 9.5, 3000),
+                            rng.uniform(-2.0, 2.0, 3000),
+                            rng.uniform(2.9, 3.0, 3000)])
+    scene = Scene(points=np.vstack([row, ac, ceil]))
+    scene.meta["yaw"] = 0.0
+    _bootstrap_meta(scene, (-1.5, -0.9, 9.5, 0.9))
+    scene.boxes = []
+    _, cam, W, H = ground._render_topdown(scene, 0.0)
+    # ONE generous rect: the row plus the whole clump (the fit snaps
+    # to the row's denser run; the clump's points stay unfitted)
+    uv = cam.project_cv(np.column_stack(
+        [[-0.6, 8.6, 8.6, -0.6], [-0.8, -0.8, 0.8, 0.8],
+         np.full(4, 1.0)]))
+    px = (max(float(uv[:, 0].min()), 0.0), max(float(uv[:, 1].min()), 0.0),
+          min(float(uv[:, 0].max()), W), min(float(uv[:, 1].max()), H))
+    import json as _json
+    reply = ("Row and unit.\n" + _json.dumps(
+        [{"bbox_2d": [int(round(px[0] / W * 1000)),
+                      int(round(px[1] / H * 1000)),
+                      int(round(px[2] / W * 1000)),
+                      int(round(px[3] / H * 1000))],
+          "label": "row"}]))
+
+    judge = VLMJudge(backend="qwen")
+
+    def _fake_call(png, prompt, *a, **k):
+        return reply
+    judge._qwen_image_call = _fake_call
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        ok = ground.ground_stage(scene, judge, out_dir=td)
+        assert ok, "grounding must succeed"
+    assert len(scene.boxes) == 2, \
+        f"row + re-proposed clump; got {len(scene.boxes)} boxes: " \
+        + str([(round(b.center[0], 2), round(b.center[1], 2))
+               for b in scene.boxes])
+    acb = min(scene.boxes, key=lambda b: abs(b.center[0] - 8.0))
+    assert abs(acb.center[0] - 8.0) < 0.3 and acb.size[1] > 0.5, \
+        f"the clump must get its own box, got centre {acb.center[:2]} " \
+        f"size {acb.size[:2]}"
+    print("PASS adjacent clump recall (point coverage, not rect area)")
+
+
 def test_floor_map_mesh_mode():
     """mesh_mode: a mesh sampling has no under-floor haze, so a tile's
     floor is its plain MINIMUM z -- even when the slab is sparsely
