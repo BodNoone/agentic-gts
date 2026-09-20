@@ -935,27 +935,18 @@ def _absorb_single(single: dict, fines: list, axis, along0: float) -> bool:
     grounds SEVERAL -> the several stand; the row is one whole and the
     single box is that whole unresolved).
 
-    The single's back-projected points are REAL surface points: they
-    are clipped into whichever fine span contains them (more evidence
-    for the piece's point support / height). Its EXTENT is dropped --
-    unioning it would stretch a piece across the seam. Returns True
-    when the single touched any fine span (absorbed); False when it
-    overlapped none (the caller keeps it -- recall: a region the
-    multi face never grounded)."""
-    hit = False
+    NOTHING of the single survives (user report: the back view's
+    unresolved whole-row box swallowed the top cable connections into
+    its SAM mask, and the point contribution dragged the pieces'
+    P97.5 height to the cable bundle even after the extent was
+    dropped) -- extent dropped, points dropped, only the collision
+    flag returned. Returns True when the single overlapped any fine
+    span (absorbed); False when it overlapped none (the caller keeps
+    it -- recall: a region the multi face never grounded)."""
     for f in fines:
         if min(single["hi"], f["hi"]) - max(single["lo"], f["lo"]) > 0:
-            hit = True
-    if single["pts"] is not None and axis is not None:
-        al = single["pts"][:, :2] @ axis - along0
-        for f in fines:
-            if f["pts"] is None:
-                continue
-            m = (al >= f["lo"]) & (al <= f["hi"])
-            if m.any():
-                f["pts"] = np.vstack([f["pts"], single["pts"][m]])
-                hit = True
-    return hit
+            return True
+    return False
 
 
 def _merge_cross_view(spans: list, axis=None, along0: float = 0.0) -> list:
@@ -970,10 +961,10 @@ def _merge_cross_view(spans: list, axis=None, along0: float = 0.0) -> list:
     USER RULE -- instance COUNT decides first: when one face grounds
     ONE instance while the other grounds SEVERAL, the several stand
     (the row is one whole; the single box is that whole unresolved).
-    The single face's span is ABSORBED (_absorb_single): points
-    clipped into the fine spans, extent dropped -- even a PARTIAL
-    single (covering cabinet A and half of B) must not union with A
-    and stretch it across the seam.
+    The single face's span is fully DISCARDED -- extent dropped AND
+    points dropped (user report: the single face's whole-row mask
+    carried the top cable connections into the pieces' point pools
+    and the P97.5 height read the cable bundle).
 
     Graph merge handles the rest: mutual single-overlap pairs union
     (both faces saw one cabinet), a span bridging TWO OR MORE spans

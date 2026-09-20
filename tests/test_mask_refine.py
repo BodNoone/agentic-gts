@@ -794,8 +794,11 @@ def test_cross_view_single_face_yields_to_multi():
     SEVERAL -> the several stand (the row is one whole; the single box
     is that whole unresolved). Even a PARTIAL single (the poor face's
     one box covering cabinet A and half of B) must NOT union with A --
-    that would stretch A's piece across the seam. Its points are
-    clipped into the fine spans; its extent is dropped."""
+    that would stretch A's piece across the seam. NOTHING of the
+    single survives: its extent is dropped AND its points are dropped
+    (user report: the single face's whole-row mask carried the top
+    cable connections into the pieces' point pools and the P97.5
+    height read the cable bundle)."""
     from agentic_gts.agent.mask_refine import _merge_cross_view
     axis = np.array([1.0, 0.0])
     mk = lambda xs: np.column_stack(
@@ -815,9 +818,10 @@ def test_cross_view_single_face_yields_to_multi():
     assert abs(a["lo"]) < 1e-9 and abs(a["hi"] - 1.0) < 1e-9, \
         "A's extent must NOT stretch to the absorbed single's 1.3"
     assert abs(b["lo"] - 1.05) < 1e-9 and abs(b["hi"] - 2.05) < 1e-9
-    # the single's real surface points were clipped into the fines
-    assert len(a["pts"]) == 3, "A keeps its 0.5 + the single's 0.2/0.8"
-    assert len(b["pts"]) == 2, "B keeps its 1.5 + the single's 1.2"
+    # the single's points are NOT contributed to the fines: the
+    # whole-row mask's top-cable z would drag the P97.5 height
+    assert len(a["pts"]) == 1, "A keeps ONLY its own 0.5 point"
+    assert len(b["pts"]) == 1, "B keeps ONLY its own 1.5 point"
     print("PASS single-instance face yields to the multi face")
 
 
