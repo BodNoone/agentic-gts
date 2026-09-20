@@ -751,6 +751,45 @@ def test_ground_stage_snap_keeps_close_devices_apart():
           "gap respected)")
 
 
+def test_snap_pool_excludes_trays():
+    """The rect snap must run on the RENDER-CUT pool, not the fit pool
+    (user report: close devices still merged, and devices not even
+    near the wall framed together with wall strips): the fit pool
+    carries the cable trays -- dense, gapless, room-spanning -- so its
+    occupancy grid is occupied EVERYWHERE, the growth condition is
+    always satisfied and every rect grows its full max_grow budget in
+    every direction, swallowing whatever sits within 0.6m. On the
+    render-cut pool the inter-device gap is empty cells the growth
+    cannot cross."""
+    from agentic_gts.agent.ground import _snap_rect_to_clump
+
+    rng = np.random.default_rng(19)
+    rowA = _row_points(0.0, 6.0, y=0.0, rng=rng)
+    rowB = _row_points(6.6, 12.6, y=0.0, rng=rng)      # 0.6m end gap
+    tray = np.column_stack([rng.uniform(-1.0, 13.0, 9000),
+                            rng.uniform(-1.0, 1.0, 9000),
+                            rng.uniform(2.2, 2.4, 9000)])
+    clean = np.vstack([rowA[rowA[:, 2] > 0.30],
+                       rowB[rowB[:, 2] > 0.30]])
+    rect = (-0.2, -0.8, 5.8, 0.8)          # rowA, far end clipped 0.2m
+
+    # the old bug, documented: on the tray-laden fit pool the gap cells
+    # read as occupied and the rect grows across the gap toward rowB
+    old = _snap_rect_to_clump(np.vstack([clean, tray]), rect)
+    assert old[2] >= 6.3, \
+        f"guard: the fit pool's tray DOES overgrow the gap " \
+        f"(x1={old[2]:.2f}m; if this fails the bug changed shape)"
+
+    # fixed: the render-cut pool stops the growth at the empty gap
+    # while still recovering rowA's own clipped edge
+    new = _snap_rect_to_clump(clean, rect)
+    assert new[2] < 6.35, \
+        f"must not cross the 0.6m empty gap, x1={new[2]:.2f}m"
+    assert new[2] > 5.9, "must still recover rowA's own clipped edge"
+    print(f"PASS snap pool excludes trays (fit-pool x1={old[2]:.2f}m "
+          f"overgrows, render-cut x1={new[2]:.2f}m stops at the gap)")
+
+
 def test_ground_stage_adjacent_clump_recall():
     """The recall net's coverage must judge what was ACTUALLY
     DETECTED (user report: the net never fired, obvious rectangular

@@ -1298,6 +1298,30 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     if len(pts_fit) < 100:
         pts_fit = _rot_xy(P[h_fit > 0.30], -yaw)
 
+    # RENDER-CUT pool (trays removed): every "what the groundview
+    # shows" judgement -- the rect snap, the cluster recall net, the
+    # adjacency-merge probe -- runs on THIS pool, never on pts_fit.
+    # pts_fit (0.30 .. z_top + 0.10) carries the CABLE TRAYS: dense,
+    # gapless, spanning every aisle, so its occupancy grid is occupied
+    # EVERYWHERE -- a rect snap on it grows every rect the full
+    # max_grow in every direction and swallows whatever sits within
+    # 0.6m: closely spaced devices merged into one grounding, wall
+    # strips framed into the boxes of devices not even near the wall
+    # (user reports -- and the groundview, whose render cuts the
+    # trays, correctly showed the devices fully separate). The render
+    # cut clears the trays; devices and walls remain, and an
+    # inter-device gap is EMPTY cells the growth cannot cross.
+    pts_clu = pts_fit
+    try:
+        cc = _render_cut(
+            fit_top, mesh_mode=bool(scene.meta.get("geometry_is_mesh")))
+        pts_clu = _rot_xy(
+            P[(h_fit > 0.30) & (h_fit <= (cc if np.isfinite(cc)
+                                          else fit_top + 0.10))], -yaw)
+    except Exception as e:
+        print(f"[ground] render-cut pool failed ({type(e).__name__}: {e})"
+              f" -> using the fit pool")
+
     def _frame_rect(cam, r, z_plane):
         uv = np.array([[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]],
                       dtype=float)
@@ -1329,11 +1353,14 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                                 (rect_r[1] + rect_r[3]) / 2.0, 0.0]]),
                      yaw)[0]
         # Snap the rect to its density clump (user insight: re-include
-        # the clump pixels the 2D grounding left outside; user report:
-        # the blanket dilation merged closely spaced devices): the rect
-        # grows only through real point support and stops cold at the
-        # empty strip of an inter-device gap.
-        rect_s = _snap_rect_to_clump(pts_fit, rect_r)
+        # the clump pixels the 2D grounding left outside) on the
+        # RENDER-CUT pool: on the fit pool the cable trays occupy every
+        # cell, the growth condition is always satisfied and the rect
+        # swallows whatever sits within max_grow -- closely spaced
+        # devices merged, wall strips framed in (user report). On the
+        # render-cut pool an inter-device gap is empty cells the
+        # growth cannot cross.
+        rect_s = _snap_rect_to_clump(pts_clu, rect_r)
         bbs = _fit_region_boxes(pts_fit, rect_s,
                                 floor_z=float(fl(cw[0], cw[1])))
         # _fit_region_boxes (plural): a deep fit -- the VLM drew ONE
@@ -1388,24 +1415,10 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # rejected or the call failing -> nothing added). Clusters already
     # covered by a VLM rect are still skipped: the net must only ADD
     # recall, never question the rects.
-    pts_clu = pts_fit                    # render-cut pool (trays removed)
+    # cluster recall net: the recall safety net over the render-cut
+    # pool (trays removed -- the fit pool's trays bridge every aisle
+    # and would seam the whole room into one cluster).
     try:
-        # cluster OCCUPANCY pool: cut at the RENDER cut, NOT the fit
-        # top. With a mesh the anchored z_top walk runs right up the
-        # TRAYS (dense gapless planes connected to the rack tops),
-        # so the fit pool (0.30 .. z_top + 0.10) carries tray planes
-        # SPANNING EVERY AISLE -- the one-cell dilation stitches the
-        # whole room into ONE cluster, every VLM rect lands inside it
-        # (reverse containment) -> "covered", the recall net goes
-        # silent and every device the VLM missed stays missed (user
-        # report: mesh runs still full of misses despite the net).
-        # The render cut clears the trays and every device category
-        # stays below it (AC ~1m < 0.5 x any real z_top).
-        cc = _render_cut(
-            fit_top, mesh_mode=bool(scene.meta.get("geometry_is_mesh")))
-        pts_clu = _rot_xy(
-            P[(h_fit > 0.30) & (h_fit <= (cc if np.isfinite(cc)
-                                          else fit_top + 0.10))], -yaw)
         cands = _cluster_candidates(pts_clu)
     except Exception as e:
         print(f"[ground] clustering failed ({type(e).__name__}: {e})")
