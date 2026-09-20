@@ -640,8 +640,9 @@ def test_ground_stage_cluster_recall():
 def test_ground_stage_rect_dilation():
     """A slightly-narrow VLM rect (user report: global boxes not quite
     covering the device, the final 3D box loses the edge) must not
-    clip the fit: the rect is dilated before the point selection, and
-    the device's own edge points snap the boundary back out."""
+    clip the fit: the rect SNAPS to its density clump (edge-cell
+    completion + strip growth), and the device's own edge points snap
+    the boundary back out."""
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
 
@@ -686,6 +687,68 @@ def test_ground_stage_rect_dilation():
         f"(want ~1.1)"
     assert abs(b.center[1]) < 0.15, f"centre y {b.center[1]:.2f} skewed"
     print(f"PASS rect dilation (clipped rect, full depth {b.size[1]:.2f}m)")
+
+
+def test_ground_stage_snap_keeps_close_devices_apart():
+    """The snap must NOT bridge closely spaced devices (user report:
+    the blanket 0.30m dilation grounded near devices together): two
+    rows end-to-end with a 0.6m gap, each VLM rect clipped by 0.3m at
+    the gap side -- each rect recovers ITS OWN row's cut edge through
+    the occupied cells and stops cold at the empty gap strip; the two
+    groundings stay two boxes with their full lengths."""
+    from agentic_gts.agent import ground
+    from agentic_gts.agent.judge import VLMJudge
+
+    rng = np.random.default_rng(23)
+    rowA = _row_points(0.0, 6.0, y=0.0, rng=rng)
+    rowB = _row_points(6.6, 12.6, y=0.0, rng=rng)   # 0.6m end gap
+    ceil = np.column_stack([rng.uniform(-1.5, 13.5, 3000),
+                            rng.uniform(-2.0, 2.0, 3000),
+                            rng.uniform(2.9, 3.0, 3000)])
+    scene = Scene(points=np.vstack([rowA, rowB, ceil]))
+    scene.meta["yaw"] = 0.0
+    _bootstrap_meta(scene, (-1.0, -0.9, 13.0, 0.9))
+    scene.boxes = []
+    _, cam, W, H = ground._render_topdown(scene, 0.0)
+    # two rects, each clipped 0.3m at the gap side
+    corners = np.array([[0.2, 5.7], [6.9, 12.3]], dtype=float)
+    import json as _json
+    entries = []
+    for (xa, xb) in corners:
+        uv = cam.project_cv(np.column_stack(
+            [[xa, xb, xb, xa], [-0.8, -0.8, 0.8, 0.8],
+             np.full(4, 1.0)]))
+        px = (max(float(uv[:, 0].min()), 0.0),
+              max(float(uv[:, 1].min()), 0.0),
+              min(float(uv[:, 0].max()), W),
+              min(float(uv[:, 1].max()), H))
+        entries.append({"bbox_2d": [
+            int(round(px[0] / W * 1000)), int(round(px[1] / H * 1000)),
+            int(round(px[2] / W * 1000)), int(round(px[3] / H * 1000))],
+            "label": "row"})
+    reply = "Two rows.\n" + _json.dumps(entries)
+
+    judge = VLMJudge(backend="qwen")
+
+    def _fake_call(png, prompt, *a, **k):
+        return reply
+    judge._qwen_image_call = _fake_call
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        ok = ground.ground_stage(scene, judge, out_dir=td)
+        assert ok, "grounding must succeed"
+    assert len(scene.boxes) == 2, \
+        f"the 0.6m gap must keep the rows apart; got " \
+        f"{len(scene.boxes)} boxes: " \
+        + str([(round(b.center[0], 2), round(b.size[0], 2))
+               for b in scene.boxes])
+    for b in scene.boxes:
+        assert 5.5 < b.size[0] < 6.7, \
+            f"a clipped end must be recovered, got length {b.size[0]:.2f}"
+    xs = sorted(b.center[0] for b in scene.boxes)
+    assert xs[1] - xs[0] > 5.5, "the two rows must remain distinct"
+    print("PASS snap keeps close devices apart (edges recovered, "
+          "gap respected)")
 
 
 def test_ground_stage_adjacent_clump_recall():

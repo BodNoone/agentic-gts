@@ -692,17 +692,101 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
 _MAX_DEVICE_DEPTH = 1.8
 _MIN_DEVICE_DEPTH = 0.40
 _SPLIT_MIN_GAP = 0.30
-# Lateral dilation applied to every VLM rect before the point fit.
-# The VLM regularly under-boxes by a fraction of a cabinet (user
-# report: global boxes slightly narrow, the final 3D box loses the
-# edge) -- the fit selects points INSIDE the rect, so a clipped rect
-# clips the box. Dilating by 0.30m lets the device's OWN edge points
-# snap the boundary back out (dilation into an empty aisle adds
-# nothing); the smallest real aisle is 0.6m, so a face-to-face
-# neighbour is never reached. The one hazard -- back-to-back rows
-# with NO gap merging into an unsplittable >1.8m deep fit -- is
-# caught by the caller and retried on the undilated rect.
-_RECT_DILATION = 0.30
+
+
+def _snap_rect_to_clump(points: np.ndarray, rect, cell: float = 0.30,
+                        min_cell_pts: int = 4, max_grow: float = 0.60,
+                        edge_frac: float = 0.25):
+    """Grow a VLM rect outward to the boundary of the density clump it
+    sits on (user insight: re-include the clump pixels the 2D grounding
+    left outside the box) -- NOT a blanket dilation, which bridged
+    closely spaced devices into one grounding (user report).
+
+    Two mechanisms, both cell-granular:
+      * EDGE-CELL COMPLETION: when the cell containing a rect edge is
+        itself occupied, the edge extends to that cell's far boundary
+        (the device continues inside the same cell the rect cuts
+        mid-way through);
+      * STRIP GROWTH: each side then grows one cell at a time while
+        the strip immediately outside holds real support (>= edge_frac
+        of the edge's cells occupied).
+    The empty strip of an inter-device gap stops the growth cold -- a
+    rect tracks its OWN device's boundary and never crosses a density
+    gap; max_grow bounds haze-driven runaway. The fit afterwards snaps
+    to actual points, so sub-cell overshoot is harmless."""
+    P = np.asarray(points, dtype=np.float64)
+    if len(P) < 100:
+        return rect
+    ix = np.floor(P[:, 0] / cell).astype(np.int64)
+    iy = np.floor(P[:, 1] / cell).astype(np.int64)
+    keys, inv = np.unique(np.column_stack([ix, iy]), axis=0,
+                          return_inverse=True)
+    counts = np.bincount(inv, minlength=len(keys))
+    occ = {(int(keys[k, 0]), int(keys[k, 1]))
+           for k in np.nonzero(counts >= min_cell_pts)[0]}
+    if not occ:
+        return rect
+
+    def _strip_x(i, j0, j1):
+        return sum(1 for j in range(j0, j1 + 1) if (i, j) in occ)
+
+    def _strip_y(j, i0, i1):
+        return sum(1 for i in range(i0, i1 + 1) if (i, j) in occ)
+
+    x0, y0, x1, y1 = rect
+    grown = [0.0, 0.0, 0.0, 0.0]                 # per side
+    while True:
+        moved = False
+        i0 = int(math.floor(x0 / cell))
+        i1 = int(math.floor(x1 / cell))
+        j0 = int(math.floor(y0 / cell))
+        j1 = int(math.floor(y1 / cell))
+        # edge-cell completion: the rect cuts mid-cell through its own
+        # device -- extend to the cell boundary first (once per side,
+        # it counts toward max_grow; the equality guard makes it fire
+        # exactly once)
+        if grown[0] < max_grow and x0 > i0 * cell and \
+                _strip_x(i0, j0, j1) >= 1:
+            x0 = i0 * cell
+            grown[0] += cell
+            moved = True
+        if grown[2] < max_grow and x1 < (i1 + 1) * cell and \
+                _strip_x(i1, j0, j1) >= 1:
+            x1 = (i1 + 1) * cell
+            grown[2] += cell
+            moved = True
+        if grown[1] < max_grow and y0 > j0 * cell and \
+                _strip_y(j0, i0, i1) >= 1:
+            y0 = j0 * cell
+            grown[1] += cell
+            moved = True
+        if grown[3] < max_grow and y1 < (j1 + 1) * cell and \
+                _strip_y(j1, i0, i1) >= 1:
+            y1 = (j1 + 1) * cell
+            grown[3] += cell
+            moved = True
+        # strip growth: continue only through real support
+        thr_y = max(1, int(edge_frac * (j1 - j0 + 1)))
+        thr_x = max(1, int(edge_frac * (i1 - i0 + 1)))
+        if grown[0] < max_grow and _strip_x(i0 - 1, j0, j1) >= thr_y:
+            x0 -= cell
+            grown[0] += cell
+            moved = True
+        if grown[2] < max_grow and _strip_x(i1 + 1, j0, j1) >= thr_y:
+            x1 += cell
+            grown[2] += cell
+            moved = True
+        if grown[1] < max_grow and _strip_y(j0 - 1, i0, i1) >= thr_x:
+            y0 -= cell
+            grown[1] += cell
+            moved = True
+        if grown[3] < max_grow and _strip_y(j1 + 1, i0, i1) >= thr_x:
+            y1 += cell
+            grown[3] += cell
+            moved = True
+        if not moved:
+            break
+    return (x0, y0, x1, y1)
 
 
 def _cross_gap_split(v: np.ndarray, peak_frac: float = 0.25,
@@ -1232,20 +1316,14 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         cw = _rot_xy(np.array([[(rect_r[0] + rect_r[2]) / 2.0,
                                 (rect_r[1] + rect_r[3]) / 2.0, 0.0]]),
                      yaw)[0]
-        # Dilate the rect before fitting (user report: VLM boxes
-        # slightly narrow, the final 3D box loses the edge): the fit
-        # selects points INSIDE the rect, so a clipped rect clips the
-        # box -- dilation lets the device's own edge points snap the
-        # boundary back out. If the dilation merged back-to-back rows
-        # into an unsplittable >_MAX_DEVICE_DEPTH fit, retry on the
-        # undilated rect (the pre-dilation fit was clean).
-        rect_d = (rect_r[0] - _RECT_DILATION, rect_r[1] - _RECT_DILATION,
-                  rect_r[2] + _RECT_DILATION, rect_r[3] + _RECT_DILATION)
-        bbs = _fit_region_boxes(pts_fit, rect_d,
+        # Snap the rect to its density clump (user insight: re-include
+        # the clump pixels the 2D grounding left outside; user report:
+        # the blanket dilation merged closely spaced devices): the rect
+        # grows only through real point support and stops cold at the
+        # empty strip of an inter-device gap.
+        rect_s = _snap_rect_to_clump(pts_fit, rect_r)
+        bbs = _fit_region_boxes(pts_fit, rect_s,
                                 floor_z=float(fl(cw[0], cw[1])))
-        if any(b.size[1] > _MAX_DEVICE_DEPTH for b in bbs):
-            bbs = _fit_region_boxes(pts_fit, rect_r,
-                                    floor_z=float(fl(cw[0], cw[1])))
         # _fit_region_boxes (plural): a deep fit -- the VLM drew ONE
         # rect around two opposing rows -- splits at the aisle here,
         # before the box enters the pipeline (stageC can only split
