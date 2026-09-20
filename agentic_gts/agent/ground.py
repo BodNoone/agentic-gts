@@ -579,7 +579,8 @@ def _save_grounded_fail_png(base_img, out_dir: str, why: str) -> None:
         print(f"[ground] failure render failed ({type(e).__name__}: {e})")
 
 
-def _region_axis_span(v: np.ndarray, cell: float = 0.05):
+def _region_axis_span(v: np.ndarray, cell: float = 0.05,
+                     mesh_mode: bool = False):
     """Axis extent for region fitting: peak-peeling strong clusters
     with a percentile sanity floor.
 
@@ -600,6 +601,12 @@ def _region_axis_span(v: np.ndarray, cell: float = 0.05):
     tightens it later; a seed that under-covers the device has no
     recovery path.
 
+    mesh_mode (user directive): a mesh sampling has NO haze, so the
+    anti-haze cuts only ever bite REAL sparser sections (thin
+    dividers, starved face bands). Keep/connect drop to 2%/10% --
+    nearly everything connected counts, the percentile floor stays
+    as the backstop.
+
     Safety floor: when the peeled span still covers < 65% of the
     P0.5-P99.5 extent, the structure is more heterogeneous than the
     bins can see (or the slice was too thin) -- return the percentile
@@ -617,14 +624,15 @@ def _region_axis_span(v: np.ndarray, cell: float = 0.05):
     first_peak = float(hist.max())
     if first_peak < 3.0:
         return p_lo, p_hi
-    keep_thr = 0.06 * first_peak
+    keep_thr = (0.02 if mesh_mode else 0.06) * first_peak
+    connect = 0.10 if mesh_mode else 0.20
     remaining = hist.astype(float).copy()
     kept = np.zeros(len(hist), dtype=bool)
     while True:
         peak = float(remaining.max())
         if peak < max(keep_thr, 3.0):
             break
-        thr = 0.20 * peak
+        thr = connect * peak
         i0 = int(np.argmax(remaining))
         kept[i0] = True
         remaining[i0] = 0.0
@@ -648,7 +656,7 @@ def _region_axis_span(v: np.ndarray, cell: float = 0.05):
 
 
 def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
-                    floor_z: float = 0.0):
+                    floor_z: float = 0.0, mesh_mode: bool = False):
     """Fit a full-depth OBB (yaw=0; points already in the row-aligned
     frame) to the points inside a grounded 2D rect.
 
@@ -715,8 +723,8 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
     core = dev[(dev[:, 2] >= zc0) & (dev[:, 2] <= zc1)]
     if len(core) < 30:
         core = dev                   # thin structure: whole band
-    sx = _region_axis_span(core[:, 0])
-    sy = _region_axis_span(core[:, 1])
+    sx = _region_axis_span(core[:, 0], mesh_mode=mesh_mode)
+    sy = _region_axis_span(core[:, 1], mesh_mode=mesh_mode)
     if sx is not None and sy is not None:
         (x_lo, x_hi), (y_lo, y_hi) = sx, sy
     else:                            # too sparse to bin: percentile fit
@@ -822,7 +830,8 @@ def _cross_gap_split(v: np.ndarray, peak_frac: float = 0.25,
 def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
                       floor_z: float = 0.0,
                       max_depth: float = _MAX_DEVICE_DEPTH,
-                      min_side: float = _MIN_DEVICE_DEPTH) -> list:
+                      min_side: float = _MIN_DEVICE_DEPTH,
+                      mesh_mode: bool = False) -> list:
     """Fit one rect, then split DEEP fits: a rect the VLM drew around
     TWO opposing rows (front + back, an aisle between) fits as ONE box
     with the union depth, and nothing downstream can split across the
@@ -841,7 +850,8 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
     gap + 1.1 (device) ~= 1.6m, under the 1.8 default yet NOT a single
     device; the split's min-side rule (_MIN_DEVICE_DEPTH 0.40) then
     discards the wall side and keeps the clean device box."""
-    bb = _fit_region_box(points, rect, min_pts, floor_z)
+    bb = _fit_region_box(points, rect, min_pts, floor_z,
+                         mesh_mode=mesh_mode)
     if bb is None:
         return []
     axis = 1 if abs(float(bb.yaw)) < 1e-6 else 0   # cross axis of the fit
@@ -866,7 +876,8 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
     for sub in subs:
         out.extend(_fit_region_boxes(points, sub, min_pts, floor_z,
                                      max_depth=max_depth,
-                                     min_side=min_side))
+                                     min_side=min_side,
+                                     mesh_mode=mesh_mode))
     return out or [bb]
 
 
@@ -1301,7 +1312,8 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # to the local floor (stepped rooms: a raised section's slab is
     # that section's floor, and its racks are NOT a step taller).
     P = np.asarray(scene.points, dtype=np.float64)
-    fl = _floor_map(P, mesh_mode=bool(scene.meta.get("geometry_is_mesh")))
+    is_mesh = bool(scene.meta.get("geometry_is_mesh"))
+    fl = _floor_map(P, mesh_mode=is_mesh)
     h_fit = P[:, 2] - fl(P[:, 0], P[:, 1])
     fit_top = float(scene.meta.get("z_top", 2.5) or 2.5)
     pts_fit = _rot_xy(P[(h_fit > 0.30) & (h_fit <= fit_top + 0.10)], -yaw)
@@ -1365,7 +1377,8 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                                 (rect_r[1] + rect_r[3]) / 2.0, 0.0]]),
                      yaw)[0]
         bbs = _fit_region_boxes(pts_fit, rect_r,
-                                floor_z=float(fl(cw[0], cw[1])))
+                                floor_z=float(fl(cw[0], cw[1])),
+                                mesh_mode=is_mesh)
         # _fit_region_boxes (plural): a deep fit -- the VLM drew ONE
         # rect around two opposing rows -- splits at the aisle here,
         # before the box enters the pipeline (stageC can only split
@@ -1529,7 +1542,8 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                       (rect[1] + rect[3]) / 2.0, 0.0]]), yaw)[0]
                 for bb in _fit_region_boxes(
                         pts_fit, rect, floor_z=float(fl(cw[0], cw[1])),
-                        max_depth=1.35, min_side=0.15):
+                        max_depth=1.35, min_side=0.15,
+                        mesh_mode=is_mesh):
                     # wall-thin fits never enter the pipeline: a wall
                     # blob OUT-SUPPORTS real device boxes on sheer
                     # point count and would eat them in the dedup (no
