@@ -963,6 +963,65 @@ def test_front_azim_puts_camera_on_open_side():
           "(both layouts, both directions)")
 
 
+def test_free_row_end_and_side_azim():
+    """The SIDE view must stand beyond the row's FREE end (user
+    report: a cabinet whose side face is flush against a wall veiled
+    the render -- the old azim = front + 90 picked the end blindly).
+    _free_row_end measures opacity-mass corridors past BOTH row ends
+    and returns the open one; _side_azim turns that into the azimuth
+    whose EYE displacement (make_local_cam's own math) points out of
+    the free end -- for BOTH box layouts and wall ends."""
+    from agentic_gts.agent.mask_refine import (_free_row_end, _front_azim,
+                                               _side_azim)
+    from agentic_gts.tools.gs_io import GaussianData
+    from agentic_gts.output.gs_render import make_local_cam
+    rng = np.random.default_rng(17)
+    for size, yaw, wall_end in [((6.0, 1.1, 2.0), 0.0, +1.0),
+                                ((6.0, 1.1, 2.0), -0.7, -1.0),
+                                ((1.1, 6.0, 2.0), 0.4, +1.0)]:
+        box = OrientedBox(center=(0.0, 0.0, 1.0), size=size, yaw=yaw)
+        axis = np.array([math.cos(yaw), math.sin(yaw)])
+        cross = np.array([-math.sin(yaw), math.cos(yaw)])
+        v = axis if size[0] >= size[1] else cross
+        long_half = max(size[0], size[1]) / 2.0
+        # dense opaque wall band flush past the wall_end side face
+        n = 600
+        along = rng.uniform(-0.5, 0.5, n)
+        wall = np.column_stack([
+            along * cross[0] + (long_half + 0.10) * wall_end * v[0],
+            along * cross[1] + (long_half + 0.10) * wall_end * v[1],
+            rng.uniform(0.3, 1.8, n)])
+        means = wall.astype(np.float32)
+        gs = GaussianData(
+            means=means,
+            log_scales=np.full((n, 3), -6.0, dtype=np.float32),
+            quats=np.tile(np.array([[1.0, 0, 0, 0]], np.float32), (n, 1)),
+            raw_opacity=np.full(n, 2.0, dtype=np.float32),
+            f_dc=np.zeros((n, 3), dtype=np.float32),
+        )
+        end_sign, corridor, row_v = _free_row_end(gs, box)
+        assert end_sign == -wall_end, \
+            f"free end must be the OPEN one (yaw={yaw}, wall at " \
+            f"{wall_end:+.0f}), got {end_sign:+.0f}"
+        assert corridor > 2.0, \
+            f"open end corridor must stay wide, got {corridor:.2f}"
+        assert abs(float(row_v @ v)) > 0.99, "row axis mismatch"
+        # end-to-end: the chosen side azimuth puts the EYE out of the
+        # free end (and thus NOT inside the flush wall)
+        open_face = cross if size[0] >= size[1] else axis
+        azim_front = _front_azim(box, open_face)
+        azim_side = _side_azim(box, azim_front, end_sign, row_v)
+        cam = make_local_cam([box], elev_deg=18.0, azim_deg=azim_side,
+                             standoff=1.0)
+        disp = np.asarray(cam.eye)[:2] - np.asarray(box.center)[:2]
+        assert float(disp @ row_v) * end_sign > 0.0, (
+            f"side eye on the WALLED end: yaw={yaw}, size={size}, "
+            f"azim_side={azim_side}, disp@v={float(disp @ row_v):.2f}, "
+            f"end_sign={end_sign:+.0f}")
+    print("PASS side view stands beyond the free row end "
+          "(both layouts, wall at either end)")
+
+
 def test_open_side_flush_wall_and_floaters():
     """The open-side pick for a WALL-ADJACENT box: a wall flush against
     one face (gap < 0.1 m) must BLOCK that side -- the old single-point

@@ -389,6 +389,91 @@ def _open_side(gs, box: OrientedBox, reach: float = 3.0):
     return s * face_axis, min(side_corridor[s], reach)
 
 
+def _free_row_end(gs, box: OrientedBox, reach: float = 3.0):
+    """The row's FREE end (the side-view camera's ground) and its
+    corridor width.
+
+    The side view looks ALONG the row from beyond one row end; the
+    old slot picked that end blindly (front + 90), so a cabinet whose
+    SIDE face is flush against a wall put the eye inside the wall and
+    the render came out a smooth veil (user report). Same measurement
+    as _open_side, but along the ROW axis beyond the row's end faces:
+    5cm opacity-mass bins (a bin blocks when its summed opacity >=
+    1.0 -- a wall is a solid mass however diffuse it renders), with
+    the far-field override (past a real open end the room continues;
+    past a wall there is only faint smear).
+
+    Returns (end_sign, corridor, v): end_sign +-1 along the row axis
+    v (the direction OUT of the free end), corridor the clear width
+    past that end (capped at reach), v the unit row axis.
+    """
+    pts = np.asarray(gs.means, dtype=float)
+    op = 1.0 / (1.0 + np.exp(-np.asarray(gs.raw_opacity, dtype=float)))
+    c = np.asarray(box.center, dtype=float)
+    yaw = float(box.yaw)
+    axis = np.array([math.cos(yaw), math.sin(yaw)])       # local x
+    cross = np.array([-math.sin(yaw), math.cos(yaw)])     # local y
+    size = np.asarray(box.size, dtype=float)
+    # the ROW axis carries the LONG side (same convention as _open_side)
+    if size[0] >= size[1]:
+        v, long_half = axis, size[0] / 2.0
+    else:
+        v, long_half = cross, size[1] / 2.0
+    u = cross if size[0] >= size[1] else axis
+    face_half = min(size[0], size[1]) / 2.0
+    d = pts[:, :2] - c[:2]
+    du = d @ u
+    dv = d @ v
+    z = pts[:, 2]
+    z_top = c[2] + size[2] / 2.0
+    band = (z > 0.25) & (z < max(min(z_top - 0.2, 2.0), 0.5))
+    strip = np.abs(du) < face_half + 1.0
+    bin_edges = np.arange(0.02, reach + 0.05, 0.05)
+    end_corridor, end_far = {}, {}
+    for s in (1.0, -1.0):
+        beyond = dv * s - long_half    # distance past the s-side end face
+        m = strip & (beyond > 0.02) & (beyond < reach) & band
+        corridor = reach
+        if m.any():
+            hist, _ = np.histogram(beyond[m], bins=bin_edges, weights=op[m])
+            blocked = np.nonzero(hist >= 1.0)[0]
+            if len(blocked):
+                corridor = float(bin_edges[blocked[0]])
+        end_corridor[s] = corridor
+        far = strip & (beyond > 1.2) & band
+        end_far[s] = float(op[far].sum())
+    f1, f2 = end_far[1.0], end_far[-1.0]
+    if f1 >= 3.0 * f2 and f1 >= 20.0:
+        s = 1.0
+    elif f2 >= 3.0 * f1 and f2 >= 20.0:
+        s = -1.0
+    else:
+        s = 1.0 if end_corridor[1.0] >= end_corridor[-1.0] else -1.0
+    return s, min(end_corridor[s], reach), v
+
+
+def _side_azim(box: OrientedBox, azim_front: float,
+               end_sign: float, row_v) -> float:
+    """The side-view azimuth whose EYE stands out of the FREE row end.
+
+    make_local_cam's eye displacement at azimuth A is R(A) @ cross
+    (dist > 0 along it); for the side candidates that is R(azim_front
+    +- 90) @ cross. 2D rotations commute, so R(azim_front + 90) @
+    cross = R(azim_front) @ R(90) @ cross -- computed from the SAME
+    math make_local_cam uses, never from a remembered sign convention
+    (the trap that once inverted _front_azim).
+    """
+    az = math.radians(azim_front)
+    rot = np.array([[math.cos(az), -math.sin(az)],
+                    [math.sin(az), math.cos(az)]])
+    base = np.array([-math.sin(float(box.yaw)),
+                     math.cos(float(box.yaw))])
+    plus = rot @ np.array([-base[1], base[0]])   # R(azim_front + 90) @ cross
+    if float(np.asarray(plus) @ np.asarray(row_v)) * end_sign < 0.0:
+        return azim_front - 90.0
+    return azim_front + 90.0
+
+
 def _box_only_mask(gs, box: OrientedBox, pad: float = 0.15) -> np.ndarray:
     """Boolean mask over gs: True only for gaussians INSIDE the box's OBB
     (plus `pad` metres of slack, since the fitted OBB clips a few cm off
@@ -482,16 +567,35 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # to judge does not participate in the refinement, whichever
     # view it is (a wall-adjacent box can fog up its BACK or its SIDE
     # render just the same).
-    slots = (("front", 18.0, azim_front),
-             ("back", 18.0, azim_front + 180.0),
-             ("side", 18.0, azim_front + 90.0))
     # standoff: ~80% into the corridor, never further than 2.2m; the
     # camera widens its lens to frame, it does not back off
     standoff = float(np.clip(0.8 * corridor, 0.6, 2.2))
+    # SIDE slot placement (user report: the side view rendered as a
+    # veil when the cabinet's SIDE face was flush against a wall): the
+    # old azim = front + 90 stands the eye beyond ONE row end, picked
+    # blindly -- the walled end puts the eye inside the wall. Pick the
+    # FREE end instead (_free_row_end, same opacity-mass corridor
+    # measurement as _open_side), and cap the side standoff by that
+    # end's corridor. The candidate azimuth whose EYE DISPLACEMENT
+    # (make_local_cam's own rotation math: R(azim) @ cross) points out
+    # of the free end wins -- computed, not remembered, so the sign
+    # trap that once inverted _front_azim cannot recur here.
+    azim_side = azim_front + 90.0
+    standoff_side = standoff
+    try:
+        end_sign, end_corridor, row_v = _free_row_end(gs, box)
+        azim_side = _side_azim(box, azim_front, end_sign, row_v)
+        standoff_side = float(np.clip(0.8 * end_corridor, 0.35, 2.2))
+    except Exception as e:
+        print(f"[mask-refine] free-row-end pick failed "
+              f"({type(e).__name__}: {e}) -> default side slot")
+    slots = (("front", 18.0, azim_front, standoff),
+             ("back", 18.0, azim_front + 180.0, standoff),
+             ("side", 18.0, azim_side, standoff_side))
     out = []
-    for name, elev, azim in slots:
+    for name, elev, azim, so in slots:
         cam = make_local_cam([box], W=768, H=768, elev_deg=elev,
-                             azim_deg=azim, standoff=standoff)
+                             azim_deg=azim, standoff=so)
         # render ONLY the device: every gaussian outside the box's OBB
         # (plus slack) is hidden -- occluders and fog sources alike
         sub = _subset_or_none(gs, _box_only_mask(gs, box))
