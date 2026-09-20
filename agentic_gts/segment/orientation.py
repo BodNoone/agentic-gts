@@ -228,6 +228,8 @@ def fit_wall_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
     z = points[:, 2]
     band = points[(z > z_range[0]) & (z < z_range[1])]
     if len(band) < 500:
+        print(f"[diag][yaw] wall fit: device band too small "
+              f"({len(band)} pts) -> skip")
         return None
     if len(band) > 150_000:
         sel = np.random.default_rng(0).choice(len(band), 150_000,
@@ -237,7 +239,9 @@ def fit_wall_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
     try:
         from scipy.spatial import ConvexHull
         hull = ConvexHull(pts)
-    except Exception:
+    except Exception as e:
+        print(f"[diag][yaw] wall fit: hull failed ({type(e).__name__}) "
+              f"-> skip")
         return None
     verts = pts[hull.vertices]
 
@@ -259,6 +263,9 @@ def fit_wall_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
         edges.append({"a": a, "u": u, "L": L, "mask": sup,
                       "ang": math.atan2(u[1], u[0])})
     if not edges:
+        print(f"[diag][yaw] wall fit: {len(verts)} hull verts but no "
+              f"edge >= {min_edge}m with >=50 support pts (irregular "
+              f"/ chamfered boundary) -> skip")
         return None
 
     # fold mod-90: an orthogonal room's walls form ONE family
@@ -271,6 +278,11 @@ def fit_wall_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
     best_key = max(fam, key=lambda k: fam[k])
     conf = fam[best_key] / total
     if conf < min_conf:
+        fams = sorted(((round(math.degrees(k * bin_deg), 1), round(v))
+                       for k, v in fam.items()), key=lambda t: -t[1])[:3]
+        print(f"[diag][yaw] wall fit: no dominant family -- top "
+              f"(deg, pts): {fams}, best share {conf:.0%} "
+              f"< {min_conf:.0%} -> skip")
         return None
 
     # refine: PCA on each family edge's supporting points
@@ -300,6 +312,8 @@ def fit_wall_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
             continue
         votes.append((np.exp(4j * (e["ang"] + d)), float(len(p))))
     if not votes:
+        print("[diag][yaw] wall fit: family edges too small / blob-ish "
+              "for PCA -> skip")
         return None
     tot = sum(w for _, w in votes)
     zs = sum(c * w for c, w in votes) / tot
