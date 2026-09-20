@@ -164,6 +164,12 @@ def _layout_frame(scene, yaw: float):
 _MAX_SINGLE_SPAN = 25.0
 _TILE_OVERLAP = 2.5
 
+# recall tilt views (user direction 1): the extra L/R cameras deviate
+# from vertical by this much -- small enough to keep the nadir's
+# layout fidelity (rows stay near-axis-aligned, rects back-project
+# close to their footprint), large enough to expose device FACES.
+_RECALL_TILT_DEG = 20.0
+
 
 def _tile_frames(layout):
     """Overlapping tile frames covering the rotated-frame layout AABB,
@@ -218,7 +224,7 @@ def _render_keep_mask(hg: np.ndarray, op: np.ndarray,
 
 
 def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
-                    frame=None):
+                    frame=None, tilt_deg: float = 0.0, tilt_dir: int = 0):
     """Base top-down render, no overlays. Camera fitted over the
     yaw-rotated cloud (rows parallel to the image axes), then rotated
     back into world so the GS render and the pixel back-projection
@@ -233,6 +239,15 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
     byproducts (scene.meta z_top + device_footprint): there is no
     hint-box input anymore. `frame` (rotated-frame AABB) overrides the
     framing for TILED views over a big layout (ground resolution).
+
+    tilt_deg + tilt_dir (user direction 1, recall views): tilt the
+    nadir camera SLIGHTLY toward +/- row-frame y (across the rows, the
+    device faces). The nadir frame only shows roof-plates; a slight
+    tilt exposes the FACES (doors, panels, AC grilles) and lets the
+    VLM ground structures the flat view renders featureless. The tilt
+    is small on purpose (default 20 deg): the view keeps most of the
+    nadir's layout fidelity, and each rect still back-projects through
+    ITS OWN camera (unproject_ground handles non-nadir rays).
 
     Returns (img_float, cam, W, H).
     """
@@ -306,6 +321,29 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
             size=(float(hi[0] - lo[0]), float(hi[1] - lo[1]), 2.0),
             yaw=0.0))
     cam_r = make_godview_cam(pts_rot, boxes_rot, nadir=True, W=W, H=H)
+    if tilt_deg and tilt_dir:
+        # recall tilt (user direction 1): shift the eye along +/-y in
+        # the ROW frame (the cam below rotates it back to world), so
+        # the tilt direction is across-the-rows regardless of yaw.
+        # The shift is set so the sight line through the LAYOUT
+        # CENTRE deviates from vertical by tilt_deg; the eye also
+        # climbs ~25% of the tilt factor because the perspective
+        # spreads the near edge outward and the frame must still
+        # cover the whole layout. up: the old +y hint projected onto
+        # the (now tilted) image plane -- the view stays row-aligned.
+        t = math.tan(math.radians(float(tilt_deg)))
+        tz = float(cam_r.target[2])
+        ez2 = float(cam_r.eye[2]) * (1.0 + 0.25 * t)
+        off = t * max(ez2 - tz, 1.0)
+        eye2 = np.array([float(cam_r.eye[0]),
+                         float(cam_r.eye[1]) + tilt_dir * off,
+                         ez2])
+        fwd = np.asarray(cam_r.target, dtype=float) - eye2
+        up_h = np.array([0.0, 1.0, 0.0])
+        up_h = up_h - float(up_h @ fwd / (fwd @ fwd)) * fwd
+        up_h = up_h / np.linalg.norm(up_h)
+        cam_r = Cam(eye=eye2, target=np.asarray(cam_r.target, dtype=float),
+                    up=up_h, fovy_deg=cam_r.fovy_deg, W=W, H=H)
     # rotate the camera back into world (rotation about z: the nadir
     # axis rotates with it)
     if abs(yaw) > 1e-9:
@@ -902,95 +940,6 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
     return out or [bb]
 
 
-def _wall_axis_cells(P: np.ndarray, h_fit: np.ndarray, yaw: float,
-                     z_top: float, cell: float = 0.15,
-                     thin: float = 0.45, r: int = 4):
-    """Wall cell keys split by the axis they ELONGATE, for the cluster
-    rect caps (user question: does pure-geometry grounding survive
-    wall-touching devices?).
-
-    A wall flush against a device merges into its density cluster and
-    stretches the fitted box along the wall's length -- a wall longer
-    than the row wins the whole span, and stageC's IoU guard then
-    rejects the correction. But devices STOP at the device top while
-    walls run on to the ceiling: a cell whose points continue >= 0.6m
-    ABOVE the device band (>= 3 distinct 0.20m z-bins in z_top+0.10
-    .. z_top+1.20) is a wall cell.
-
-    Per-CELL LOCAL axis classification, NOT per connected component
-    (the component view breaks on real rooms: the walls form ONE
-    connected ring, and a long room tips the ring's GLOBAL extents
-    toward one axis -- in the corner test a 22m + 8m wall pair merged
-    into a single 'x-elongated' component and the cross wall's cells
-    were never marked). Each wall cell looks at its OWN +-0.6m
-    neighbourhood: the run of wall cells along x (within +-2 cells in
-    y, covering wall thickness) vs along y. Longer than `thin`
-    (0.45m -- no device category is thinner) and >= 2x the other ->
-    the cell elongates that axis and is 'bad' for it; elongated both
-    ways (a corner, a pillar) -> bad for both. The caller shrinks
-    each cluster rect along its walls' elongated axes to the span of
-    the remaining (device) cells.
-
-    Deliberate properties:
-      * horizontal overheads never trip the z-bin test -- trays and
-        ceilings pack into 1-2 z-bins, only vertical continuations
-        spread over 3+;
-      * the morphological alternative (erosion on the occupancy grid)
-        is WRONG here: a rack row is a HOLLOW shell -- two face bands
-        -- and erosion strips the faces themselves;
-      * a contact cell shared by the wall above and the rack's back
-        face stays good for the OTHER axis, so a perpendicular wall's
-        cap still sees the row's own back band;
-      * open doors are device-height: no high continuation, they stay
-        in-pool by design (stageC's `open cabinet door` rule owns
-        them).
-
-    Returns (x_bad, y_bad): int64 key arrays (ix * 10**7 + iy), or
-    (None, None) when no wall cells were found.
-    """
-    hi_m = (h_fit > z_top + 0.10) & (h_fit < z_top + 1.20)
-    if int(hi_m.sum()) < 100:
-        return None, None
-    Q = _rot_xy(P[hi_m], -yaw)
-    qix = np.floor(Q[:, 0] / cell).astype(np.int64)
-    qiy = np.floor(Q[:, 1] / cell).astype(np.int64)
-    zb = np.floor((h_fit[hi_m] - z_top) / 0.20).astype(np.int64)
-    pairs, pinv = np.unique(np.column_stack([qix, qiy]), axis=0,
-                            return_inverse=True)
-    up = np.unique(np.column_stack([pinv, zb]), axis=0)
-    cnt = np.bincount(up[:, 0], minlength=len(pairs))
-    cells = pairs[cnt >= 3]
-    if not len(cells):
-        return None, None
-    i0, j0 = int(cells[:, 0].min()), int(cells[:, 1].min())
-    W = np.zeros((int(cells[:, 0].max()) - i0 + 1,
-                  int(cells[:, 1].max()) - j0 + 1), dtype=bool)
-    W[cells[:, 0] - i0, cells[:, 1] - j0] = True
-    x_bad: list[int] = []
-    y_bad: list[int] = []
-    for a, b in cells:
-        i, j = int(a) - i0, int(b) - j0
-        # the wall run ALONG x through this cell: wall cells within
-        # +-2 cells in y (wall thickness) and +-r cells in x
-        sl = W[max(0, i - 2):i + 3, max(0, j - r):j + r + 1]
-        cols = np.nonzero(sl.any(axis=0))[0]
-        ex = float(cols.max() - cols.min() + 1) * cell if len(cols) else 0.0
-        sl2 = W[max(0, i - r):i + r + 1, max(0, j - 2):j + 3]
-        rows = np.nonzero(sl2.any(axis=1))[0]
-        ey = float(rows.max() - rows.min() + 1) * cell if len(rows) else 0.0
-        k = int(a) * 10_000_000 + int(b)
-        if ex > thin and ex >= 2.0 * ey:
-            x_bad.append(k)          # runs along the row axis here
-        elif ey > thin and ey >= 2.0 * ex:
-            y_bad.append(k)          # runs across the row axis here
-        elif ex > thin and ey > thin:
-            x_bad.append(k)          # corner / pillar: bad both ways
-            y_bad.append(k)
-        # else: local sliver -- good on both axes
-    return (np.array(x_bad, dtype=np.int64) if x_bad else None,
-            np.array(y_bad, dtype=np.int64) if y_bad else None)
-
-
 def _cluster_candidates(points: np.ndarray, cell: float = 0.30,
                         min_cell_pts: int = 6, min_cluster_pts: int = 60,
                         margin: float = 0.15) -> list:
@@ -1296,143 +1245,6 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
 # ---------- grounding stage ----------
 
 
-def _ground_stage_mesh(scene, yaw: float,
-                       out_dir: str | None = None) -> bool:
-    """Geometry-first global proposal (user direction 2), MESH inputs.
-
-    With a mesh the recall source is the geometry ITSELF: devices are
-    closed / semi-closed rectangular structures in a clean cloud, so
-    EVERY density clump in the device band is proposed as a box --
-    no VLM call, no image detection to be unstable, no rect snap /
-    coverage / merge patches (the whole stack the VLM path needed
-    because its rects clipped and drifted). The VLM's role moves
-    entirely to the per-box LOCAL views: stageC's cheap front-view
-    type check culls non-devices BEFORE the SAM cost, and the SAM
-    refinement tightens imprecise fits. Wrong proposals are cheap; a
-    missed device is lost (user directive: recall-first).
-
-    Pools: the CLUSTER pool runs on the render cut (0.50 x z_top --
-    the mesh trays sit above it), because the fit pool (z_top + 0.10)
-    carries the trays, whose gapless strips span every aisle and seam
-    the whole room into ONE cluster; the FIT pool keeps the rack tops
-    (box height belongs in the box).
-    """
-    import os
-    from agentic_gts.output.gs_render import png_bytes
-    P = np.asarray(scene.points, dtype=np.float64)
-    fl = _floor_map(P, mesh_mode=True)
-    h_fit = P[:, 2] - fl(P[:, 0], P[:, 1])
-    fit_top = float(scene.meta.get("z_top", 2.5) or 2.5)
-    pts_fit = _rot_xy(P[(h_fit > 0.30) & (h_fit <= fit_top + 0.10)], -yaw)
-    if len(pts_fit) < 100:
-        pts_fit = _rot_xy(P[h_fit > 0.30], -yaw)
-    cc = _render_cut(fit_top, mesh_mode=True)
-    pts_clu = _rot_xy(
-        P[(h_fit > 0.30) & (h_fit <= (cc if np.isfinite(cc)
-                                      else fit_top))], -yaw)
-    # WALL CAPS (user question: wall-touching devices): walls run on
-    # to the ceiling, devices stop at the device top -- the z-bin
-    # continuation test marks wall cells, and each cluster rect is
-    # shrunk along its walls' ELONGATED axes to the device cells'
-    # span, so a flush wall neither stretches the box to its own
-    # length nor deepens it beyond the row (the wall sliver <= 0.3m
-    # that shares a contact cell with the rack's back face stays --
-    # removing it would remove the back face; stageC refines it).
-    xb, yb = _wall_axis_cells(P, h_fit, yaw, fit_top)
-    try:
-        cands = _cluster_candidates(pts_clu)
-    except Exception as e:
-        print(f"[ground] mesh clustering failed ({type(e).__name__}: {e})")
-        cands = []
-    if cands and (xb is not None or yb is not None):
-        cu = np.unique(np.column_stack([
-            np.floor(pts_clu[:, 0] / 0.15).astype(np.int64),
-            np.floor(pts_clu[:, 1] / 0.15).astype(np.int64)]), axis=0)
-        cuk = cu[:, 0] * 10_000_000 + cu[:, 1]
-        cb_x = np.isin(cuk, xb) if xb is not None \
-            else np.zeros(len(cu), dtype=bool)
-        cb_y = np.isin(cuk, yb) if yb is not None \
-            else np.zeros(len(cu), dtype=bool)
-        cxc = (cu[:, 0] + 0.5) * 0.15
-        cyc = (cu[:, 1] + 0.5) * 0.15
-        fixed = []
-        n_cap = 0
-        for rect, npts in cands:
-            m = ((cxc >= rect[0] - 0.15) & (cxc <= rect[2] + 0.15) &
-                 (cyc >= rect[1] - 0.15) & (cyc <= rect[3] + 0.15))
-            r = [rect[0], rect[1], rect[2], rect[3]]
-            if cb_x.any() and (m & cb_x).any():
-                g = cu[m & ~cb_x]
-                if len(g):
-                    r[0] = max(r[0], float(g[:, 0].min()) * 0.15)
-                    r[2] = min(r[2], float(g[:, 0].max() + 1) * 0.15)
-            if cb_y.any() and (m & cb_y).any():
-                g = cu[m & ~cb_y]
-                if len(g):
-                    r[1] = max(r[1], float(g[:, 1].min()) * 0.15)
-                    r[3] = min(r[3], float(g[:, 1].max() + 1) * 0.15)
-            if r != [rect[0], rect[1], rect[2], rect[3]]:
-                n_cap += 1
-            fixed.append((tuple(r), npts))
-        cands = fixed
-        if n_cap:
-            print(f"[ground] wall-cap: {n_cap} cluster rect(s) shrunk "
-                  f"along wall-elongated axes")
-    boxes = []
-    for cid, (rect, _npts) in enumerate(cands, start=1):
-        cw = _rot_xy(np.array(
-            [[(rect[0] + rect[2]) / 2.0,
-              (rect[1] + rect[3]) / 2.0, 0.0]]), yaw)[0]
-        for bb in _fit_region_boxes(
-                pts_fit, rect, floor_z=float(fl(cw[0], cw[1])),
-                max_depth=1.35, min_side=0.15):
-            # wall-thin fits never enter the pipeline: a wall blob
-            # OUT-SUPPORTS real device boxes on sheer point count and
-            # would eat them in the dedup (no device category is
-            # thinner than 0.35m; walls are 0.1-0.3m)
-            if bb.size[1] < 0.35:
-                continue
-            c = _rot_xy(np.array(
-                [[bb.center[0], bb.center[1], 0.0]]), yaw)[0]
-            boxes.append(OrientedBox(
-                center=(float(c[0]), float(c[1]), bb.center[2]),
-                size=bb.size, yaw=yaw + float(bb.yaw),
-                device_type=DeviceType.RACK,
-                meta={"grounded": True, "cluster": cid,
-                      "n_pts": bb.meta.get("n_pts", 0)}))
-    if not boxes:
-        print("[ground] mesh geometry proposal: no structure survived "
-              "the fit guards")
-        return False
-    # dedup: adjacent clusters whose fits bleed into each other
-    dedup = []
-    for b in sorted(boxes, key=lambda x: -int(x.meta.get("n_pts", 0))):
-        if any(b.iou_2d(d) >= 0.5 or b.containment_2d(d) >= 0.85
-               for d in dedup):
-            continue
-        dedup.append(b)
-    if len(dedup) < len(boxes):
-        print(f"[ground] dropped {len(boxes) - len(dedup)} duplicate/"
-              f"contained box(es)")
-    boxes = dedup
-    scene.boxes = boxes
-    print(f"[ground] MESH geometry-first: {len(cands)} cluster(s) -> "
-          f"{len(boxes)} proposed box(es) (no VLM; stageC local views "
-          f"type-confirm)")
-    # audit: same artifacts as the VLM path (plain view + proposals)
-    if out_dir:
-        try:
-            img, cam, _W, _H = _render_topdown(scene, yaw)
-            with open(os.path.join(out_dir, "groundview.png"), "wb") as f:
-                f.write(png_bytes(img))
-            _save_grounded_png(img, cam, boxes, [], out_dir,
-                               fname="grounded.png")
-        except Exception as e:
-            print(f"[ground] mesh audit render failed "
-                  f"({type(e).__name__}: {e})")
-    return True
-
-
 def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     """Replace scene.boxes with VLM-grounded per-region boxes.
 
@@ -1459,14 +1271,6 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
               "-> nothing to ground")
         return False
     yaw = float(scene.meta.get("yaw", 0.0) or 0.0)
-    # MESH (user direction 2, geometry-first): with a clean mesh the
-    # recall source is the geometry itself -- every density clump is
-    # proposed, deterministically, with NO VLM call in this stage.
-    # Only 3DGS-only scenes (no mesh) still need the VLM image
-    # grounding path below: theirs is the only recall source there,
-    # and the haze in those clouds makes direct fitting unreliable.
-    if bool(scene.meta.get("geometry_is_mesh")):
-        return _ground_stage_mesh(scene, yaw, out_dir)
     # ---- views: one nadir view, or TILES over a big layout ----
     # A single view must fit the whole layout; past ~25m of span the
     # camera climbs so high that cabinets render a dozen pixels wide
@@ -1506,6 +1310,41 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         rects = judge.ground_regions(png, W, H, png_path=png_path)
         print(f"[ground] view {fname}: {len(rects)} regions")
         views.append((img, cam, W, H, fname, rects))
+        # ---- recall tilt views (user direction 1) ----
+        # Two extra cameras slightly tilted toward +/- across-row, on
+        # THIS view's frame: the flat nadir frame renders every device
+        # as a roof-plate -- featureless boxes are where image
+        # grounding misses -- while a slight tilt exposes the faces.
+        # Recall only ADDS views: the dedup below folds the duplicate
+        # boxes, and each tilted rect back-projects through its own
+        # camera (unproject_ground), so no geometry is shared with the
+        # nadir frame by mistake.
+        stem = fname[:-4] if fname.endswith(".png") else fname
+        for tag, d in (("L", -1), ("R", +1)):
+            try:
+                img_t, cam_t, W_t, H_t = _render_topdown(
+                    scene, yaw, frame=fr, tilt_deg=_RECALL_TILT_DEG,
+                    tilt_dir=d)
+                png_t = png_bytes(img_t)
+            except Exception as e:
+                print(f"[ground] tilt-{tag} render failed "
+                      f"({type(e).__name__}: {e})")
+                continue
+            pngp_t = None
+            if out_dir:
+                pngp_t = os.path.join(out_dir, f"{stem}_{tag}.png")
+                try:
+                    with open(pngp_t, "wb") as f:
+                        f.write(png_t)
+                except Exception as e:
+                    print(f"[ground] png save failed "
+                          f"({type(e).__name__})")
+                    pngp_t = None
+            rects_t = judge.ground_regions(png_t, W_t, H_t,
+                                           png_path=pngp_t)
+            print(f"[ground] view {stem}_{tag}: {len(rects_t)} regions")
+            views.append((img_t, cam_t, W_t, H_t, f"{stem}_{tag}.png",
+                          rects_t))
     if not views:
         return False                 # every render failed (logged above)
     if not any(v[5] for v in views):

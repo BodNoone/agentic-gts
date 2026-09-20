@@ -43,144 +43,124 @@ def _bootstrap_meta(scene, footprint, z_top=2.1):
     scene.meta["device_footprint"] = footprint
 
 
-def test_ground_stage_mesh_geometry_first():
-    """MESH inputs take the geometry-first path (user direction 2):
-    every density clump in the device band is proposed as a box --
-    DETERMINISTICALLY, with NO VLM call (judge=None must work), no
-    rect snap / coverage / merge patches. A clean mesh room with two
-    rows across a real aisle, a 1m AC block, a thin wall band and a
-    tray strip above the cluster cut must yield exactly the three
-    devices: the wall's fit is thickness-rejected, the tray (above
-    the render cut) never stitches the rows into one cluster, and the
-    aisle keeps the rows as separate proposals."""
+def test_render_topdown_tilt_camera_geometry():
+    """Recall tilt views (user direction 1): the L/R cameras deviate
+    from vertical by ~tilt_deg along the ROW-frame cross axis (eye on
+    -y / +y, sight line pointing back across), up stays orthogonal to
+    the sight line, and pixel->world roundtrip through each tilted
+    camera still closes (unproject_ground handles non-nadir rays)."""
     from agentic_gts.agent import ground
+    from agentic_gts.output.gs_render import unproject_ground
 
-    rng = np.random.default_rng(31)
-    rowA = _row_points(0.0, 6.0, y=0.0, rng=rng)
-    rowB = _row_points(0.0, 6.0, y=3.0, rng=rng)
-    ac = _row_points(8.0, 9.0, y=0.0, depth=1.0, height=1.0, rng=rng)
-    wall = np.column_stack([rng.uniform(-2.0, 10.0, 6000),
-                            6.0 + rng.uniform(-0.1, 0.1, 6000),
-                            rng.uniform(0.0, 2.5, 6000)])
-    tray = np.column_stack([rng.uniform(-2.0, 10.0, 4000),
-                            rng.uniform(-1.0, 4.0, 4000),
-                            rng.uniform(1.7, 1.9, 4000)])
-    scene = Scene(points=np.vstack([rowA, rowB, ac, wall, tray]))
-    scene.meta["yaw"] = 0.0
-    scene.meta["geometry_is_mesh"] = True
-    _bootstrap_meta(scene, (-2.5, -1.0, 10.0, 6.5), z_top=2.1)
-    scene.boxes = []
-
-    ok = ground.ground_stage(scene, judge=None)
-    assert ok, "geometry-first proposal must succeed without a judge"
-    assert len(scene.boxes) == 3, \
-        f"two rows + AC expected; got {len(scene.boxes)}: " \
-        + str([(round(b.center[0], 1), round(b.center[1], 1),
-                round(b.size[0], 1)) for b in scene.boxes])
-    # the thin wall (0.2m) is thickness-rejected: no long box
-    for b in scene.boxes:
-        assert max(b.size[0], b.size[1]) < 8.0, \
-            f"wall-thin fit leaked in: {b.size}"
-        assert b.meta.get("cluster"), "every mesh box must be a " \
-            "cluster proposal (stageC cheap type check keys on it)"
-    rows = sorted((b for b in scene.boxes
-                   if max(b.size[0], b.size[1]) > 4.0),
-                  key=lambda b: b.center[1])
-    assert len(rows) == 2, \
-        f"exactly the two 6m rows are long, got {len(rows)}"
-    assert abs(rows[0].center[1]) < 0.4, "rowA centred near y=0"
-    assert abs(rows[1].center[1] - 3.0) < 0.4, "rowB centred near y=3"
-    for b in rows:
-        assert 5.4 < max(b.size[0], b.size[1]) < 6.7, \
-            f"row length {b.size[0]:.2f}m, expected ~6m"
-    print("PASS mesh geometry-first (3 devices, wall rejected, "
-          "tray unstitched, judge=None)")
-
-
-def test_ground_stage_mesh_rotated_layout():
-    """The geometry-first path in a ROTATED room: clusters are found
-    in the row frame, fitted, and the boxes rotate back out -- two
-    rows at 17 deg must come out as ~6m boxes whose own yaw folds to
-    17 deg, and the recall must not depend on the room's rotation."""
-    from agentic_gts.agent import ground
-
-    rng = np.random.default_rng(37)
-    rowA = _row_points(0.0, 6.0, y=0.0, rng=rng)
-    rowB = _row_points(0.0, 6.0, y=3.0, rng=rng)
-    pts = np.vstack([rowA, rowB])
-    a = math.radians(17.0)
-    R = np.array([[math.cos(a), -math.sin(a), 0.0],
-                  [math.sin(a), math.cos(a), 0.0], [0.0, 0.0, 1.0]])
-    pts = pts @ R.T
+    rng = np.random.default_rng(11)
+    pts = np.vstack([_row_points(0.0, 6.0, y=0.0, rng=rng),
+                     _row_points(0.0, 6.0, y=3.0, rng=rng)])
     scene = Scene(points=pts)
-    scene.meta["yaw"] = a
-    scene.meta["geometry_is_mesh"] = True
-    _bootstrap_meta(scene, tuple(float(v) for v in
-                                 pts[:, :2].min(axis=0)[:2])
-                    + tuple(float(v) for v in pts[:, :2].max(axis=0)[:2]),
-                    z_top=2.1)
-    scene.boxes = []
-
-    assert ground.ground_stage(scene, judge=None)
-    assert len(scene.boxes) == 2, \
-        f"both rows must be proposed at 17 deg, got {len(scene.boxes)}"
-    for b in scene.boxes:
-        assert 5.4 < max(b.size[0], b.size[1]) < 6.7, \
-            f"row length {b.size[0]:.2f}m at 17 deg, expected ~6m"
-        fold = math.degrees(math.remainder(float(b.yaw) - a, math.pi / 2))
-        assert abs(fold) < 2.0, \
-            f"box yaw must fold to the room yaw, off by {fold:.1f} deg"
-    print("PASS mesh geometry-first rotated (17 deg, both rows, "
-          "yaws fold home)")
-
-
-def test_ground_stage_mesh_wall_touching_devices():
-    """Wall-touching devices (user question): a 22m wall flush against
-    the row's back face and an 8m wall flush against its end merge
-    into the row's density cluster -- without caps the fit stretches
-    to the WALLS' spans (a ~22 x 8m box, which stageC's IoU guard can
-    never correct). The z-continuation test marks the wall cells
-    (devices stop at z_top, walls run to the ceiling), and each
-    cluster rect is capped along the walls' elongated axes: the box
-    must come out row-sized, not wall-sized. The back-face contact
-    cell is wall-marked but stays good for the OTHER axis, so the
-    perpendicular wall's cap still sees the row's own back band."""
-    from agentic_gts.agent import ground
-
-    rng = np.random.default_rng(43)
-    row = _row_points(0.0, 6.0, y=0.0, depth=1.1, rng=rng)
-    # parallel wall: 22m long (>> row), flush at the back face y=-0.55
-    wallP = np.column_stack([rng.uniform(-8.0, 14.0, 12000),
-                             -0.65 + rng.uniform(-0.10, 0.10, 12000),
-                             rng.uniform(0.0, 3.4, 12000)])
-    # perpendicular wall: 8m long in y, flush at the row end x=6
-    wallQ = np.column_stack([6.15 + rng.uniform(-0.10, 0.10, 8000),
-                            rng.uniform(-4.0, 4.0, 8000),
-                            rng.uniform(0.0, 3.4, 8000)])
-    scene = Scene(points=np.vstack([row, wallP, wallQ]))
     scene.meta["yaw"] = 0.0
-    scene.meta["geometry_is_mesh"] = True
-    _bootstrap_meta(scene, (-8.5, -4.5, 14.5, 4.5), z_top=2.1)
+    _bootstrap_meta(scene, (-0.5, -0.8, 6.5, 3.8))
+    _, cam0, W, H = ground._render_topdown(scene, 0.0)
+    _, camL, _, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
+                                           tilt_dir=-1)
+    _, camR, _, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
+                                           tilt_dir=+1)
+    # eyes sit on opposite sides of the layout, across the rows
+    assert camL.eye[1] < cam0.eye[1] - 0.5, "L eye must sit toward -y"
+    assert camR.eye[1] > cam0.eye[1] + 0.5, "R eye must sit toward +y"
+    for cam, sgn in ((camL, -1), (camR, +1)):
+        fwd = np.asarray(cam.target, float) - np.asarray(cam.eye, float)
+        # the sight line tilts back across the rows by ~tilt_deg
+        ang = math.degrees(math.atan2(abs(float(fwd[1])),
+                                       abs(float(fwd[2]))))
+        assert abs(ang - 20.0) < 2.0, f"tilt angle {ang:.1f} deg"
+        assert fwd[1] * sgn < 0, "sight line must point back at the layout"
+        # up stays a proper image up: orthogonal to the sight line
+        u = np.asarray(cam.up, float)
+        assert abs(float(u @ fwd)) < 1e-6 * float(np.linalg.norm(fwd))
+    # roundtrip through the tilted cameras: project a world patch,
+    # unproject onto the SAME z-plane -> the same XY
+    world = np.column_stack([rng.uniform(-0.5, 6.5, 40),
+                            rng.uniform(-0.8, 3.8, 40), np.full(40, 1.0)])
+    for cam in (camL, camR):
+        uv = cam.project_cv(world)
+        assert ((uv[:, 0] >= 0) & (uv[:, 0] < W)
+                & (uv[:, 1] >= 0) & (uv[:, 1] < H)).all(), \
+            "the whole layout must stay in the tilted frame"
+        back = unproject_ground(cam, uv, z_plane=1.0)
+        assert np.allclose(back[:, :2], world[:, :2], atol=0.01), \
+            f"tilt roundtrip error " \
+            f"{np.abs(back[:, :2] - world[:, :2]).max():.4f} m"
+    print("PASS tilt camera geometry (L/R eyes, 20 deg sight lines, "
+          "roundtrip closed)")
+
+
+def test_ground_stage_tilt_views_add_recall():
+    """End-to-end recall (user direction 1): the nadir view outlines
+    only row 1; the tilted R view ALSO sees row 2 and a lone AC block
+    -- the pipeline must ground all three. Each view's rects are
+    fabricated through ITS OWN camera (the fake judge dispatches on
+    the saved png name), so the tilted rects travel the real
+    pixel->world->snap->fit path."""
+    from agentic_gts.agent import ground
+    from agentic_gts.agent.judge import VLMJudge
+
+    rng = np.random.default_rng(17)
+    row1 = _row_points(0.0, 6.0, y=0.0, rng=rng)
+    row2 = _row_points(0.0, 6.0, y=3.0, rng=rng)
+    ac = _row_points(8.0, 9.0, y=0.0, depth=1.0, height=1.0, rng=rng)
+    scene = Scene(points=np.vstack([row1, row2, ac]))
+    scene.meta["yaw"] = 0.0
+    _bootstrap_meta(scene, (-0.5, -0.8, 9.5, 3.8))
     scene.boxes = []
 
-    ok = ground.ground_stage(scene, judge=None)
-    assert ok, "geometry-first proposal must succeed"
-    assert len(scene.boxes) == 1, \
-        f"the row must ground as ONE box, got {len(scene.boxes)}: " \
+    _, cam0, W, H = ground._render_topdown(scene, 0.0)
+    _, camL, _, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
+                                           tilt_dir=-1)
+    _, camR, _, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
+                                           tilt_dir=+1)
+    view_rects = {
+        "groundview.png": (cam0, [((-0.2, 6.2), (-0.6, 0.6))]),
+        "groundview_L.png": (camL, [((-0.2, 6.2), (-0.6, 0.6))]),
+        "groundview_R.png": (camR, [((-0.2, 6.2), (-0.6, 0.6)),
+                                     ((-0.2, 6.2), (2.4, 3.6)),
+                                     ((7.8, 9.2), (-0.6, 0.6))]),
+    }
+
+    def _fake_ground(png, W_, H_, png_path=None):
+        name = os.path.basename(png_path or "groundview.png")
+        cam, specs = view_rects[name]
+        rects = []
+        for (xa, xb), (ya, yb) in specs:
+            uv = cam.project_cv(np.column_stack(
+                [[xa, xb, xb, xa], [ya, ya, yb, yb], np.full(4, 1.0)]))
+            rects.append((float(np.clip(uv[:, 0].min(), 0, W_)),
+                          float(np.clip(uv[:, 1].min(), 0, H_)),
+                          float(np.clip(uv[:, 0].max(), 0, W_)),
+                          float(np.clip(uv[:, 1].max(), 0, H_))))
+        return rects
+
+    judge = VLMJudge(backend="qwen")
+    judge.ground_regions = _fake_ground
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        ok = ground.ground_stage(scene, judge, out_dir=td)
+        assert ok, "tilt-view grounding must succeed"
+        for name in view_rects:
+            assert os.path.exists(os.path.join(td, name)), \
+                f"{name} (recall view input) was not saved"
+    assert len(scene.boxes) == 3, \
+        f"row1 + tilt-seen row2 + tilt-seen AC, got {len(scene.boxes)}: " \
         + str([(round(b.center[0], 1), round(b.center[1], 1),
                 (round(b.size[0], 1), round(b.size[1], 1)))
                for b in scene.boxes])
-    b = scene.boxes[0]
-    # row length, not the 22m wall; the perpendicular wall may add its
-    # own 0.2m flush thickness to x
-    assert 5.4 < b.size[0] < 6.9, \
-        f"length must be row-sized, not wall-sized: {b.size[0]:.2f}m"
-    # row depth 1.1 (+ the parallel wall's contact sliver <= 0.3m),
-    # not the 8m cross wall
-    assert 0.9 < b.size[1] < 1.5, \
-        f"depth must be row-sized, not wall-sized: {b.size[1]:.2f}m"
-    print(f"PASS wall-touching devices (row {b.size[0]:.2f} x "
-          f"{b.size[1]:.2f}m despite 22m + 8m flush walls)")
+    acb = [b for b in scene.boxes if b.center[0] > 6.5]
+    assert len(acb) == 1, "the AC must come from the tilted R view"
+    assert abs(acb[0].center[1]) < 0.3 and 0.8 < acb[0].size[1] < 1.4
+    rows = sorted((b for b in scene.boxes if b.center[0] < 6.5),
+                  key=lambda b: b.center[1])
+    assert len(rows) == 2 and abs(rows[1].center[1] - 3.0) < 0.3, \
+        "row2 (tilt-seen) must also be grounded"
+    print("PASS tilt views add recall (nadir missed 2, tilted R "
+          "recovered both)")
 
 
 def test_unproject_ground_roundtrip():
