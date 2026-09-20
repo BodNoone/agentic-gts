@@ -207,7 +207,7 @@ def seed_axis_delta(boxes, points: np.ndarray, cur_yaw: float,
 
 def fit_wall_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
                  support_r: float = 0.30, min_edge: float = 1.0,
-                 bin_deg: float = 5.0, min_conf: float = 0.5
+                 tol_deg: float = 6.0, min_conf: float = 0.5
                  ) -> tuple[float, float] | None:
     """Dominant yaw from the OUTER WALL lines -- the mesh fast path.
 
@@ -268,20 +268,34 @@ def fit_wall_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
               f"/ chamfered boundary) -> skip")
         return None
 
-    # fold mod-90: an orthogonal room's walls form ONE family
-    fam: dict[int, float] = {}
-    for e in edges:
-        w = math.remainder(e["ang"], math.pi / 2)
-        key = int(round(math.degrees(w) / bin_deg))
-        fam[key] = fam.get(key, 0.0) + float(e["mask"].sum())
-    total = sum(fam.values())
-    best_key = max(fam, key=lambda k: fam[k])
-    conf = fam[best_key] / total
+    # fold mod-90: an orthogonal room's walls form ONE family -- but
+    # the raw hull-edge angles WOBBLE a few degrees (devices against
+    # the wall push hull vertices out; sampling noise), so rigid
+    # histogram bins SPLIT one family across adjacent bins (user scene
+    # dianchifang: the true -17.5 deg walls sit exactly between the
+    # -20 and -15 bins; the family split 5766 + 5269 pts, best rigid
+    # share 33% -> skip). Cluster with TOLERANCE instead: every edge
+    # seeds a family of all edges within `tol` in folded space; the
+    # heaviest family wins.
+    tol = math.radians(tol_deg)
+    folds = [math.remainder(e["ang"], math.pi / 2) for e in edges]
+    sups = [float(e["mask"].sum()) for e in edges]
+    total = sum(sups)
+
+    def _fam(i: int) -> float:
+        return sum(sups[j] for j in range(len(edges))
+                   if abs(math.remainder(folds[i] - folds[j],
+                                         math.pi / 2)) <= tol)
+
+    best_i = max(range(len(edges)), key=_fam)
+    best_sup = _fam(best_i)
+    conf = best_sup / total
     if conf < min_conf:
-        fams = sorted(((round(math.degrees(k * bin_deg), 1), round(v))
-                       for k, v in fam.items()), key=lambda t: -t[1])[:3]
-        print(f"[diag][yaw] wall fit: no dominant family -- top "
-              f"(deg, pts): {fams}, best share {conf:.0%} "
+        top = sorted(((round(math.degrees(f), 1), round(s))
+                      for f, s in zip(folds, sups)),
+                     key=lambda t: -t[1])[:3]
+        print(f"[diag][yaw] wall fit: no dominant family -- top edge "
+              f"(deg, pts): {top}, best cluster share {conf:.0%} "
               f"< {min_conf:.0%} -> skip")
         return None
 
@@ -293,8 +307,9 @@ def fit_wall_yaw(points: np.ndarray, z_range: tuple[float, float] = (0.4, 2.5),
     # directions equal mod-360, so the circular mean is well-defined.
     votes: list[tuple[complex, float]] = []
     for e in edges:
-        w = math.remainder(e["ang"], math.pi / 2)
-        if int(round(math.degrees(w) / bin_deg)) != best_key:
+        if abs(math.remainder(
+                folds[best_i] - math.remainder(e["ang"], math.pi / 2),
+                math.pi / 2)) > tol:
             continue
         p = pts[e["mask"]]
         if len(p) < 30:

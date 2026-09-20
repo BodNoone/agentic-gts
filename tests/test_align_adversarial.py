@@ -392,6 +392,57 @@ def test_fit_wall_yaw():
     print("PASS fit wall yaw (mesh fast path)")
 
 
+def test_fit_wall_yaw_bin_boundary_split():
+    """Regression (user scene dianchifang): the true walls at -17.5 deg
+    sit EXACTLY between rigid 5-deg histogram bins, and per-edge
+    wobble (devices against the wall pushing hull vertices out)
+    split the family into -20 and -15 bins -- 5766 + 5269 pts, best
+    rigid share 33%, fast path skipped, wrong vote-chain yaw. Tolerance
+    clustering must merge the wobbling family and return the wall
+    yaw."""
+    from agentic_gts.segment.orientation import fit_wall_yaw
+
+    rng = np.random.default_rng(11)
+    theta = math.radians(-17.5)
+    jitters = [math.radians(d) for d in (-1.8, 1.6, -1.2, 2.0)]
+    W, H = 16.0, 10.0
+    segs = [((0, 0), (W, 0)), ((W, 0), (W, H)),
+            ((W, H), (0, H)), ((0, H), (0, 0))]
+    pts = []
+    for (p0, p1), jit in zip(segs, jitters):
+        p0 = np.array(p0, dtype=float) - np.array([W / 2, H / 2])
+        p1 = np.array(p1, dtype=float) - np.array([W / 2, H / 2])
+        mid = (p0 + p1) / 2                       # tilt around midpoint
+        c, s = math.cos(jit), math.sin(jit)
+        Rj = np.array([[c, -s], [s, c]])
+        p0, p1 = Rj @ (p0 - mid) + mid, Rj @ (p1 - mid) + mid
+        u = (p1 - p0) / np.linalg.norm(p1 - p0)
+        v = np.array([-u[1], u[0]])
+        n = 4000
+        t = rng.uniform(0.0, 1.0, (n, 1))
+        w = rng.normal(0, 0.05, (n, 1))
+        seg = p0 + t * u + w * v
+        pts.append(np.column_stack([seg, rng.uniform(0.5, 2.4, (n, 1))]))
+    # device rows parallel to the long walls (nominal direction)
+    for y in (-3.0, 0.0, 3.0):
+        t = rng.uniform(-6.0, 6.0, (1500, 1))
+        w = rng.uniform(-0.3, 0.3, (1500, 1))
+        pts.append(np.column_stack([t, np.full_like(t, y) + w,
+                                     rng.uniform(0.5, 2.4, (1500, 1))]))
+    P = np.vstack(pts)
+    c, s = math.cos(theta), math.sin(theta)
+    R = np.array([[c, -s], [s, c]])
+    P[:, :2] = P[:, :2] @ R.T
+    r = fit_wall_yaw(P)
+    assert r is not None, "bin-boundary family must cluster by tolerance"
+    yaw, conf = r
+    assert abs(math.degrees(yaw) + 17.5) < 1.5, \
+        f"expected ~-17.5 deg, got {math.degrees(yaw):.1f}"
+    assert conf >= 0.9, f"one wobbly family, got share {conf:.2f}"
+    print(f"PASS wall yaw bin-boundary split (yaw="
+          f"{math.degrees(yaw):+.1f} deg, share {conf:.0%})")
+
+
 def test_estimate_yaw_detailed_mesh_flag():
     """mesh=True runs the wall fast path FIRST and marks the source;
     mesh=False (3DGS inputs) keeps the pure device-vote path."""
