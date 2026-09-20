@@ -349,79 +349,11 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
     return img, cam, W, H
 
 
-def _render_oblique(scene, yaw: float, fl, cut, W: int = 1280,
-                    H: int = 1024):
-    """Oblique companion view for the cluster adjudication image.
-
-    The user's insight: an oblique view disambiguates what a clean
-    nadir cannot -- racks show their vertical FACES and thickness,
-    walls stay thin and flat, clutter reads small and irregular. Same
-    height band as the nadir groundview (the ground / top cuts already
-    leave nothing but walls, devices and junk), camera at 55 deg
-    elevation, WORLD frame like the nadir one so row-frame cluster
-    rects project identically. Returns (img, cam)."""
-    from agentic_gts.output.gs_render import (Cam, make_godview_cam,
-                                              render_gs_view)
-    points = np.asarray(scene.points, dtype=np.float64)
-    h = points[:, 2] - fl(points[:, 0], points[:, 1])
-    if np.isfinite(cut):
-        band = points[(h > 1.00) & (h < cut)]
-    else:
-        band = points[h > 1.00]
-    if len(band) < 100:
-        band = points[h > 0.30]
-    pts_rot = _rot_xy(band, -yaw)
-    boxes_rot = []
-    lh = _layout_frame(scene, yaw)
-    if lh is not None:
-        lo, hi = lh
-        c = (lo + hi) / 2.0
-        boxes_rot.append(OrientedBox(
-            center=(float(c[0]), float(c[1]), 1.0),
-            size=(float(hi[0] - lo[0]), float(hi[1] - lo[1]), 2.0),
-            yaw=0.0))
-    cam_r = make_godview_cam(pts_rot, boxes_rot, nadir=False, W=W, H=H)
-    if abs(yaw) > 1e-9:
-        c_, s_ = math.cos(yaw), math.sin(yaw)
-        rz = lambda v: np.array([c_ * v[0] - s_ * v[1],
-                                 s_ * v[0] + c_ * v[1], v[2]])
-        cam = Cam(eye=rz(cam_r.eye), target=rz(cam_r.target),
-                  up=rz(cam_r.up), fovy_deg=cam_r.fovy_deg, W=W, H=H)
-    else:
-        cam = cam_r
-    img = None
-    gs_ply = scene.meta.get("gs_ply")
-    if gs_ply:
-        try:
-            from agentic_gts.tools.gs_io import read_gaussian_ply
-            gs = read_gaussian_ply(gs_ply)
-            gm = np.asarray(gs.means, dtype=np.float64)
-            hg = gm[:, 2] - fl(gm[:, 0], gm[:, 1])
-            op = 1.0 / (1.0 + np.exp(
-                -np.asarray(gs.raw_opacity, dtype=np.float64)))
-            keep = _render_keep_mask(hg, op, cut)
-            if keep.sum() < 100:       # very low structures: relax
-                keep = hg > 0.30
-                if np.isfinite(cut):
-                    keep &= hg < cut
-            img = render_gs_view(gs, (), cam,
-                                 cut_z=float("inf"),
-                                 cut_z_low=float("-inf"),
-                                 keep_mask=keep)
-        except Exception as e:
-            print(f"[ground] oblique GS render failed "
-                  f"({type(e).__name__}: {e}) -> scatter")
-    if img is None:
-        img = _projected_scatter(band, cam, W, H)
-    return img, cam
-
-
 def _draw_cluster_candidates(img: np.ndarray, cam, cands, yaw: float,
                               W: int, H: int) -> np.ndarray:
     """Yellow numbered boxes for the missed cluster candidates, drawn
-    on the (nadir or oblique) view: the row-frame rect corners rotate
-    back to world at structure height and project through this view's
-    own camera."""
+    on the nadir view: the row-frame rect corners rotate back to world
+    at structure height and project through this view's own camera."""
     from PIL import Image, ImageDraw, ImageFont
     u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3].copy()
     pil = Image.fromarray(u8)
@@ -1274,16 +1206,22 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     n_rects_total = sum(len(v[5]) for v in views)
     print(f"[ground] {n_rects_total} VLM regions "
           f"({len(views)} view(s)) -> {len(boxes)} fitted boxes")
-    # --- cluster recall net (user insight) ---
+    # --- cluster recall net (user insight, RECALL-FIRST) ---
     # After the ground and top cuts the fit pool holds nothing but
     # walls, devices and junk -- every structure reads as a DENSITY
     # CLUMP in row-frame space, and free-form image detection MISSES
-    # some on a clean nadir view (user report: whole rows lost). The
-    # net: connected components over the density grid PROPOSE, the
-    # VLM (nadir + oblique side by side, one batch call) CLASSIFIES.
-    # Clusters already covered by a VLM rect are skipped: the net
-    # must only ever ADD recall, never question the rects. A failed
-    # classification adds nothing -- recall nets never invent boxes.
+    # some on a clean nadir view (user report: obvious rectangular
+    # clumps left unboxed -> missed devices). The net: connected
+    # components over the density grid PROPOSE, and (user directive)
+    # every uncovered cluster becomes a box UNCONDITIONALLY -- a
+    # wrong proposal is CHEAP, a missed device is LOST: stageC's
+    # per-box local views type-confirm each box and non-devices die
+    # there (type_suspect -> LOW -> final filter). The earlier VLM
+    # classification gate re-imported the very instability the net
+    # exists to absorb (user report: unstable grounding, clusters
+    # rejected or the call failing -> nothing added). Clusters already
+    # covered by a VLM rect are still skipped: the net must only ADD
+    # recall, never question the rects.
     try:
         # cluster OCCUPANCY pool: cut at the RENDER cut, NOT the fit
         # top. With a mesh the anchored z_top walk runs right up the
@@ -1309,44 +1247,36 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
               if not any(_rect_covered(r, vr) for vr in row_rects)]
     if missed:
         print(f"[ground] cluster recall net: {len(missed)} uncovered "
-              f"candidate(s) of {len(cands)} -> adjudicating")
+              f"candidate(s) of {len(cands)} -> proposing ALL "
+              f"(stageC local views cull non-devices)")
         n_added = 0
         try:
             W0, H0 = views[0][2], views[0][3]
-            ob_img, ob_cam = _render_oblique(
-                scene, yaw, fl, _render_cut(
-                    float(scene.meta["z_top"]),
-                    mesh_mode=bool(scene.meta.get("geometry_is_mesh"))),
-                W=W0, H=H0)
-            pair = np.hstack([
-                _draw_cluster_candidates(views[0][0], views[0][1],
-                                         missed, yaw, W0, H0),
-                _draw_cluster_candidates(ob_img, ob_cam, missed,
-                                         yaw, W0, H0)])
-            png_c = png_bytes(pair)
-            png_path_c = None
+            png_c = png_bytes(_draw_cluster_candidates(
+                views[0][0], views[0][1], missed, yaw, W0, H0))
             if out_dir:
-                png_path_c = os.path.join(out_dir, "cluster_check.png")
                 try:
-                    with open(png_path_c, "wb") as f:
+                    with open(os.path.join(out_dir,
+                                           "cluster_check.png"), "wb") as f:
                         f.write(png_c)
                 except Exception as e:
                     print(f"[ground] cluster png save failed "
                           f"({type(e).__name__})")
-                    png_path_c = None
-            verdicts = judge.classify_clusters(png_c, len(missed),
-                                               png_path_c)
             for cid, (rect, _npts) in enumerate(missed, start=1):
-                t = verdicts.get(cid, "")
-                if not any(k in t for k in ("rack", "cabinet", "server",
-                                            "ac", "air", "cooling")):
-                    continue
                 cw = _rot_xy(np.array(
                     [[(rect[0] + rect[2]) / 2.0,
                       (rect[1] + rect[3]) / 2.0, 0.0]]), yaw)[0]
                 for bb in _fit_region_boxes(
                         pts_fit, rect, floor_z=float(fl(cw[0], cw[1])),
                         max_depth=1.35, min_side=0.15):
+                    # wall-thin fits never enter the pipeline: a wall
+                    # blob OUT-SUPPORTS real device boxes on sheer
+                    # point count and would eat them in the dedup (no
+                    # device category is thinner than 0.35m; walls
+                    # are 0.1-0.3m). Everything thicker is proposed
+                    # and left for stageC to confirm or cull.
+                    if bb.size[1] < 0.35:
+                        continue
                     c = _rot_xy(np.array(
                         [[bb.center[0], bb.center[1], 0.0]]), yaw)[0]
                     boxes.append(OrientedBox(
@@ -1356,8 +1286,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                         meta={"grounded": True, "cluster": cid,
                               "n_pts": bb.meta.get("n_pts", 0)}))
                     n_added += 1
-            print(f"[ground] cluster recall net: {n_added} box(es) added "
-                  f"({len(verdicts)}/{len(missed)} classified)")
+            print(f"[ground] cluster recall net: {n_added} box(es) added")
         except Exception as e:
             print(f"[ground] cluster recall net failed "
                   f"({type(e).__name__}: {e}) -> skipped")

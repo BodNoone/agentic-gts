@@ -575,21 +575,29 @@ def test_ground_stage_cluster_recall():
     """The VLM MISSED a whole row on the nadir view (user report: a
     clean view cannot always be split into the wanted categories and
     devices get missed): the cluster recall net must recover it --
-    connected density components PROPOSE the uncovered clump, the VLM
-    CLASSIFIES the pre-marked candidates (nadir + oblique pair, one
-    batch call), and the ruled-device cluster fits into a box."""
+    connected density components PROPOSE the uncovered clump, and
+    (user directive: recall-first) EVERY proposal becomes a box with
+    NO VLM classification gate -- wrong proposals are cheap, missed
+    devices are lost; stageC's local views type-confirm and cull.
+    A wall-thin cluster is the one geometric refusal: a wall blob
+    out-supports real boxes and would eat them in the dedup."""
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
 
     rng = np.random.default_rng(3)
     pts = np.vstack([_row_points(0.0, 6.0, y=0.0, rng=rng),
                      _row_points(-1.0, 5.0, y=3.0, rng=rng)])
+    # a free-standing wall sheet (0.2m thick) far from both rows: the
+    # net finds its cluster but the wall-thin guard must refuse it
+    wall = np.column_stack([rng.uniform(0.0, 8.0, 16000),
+                            rng.uniform(5.8, 6.0, 16000),
+                            rng.uniform(0.1, 2.4, 16000)])
     ceil = np.column_stack([rng.uniform(-2.0, 7.0, 3000),
-                            rng.uniform(-2.0, 5.0, 3000),
+                            rng.uniform(-2.0, 7.0, 3000),
                             rng.uniform(2.9, 3.0, 3000)])
-    scene = Scene(points=np.vstack([pts, ceil]))
+    scene = Scene(points=np.vstack([pts, wall, ceil]))
     scene.meta["yaw"] = 0.0
-    _bootstrap_meta(scene, (-1.5, -0.8, 6.5, 3.8))
+    _bootstrap_meta(scene, (-1.5, -0.8, 8.5, 6.5))
     scene.boxes = []
     _, cam, W, H = ground._render_topdown(scene, 0.0)
     # the VLM grounds ONLY row 1 -- row 2 is the missed device
@@ -609,8 +617,6 @@ def test_ground_stage_cluster_recall():
     judge = VLMJudge(backend="qwen")
 
     def _fake_call(png, prompt, *a, **k):
-        if "yellow numbered" in prompt:      # cluster adjudication
-            return _json.dumps([{"id": 1, "type": "rack row"}])
         return reply                         # grounding: row 1 only
     judge._qwen_image_call = _fake_call
     import tempfile
@@ -618,7 +624,7 @@ def test_ground_stage_cluster_recall():
         ok = ground.ground_stage(scene, judge, out_dir=td)
         assert ok, "grounding must succeed (row 1 grounded)"
         assert os.path.exists(os.path.join(td, "cluster_check.png")), \
-            "cluster adjudication image was not saved"
+            "cluster candidates image was not saved"
     assert len(scene.boxes) == 2, \
         f"missed row must be recovered by the cluster net, " \
         f"got {len(scene.boxes)} boxes"
