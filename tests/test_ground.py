@@ -1279,6 +1279,44 @@ def test_merge_adjacent_boxes():
           f"corner-kiss and haze-gap kept separate; dense bridge merged)")
 
 
+def test_merge_adjacent_tray_bridge():
+    """MESH tray bridge (user report: close devices with NO overlap on
+    the groundview still merged): the fit pool (0.30 .. z_top+0.10)
+    carries a dense cable-tray strip spanning the gap ABOVE the
+    devices -- dense enough to pass the density ratio like a real
+    seam. With probe_pool (the render-cut pool, trays removed) the
+    junction holds nothing and the boxes stay separate; the same tray
+    WITHOUT the probe pool still merges (the old behaviour, guard)."""
+    from agentic_gts.agent.ground import _merge_adjacent_boxes
+    from agentic_gts.core.models import OrientedBox
+    rng = np.random.default_rng(41)
+    rowA = _row_points(0.0, 6.0, y=0.0, rng=rng)
+    rowB = _row_points(0.0, 6.0, y=1.6, rng=rng)     # 0.5m lateral gap
+    fit_pool = np.vstack([rowA[rowA[:, 2] > 0.30],
+                          rowB[rowB[:, 2] > 0.30]])
+    # dense tray strip bridging the gap ABOVE the rows (mesh trays are
+    # as dense as device surfaces -- the density ratio cannot tell)
+    tray = np.column_stack([rng.uniform(0.0, 6.0, 5000),
+                            rng.uniform(0.5, 1.1, 5000),
+                            rng.uniform(2.2, 2.4, 5000)])
+    pf = np.vstack([fit_pool, tray])
+    a = OrientedBox(center=(3.0, 0.0, 1.05), size=(6.0, 1.1, 2.1),
+                    yaw=0.0)
+    b = OrientedBox(center=(3.0, 1.6, 1.05), size=(6.0, 1.1, 2.1),
+                    yaw=0.0)
+    # old behaviour: the fit pool's tray passes the probe -> merged
+    out_old = _merge_adjacent_boxes([a, b], pf, 0.0)
+    assert len(out_old) == 1, \
+        "guard: the tray DOES bridge the fit-pool probe (old bug)"
+    # fixed: the render-cut pool (tray above the cut removed) leaves
+    # the junction empty -> separate
+    out = _merge_adjacent_boxes([a, b], pf, 0.0, probe_pool=fit_pool)
+    assert len(out) == 2, \
+        f"tray-bridged close devices must stay separate on the " \
+        f"render-cut pool; got {len(out)}"
+    print("PASS tray bridge (probe on render-cut pool stays separate)")
+
+
 def test_containment_2d_nested():
     """containment_2d sees what iou_2d cannot: a small box nested in a
     big one has IoU = area ratio (< 0.5) but containment ~1.0."""

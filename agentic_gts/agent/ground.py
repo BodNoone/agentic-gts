@@ -1056,7 +1056,8 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
                           bridge_tol: float = 0.50,
                           min_gap_pts: int = 15,
                           density_ratio: float = 0.30,
-                          floor_at=None) -> list:
+                          floor_at=None,
+                          probe_pool: np.ndarray | None = None) -> list:
     """Merge tightly-ADJACENT grounded boxes; splitting is stageC's job.
 
     The VLM sometimes over-splits ONE physical structure into several
@@ -1080,7 +1081,18 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
     it outnumbers the count threshold. Each union is REFITTED to point
     support (never boundary-united: noise would inflate the edges);
     the local refine then does the true splitting.
-    """
+
+    probe_pool: the pool the DENSITY EVIDENCE is measured on. With a
+    mesh the default pts_fit (0.30 .. z_top + 0.10) carries the CABLE
+    TRAYS -- dense, gapless, physically bridging adjacent device tops
+    -- and a tray strip in the junction passes the density ratio like
+    a real seam, merging devices that have NO overlap on the rendered
+    groundview (user report: the render cut hides the trays, the
+    merge probe does not see them). The caller passes the render-cut
+    pool (trays removed, device bodies kept) so only the devices'
+    own band can testify. The final union refit still uses pts_fit
+    (rack tops belong in the box height)."""
+    pp = pts_fit if probe_pool is None else probe_pool
     n = len(boxes)
     if n < 2:
         return boxes
@@ -1096,8 +1108,8 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
     # (surfaces are dense, an inflated fit barely dilutes it)
     dens = []
     for r in rects:
-        m = ((pts_fit[:, 0] >= r[0]) & (pts_fit[:, 0] <= r[2]) &
-             (pts_fit[:, 1] >= r[1]) & (pts_fit[:, 1] <= r[3]))
+        m = ((pp[:, 0] >= r[0]) & (pp[:, 0] <= r[2]) &
+             (pp[:, 1] >= r[1]) & (pp[:, 1] <= r[3]))
         area = max((r[2] - r[0]) * (r[3] - r[1]), 1e-6)
         dens.append(float(m.sum()) / area)
     parent = list(range(n))
@@ -1144,9 +1156,9 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
                     s_lo, s_hi = c1 + 0.05, c0 - 0.05
                 if s_hi - s_lo < 0.05:
                     continue          # degenerate probe, no evidence
-                m = ((pts_fit[:, axis] >= s_lo) &
-                     (pts_fit[:, axis] <= s_hi) &
-                     (pts_fit[:, o] >= p_lo) & (pts_fit[:, o] <= p_hi))
+                m = ((pp[:, axis] >= s_lo) &
+                     (pp[:, axis] <= s_hi) &
+                     (pp[:, o] >= p_lo) & (pp[:, o] <= p_hi))
                 n_br = int(m.sum())
                 if n_br < min_gap_pts:
                     continue          # nothing bridging at all
@@ -1376,6 +1388,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # rejected or the call failing -> nothing added). Clusters already
     # covered by a VLM rect are still skipped: the net must only ADD
     # recall, never question the rects.
+    pts_clu = pts_fit                    # render-cut pool (trays removed)
     try:
         # cluster OCCUPANCY pool: cut at the RENDER cut, NOT the fit
         # top. With a mesh the anchored z_top walk runs right up the
@@ -1484,8 +1497,13 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # each fits its own box and the seam never heals (stageC only
     # splits, never merges). Touching / point-bridged boxes merge into
     # a point-support-refitted union; the true splitting is the local
-    # refine's job.
-    boxes = _merge_adjacent_boxes(boxes, pts_fit, yaw, floor_at=fl)
+    # refine's job. The density EVIDENCE is measured on the render-cut
+    # pool -- with a mesh the fit pool carries the cable trays, whose
+    # gapless strips bridge adjacent device tops and pass the density
+    # ratio like a real seam, merging devices that look fully separate
+    # on the groundview (user report).
+    boxes = _merge_adjacent_boxes(boxes, pts_fit, yaw, floor_at=fl,
+                                  probe_pool=pts_clu)
     scene.boxes = boxes
     # result audit: one image per view -- the view's own raw VLM rects
     # (colored) plus the final fitted boxes (red) projected through the
