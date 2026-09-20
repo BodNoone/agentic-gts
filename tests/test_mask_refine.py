@@ -1032,12 +1032,13 @@ def test_free_row_end_and_side_azim():
 def test_box_only_mask_excludes_flush_parallel_wall():
     """A wall FLUSH against the row's closed lateral face fogs the
     local views from ANY camera position: its gaussian means sit
-    within the 0.15m OBB slack and render as a full-height sheet
+    within the horizontal OBB slack and render as a full-height sheet
     behind the rack (user report: side view still a veil with the
     camera already on the free end). The wall_vec tightening must
     drop the wall's means (>= 5cm past the face) while keeping the
-    device's own bled face gaussians (a couple of cm out) and the
-    body; the OPEN side keeps the full 0.15m slack."""
+    device's own bled face gaussians -- including a few cm of
+    placement-offset bleed -- and the body; the OPEN side keeps the
+    full horizontal slack."""
     from types import SimpleNamespace
     from agentic_gts.agent.mask_refine import _box_only_mask
     rng = np.random.default_rng(23)
@@ -1051,26 +1052,37 @@ def test_box_only_mask_excludes_flush_parallel_wall():
     bled = np.column_stack([rng.uniform(-2.9, 2.9, 400),
                             rng.uniform(-0.58, -0.54, 400),
                             rng.uniform(0.2, 1.8, 400)])
+    # placement-offset bleed: a grounded box shifted ~4cm toward the
+    # wall leaves a device strip just past the face -- within the
+    # walled-side slack (wall_pad 0.05) it must still render
+    offset_strip = np.column_stack([rng.uniform(-2.9, 2.9, 100),
+                                    rng.uniform(-0.595, -0.585, 100),
+                                    rng.uniform(0.2, 1.8, 100)])
     # flush parallel wall: means 5-20cm past the face -- INSIDE the
-    # plain 0.15m slack (the fog source)
+    # plain horizontal slack (the fog source)
     wall = np.column_stack([rng.uniform(-3.2, 3.2, 4000),
                             rng.uniform(-0.75, -0.61, 4000),
                             rng.uniform(0.0, 2.6, 4000)])
-    gs = SimpleNamespace(means=np.vstack([body, bled, wall]))
+    gs = SimpleNamespace(means=np.vstack([body, bled, offset_strip, wall]))
     # open side +y -> walled lateral side -y (wall_vec (0,-1))
     m = _box_only_mask(gs, box, wall_vec=np.array([0.0, -1.0]),
                        face_half=0.55)
     assert m[:len(body)].all(), "device body must render"
-    assert m[len(body):len(body) + len(bled)].mean() > 0.9, \
+    i0 = len(body)
+    assert m[i0:i0 + len(bled)].mean() > 0.9, \
         "the device's own bled back-face gaussians (<=3cm out) " \
         "must survive the tightening"
-    assert not m[len(body) + len(bled):].any(), \
+    i1 = i0 + len(bled)
+    assert m[i1:i1 + len(offset_strip)].all(), \
+        "a small placement-offset strip (~4cm past the face) must " \
+        "survive the walled-side slack"
+    assert not m[i1 + len(offset_strip):].any(), \
         "the flush parallel wall (>=5cm past the face) must be masked"
     # without the tightening the wall IS inside the plain slack (the
     # regression this test pins)
     m0 = _box_only_mask(gs, box)
-    assert m0[len(body) + len(bled):].mean() > 0.5, \
-        "pre-conditions: the wall really is within the 0.15m slack"
+    assert m0[i1 + len(offset_strip):].mean() > 0.5, \
+        "pre-conditions: the wall really is within the plain slack"
     print("PASS box-only mask drops the flush parallel wall, keeps "
           "the device's bled face gaussians")
 
@@ -1580,20 +1592,27 @@ def test_box_only_mask_hides_everything_outside():
     pts = np.array([
         [3.0, 0.0, 1.0],      # inside the box
         [3.0, 0.4, 1.0],      # box front band (own face bleed, < pad)
-        [3.0, 0.8, 1.0],      # just outside the padded face -> hidden
-        [3.0, 1.2, 1.0],      # occluder / facing row in the aisle
+        [3.0, 0.8, 1.0],      # 0.25m past the face: within the 0.30m
+                               # HORIZONTAL offset tolerance -> kept
+        [3.0, 1.2, 1.0],      # well outside the padded face -> hidden
         [3.0, -1.5, 1.0],     # background behind the far face
         [8.5, 0.0, 1.0],      # neighbour beside the row
         [3.0, 1.2, 0.02],     # floor in front of the aisle
+        [3.0, 0.0, 2.4],      # 0.4m above the top: hidden -- the widened
+                               # HORIZONTAL pad must NOT loosen the z
+                               # axis (trays / ceiling haze stay out)
     ])
     gs = SimpleNamespace(means=pts)
     m = _box_only_mask(gs, box)
     assert m[0] and m[1], "box interior / own face band must be kept"
-    assert not m[2], "outside the padded OBB must be hidden"
-    assert not m[3], "aisle occluder must be hidden"
+    assert m[2], "a device strip within the placement-offset tolerance " \
+        "must render (user report: grounded box offset cut it off)"
+    assert not m[3], "outside the padded OBB must be hidden"
     assert not m[4], "background must be hidden (device-only view)"
     assert not m[5], "neighbour must be hidden"
     assert not m[6], "floor must be hidden"
+    assert not m[7], "z slack stays at z_pad (0.15m), not the wider " \
+        "horizontal pad"
     # rotated box: the mask follows the OBB axes, not the world axes
     yaw = math.radians(30.0)
     box2 = OrientedBox(center=(0, 0, 1), size=(2, 0.6, 2), yaw=yaw)

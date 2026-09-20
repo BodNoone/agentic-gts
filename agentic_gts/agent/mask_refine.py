@@ -474,12 +474,19 @@ def _side_azim(box: OrientedBox, azim_front: float,
     return azim_front + 90.0
 
 
-def _box_only_mask(gs, box: OrientedBox, pad: float = 0.15,
+def _box_only_mask(gs, box: OrientedBox, pad: float = 0.30,
                    wall_vec=None, face_half: float | None = None,
-                   wall_pad: float = 0.03) -> np.ndarray:
+                   wall_pad: float = 0.05,
+                   z_pad: float = 0.15) -> np.ndarray:
     """Boolean mask over gs: True only for gaussians INSIDE the box's OBB
-    (plus `pad` metres of slack, since the fitted OBB clips a few cm off
-    the device's own face gaussians).
+    (plus `pad` metres of HORIZONTAL slack, since the globally grounded
+    OBB carries a placement offset of up to ~15cm -- a tight slack cut
+    a strip of the device off the local views, user report).
+
+    The slack is HORIZONTAL-ONLY: `z_pad` (kept at the old 0.15m)
+    governs the vertical axis, so widening `pad` does not reach up and
+    pull the cable trays / ceiling haze above the device into the
+    render.
 
     The local views exist to show the VLM and SAM exactly ONE device.
     Keeping the rest of the scene (the earlier 'normal aisle photo'
@@ -493,15 +500,18 @@ def _box_only_mask(gs, box: OrientedBox, pad: float = 0.15,
     wall-flush row still fogged with the camera already on the free
     end -- the fog was IN the mask, not at the camera): a wall FLUSH
     against the box's closed lateral face has its gaussian means
-    within the 0.15m slack, so it rendered as a full-height sheet
-    behind the rack no matter where the eye stood. On the WALLED side
-    only, the outside-face slack shrinks to `wall_pad` (0.03m): the
-    wall's means (>= 5cm past the face) drop out while the device's
-    own bled face gaussians (a couple of cm) survive. The open side
-    keeps the full slack.
+    within the slack, so it rendered as a full-height sheet behind the
+    rack no matter where the eye stood. On the WALLED side only, the
+    outside-face slack shrinks to `wall_pad` (0.05m): the wall's means
+    (>= 5cm past the face) drop out while the device's own bled face
+    gaussians (a couple of cm, plus a small placement offset) survive.
+    The open side keeps the full slack.
     """
     means = np.asarray(gs.means, dtype=float)
-    m = box.contains(means, margin=pad)
+    local = box.world_to_local(means)
+    half = np.asarray(box.size, dtype=float) / 2.0
+    m = np.all(np.abs(local[:, :2]) <= half[:2] + pad, axis=1)
+    m &= np.abs(local[:, 2]) <= half[2] + z_pad
     if wall_vec is not None and face_half is not None:
         off = (means[:, :2] - np.asarray(box.center, dtype=float)[:2]) \
             @ np.asarray(wall_vec, dtype=float)
@@ -636,9 +646,9 @@ def render_local_views(scene: Scene, box: OrientedBox,
     standoff = float(np.clip(0.8 * corridor, 0.6, 2.2))
     # WALLED lateral side (from _open_side's pick): the closed lateral
     # face's outside slack shrinks in _box_only_mask below -- a flush
-    # wall's means sit within the 0.15m slack and render as a sheet
-    # behind the rack (user report: side still fogged with the camera
-    # already on the free end -- the fog was IN the mask).
+    # wall's means sit within the horizontal slack and render as a
+    # sheet behind the rack (user report: side still fogged with the
+    # camera already on the free end -- the fog was IN the mask).
     if box.size[0] >= box.size[1]:
         face_half = float(box.size[1]) / 2.0
     else:
