@@ -134,6 +134,55 @@ def test_ground_stage_mesh_rotated_layout():
           "yaws fold home)")
 
 
+def test_ground_stage_mesh_wall_touching_devices():
+    """Wall-touching devices (user question): a 22m wall flush against
+    the row's back face and an 8m wall flush against its end merge
+    into the row's density cluster -- without caps the fit stretches
+    to the WALLS' spans (a ~22 x 8m box, which stageC's IoU guard can
+    never correct). The z-continuation test marks the wall cells
+    (devices stop at z_top, walls run to the ceiling), and each
+    cluster rect is capped along the walls' elongated axes: the box
+    must come out row-sized, not wall-sized. The back-face contact
+    cell is wall-marked but stays good for the OTHER axis, so the
+    perpendicular wall's cap still sees the row's own back band."""
+    from agentic_gts.agent import ground
+
+    rng = np.random.default_rng(43)
+    row = _row_points(0.0, 6.0, y=0.0, depth=1.1, rng=rng)
+    # parallel wall: 22m long (>> row), flush at the back face y=-0.55
+    wallP = np.column_stack([rng.uniform(-8.0, 14.0, 12000),
+                             -0.65 + rng.uniform(-0.10, 0.10, 12000),
+                             rng.uniform(0.0, 3.4, 12000)])
+    # perpendicular wall: 8m long in y, flush at the row end x=6
+    wallQ = np.column_stack([6.15 + rng.uniform(-0.10, 0.10, 8000),
+                            rng.uniform(-4.0, 4.0, 8000),
+                            rng.uniform(0.0, 3.4, 8000)])
+    scene = Scene(points=np.vstack([row, wallP, wallQ]))
+    scene.meta["yaw"] = 0.0
+    scene.meta["geometry_is_mesh"] = True
+    _bootstrap_meta(scene, (-8.5, -4.5, 14.5, 4.5), z_top=2.1)
+    scene.boxes = []
+
+    ok = ground.ground_stage(scene, judge=None)
+    assert ok, "geometry-first proposal must succeed"
+    assert len(scene.boxes) == 1, \
+        f"the row must ground as ONE box, got {len(scene.boxes)}: " \
+        + str([(round(b.center[0], 1), round(b.center[1], 1),
+                (round(b.size[0], 1), round(b.size[1], 1)))
+               for b in scene.boxes])
+    b = scene.boxes[0]
+    # row length, not the 22m wall; the perpendicular wall may add its
+    # own 0.2m flush thickness to x
+    assert 5.4 < b.size[0] < 6.9, \
+        f"length must be row-sized, not wall-sized: {b.size[0]:.2f}m"
+    # row depth 1.1 (+ the parallel wall's contact sliver <= 0.3m),
+    # not the 8m cross wall
+    assert 0.9 < b.size[1] < 1.5, \
+        f"depth must be row-sized, not wall-sized: {b.size[1]:.2f}m"
+    print(f"PASS wall-touching devices (row {b.size[0]:.2f} x "
+          f"{b.size[1]:.2f}m despite 22m + 8m flush walls)")
+
+
 def test_unproject_ground_roundtrip():
     from agentic_gts.output.gs_render import (make_godview_cam,
                                               unproject_ground)

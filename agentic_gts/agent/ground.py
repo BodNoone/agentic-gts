@@ -902,6 +902,95 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
     return out or [bb]
 
 
+def _wall_axis_cells(P: np.ndarray, h_fit: np.ndarray, yaw: float,
+                     z_top: float, cell: float = 0.15,
+                     thin: float = 0.45, r: int = 4):
+    """Wall cell keys split by the axis they ELONGATE, for the cluster
+    rect caps (user question: does pure-geometry grounding survive
+    wall-touching devices?).
+
+    A wall flush against a device merges into its density cluster and
+    stretches the fitted box along the wall's length -- a wall longer
+    than the row wins the whole span, and stageC's IoU guard then
+    rejects the correction. But devices STOP at the device top while
+    walls run on to the ceiling: a cell whose points continue >= 0.6m
+    ABOVE the device band (>= 3 distinct 0.20m z-bins in z_top+0.10
+    .. z_top+1.20) is a wall cell.
+
+    Per-CELL LOCAL axis classification, NOT per connected component
+    (the component view breaks on real rooms: the walls form ONE
+    connected ring, and a long room tips the ring's GLOBAL extents
+    toward one axis -- in the corner test a 22m + 8m wall pair merged
+    into a single 'x-elongated' component and the cross wall's cells
+    were never marked). Each wall cell looks at its OWN +-0.6m
+    neighbourhood: the run of wall cells along x (within +-2 cells in
+    y, covering wall thickness) vs along y. Longer than `thin`
+    (0.45m -- no device category is thinner) and >= 2x the other ->
+    the cell elongates that axis and is 'bad' for it; elongated both
+    ways (a corner, a pillar) -> bad for both. The caller shrinks
+    each cluster rect along its walls' elongated axes to the span of
+    the remaining (device) cells.
+
+    Deliberate properties:
+      * horizontal overheads never trip the z-bin test -- trays and
+        ceilings pack into 1-2 z-bins, only vertical continuations
+        spread over 3+;
+      * the morphological alternative (erosion on the occupancy grid)
+        is WRONG here: a rack row is a HOLLOW shell -- two face bands
+        -- and erosion strips the faces themselves;
+      * a contact cell shared by the wall above and the rack's back
+        face stays good for the OTHER axis, so a perpendicular wall's
+        cap still sees the row's own back band;
+      * open doors are device-height: no high continuation, they stay
+        in-pool by design (stageC's `open cabinet door` rule owns
+        them).
+
+    Returns (x_bad, y_bad): int64 key arrays (ix * 10**7 + iy), or
+    (None, None) when no wall cells were found.
+    """
+    hi_m = (h_fit > z_top + 0.10) & (h_fit < z_top + 1.20)
+    if int(hi_m.sum()) < 100:
+        return None, None
+    Q = _rot_xy(P[hi_m], -yaw)
+    qix = np.floor(Q[:, 0] / cell).astype(np.int64)
+    qiy = np.floor(Q[:, 1] / cell).astype(np.int64)
+    zb = np.floor((h_fit[hi_m] - z_top) / 0.20).astype(np.int64)
+    pairs, pinv = np.unique(np.column_stack([qix, qiy]), axis=0,
+                            return_inverse=True)
+    up = np.unique(np.column_stack([pinv, zb]), axis=0)
+    cnt = np.bincount(up[:, 0], minlength=len(pairs))
+    cells = pairs[cnt >= 3]
+    if not len(cells):
+        return None, None
+    i0, j0 = int(cells[:, 0].min()), int(cells[:, 1].min())
+    W = np.zeros((int(cells[:, 0].max()) - i0 + 1,
+                  int(cells[:, 1].max()) - j0 + 1), dtype=bool)
+    W[cells[:, 0] - i0, cells[:, 1] - j0] = True
+    x_bad: list[int] = []
+    y_bad: list[int] = []
+    for a, b in cells:
+        i, j = int(a) - i0, int(b) - j0
+        # the wall run ALONG x through this cell: wall cells within
+        # +-2 cells in y (wall thickness) and +-r cells in x
+        sl = W[max(0, i - 2):i + 3, max(0, j - r):j + r + 1]
+        cols = np.nonzero(sl.any(axis=0))[0]
+        ex = float(cols.max() - cols.min() + 1) * cell if len(cols) else 0.0
+        sl2 = W[max(0, i - r):i + r + 1, max(0, j - 2):j + 3]
+        rows = np.nonzero(sl2.any(axis=1))[0]
+        ey = float(rows.max() - rows.min() + 1) * cell if len(rows) else 0.0
+        k = int(a) * 10_000_000 + int(b)
+        if ex > thin and ex >= 2.0 * ey:
+            x_bad.append(k)          # runs along the row axis here
+        elif ey > thin and ey >= 2.0 * ex:
+            y_bad.append(k)          # runs across the row axis here
+        elif ex > thin and ey > thin:
+            x_bad.append(k)          # corner / pillar: bad both ways
+            y_bad.append(k)
+        # else: local sliver -- good on both axes
+    return (np.array(x_bad, dtype=np.int64) if x_bad else None,
+            np.array(y_bad, dtype=np.int64) if y_bad else None)
+
+
 def _cluster_candidates(points: np.ndarray, cell: float = 0.30,
                         min_cell_pts: int = 6, min_cluster_pts: int = 60,
                         margin: float = 0.15) -> list:
@@ -1241,11 +1330,54 @@ def _ground_stage_mesh(scene, yaw: float,
     pts_clu = _rot_xy(
         P[(h_fit > 0.30) & (h_fit <= (cc if np.isfinite(cc)
                                       else fit_top))], -yaw)
+    # WALL CAPS (user question: wall-touching devices): walls run on
+    # to the ceiling, devices stop at the device top -- the z-bin
+    # continuation test marks wall cells, and each cluster rect is
+    # shrunk along its walls' ELONGATED axes to the device cells'
+    # span, so a flush wall neither stretches the box to its own
+    # length nor deepens it beyond the row (the wall sliver <= 0.3m
+    # that shares a contact cell with the rack's back face stays --
+    # removing it would remove the back face; stageC refines it).
+    xb, yb = _wall_axis_cells(P, h_fit, yaw, fit_top)
     try:
         cands = _cluster_candidates(pts_clu)
     except Exception as e:
         print(f"[ground] mesh clustering failed ({type(e).__name__}: {e})")
         cands = []
+    if cands and (xb is not None or yb is not None):
+        cu = np.unique(np.column_stack([
+            np.floor(pts_clu[:, 0] / 0.15).astype(np.int64),
+            np.floor(pts_clu[:, 1] / 0.15).astype(np.int64)]), axis=0)
+        cuk = cu[:, 0] * 10_000_000 + cu[:, 1]
+        cb_x = np.isin(cuk, xb) if xb is not None \
+            else np.zeros(len(cu), dtype=bool)
+        cb_y = np.isin(cuk, yb) if yb is not None \
+            else np.zeros(len(cu), dtype=bool)
+        cxc = (cu[:, 0] + 0.5) * 0.15
+        cyc = (cu[:, 1] + 0.5) * 0.15
+        fixed = []
+        n_cap = 0
+        for rect, npts in cands:
+            m = ((cxc >= rect[0] - 0.15) & (cxc <= rect[2] + 0.15) &
+                 (cyc >= rect[1] - 0.15) & (cyc <= rect[3] + 0.15))
+            r = [rect[0], rect[1], rect[2], rect[3]]
+            if cb_x.any() and (m & cb_x).any():
+                g = cu[m & ~cb_x]
+                if len(g):
+                    r[0] = max(r[0], float(g[:, 0].min()) * 0.15)
+                    r[2] = min(r[2], float(g[:, 0].max() + 1) * 0.15)
+            if cb_y.any() and (m & cb_y).any():
+                g = cu[m & ~cb_y]
+                if len(g):
+                    r[1] = max(r[1], float(g[:, 1].min()) * 0.15)
+                    r[3] = min(r[3], float(g[:, 1].max() + 1) * 0.15)
+            if r != [rect[0], rect[1], rect[2], rect[3]]:
+                n_cap += 1
+            fixed.append((tuple(r), npts))
+        cands = fixed
+        if n_cap:
+            print(f"[ground] wall-cap: {n_cap} cluster rect(s) shrunk "
+                  f"along wall-elongated axes")
     boxes = []
     for cid, (rect, _npts) in enumerate(cands, start=1):
         cw = _rot_xy(np.array(
