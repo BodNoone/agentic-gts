@@ -601,6 +601,91 @@ def test_back_view_rescues_poor_front_end_to_end():
     print("PASS back view rescues a poor front (coarse span dropped)")
 
 
+def test_cluster_box_type_gate_skips_sam():
+    """Recall-first cluster proposals (user question: why should a
+    pillar / UPS / junk block pay the FULL SAM refinement?): the type
+    gate runs BEFORE refine_box on boxes with meta['cluster'] -- a
+    'not equipment' verdict marks LOW and the SAM path is never
+    entered for that box; a confirmed device proceeds through SAM as
+    usual."""
+    from agentic_gts.agent import mask_refine as mr
+    from agentic_gts.agent.judge import Verdict, VLMJudge
+    from agentic_gts.agent.loop import AgentReport, LayoutAgent
+    from agentic_gts.core.models import Confidence
+    from agentic_gts.output.gs_render import Cam
+
+    rng = np.random.default_rng(3)
+    pts = np.column_stack([rng.uniform(-1.0, 1.0, 2000),
+                           rng.uniform(-0.5, 0.5, 2000),
+                           rng.uniform(0.1, 2.0, 2000)])
+    scene = Scene(points=pts)
+    pillar = OrientedBox(center=(0.0, 0.0, 1.0), size=(0.8, 0.8, 1.9),
+                         yaw=0.0, meta={"cluster": 1})
+    rack = OrientedBox(center=(3.0, 0.0, 1.0), size=(2.0, 1.0, 1.9),
+                       yaw=0.0, meta={"cluster": 2})
+    scene.boxes = [pillar, rack]
+    img = np.zeros((768, 768, 3), np.float32)
+    views = [{"name": n, "cam": Cam(
+                  eye=np.array([0.0, 4.0 if n != "back" else -4.0, 1.2]),
+                  target=np.array([0.0, 0.0, 1.0]),
+                  up=np.array([0.0, 0.0, 1.0]), fovy_deg=60.0,
+                  W=768, H=768), "path": None, "prompt_path": None,
+              "image": img, "prompt_image": img}
+             for n in ("front", "back", "side")]
+    _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
+             mr.SamPredictorAdapter.predict)
+    mr.render_local_views = lambda scene, box, out_dir: views
+    mr.SamPredictorAdapter._load = lambda self: None
+
+    def fake_predict(self, image, box_pix):
+        m = np.zeros(image.shape[:2], bool)
+        x1, y1, x2, y2 = (int(round(float(v))) for v in box_pix)
+        m[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)] = True
+        return [m], [0.95]
+
+    mr.SamPredictorAdapter.predict = fake_predict
+
+    j = VLMJudge(backend="qwen")
+
+    def fake_confirm(png, box, png_path=None):
+        is_rack = box.meta.get("cluster") == 2
+        return Verdict(action="confirm",
+                       params={"is_rack": is_rack, "confidence": 0.9},
+                       confidence=0.9, detail="fake")
+
+    j.adjudicate_rack_confirm = fake_confirm
+
+    grounded = []
+
+    def fake_ground(image, box, view_name, png_path=None):
+        grounded.append((box.box_id, view_name))
+        groups = [{"bbox": (10, 10, 990, 990), "hypothesis": "rack",
+                   "confidence": 0.9}]
+        return Verdict(action="segment", params={"groups": groups},
+                       confidence=0.9, detail="fake")
+
+    j.adjudicate_sam_boxes = fake_ground
+
+    agent = LayoutAgent(judge=j, opts={"sam_checkpoint": "fake.pt"},
+                        out_dir=None)
+    try:
+        agent._local_mask_refine(scene, AgentReport())
+    finally:
+        (mr.render_local_views, mr.SamPredictorAdapter._load,
+         mr.SamPredictorAdapter.predict) = _real
+
+    assert pillar.confidence == Confidence.LOW, \
+        "pillar verdict must mark the cluster box LOW"
+    assert pillar.meta.get("type_suspect"), \
+        "pillar must carry type_suspect for the final filter"
+    assert rack.confidence != Confidence.LOW, \
+        "confirmed device must stay above LOW"
+    assert all(bid == rack.box_id for bid, _ in grounded), \
+        "the SAM grounding must run ONLY for the confirmed rack, " \
+        f"got calls for {sorted(set(bid for bid, _ in grounded))}"
+    print("PASS cluster type gate (pillar LOW before SAM, rack refines)")
+
+
 def test_vlm_quality_verdict_drops_garbage_view():
     """VLM quality verdict (user direction: judged TOGETHER with the
     grounding in the same call, garbage views DROPPED): a fogged front

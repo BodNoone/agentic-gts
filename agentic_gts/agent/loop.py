@@ -125,6 +125,40 @@ class LayoutAgent:
             views = (render_local_views(scene, old, self.out_dir)
                      if (sam.available
                          or self.judge.backend != "mock") else [])
+            # ---- type gate for CLUSTER-proposed boxes (BEFORE SAM) ----
+            # The recall-first net proposes every density clump with NO
+            # VLM label behind it; a pillar / UPS / junk block would
+            # otherwise pay the FULL SAM refinement (local grounding
+            # calls + masks + refit) before the type-confirm marks it
+            # LOW. Ask the one cheap yes/no FIRST: 'not equipment' ->
+            # LOW + skip the refinement entirely. VLM-grounded boxes
+            # keep SAM-first (their grounding already said 'device';
+            # the post-SAM skip_confirm logic covers them). A 'no'
+            # NEVER deletes -- LOW + human review, as always.
+            confirmed_rack: bool | None = None
+            if (old.meta.get("cluster")
+                    and (sam.available or self.judge.backend != "mock")):
+                try:
+                    r = confirm_device_type(self.judge, old, views)
+                except Exception as e:
+                    print(f"[type-confirm] {old.box_id[:6]} failed "
+                          f"({type(e).__name__}: {e})")
+                    r = None
+                if r is not None:
+                    conf_audits.append({"box_id": old.box_id, **r})
+                    confirmed_rack = bool(r["is_rack"])
+                    if not confirmed_rack:
+                        old.confidence = Confidence.LOW
+                        old.meta["type_suspect"] = True
+                        report.unresolved.append(
+                            {"issue": {"type": "not_a_rack",
+                                       "box_id": old.box_id,
+                                       "confidence": r["confidence"]},
+                             "ok": False})
+                        print(f"[type-confirm] {old.box_id[:6]} NOT a rack "
+                              f"(conf {r['confidence']:.2f}) -> LOW, "
+                              f"SAM refinement skipped")
+                        continue
             # ---- SAM mask refinement (multi-instance), runs FIRST: its
             # grounding result also decides whether the type-confirm
             # question is worth asking ----
@@ -156,35 +190,40 @@ class LayoutAgent:
             # SKIP when the local grounding already answered it: every
             # accepted instance is equipment-labelled with a strong
             # score (>= 0.6) -- asking again would be a redundant third
-            # VLM call per box. Runs BEFORE the adoption below so the
-            # LOW mark propagates into the refit through meta copy.
-            skip_confirm = bool(instances) and all(
-                _is_equipment_label(e["label"]) and e["score"] >= 0.6
-                for e in instances)
-            if skip_confirm:
-                conf_audits.append({
-                    "box_id": old.box_id, "is_rack": True,
-                    "skipped": "local grounding labelled every instance "
-                               "as equipment with score >= 0.6"})
+            # VLM call per box. A cluster box the early gate already
+            # confirmed (or rejected) is never re-asked either.
+            if confirmed_rack:
+                pass                    # early gate already recorded it
             else:
-                try:
-                    r = confirm_device_type(self.judge, old, views)
-                except Exception as e:
-                    print(f"[type-confirm] {old.box_id[:6]} failed "
-                          f"({type(e).__name__}: {e})")
-                    r = None
-                if r is not None:
-                    conf_audits.append({"box_id": old.box_id, **r})
-                    if not r["is_rack"]:
-                        old.confidence = Confidence.LOW
-                        old.meta["type_suspect"] = True
-                        report.unresolved.append(
-                            {"issue": {"type": "not_a_rack",
-                                       "box_id": old.box_id,
-                                       "confidence": r["confidence"]},
-                             "ok": False})
-                        print(f"[type-confirm] {old.box_id[:6]} NOT a rack "
-                              f"(conf {r['confidence']:.2f}) -> LOW + review")
+                skip_confirm = bool(instances) and all(
+                    _is_equipment_label(e["label"]) and e["score"] >= 0.6
+                    for e in instances)
+                if skip_confirm:
+                    conf_audits.append({
+                        "box_id": old.box_id, "is_rack": True,
+                        "skipped": "local grounding labelled every "
+                                   "instance as equipment with "
+                                   "score >= 0.6"})
+                else:
+                    try:
+                        r = confirm_device_type(self.judge, old, views)
+                    except Exception as e:
+                        print(f"[type-confirm] {old.box_id[:6]} failed "
+                              f"({type(e).__name__}: {e})")
+                        r = None
+                    if r is not None:
+                        conf_audits.append({"box_id": old.box_id, **r})
+                        if not r["is_rack"]:
+                            old.confidence = Confidence.LOW
+                            old.meta["type_suspect"] = True
+                            report.unresolved.append(
+                                {"issue": {"type": "not_a_rack",
+                                           "box_id": old.box_id,
+                                           "confidence": r["confidence"]},
+                                 "ok": False})
+                            print(f"[type-confirm] {old.box_id[:6]} NOT a "
+                                  f"rack (conf {r['confidence']:.2f}) "
+                                  f"-> LOW + review")
             # ---- adoption: the primary keeps the old identity, extra
             # split instances enter as new boxes ----
             if not instances:
