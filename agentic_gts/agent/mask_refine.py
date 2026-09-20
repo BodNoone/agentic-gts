@@ -1697,19 +1697,29 @@ def _is_ladder(label) -> bool:
     return "ladder" in l or "cable tray" in l
 
 
+def _is_top_cable(label) -> bool:
+    """The top-cable positive class: a bundle of cables running across
+    or connected to the TOP of the device (user report: the FRONT view
+    grounded them inside the device box -- the back view did not --
+    and the multi-view mask union dragged the P97.5 height to the
+    cable bundle). Like the door and the ladder, the cable pixels are
+    SUBTRACTED from every device back-projection."""
+    return "cable" in str(label or "").lower()
+
+
 def _is_subtractive(label) -> bool:
     """Subtractive classes: labelled structures whose SAM masks are
     pixel-REMOVED from every device back-projection -- the device
     spans, thickness pools and height reads never see them."""
-    return _is_door(label) or _is_ladder(label)
+    return _is_door(label) or _is_ladder(label) or _is_top_cable(label)
 
 
 def _door_union(image: np.ndarray, groups: list, sam: SamPredictorAdapter
                 ) -> np.ndarray | None:
     """Pixel union of the SAM masks of every SUBTRACTIVE-class box
-    (open cabinet door, cable ladder) -- the subtractive layer for
-    device back-projection. None when the VLM found none in this view
-    (the common case)."""
+    (open cabinet door, cable ladder, top cable) -- the subtractive
+    layer for device back-projection. None when the VLM found none
+    in this view (the common case)."""
     u: np.ndarray | None = None
     for g in groups:
         if not _is_subtractive(g.get("hypothesis")):

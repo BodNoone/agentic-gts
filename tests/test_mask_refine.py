@@ -192,6 +192,16 @@ def test_sam_box_prompt_construction():
         "the cable ladder must be a positive detection class"
     assert "never any part of a rack or cabinet" in prompt, \
         "the ladder box must exclude the device itself"
+    # the top cable is the THIRD subtractive class (user report: the
+    # FRONT view grounded top cable connections inside the device box
+    # -- the back view did not -- and the multi-view mask union read
+    # the height at the cable bundle)
+    assert "top cable" in prompt, \
+        "the top cable must be a positive detection class"
+    assert "cable connections above the rack tops" in prompt, \
+        "the top-cable rule must say where the cables sit"
+    assert "the box covers ONLY the cable bundle" in prompt, \
+        "the top-cable box must exclude the device itself"
     # VLM quality verdict (user direction: judged TOGETHER with the
     # grounding in the same call, garbage views dropped)
     assert "quality: good" in prompt and "quality: poor" in prompt, \
@@ -1236,6 +1246,21 @@ def test_door_class_subtracts_from_device_points():
         "only the ladder box hits the subtractive SAM"
     assert ul is not None and ul[30, 40], \
         "the ladder mask must enter the subtractive union"
+
+    # the TOP CABLE joins the subtractive classes (user report: the
+    # FRONT view grounded top cable connections inside the device box
+    # -- the back view did not -- and the multi-view mask union read
+    # the height at the cable bundle)
+    assert _is_subtractive("top cable")
+    assert _is_subtractive("Top Cable Bundle")
+    cab = _FakeSam()
+    groups_c = [{"bbox": (100, 100, 400, 500), "hypothesis": "rack"},
+                {"bbox": (500, 100, 700, 900), "hypothesis": "top cable"}]
+    uc = _door_union(IMG, groups_c, cab)
+    assert len(cab.calls) == 1, \
+        "only the top-cable box hits the subtractive SAM"
+    assert uc is not None and uc[30, 40], \
+        "the top-cable mask must enter the subtractive union"
 
     # _mask_to_points: points projecting into the door mask are dropped
     box = OrientedBox(center=(0.0, 0.0, 1.0), size=(2.0, 1.0, 2.0),
