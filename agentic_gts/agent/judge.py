@@ -574,6 +574,66 @@ class VLMJudge:
             conf = 0.5
         return {"is_rack": is_rack, "confidence": conf}
 
+    _SIDE_PICK_PROMPT = (
+        "This image contains several square panels side by side; each "
+        "panel has a big YELLOW letter (A, B, C...) in its top-left "
+        "corner. Every panel renders the SAME device (a server rack / "
+        "IT cabinet row or an air-conditioning unit) from a DIFFERENT "
+        "camera position. Pick the panel where the device is shown "
+        "most CLEARLY: crisp structure, panels and edges visible. A "
+        "smooth grey veil, a blurred haze or a nearly empty frame is a "
+        "BAD panel. Reply with ONLY the letter of the best panel."
+    )
+
+    def adjudicate_side_pick(self, image: np.ndarray, box,
+                             n_panels: int,
+                             png_path: str | None = None) -> Verdict:
+        """Pick the clearest side-view candidate (user direction: the
+        geometric rules for where the side camera stands keep
+        misjudging which end is clear -- let the VLM look at the
+        actual renders). One tiny call: panels labeled A.. in one
+        image, reply one letter. params["pick"] is the panel index or
+        None (unparseable -> the caller's rule order stands)."""
+        import re
+        if self.backend == "mock" or n_panels < 1:
+            return Verdict(action="keep", params={"pick": None},
+                           confidence=0.0,
+                           detail="mock: no side-pick signal")
+        png = self._array_png_bytes(image)
+        if png_path is None:
+            png_path = self._save_evidence_png(
+                image, f"side_pick_{box.box_id}.png")
+        try:
+            if self.backend == "local":
+                text = self._local_image_call(
+                    png, self._SIDE_PICK_PROMPT, max_new_tokens=16)
+            else:
+                text = self._qwen_image_call(
+                    png, self._SIDE_PICK_PROMPT, max_tokens=16)
+        except Exception as e:
+            self._record("side_pick", self._SIDE_PICK_PROMPT, "", "",
+                         0.0, f"call failed: {e}", png_path=png_path)
+            return Verdict(action="keep", params={"pick": None},
+                           confidence=0.0, detail=f"call failed: {e}")
+        body = self._strip_think(text)
+        pick = None
+        last = chr(ord("A") + n_panels - 1)
+        m = re.match(r"\s*([A-%s])\b" % last, body.strip())
+        if not m:
+            m = re.search(r"\b([A-%s])\b" % last, body)
+        if m:
+            pick = ord(m.group(1)) - ord("A")
+        self._record("side_pick", self._SIDE_PICK_PROMPT, body,
+                    chr(ord("A") + pick) if pick is not None else "?",
+                    1.0 if pick is not None else 0.0,
+                    "panel letter -> side-view candidate",
+                    png_path=png_path)
+        return Verdict(action="keep", params={"pick": pick},
+                       confidence=1.0 if pick is not None else 0.0,
+                       detail=f"panel {chr(ord('A') + pick)}"
+                       if pick is not None else "unparseable",
+                       raw=text, png_path=png_path)
+
     @staticmethod
     def _array_png_bytes(arr: np.ndarray) -> bytes:
         import matplotlib

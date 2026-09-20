@@ -552,7 +552,7 @@ def test_back_view_rescues_poor_front_end_to_end():
               "image": img}]
     _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
              mr.SamPredictorAdapter.predict)
-    mr.render_local_views = lambda scene, box, out_dir: views
+    mr.render_local_views = lambda scene, box, out_dir, judge=None: views
 
     j = VLMJudge(backend="mock")
 
@@ -634,7 +634,7 @@ def test_cluster_box_type_gate_skips_sam():
              for n in ("front", "back", "side")]
     _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
              mr.SamPredictorAdapter.predict)
-    mr.render_local_views = lambda scene, box, out_dir: views
+    mr.render_local_views = lambda scene, box, out_dir, judge=None: views
     mr.SamPredictorAdapter._load = lambda self: None
 
     def fake_predict(self, image, box_pix):
@@ -720,7 +720,7 @@ def test_vlm_quality_verdict_drops_garbage_view():
              for n in ("front", "back", "side")]
     _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
              mr.SamPredictorAdapter.predict)
-    mr.render_local_views = lambda scene, box, out_dir: views
+    mr.render_local_views = lambda scene, box, out_dir, judge=None: views
 
     j = VLMJudge(backend="mock")
 
@@ -1305,7 +1305,7 @@ def test_local_refine_splits_joined_row_end_to_end():
                   "prompt_path": None, "image": img}]
         _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
                  mr.SamPredictorAdapter.predict)
-        mr.render_local_views = lambda scene, box, out_dir: views
+        mr.render_local_views = lambda scene, box, out_dir, judge=None: views
 
         # VLM grounding: TWO device instances on the front view, ONE on
         # the side profile; SAM segments exactly the prompted rectangle
@@ -1766,6 +1766,141 @@ def test_view_quality_gate_drops_haze_views():
         f"the fogged back view must be dropped, got {names}"
     assert "front" in names, names
     print("PASS view quality gate (veils dropped, clean kept)")
+
+
+def test_side_panel_image_labels():
+    """The side-arbitration composite: panels side by side on a dark
+    canvas with a big yellow A/B/C stenciled into each panel's
+    top-left corner (the letters the VLM reply keys on)."""
+    from agentic_gts.agent.mask_refine import _side_panel_image
+    rng = np.random.default_rng(3)
+    imgs = [rng.uniform(0.0, 0.6, (96, 96, 3)).astype(np.float32)
+            for _ in range(3)]
+    p = _side_panel_image(imgs, scale=6, gap=8)
+    assert p.shape == (96, 3 * 96 + 2 * 8, 3), p.shape
+    # yellow stencil = saturated R=G>>B cells (random panels top out
+    # at 0.6, so only the letters can reach these)
+    yel = ((p[..., 0] > 0.9) & (p[..., 1] > 0.8) & (p[..., 2] < 0.1))
+    assert yel[14:56, 14:44].sum() > 200, "stencil A missing in panel 0"
+    x1 = 96 + 8 + 14
+    assert yel[14:56, x1:x1 + 30].sum() > 200, \
+        "stencil B missing in panel 1"
+    assert not yel[:, 96:104].any(), "gap must stay clean"
+    print("PASS side panel composite (A/B/C stencils, dark gaps)")
+
+
+def test_adjudicate_side_pick_parses_letter():
+    """The side-pick verdict: reply 'C' -> panel 2; a wordy reply
+    'The best panel is B.' -> 1; garbage / out-of-range -> None (the
+    caller's rule order stands). Mock backend gives no signal."""
+    from agentic_gts.agent.judge import VLMJudge
+    j = VLMJudge(backend="qwen")
+    box = OrientedBox(center=(0, 0, 1), size=(6, 1, 2), yaw=0.0)
+    img = np.zeros((64, 64, 3), np.float32)
+
+    def _fake(png, prompt, *a, **k):
+        return _fake.reply
+    j._qwen_image_call = _fake
+    _fake.reply = "C"
+    v = j.adjudicate_side_pick(img, box, n_panels=3)
+    assert v.params["pick"] == 2, v.params
+    _fake.reply = "The best panel is B."
+    v = j.adjudicate_side_pick(img, box, n_panels=3)
+    assert v.params["pick"] == 1, v.params
+    _fake.reply = "panel 7 please"
+    v = j.adjudicate_side_pick(img, box, n_panels=3)
+    assert v.params["pick"] is None, v.params
+    jm = VLMJudge(backend="mock")
+    vm = jm.adjudicate_side_pick(img, box, n_panels=3)
+    assert vm.params["pick"] is None
+    print("PASS side-pick parse (C->2, wordy B->1, junk/mock->None)")
+
+
+def test_side_view_vlm_arbitration_overrides_rule():
+    """SIDE view candidate arbitration (user direction: the placement
+    rules keep misjudging which end is clear -- let the VLM look at
+    the renders). Both ends render clean here; the fake VLM replies
+    'C' (the OPPOSITE-end candidate), so the chosen side camera must
+    stand at the opposite end from the rule pick. Without a judge the
+    rule pick stands."""
+    from agentic_gts.agent import mask_refine as mr
+    from agentic_gts.agent.judge import VLMJudge
+    from agentic_gts.agent.mask_refine import (_free_row_end, _front_azim,
+                                               _open_side, _side_azim)
+    from agentic_gts.tools.gs_io import GaussianData
+    from agentic_gts.output.gs_render import make_local_cam
+
+    rng = np.random.default_rng(5)
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(4.0, 1.0, 2.0),
+                     yaw=0.0)
+    scene = Scene(points=np.zeros((10, 3)))
+    scene.meta["gs_ply"] = "fake.ply"
+    means = np.column_stack([rng.uniform(-2, 2, 800),
+                             rng.uniform(-2.5, 2.5, 800),
+                             rng.uniform(0.3, 1.7, 800)])
+    means = np.vstack([means,
+                       np.full((400, 3), [0.0, -0.6, 1.0])])
+    means = means.astype(np.float32)
+    n = len(means)
+    gs = GaussianData(
+        means=means,
+        log_scales=np.full((n, 3), -6.0, dtype=np.float32),
+        quats=np.tile(np.array([[1.0, 0, 0, 0]], np.float32), (n, 1)),
+        raw_opacity=np.full(n, 2.0, dtype=np.float32),
+        f_dc=np.zeros((n, 3), dtype=np.float32),
+    )
+    # the rule pick's azimuth, computed with the same helpers
+    open_vec, _cor = _open_side(gs, box)
+    azim_front = _front_azim(box, open_vec)
+    end_sign, _ec, row_v = _free_row_end(gs, box)
+    azim_rule = _side_azim(box, azim_front, end_sign, row_v)
+    standoff = 2.2
+    eye_rule = np.asarray(make_local_cam(
+        [box], W=768, H=768, elev_deg=18.0, azim_deg=azim_rule,
+        standoff=standoff).eye)
+
+    import agentic_gts.output.gs_render as gsr
+    import agentic_gts.tools.gs_io as gio
+    _real = (gsr.rasterize_gs, gsr.render_gs_view, gsr.png_bytes,
+             gio.read_gaussian_ply)
+    # clean render everywhere except cameras on the -y (wall) side
+    img = np.full((768, 768, 3), 0.01, np.float32)
+    flat = img.reshape(-1, 3)
+    idx = np.random.default_rng(0).choice(len(flat), 768 * 768 // 3,
+                                          replace=False)
+    flat[idx] = 0.85
+    fog = np.full((768, 768, 3), 0.42, np.float32)
+
+    def fake_raster(sub, cam):
+        return fog if float(np.asarray(cam.eye)[1]) < -0.5 else img
+
+    gsr.rasterize_gs = fake_raster
+    gsr.render_gs_view = lambda *a, **k: img
+    gsr.png_bytes = lambda a: b"png"
+    gio.read_gaussian_ply = lambda p: gs
+
+    judge = VLMJudge(backend="qwen")
+    judge._qwen_image_call = lambda png, prompt, *a, **k: "C"
+    try:
+        views = mr.render_local_views(scene, box, None, judge=judge)
+        names = [v["name"] for v in views]
+        assert "back" not in names, names
+        side = next(v for v in views if v["name"] == "side")
+        eye_c = np.asarray(side["cam"].eye)
+        assert eye_c[0] * eye_rule[0] < 0, \
+            (f"VLM pick 'C' (opposite end) must flip the side camera: "
+             f"rule eye {eye_rule[:2]}, chosen eye {eye_c[:2]}")
+        # no judge -> the rule order stands (eye on the rule end)
+        views2 = mr.render_local_views(scene, box, None)
+        side2 = next(v for v in views2 if v["name"] == "side")
+        eye2 = np.asarray(side2["cam"].eye)
+        assert eye2[0] * eye_rule[0] > 0, \
+            f"no-judge fallback must keep the rule pick, got {eye2[:2]}"
+    finally:
+        (gsr.rasterize_gs, gsr.render_gs_view, gsr.png_bytes,
+         gio.read_gaussian_ply) = _real
+    print("PASS side VLM arbitration (C flips the end; no-judge "
+          "fallback keeps the rule pick)")
 
 
 def test_sam2_model_cfg_file_path_registers_hydra_dir():

@@ -122,7 +122,8 @@ class LayoutAgent:
             if scene.get_box(old.box_id) is None:
                 continue
             # one render per box, shared by both questions
-            views = (render_local_views(scene, old, self.out_dir)
+            views = (render_local_views(scene, old, self.out_dir,
+                                        judge=self.judge)
                      if (sam.available
                          or self.judge.backend != "mock") else [])
             # ---- type gate for CLUSTER-proposed boxes (BEFORE SAM) ----

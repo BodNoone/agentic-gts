@@ -534,8 +534,45 @@ def _front_azim(box: OrientedBox, open_vec) -> float:
     return azim
 
 
+_SIDE_LETTER_GLYPHS = {
+    "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+    "B": ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
+    "C": ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
+    "D": ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+}
+
+
+def _side_panel_image(imgs: list, scale: int = 16,
+                      gap: int = 10) -> np.ndarray:
+    """Composite side-view candidates into ONE labeled panel image.
+
+    Panels sit side by side on a dark canvas with a big YELLOW A/B/C
+    stenciled into each panel's top-left corner (pure-numpy bitmap
+    glyphs -- no PIL font dependency). This is the single image the
+    VLM arbitrates on (user direction: let the VLM pick the clearest
+    side view instead of more placement rules).
+    """
+    H, W = imgs[0].shape[:2]
+    n = len(imgs)
+    canvas = np.full((H, n * W + (n - 1) * gap, 3), 0.03, dtype=np.float32)
+    for i, im in enumerate(imgs):
+        a = np.asarray(im, dtype=np.float32)[..., :3]
+        canvas[:, i * (W + gap):(i + 1) * W + i * gap] = a
+    for i in range(n):
+        g = _SIDE_LETTER_GLYPHS[chr(65 + i)]
+        x0 = i * (W + gap) + 14
+        for r, row in enumerate(g):
+            for c, v in enumerate(row):
+                if v == "1":
+                    canvas[14 + r * scale:14 + (r + 1) * scale,
+                           x0 + c * scale:x0 + (c + 1) * scale] = \
+                        (1.0, 0.9, 0.0)
+    return canvas
+
+
 def render_local_views(scene: Scene, box: OrientedBox,
-                       out_dir: str | None = None) -> list[dict]:
+                       out_dir: str | None = None,
+                       judge=None) -> list[dict]:
     """Render front + side local views: ONE device, isolated.
 
     The views feed the VLM and SAM, which only need the target box --
@@ -553,6 +590,14 @@ def render_local_views(scene: Scene, box: OrientedBox,
         the camera happened to end up inside (the earlier 'keep the
         environment' attempt still hazed out whenever the eye stood in
         a big low-opacity floater).
+
+    SIDE view (user direction: rules keep misjudging which end is
+    clear, fog persists -- let the VLM look): several CANDIDATE
+    placements are rendered (the rule-picked free end, a nearer
+    standoff at the same end, the opposite end), each passes the cheap
+    gradient-energy gate, and the survivors are composited into one
+    labeled A/B/C panel image for ONE tiny VLM call that picks the
+    clearest. No judge / call failure / one survivor -> rule order.
     """
     gs_ply = scene.meta.get("gs_ply")
     if not gs_ply:
@@ -624,47 +669,31 @@ def render_local_views(scene: Scene, box: OrientedBox,
     except Exception as e:
         print(f"[mask-refine] free-row-end pick failed "
               f"({type(e).__name__}: {e}) -> default side slot")
-    slots = (("front", 18.0, azim_front, standoff),
-             ("back", 18.0, azim_front + 180.0, standoff),
-             ("side", 18.0, azim_side, standoff_side))
-    out = []
-    for name, elev, azim, so in slots:
+    # render ONLY the device: every gaussian outside the box's OBB
+    # (plus slack; the WALLED lateral side's slack shrunk to 0.03m --
+    # occluders and fog sources alike) is hidden. One subset serves
+    # every view (the mask does not depend on the camera).
+    sub = _subset_or_none(gs, _box_only_mask(
+        gs, box, wall_vec=wall_vec, face_half=face_half))
+
+    def _render_one(elev: float, azim: float, so: float):
         cam = make_local_cam([box], W=768, H=768, elev_deg=elev,
                              azim_deg=azim, standoff=so)
-        # render ONLY the device: every gaussian outside the box's OBB
-        # (plus slack; the WALLED lateral side's slack shrunk to 0.03m
-        # -- occluders and fog sources alike) is hidden
-        sub = _subset_or_none(gs, _box_only_mask(
-            gs, box, wall_vec=wall_vec, face_half=face_half))
         raw = rasterize_gs(sub, cam) if sub is not None else None
         if raw is None:
             raw = render_gs_view(gs, [box], cam, overlay=None,
                                  isolate_boxes=True, isolate_margin=0.8)
             if raw is None:
-                continue
+                return None, None, cam
             prompt_img = render_gs_view(
                 gs, [box], cam, overlay="wire3d", isolate_boxes=True,
                 isolate_margin=0.8)
         else:
-            prompt_img = render_gs_view(
-                sub, [box], cam, overlay="wire3d")
-        # QUALITY GATE (user rule): judge the RENDER, not the geometry.
-        # A wall-adjacent box fogs up whichever camera lands in
-        # structure; a poor view that slipped through would feed the
-        # VLM a haze and poison the split. The image is still saved
-        # (audit: the user SEES which view was dropped and why).
-        ok, why = _view_quality(raw)
-        if not ok:
-            print(f"[mask-refine] {name} view dropped: {why}")
-            if out_dir:
-                os.makedirs(out_dir, exist_ok=True)
-                path = os.path.join(
-                    out_dir, f"mask_{box.box_id}_{name}_dropped.png")
-                with open(path, "wb") as f:
-                    f.write(png_bytes(raw))
-            continue
-        path = None
-        prompt_path = None
+            prompt_img = render_gs_view(sub, [box], cam, overlay="wire3d")
+        return raw, prompt_img, cam
+
+    def _save_view(raw, name: str, prompt_img=None):
+        path = prompt_path = None
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
             path = os.path.join(out_dir, f"mask_{box.box_id}_{name}.png")
@@ -675,9 +704,111 @@ def render_local_views(scene: Scene, box: OrientedBox,
                     out_dir, f"mask_prompt_{box.box_id}_{name}.png")
                 with open(prompt_path, "wb") as f:
                     f.write(png_bytes(prompt_img))
+        return path, prompt_path
+
+    out = []
+    for name, elev, azim, so in (("front", 18.0, azim_front, standoff),
+                                 ("back", 18.0, azim_front + 180.0,
+                                  standoff)):
+        raw, prompt_img, cam = _render_one(elev, azim, so)
+        if raw is None:
+            continue
+        # QUALITY GATE (user rule): judge the RENDER, not the geometry.
+        # A wall-adjacent box fogs up whichever camera lands in
+        # structure; a poor view that slipped through would feed the
+        # VLM a haze and poison the split. The image is still saved
+        # (audit: the user SEES which view was dropped and why).
+        ok, why = _view_quality(raw)
+        if not ok:
+            print(f"[mask-refine] {name} view dropped: {why}")
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+                with open(os.path.join(
+                        out_dir,
+                        f"mask_{box.box_id}_{name}_dropped.png"),
+                        "wb") as f:
+                    f.write(png_bytes(raw))
+            continue
+        path, prompt_path = _save_view(raw, name, prompt_img)
         out.append({"name": name, "image": raw,
-                    "prompt_image": prompt_img if prompt_img is not None else raw,
+                    "prompt_image": prompt_img if prompt_img is not None
+                    else raw,
                     "cam": cam, "path": path, "prompt_path": prompt_path})
+
+    # ---- SIDE view: candidates + VLM arbitration ----
+    # The side slot looks along the row from beyond one end; every
+    # geometric pick so far (blind azim, free-end corridor, wall-masked
+    # slack) still fogged on real scenes (user reports, twice). Render
+    # a small candidate set instead and let the EVIDENCE decide: the
+    # cheap gradient gate kills any candidate that rendered a veil,
+    # then one tiny VLM call picks the clearest survivor.
+    side_cands = [(azim_side, standoff_side)]
+    near_so = max(0.35, 0.5 * standoff_side)
+    if standoff_side - near_so >= 0.25:
+        side_cands.append((azim_side, near_so))
+    alt_azim = (azim_front + 90.0
+                if abs(azim_side - (azim_front - 90.0)) < 1e-6
+                else azim_front - 90.0)
+    side_cands.append((alt_azim, standoff_side))
+    survivors = []
+    for ci, (sa, ss) in enumerate(side_cands):
+        raw, prompt_img, cam = _render_one(18.0, sa, ss)
+        if raw is None:
+            continue
+        ok, why = _view_quality(raw)
+        if not ok:
+            print(f"[mask-refine] side candidate {chr(65 + ci)} "
+                  f"dropped: {why}")
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+                with open(os.path.join(
+                        out_dir, f"mask_{box.box_id}_side_"
+                        f"{chr(65 + ci)}_dropped.png"), "wb") as f:
+                    f.write(png_bytes(raw))
+            continue
+        survivors.append((raw, prompt_img, cam))
+    if not survivors:
+        print("[mask-refine] side view dropped: no candidate passed "
+              "the quality gate")
+        return out
+    pick = 0
+    if len(survivors) >= 2 and judge is not None \
+            and getattr(judge, "backend", "mock") != "mock":
+        try:
+            panel = _side_panel_image([s[0] for s in survivors])
+            panel_path = None
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+                panel_path = os.path.join(
+                    out_dir, f"side_pick_{box.box_id}.png")
+                with open(panel_path, "wb") as f:
+                    f.write(png_bytes(panel))
+            v = judge.adjudicate_side_pick(panel, box,
+                                           n_panels=len(survivors),
+                                           png_path=panel_path)
+            p = v.params.get("pick") if v.params else None
+            if p is not None and 0 <= int(p) < len(survivors):
+                pick = int(p)
+        except Exception as e:
+            print(f"[mask-refine] side VLM arbitration failed "
+                  f"({type(e).__name__}: {e}) -> rule order")
+    raw, prompt_img, cam = survivors[pick]
+    print(f"[mask-refine] side view: candidate {chr(65 + pick)} of "
+          f"{len(survivors)} survivor(s) chosen"
+          f"{' (VLM)' if len(survivors) >= 2 else ''}")
+    for ci, (r_, _pi, _c) in enumerate(survivors):
+        if ci != pick and out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(
+                    out_dir,
+                    f"mask_{box.box_id}_side_"
+                    f"{chr(65 + ci)}_unused.png"), "wb") as f:
+                f.write(png_bytes(r_))
+    path, prompt_path = _save_view(raw, "side", prompt_img)
+    out.append({"name": "side", "image": raw,
+                "prompt_image": prompt_img if prompt_img is not None
+                else raw,
+                "cam": cam, "path": path, "prompt_path": prompt_path})
     return out
 
 
@@ -1703,7 +1834,7 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     all of them.
     """
     if views is None:
-        views = render_local_views(scene, box, out_dir)
+        views = render_local_views(scene, box, out_dir, judge=judge)
     audit = {"box_id": box.box_id, "views": [], "accepted": False}
     if not views or not sam.available:
         audit["reason"] = "no local GS views or SAM checkpoint"
