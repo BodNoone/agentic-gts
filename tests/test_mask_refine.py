@@ -1022,6 +1022,52 @@ def test_free_row_end_and_side_azim():
           "(both layouts, wall at either end)")
 
 
+def test_box_only_mask_excludes_flush_parallel_wall():
+    """A wall FLUSH against the row's closed lateral face fogs the
+    local views from ANY camera position: its gaussian means sit
+    within the 0.15m OBB slack and render as a full-height sheet
+    behind the rack (user report: side view still a veil with the
+    camera already on the free end). The wall_vec tightening must
+    drop the wall's means (>= 5cm past the face) while keeping the
+    device's own bled face gaussians (a couple of cm out) and the
+    body; the OPEN side keeps the full 0.15m slack."""
+    from types import SimpleNamespace
+    from agentic_gts.agent.mask_refine import _box_only_mask
+    rng = np.random.default_rng(23)
+    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(6.0, 1.1, 2.0),
+                      yaw=0.0)
+    # device body inside the OBB
+    body = np.column_stack([rng.uniform(-2.9, 2.9, 3000),
+                            rng.uniform(-0.5, 0.5, 3000),
+                            rng.uniform(0.1, 1.9, 3000)])
+    # device back-face gaussians bled ~2cm past the face (y=-0.55)
+    bled = np.column_stack([rng.uniform(-2.9, 2.9, 400),
+                            rng.uniform(-0.58, -0.54, 400),
+                            rng.uniform(0.2, 1.8, 400)])
+    # flush parallel wall: means 5-20cm past the face -- INSIDE the
+    # plain 0.15m slack (the fog source)
+    wall = np.column_stack([rng.uniform(-3.2, 3.2, 4000),
+                            rng.uniform(-0.75, -0.61, 4000),
+                            rng.uniform(0.0, 2.6, 4000)])
+    gs = SimpleNamespace(means=np.vstack([body, bled, wall]))
+    # open side +y -> walled lateral side -y (wall_vec (0,-1))
+    m = _box_only_mask(gs, box, wall_vec=np.array([0.0, -1.0]),
+                       face_half=0.55)
+    assert m[:len(body)].all(), "device body must render"
+    assert m[len(body):len(body) + len(bled)].mean() > 0.9, \
+        "the device's own bled back-face gaussians (<=3cm out) " \
+        "must survive the tightening"
+    assert not m[len(body) + len(bled):].any(), \
+        "the flush parallel wall (>=5cm past the face) must be masked"
+    # without the tightening the wall IS inside the plain slack (the
+    # regression this test pins)
+    m0 = _box_only_mask(gs, box)
+    assert m0[len(body) + len(bled):].mean() > 0.5, \
+        "pre-conditions: the wall really is within the 0.15m slack"
+    print("PASS box-only mask drops the flush parallel wall, keeps "
+          "the device's bled face gaussians")
+
+
 def test_open_side_flush_wall_and_floaters():
     """The open-side pick for a WALL-ADJACENT box: a wall flush against
     one face (gap < 0.1 m) must BLOCK that side -- the old single-point

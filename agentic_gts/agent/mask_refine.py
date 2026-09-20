@@ -474,7 +474,9 @@ def _side_azim(box: OrientedBox, azim_front: float,
     return azim_front + 90.0
 
 
-def _box_only_mask(gs, box: OrientedBox, pad: float = 0.15) -> np.ndarray:
+def _box_only_mask(gs, box: OrientedBox, pad: float = 0.15,
+                   wall_vec=None, face_half: float | None = None,
+                   wall_pad: float = 0.03) -> np.ndarray:
     """Boolean mask over gs: True only for gaussians INSIDE the box's OBB
     (plus `pad` metres of slack, since the fitted OBB clips a few cm off
     the device's own face gaussians).
@@ -486,8 +488,25 @@ def _box_only_mask(gs, box: OrientedBox, pad: float = 0.15) -> np.ndarray:
     from any position. Hiding everything outside the box removes both
     the occluders AND the fog source in one rule -- what renders is
     exactly the device under adjudication, on a clean background.
+
+    wall_vec / face_half / wall_pad (user report: the side view of a
+    wall-flush row still fogged with the camera already on the free
+    end -- the fog was IN the mask, not at the camera): a wall FLUSH
+    against the box's closed lateral face has its gaussian means
+    within the 0.15m slack, so it rendered as a full-height sheet
+    behind the rack no matter where the eye stood. On the WALLED side
+    only, the outside-face slack shrinks to `wall_pad` (0.03m): the
+    wall's means (>= 5cm past the face) drop out while the device's
+    own bled face gaussians (a couple of cm) survive. The open side
+    keeps the full slack.
     """
-    return box.contains(np.asarray(gs.means, dtype=float), margin=pad)
+    means = np.asarray(gs.means, dtype=float)
+    m = box.contains(means, margin=pad)
+    if wall_vec is not None and face_half is not None:
+        off = (means[:, :2] - np.asarray(box.center, dtype=float)[:2]) \
+            @ np.asarray(wall_vec, dtype=float)
+        m &= off <= face_half + wall_pad
+    return m
 
 
 def _front_azim(box: OrientedBox, open_vec) -> float:
@@ -570,22 +589,38 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # standoff: ~80% into the corridor, never further than 2.2m; the
     # camera widens its lens to frame, it does not back off
     standoff = float(np.clip(0.8 * corridor, 0.6, 2.2))
+    # WALLED lateral side (from _open_side's pick): the closed lateral
+    # face's outside slack shrinks in _box_only_mask below -- a flush
+    # wall's means sit within the 0.15m slack and render as a sheet
+    # behind the rack (user report: side still fogged with the camera
+    # already on the free end -- the fog was IN the mask).
+    if box.size[0] >= box.size[1]:
+        face_half = float(box.size[1]) / 2.0
+    else:
+        face_half = float(box.size[0]) / 2.0
+    ov = np.asarray(open_vec, dtype=float).ravel()
+    wall_vec = -ov / (float(np.linalg.norm(ov)) + 1e-12)
     # SIDE slot placement (user report: the side view rendered as a
     # veil when the cabinet's SIDE face was flush against a wall): the
     # old azim = front + 90 stands the eye beyond ONE row end, picked
     # blindly -- the walled end puts the eye inside the wall. Pick the
     # FREE end instead (_free_row_end, same opacity-mass corridor
     # measurement as _open_side), and cap the side standoff by that
-    # end's corridor. The candidate azimuth whose EYE DISPLACEMENT
-    # (make_local_cam's own rotation math: R(azim) @ cross) points out
-    # of the free end wins -- computed, not remembered, so the sign
-    # trap that once inverted _front_azim cannot recur here.
+    # end's corridor (never past a measured wall: the 0.35 floor could
+    # overrun a corridor under 0.44m). The candidate azimuth whose EYE
+    # DISPLACEMENT (make_local_cam's own rotation math: R(azim) @ cross)
+    # points out of the free end wins -- computed, not remembered, so
+    # the sign trap that once inverted _front_azim cannot recur here.
     azim_side = azim_front + 90.0
     standoff_side = standoff
     try:
         end_sign, end_corridor, row_v = _free_row_end(gs, box)
         azim_side = _side_azim(box, azim_front, end_sign, row_v)
-        standoff_side = float(np.clip(0.8 * end_corridor, 0.35, 2.2))
+        standoff_side = float(min(np.clip(0.8 * end_corridor, 0.35, 2.2),
+                                  max(end_corridor - 0.05, 0.10)))
+        print(f"[mask-refine] side view: free end {end_sign:+.0f} "
+              f"(corridor {end_corridor:.2f}m), wall-masked lateral "
+              f"side, standoff {standoff_side:.2f}m")
     except Exception as e:
         print(f"[mask-refine] free-row-end pick failed "
               f"({type(e).__name__}: {e}) -> default side slot")
@@ -597,8 +632,10 @@ def render_local_views(scene: Scene, box: OrientedBox,
         cam = make_local_cam([box], W=768, H=768, elev_deg=elev,
                              azim_deg=azim, standoff=so)
         # render ONLY the device: every gaussian outside the box's OBB
-        # (plus slack) is hidden -- occluders and fog sources alike
-        sub = _subset_or_none(gs, _box_only_mask(gs, box))
+        # (plus slack; the WALLED lateral side's slack shrunk to 0.03m
+        # -- occluders and fog sources alike) is hidden
+        sub = _subset_or_none(gs, _box_only_mask(
+            gs, box, wall_vec=wall_vec, face_half=face_half))
         raw = rasterize_gs(sub, cam) if sub is not None else None
         if raw is None:
             raw = render_gs_view(gs, [box], cam, overlay=None,
