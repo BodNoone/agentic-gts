@@ -171,6 +171,23 @@ _TILE_OVERLAP = 2.5
 _RECALL_TILT_DEG = 20.0
 
 
+def _grounding_frame(scene, yaw: float):
+    """Rotated-frame AABB the grounding views are framed on.
+
+    MESH input (user directive): the sampling is CLEAN -- no diffuse
+    outer gaussians to crop out -- and the cloud IS the room (outer
+    walls included). Frame the WHOLE cloud so the camera sits at the
+    ROOM centre; the bootstrap-layout framing exists for 3DGS, where
+    outer haze swamps the raw bbox and the hugging frame keeps the
+    racks big.
+    """
+    if bool(scene.meta.get("geometry_is_mesh")):
+        all_rot = _rot_xy(np.asarray(scene.points, dtype=np.float64),
+                          -yaw)
+        return all_rot[:, :2].min(axis=0), all_rot[:, :2].max(axis=0)
+    return _layout_frame(scene, yaw)
+
+
 def _tile_frames(layout):
     """Overlapping tile frames covering the rotated-frame layout AABB,
     or None when a SINGLE nadir view suffices.
@@ -311,7 +328,7 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
         lo, hi = np.asarray(frame[:2], dtype=float), \
             np.asarray(frame[2:], dtype=float)
     else:
-        lh = _layout_frame(scene, yaw)
+        lh = _grounding_frame(scene, yaw)
         if lh is not None:
             lo, hi = lh
     if lo is not None:
@@ -1281,7 +1298,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # is one extra VLM call, so a layout that fits stays single-view
     # (user directive: small rooms must not be tiled).
     try:
-        tiles = _tile_frames(_layout_frame(scene, yaw))
+        tiles = _tile_frames(_grounding_frame(scene, yaw))
     except Exception:
         tiles = None
     views = []                       # (img, cam, W, H, fname, rects)

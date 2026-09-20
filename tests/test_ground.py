@@ -163,6 +163,53 @@ def test_ground_stage_tilt_views_add_recall():
           "recovered both)")
 
 
+def test_render_topdown_mesh_framing_room_centre():
+    """MESH input (user directive): the sampling is clean, the cloud
+    IS the room -- the nadir camera must sit over the WHOLE-cloud
+    centre (the room's centre), not the bootstrap layout's. The
+    3DGS branch keeps the layout framing (outer haze must stay out
+    of frame). Devices shoved into one corner of a 12x8 room make
+    the two centres 3m+ apart, so the branch taken is unambiguous."""
+    from agentic_gts.agent import ground
+
+    rng = np.random.default_rng(23)
+    # room walls: four thin bands around a 12x8 footprint
+    wall = []
+    for _x0, _x1, _y0, _y1 in ((-6, 6, -4, -3.8), (-6, 6, 3.8, 4),
+                               (-6, -5.8, -3.8, 3.8), (5.8, 6, -3.8, 3.8)):
+        wall.append(np.column_stack([
+            rng.uniform(_x0, _x1, 3000), rng.uniform(_y0, _y1, 3000),
+            rng.uniform(0.0, 3.0, 3000)]))
+    # devices crammed into the room's +x/+y corner
+    dev = np.vstack([_row_points(3.0, 5.6, y=1.0, rng=rng),
+                     _row_points(3.0, 5.6, y=2.8, rng=rng)])
+    pts = np.vstack(wall + [dev])
+    room_c = (float(pts[:, 0].min() + pts[:, 0].max()) / 2.0,
+              float(pts[:, 1].min() + pts[:, 1].max()) / 2.0)
+
+    scene = Scene(points=pts)
+    scene.meta["yaw"] = 0.0
+    _bootstrap_meta(scene, (2.8, 0.6, 5.8, 3.2))
+    scene.meta["geometry_is_mesh"] = True
+    _, cam_m, _, _ = ground._render_topdown(scene, 0.0)
+    assert (abs(float(cam_m.eye[0]) - room_c[0]) < 0.3
+            and abs(float(cam_m.eye[1]) - room_c[1]) < 0.3), \
+        (f"mesh camera must centre on the ROOM ({room_c}), got eye "
+         f"({cam_m.eye[0]:.2f}, {cam_m.eye[1]:.2f})")
+
+    # the 3DGS branch (no mesh flag) keeps the layout framing: eye
+    # near the layout centre, NOT the room centre
+    scene.meta["geometry_is_mesh"] = False
+    _, cam_g, _, _ = ground._render_topdown(scene, 0.0)
+    assert abs(float(cam_g.eye[0]) - 4.3) < 0.4 \
+        and abs(float(cam_g.eye[1]) - 1.9) < 0.4, \
+        ("3DGS camera must keep the layout framing, got eye "
+         f"({cam_g.eye[0]:.2f}, {cam_g.eye[1]:.2f})")
+    print(f"PASS mesh framing: room centre ({room_c[0]:.1f},"
+          f"{room_c[1]:.1f}) vs 3DGS layout "
+          f"({cam_g.eye[0]:.1f},{cam_g.eye[1]:.1f})")
+
+
 def test_unproject_ground_roundtrip():
     from agentic_gts.output.gs_render import (make_godview_cam,
                                               unproject_ground)
