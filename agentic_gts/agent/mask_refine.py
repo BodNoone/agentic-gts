@@ -549,7 +549,14 @@ _SIDE_LETTER_GLYPHS = {
     "B": ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
     "C": ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
     "D": ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+    "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+    "F": ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
 }
+
+# Oblique side-view offset (user report: a long cable ladder beside a
+# low device fully occluded the straight profile; a slight azimuth
+# offset peeks past it without biasing the 3D thickness read).
+_SIDE_OBLIQUE_DEG = 15.0
 
 
 def _side_panel_image(imgs: list, scale: int = 16,
@@ -603,11 +610,12 @@ def render_local_views(scene: Scene, box: OrientedBox,
 
     SIDE view (user direction: rules keep misjudging which end is
     clear, fog persists -- let the VLM look): several CANDIDATE
-    placements are rendered (the rule-picked free end, a nearer
-    standoff at the same end, the opposite end), each passes the cheap
-    gradient-energy gate, and the survivors are composited into one
-    labeled A/B/C panel image for ONE tiny VLM call that picks the
-    clearest. No judge / call failure / one survivor -> rule order.
+    placements are rendered (the rule-picked free end, two slightly
+    OBLIQUE variants of it that peek past an occluding ladder, the
+    opposite end), each passes the cheap gradient-energy gate, and the
+    survivors are composited into one labeled A/B/C... panel image
+    for ONE tiny VLM call that picks the clearest. No judge / call
+    failure / one survivor -> rule order.
     """
     gs_ply = scene.meta.get("gs_ply")
     if not gs_ply:
@@ -752,10 +760,17 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # a small candidate set instead and let the EVIDENCE decide: the
     # cheap gradient gate kills any candidate that rendered a veil,
     # then one tiny VLM call picks the clearest survivor.
-    side_cands = [(azim_side, standoff_side)]
-    near_so = max(0.35, 0.5 * standoff_side)
-    if standoff_side - near_so >= 0.25:
-        side_cands.append((azim_side, near_so))
+    # OBLIQUE variants (user report: a long cable ladder standing
+    # beside a low device completely occluded the straight profile --
+    # the VLM saw only ladder): +/- 15 deg off the free-end azimuth
+    # peeks past the occluder while staying a profile view. Safe for
+    # the thickness read: it comes from the 3D back-projected points'
+    # cross-axis span, not from pixel extents, so the obliquity cannot
+    # bias it. They replace the old nearer-standoff candidate (the
+    # oblique lateral displacement likewise exits local floaters).
+    side_cands = [(azim_side, standoff_side),
+                  (azim_side + _SIDE_OBLIQUE_DEG, standoff_side),
+                  (azim_side - _SIDE_OBLIQUE_DEG, standoff_side)]
     alt_azim = (azim_front + 90.0
                 if abs(azim_side - (azim_front - 90.0)) < 1e-6
                 else azim_front - 90.0)

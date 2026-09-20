@@ -1894,10 +1894,11 @@ def test_adjudicate_side_pick_parses_letter():
 def test_side_view_vlm_arbitration_overrides_rule():
     """SIDE view candidate arbitration (user direction: the placement
     rules keep misjudging which end is clear -- let the VLM look at
-    the renders). Both ends render clean here; the fake VLM replies
-    'C' (the OPPOSITE-end candidate), so the chosen side camera must
-    stand at the opposite end from the rule pick. Without a judge the
-    rule pick stands."""
+    the renders). Candidate order: A = rule free end, B/C = +/-15 deg
+    oblique variants (peek past an occluding cable ladder), D = the
+    opposite end. All render clean here; the fake VLM replies 'D', so
+    the chosen side camera must stand at the opposite end from the
+    rule pick. Without a judge the rule pick stands."""
     from agentic_gts.agent import mask_refine as mr
     from agentic_gts.agent.judge import VLMJudge
     from agentic_gts.agent.mask_refine import (_free_row_end, _front_azim,
@@ -1946,8 +1947,12 @@ def test_side_view_vlm_arbitration_overrides_rule():
     flat[idx] = 0.85
     fog = np.full((768, 768, 3), 0.42, np.float32)
 
+    # clean render everywhere except cameras deep on the -y (wall)
+    # side; the boundary sits BEYOND the oblique candidates' swing
+    # (the eye swings ~4.2*sin(15deg) ~ 1.09 around the box centre)
+    # so all four candidates reach the panel
     def fake_raster(sub, cam):
-        return fog if float(np.asarray(cam.eye)[1]) < -0.5 else img
+        return fog if float(np.asarray(cam.eye)[1]) < -1.2 else img
 
     gsr.rasterize_gs = fake_raster
     gsr.render_gs_view = lambda *a, **k: img
@@ -1955,7 +1960,7 @@ def test_side_view_vlm_arbitration_overrides_rule():
     gio.read_gaussian_ply = lambda p: gs
 
     judge = VLMJudge(backend="qwen")
-    judge._qwen_image_call = lambda png, prompt, *a, **k: "C"
+    judge._qwen_image_call = lambda png, prompt, *a, **k: "D"
     try:
         views = mr.render_local_views(scene, box, None, judge=judge)
         names = [v["name"] for v in views]
@@ -1963,7 +1968,7 @@ def test_side_view_vlm_arbitration_overrides_rule():
         side = next(v for v in views if v["name"] == "side")
         eye_c = np.asarray(side["cam"].eye)
         assert eye_c[0] * eye_rule[0] < 0, \
-            (f"VLM pick 'C' (opposite end) must flip the side camera: "
+            (f"VLM pick 'D' (opposite end) must flip the side camera: "
              f"rule eye {eye_rule[:2]}, chosen eye {eye_c[:2]}")
         # no judge -> the rule order stands (eye on the rule end)
         views2 = mr.render_local_views(scene, box, None)
