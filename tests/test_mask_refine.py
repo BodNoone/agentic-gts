@@ -185,6 +185,13 @@ def test_sam_box_prompt_construction():
         "the open door must be a positive detection class"
     assert "its OWN instance" in prompt, \
         "the door must ground as its own instance, not be excluded"
+    # the cable ladder is the SECOND subtractive class (user report:
+    # a vertical ladder included in a front/back device box drags the
+    # mask P97.5 height to the ladder top)
+    assert "cable ladder" in prompt, \
+        "the cable ladder must be a positive detection class"
+    assert "never any part of a rack or cabinet" in prompt, \
+        "the ladder box must exclude the device itself"
     # VLM quality verdict (user direction: judged TOGETHER with the
     # grounding in the same call, garbage views dropped)
     assert "quality: good" in prompt and "quality: poor" in prompt, \
@@ -1158,7 +1165,8 @@ def test_door_class_subtracts_from_device_points():
     projects into the door mask -- the open door cannot stretch the
     span or the thickness."""
     from agentic_gts.agent.mask_refine import (
-        _door_union, _is_door, _mask_to_points,
+        _door_union, _is_door, _is_ladder, _is_subtractive,
+        _mask_to_points,
     )
     from agentic_gts.output.gs_render import Cam
 
@@ -1167,7 +1175,8 @@ def test_door_class_subtracts_from_device_points():
     assert not _is_door("rack")
     assert not _is_door(None)
 
-    # _door_union: only door-class groups, best-score SAM mask unioned
+    # _door_union: only subtractive-class groups, best-score SAM mask
+    # unioned
     IMG = np.zeros((64, 64, 3))       # 64px: VLM boxes clear the
     # degenerate-size guard (a tiny 8px test image would not)
 
@@ -1177,7 +1186,7 @@ def test_door_class_subtracts_from_device_points():
 
         def predict(self, image, box_pix):
             self.calls.append(tuple(box_pix))
-            # two door boxes -> two disjoint masks
+            # two door/ladder boxes -> two disjoint masks
             m = np.zeros((64, 64), bool)
             if box_pix[0] < 20:         # left door box
                 m[20:40, 5:20] = True
@@ -1197,6 +1206,24 @@ def test_door_class_subtracts_from_device_points():
     assert _door_union(IMG,
                        [{"bbox": (100, 100, 400, 500),
                          "hypothesis": "rack"}], sam) is None
+
+    # the CABLE LADDER joins the subtractive classes (user report: a
+    # vertical ladder included in a front/back device box drags the
+    # mask P97.5 height to the ladder top)
+    assert _is_ladder("cable ladder")
+    assert _is_ladder("Vertical Cable Tray")
+    assert not _is_ladder("rack")
+    assert _is_subtractive("cable ladder")
+    assert _is_subtractive("open cabinet door")
+    assert not _is_subtractive("air-conditioning unit")
+    lad = _FakeSam()
+    groups_l = [{"bbox": (100, 100, 400, 500), "hypothesis": "rack"},
+                {"bbox": (500, 100, 700, 900), "hypothesis": "cable ladder"}]
+    ul = _door_union(IMG, groups_l, lad)
+    assert len(lad.calls) == 1, \
+        "only the ladder box hits the subtractive SAM"
+    assert ul is not None and ul[30, 40], \
+        "the ladder mask must enter the subtractive union"
 
     # _mask_to_points: points projecting into the door mask are dropped
     box = OrientedBox(center=(0.0, 0.0, 1.0), size=(2.0, 1.0, 2.0),

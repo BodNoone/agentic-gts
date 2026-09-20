@@ -434,7 +434,7 @@ class VLMJudge:
         "frame). Minor rendering imperfections are NOT poor.\n"
         "Locate every instance that belongs to the following categories: "
         '"server rack / IT cabinet, air-conditioning unit, '
-        'open cabinet door".\n'
+        'open cabinet door, cable ladder".\n'
         "Instance rules: cabinets joined side by side in one row are "
         "DIFFERENT instances when they differ in height or in color -- "
         "give each its own box at its own boundary; truly identical "
@@ -442,6 +442,10 @@ class VLMJudge:
         "A cabinet door standing open, swung out of the body, is its "
         "OWN instance labelled \"open cabinet door\" -- the box covers "
         "ONLY the door panel itself, NOT the cabinet body behind it.\n"
+        "A cable ladder (vertical ladder rack / cable tray running up "
+        "beside or behind the device) is its OWN instance labelled "
+        "\"cable ladder\" -- the box covers ONLY the ladder itself, "
+        "never any part of a rack or cabinet.\n"
         "Each box must cover the whole visible instance it belongs to.\n"
         "Report bbox coordinates in JSON format like this: "
         '{"bbox_2d": [x1, y1, x2, y2], "label": "rack"}'

@@ -1677,14 +1677,32 @@ def _is_door(label) -> bool:
     return "door" in str(label or "").lower()
 
 
+def _is_ladder(label) -> bool:
+    """The cable-ladder positive class: a vertical ladder rack / cable
+    tray running up beside or behind the device (user report: ladders
+    included in front/back device boxes dragged the mask P97.5 height
+    to the ladder top -- the ladder gets the SAME subtractive
+    treatment as the open door)."""
+    l = str(label or "").lower()
+    return "ladder" in l or "cable tray" in l
+
+
+def _is_subtractive(label) -> bool:
+    """Subtractive classes: labelled structures whose SAM masks are
+    pixel-REMOVED from every device back-projection -- the device
+    spans, thickness pools and height reads never see them."""
+    return _is_door(label) or _is_ladder(label)
+
+
 def _door_union(image: np.ndarray, groups: list, sam: SamPredictorAdapter
                 ) -> np.ndarray | None:
-    """Pixel union of the SAM masks of every door-class box -- the
-    subtractive layer for device back-projection. None when the VLM
-    found no open door in this view (the common case)."""
+    """Pixel union of the SAM masks of every SUBTRACTIVE-class box
+    (open cabinet door, cable ladder) -- the subtractive layer for
+    device back-projection. None when the VLM found none in this view
+    (the common case)."""
     u: np.ndarray | None = None
     for g in groups:
-        if not _is_door(g.get("hypothesis")):
+        if not _is_subtractive(g.get("hypothesis")):
             continue
         group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "door"),
                          float(g.get("confidence", 0.5)))
@@ -1743,9 +1761,9 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
     doors = _door_union(voter["image"], groups, sam)
     spans = []
     for gi, g in enumerate(groups):
-        if _is_door(g.get("hypothesis")):
-            continue          # door class: subtraction only, never a
-                             # span -- box refinement fits devices only
+        if _is_subtractive(g.get("hypothesis")):
+            continue          # door / ladder: subtraction only, never
+                             # a span -- box refinement fits devices only
         group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
                          float(g.get("confidence", 0.5)))
         box_pix = group.pixel_box(W, H)
@@ -1908,7 +1926,7 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         doors = _door_union(side["image"], groups, sam)
         pool, pool_ms = [], 0.0
         for gi, g in enumerate(groups):
-            if _is_door(g.get("hypothesis")):
+            if _is_subtractive(g.get("hypothesis")):
                 continue          # subtraction only, never a pool
             group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
                              float(g.get("confidence", 0.5)))
