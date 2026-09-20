@@ -494,21 +494,28 @@ def _draw_raw_regions(img: np.ndarray, raw_rects: list) -> np.ndarray:
 
 
 def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
-    """Solid red outlines for the grounded result boxes (result-only
-    audit: the VLM answered on the clean base, the fit is shown apart)."""
+    """Solid outlines for the grounded result boxes, COLOR-CODED by
+    provenance (result-only audit: the VLM answered on the clean base,
+    the fit is shown apart). Red = nadir-grounded; ORANGE = tilt-view
+    fit; CYAN = cluster recall net. When a result box looks wrong, the
+    color says WHICH stage produced it -- a merged box that is orange
+    is tilt-perspective inflation, cyan is the recall net's cluster
+    spanning devices, red is the nadir fit itself (user debugging)."""
     from PIL import Image, ImageDraw
     u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3].copy()
     pil = Image.fromarray(u8)
     dr = ImageDraw.Draw(pil)
-    red = (255, 60, 60)
+    colors = {"nadir": (255, 60, 60), "tilt": (255, 170, 40),
+              "cluster": (40, 200, 230)}
     for b in boxes:
         z = b.center[2] + b.size[2] / 2.0
         cs = b.corners_2d()
         uv = cam.project_cv(np.column_stack([cs, np.full(len(cs), z)]))
         pts = [(int(round(p[0])), int(round(p[1]))) for p in uv]
         pts.append(pts[0])
+        col = colors.get(str(b.meta.get("view", "nadir")), (255, 60, 60))
         for a, c in zip(pts, pts[1:]):
-            dr.line((a, c), fill=red, width=2)
+            dr.line((a, c), fill=col, width=2)
     return np.asarray(pil, dtype=np.float32) / 255.0
 
 
@@ -1537,7 +1544,8 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                         center=(float(c[0]), float(c[1]), bb.center[2]),
                         size=bb.size, yaw=yaw + float(bb.yaw),
                         device_type=DeviceType.RACK,
-                        meta={"grounded": True, "cluster": cid,
+                        meta={"grounded": True, "view": "cluster",
+                              "cluster": cid,
                               "n_pts": bb.meta.get("n_pts", 0)}))
                     n_added += 1
             print(f"[ground] cluster recall net: {n_added} box(es) added")
