@@ -1434,9 +1434,10 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     boxes = []
     row_rects = []                   # row-frame AABBs, for the recall net
     fitted_rects = []                # row-frame footprints of FITTED boxes
-    for cam_v, r in [(v[1], r) for v in views for r in v[5]]:
-        rect_r = _frame_rect(cam_v, r, 1.0)
-        row_rects.append(rect_r)
+
+    def _fit_ground_rect(rect_r) -> int:
+        """Snap + fit one row-frame rect; append its boxes. Returns the
+        number of boxes appended."""
         # the rect's own LOCAL floor (stepped rooms): the section's
         # slab height, looked up at the rect's world centre
         cw = _rot_xy(np.array([[(rect_r[0] + rect_r[2]) / 2.0,
@@ -1457,6 +1458,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         # rect around two opposing rows -- splits at the aisle here,
         # before the box enters the pipeline (stageC can only split
         # along the row axis)
+        n_appended = 0
         for bb in bbs:
             c = _rot_xy(np.array([[bb.center[0], bb.center[1], 0.0]]),
                         yaw)[0]
@@ -1480,6 +1482,56 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                                  float(bb.center[1]) - 0.5 * sy,
                                  float(bb.center[0]) + 0.5 * sx,
                                  float(bb.center[1]) + 0.5 * sy))
+            n_appended += 1
+        return n_appended
+
+    def _is_tilt_view(fname_v: str) -> bool:
+        return fname_v.endswith("_L.png") or fname_v.endswith("_R.png")
+
+    # PASS 1 -- the NADIR views are the layout AUTHORITIES: vertical
+    # rays carry no perspective dilation, their rects ARE the foot-
+    # prints, and every later coverage question is answered against
+    # what they fitted.
+    for cam_v, r in [(v[1], r) for v in views
+                     if not _is_tilt_view(v[4]) for r in v[5]]:
+        rect_r = _frame_rect(cam_v, r, 1.0)
+        row_rects.append(rect_r)
+        _fit_ground_rect(rect_r)
+    # PASS 2 -- the tilt views are RECALL-ONLY (user report: red
+    # result boxes merging devices the colored rects showed apart).
+    # A tilted camera's back-projection is perspective-INFLATED: the
+    # image rect is the device's visible hull, whose rays cut any
+    # single z-plane in a footprint WIDER than the device -- such a
+    # box carries the most points and, in the n_pts-sorted dedup,
+    # EATS the correct nadir boxes (IoU/containment) before the
+    # adjacency merge chains them further. Two guards:
+    #   * the back-projection is TIGHTENED by intersecting the slices
+    #     at two device-band heights (the oblique-view lesson: the
+    #     bottom slice inflates away from the camera, the top slice
+    #     toward it, the intersection trims both);
+    #   * a tilt rect may only ground what the nadir views did NOT:
+    #     covered areas (the cluster-net point-mass test) are skipped
+    #     outright, so tilt evidence can ADD a device but never
+    #     replace, out-support or span across a nadir-grounded one.
+    tilt_added = tilt_skipped = 0
+    for cam_v, fname_v, rects_v in [(v[1], v[4], v[5]) for v in views
+                                    if _is_tilt_view(v[4])]:
+        for r in rects_v:
+            lo_r = _frame_rect(cam_v, r, 0.30)
+            hi_r = _frame_rect(cam_v, r, 1.00)
+            rect_r = (max(lo_r[0], hi_r[0]), max(lo_r[1], hi_r[1]),
+                      min(lo_r[2], hi_r[2]), min(lo_r[3], hi_r[3]))
+            if rect_r[0] >= rect_r[2] or rect_r[1] >= rect_r[3]:
+                rect_r = _frame_rect(cam_v, r, 1.0)   # disjoint slices
+            if fitted_rects and (
+                    _cluster_pts_covered(rect_r, pts_clu, fitted_rects)
+                    or any(_rect_inside(vr, rect_r) for vr in row_rects)):
+                tilt_skipped += 1
+                continue
+            tilt_added += _fit_ground_rect(rect_r)
+    if tilt_added or tilt_skipped:
+        print(f"[ground] tilt recall views: {tilt_added} box(es) added, "
+              f"{tilt_skipped} rect(s) skipped (nadir-covered)")
     if not boxes:
         print("[ground] no region survived the point-support guards")
         if out_dir:
@@ -1613,9 +1665,15 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # same camera. Tiled views draw ALL boxes (cross-tile ones project
     # outside the frame), so each tile's audit stays self-contained.
     if out_dir:
-        for img_v, cam_v, _, _, fname_v, rects_v in views:
+        for idx, (img_v, cam_v, _, _, fname_v, rects_v) in enumerate(views):
+            # non-tiled: views[0] (the NADIR view) owns grounded.png --
+            # the before/after audit must compare the colored rects and
+            # the red boxes on the view whose rays ARE the footprints;
+            # the tilt views get their own grounded_L / grounded_R
+            # audits (the last-view-writes overwrite used to put the
+            # R view's perspective into the audit instead).
+            fname_out = ("grounded.png" if (tiles is None and idx == 0)
+                         else fname_v.replace("groundview", "grounded"))
             _save_grounded_png(
-                img_v, cam_v, boxes, rects_v, out_dir,
-                fname=("grounded.png" if tiles is None else
-                       fname_v.replace("groundview", "grounded")))
+                img_v, cam_v, boxes, rects_v, out_dir, fname=fname_out)
     return True

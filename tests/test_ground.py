@@ -119,6 +119,10 @@ def test_ground_stage_tilt_views_add_recall():
                                            tilt_dir=+1)
     view_rects = {
         "groundview.png": (cam0, [((-0.2, 6.2), (-0.6, 0.6))]),
+        # the L view repeats the nadir rect (a duplicate): the recall
+        # gate must SKIP it -- a tilted rect may never re-fit an area
+        # the nadir views already own (its perspective-inflated fit
+        # would out-support and EAT the correct nadir box in dedup)
         "groundview_L.png": (camL, [((-0.2, 6.2), (-0.6, 0.6))]),
         "groundview_R.png": (camR, [((-0.2, 6.2), (-0.6, 0.6)),
                                      ((-0.2, 6.2), (2.4, 3.6)),
