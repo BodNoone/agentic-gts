@@ -126,7 +126,14 @@ def test_ground_stage_tilt_views_add_recall():
         "groundview_L.png": (camL, [((-0.2, 6.2), (-0.6, 0.6))]),
         "groundview_R.png": (camR, [((-0.2, 6.2), (-0.6, 0.6)),
                                      ((-0.2, 6.2), (2.4, 3.6)),
-                                     ((7.8, 9.2), (-0.6, 0.6))]),
+                                     ((7.8, 9.2), (-0.6, 0.6)),
+                                     # a perspective-inflated rect SPANNING
+                                     # row1 (nadir-grounded) + row2 (missed):
+                                     # the area-overlap gate must skip it
+                                     # WHOLE -- fitting it would produce the
+                                     # merged red box (user report), and the
+                                     # cluster net recovers row2 instead
+                                     ((-0.2, 6.2), (-0.6, 3.6))]),
     }
 
     def _fake_ground(png, W_, H_, png_path=None):
@@ -163,8 +170,13 @@ def test_ground_stage_tilt_views_add_recall():
                   key=lambda b: b.center[1])
     assert len(rows) == 2 and abs(rows[1].center[1] - 3.0) < 0.3, \
         "row2 (tilt-seen) must also be grounded"
+    # no box may span the aisle: the spanning tilt rect was skipped
+    for b in scene.boxes:
+        assert b.size[1] < 2.0, \
+            f"a box spans devices (depth {b.size[1]:.2f}m): the " \
+            f"spanning tilt rect leaked through"
     print("PASS tilt views add recall (nadir missed 2, tilted R "
-          "recovered both)")
+          "recovered both, spanning rect skipped)")
 
 
 def test_render_topdown_mesh_framing_room_centre():

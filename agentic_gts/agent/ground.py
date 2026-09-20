@@ -1058,13 +1058,14 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
     if n < 2:
         return boxes
     # row-frame AABB + orientation bucket (long side on x or on y)
-    rects, buckets = [], []
+    rects, buckets, srcs = [], [], []
     for b in boxes:
         cs = _rot_xy(np.column_stack([b.corners_2d(),
                                       np.zeros(4)]), -yaw)
         rects.append((float(cs[:, 0].min()), float(cs[:, 1].min()),
                       float(cs[:, 0].max()), float(cs[:, 1].max())))
         buckets.append(int(round((b.yaw - yaw) / (math.pi / 2.0))) % 2)
+        srcs.append(str(b.meta.get("view", "nadir")))
     # per-box device-band density from the SAME pool the probe uses
     # (surfaces are dense, an inflated fit barely dilutes it)
     dens = []
@@ -1085,6 +1086,12 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
         for j in range(i + 1, n):
             if buckets[i] != buckets[j]:
                 continue          # an L-junction is two structures
+            if srcs[i] != srcs[j]:
+                continue          # a tilt box never chains onto a
+                # nadir one: the merge exists to heal ONE view's
+                # over-split of one structure; cross-view pairs are
+                # by construction different devices (user report:
+                # merged red result boxes)
             a, b = rects[i], rects[j]
             for axis in (0, 1):
                 o = 1 - axis
@@ -1338,11 +1345,13 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     row_rects = []                   # row-frame AABBs, for the recall net
     fitted_rects = []                # row-frame footprints of FITTED boxes
 
-    def _fit_ground_rect(rect_r) -> int:
+    def _fit_ground_rect(rect_r, source: str = "nadir") -> int:
         """Fit one row-frame rect; append its boxes. Returns the number
-        of boxes appended. (The old rect-to-clump SNAP is retired: the
-        L/R tilt views supply the recall it existed to patch -- user
-        directive.)"""
+        of boxes appended. `source` tags the box's view ("nadir" /
+        "tilt"): the dedup and the adjacency merge both rank and pair
+        on it -- a tilt box may never eat or chain onto a nadir one
+        (user report: red result boxes merging devices the colored
+        rects showed apart)."""
         # the rect's own LOCAL floor (stepped rooms): the section's
         # slab height, looked up at the rect's world centre
         cw = _rot_xy(np.array([[(rect_r[0] + rect_r[2]) / 2.0,
@@ -1365,7 +1374,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                                       bb.center[2]),
                               size=bb.size, yaw=yaw + float(bb.yaw),
                               device_type=DeviceType.RACK,
-                              meta={"grounded": True,
+                              meta={"grounded": True, "view": source,
                                     "n_pts": bb.meta.get("n_pts", 0)})
             boxes.append(box)
             # the recall net judges coverage on what was ACTUALLY
@@ -1397,18 +1406,35 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # result boxes merging devices the colored rects showed apart).
     # A tilted camera's back-projection is perspective-INFLATED: the
     # image rect is the device's visible hull, whose rays cut any
-    # single z-plane in a footprint WIDER than the device -- such a
-    # box carries the most points and, in the n_pts-sorted dedup,
-    # EATS the correct nadir boxes (IoU/containment) before the
-    # adjacency merge chains them further. Two guards:
+    # single z-plane in a footprint WIDER than the device -- a tilt
+    # rect SPANNING an already-grounded device plus a missed one
+    # passes the old point-mass coverage gate (~50% covered) and
+    # fits a box across BOTH. Guards, in order:
     #   * the back-projection is TIGHTENED by intersecting the slices
     #     at two device-band heights (the oblique-view lesson: the
     #     bottom slice inflates away from the camera, the top slice
     #     toward it, the intersection trims both);
-    #   * a tilt rect may only ground what the nadir views did NOT:
-    #     covered areas (the cluster-net point-mass test) are skipped
-    #     outright, so tilt evidence can ADD a device but never
-    #     replace, out-support or span across a nadir-grounded one.
+    #   * a tilt rect touching already-grounded AREA at all (>= 25%
+    #     of its area inside the nadir fits / raw rects union) is
+    #     skipped WHOLE -- the cluster recall net downstream recovers
+    #     any genuinely missed device without spanning risk.
+    def _rect_covered_frac(rect, others) -> float:
+        """Fraction of rect's area inside the UNION of the AABBs."""
+        x0, y0, x1, y1 = rect
+        w, h = x1 - x0, y1 - y0
+        if w <= 0 or h <= 0 or not others:
+            return 0.0
+        step = max(w, h) / 200.0
+        xs = x0 + step * (np.arange(int(w / step)) + 0.5)
+        ys = y0 + step * (np.arange(int(h / step)) + 0.5)
+        gx, gy = np.meshgrid(xs, ys)
+        px, py = gx.ravel(), gy.ravel()
+        cov = np.zeros(len(px), dtype=bool)
+        for o in others:
+            cov |= ((px >= o[0]) & (px <= o[2]) &
+                    (py >= o[1]) & (py <= o[3]))
+        return float(cov.mean())
+
     tilt_added = tilt_skipped = 0
     for cam_v, fname_v, rects_v in [(v[1], v[4], v[5]) for v in views
                                     if _is_tilt_view(v[4])]:
@@ -1419,15 +1445,13 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                       min(lo_r[2], hi_r[2]), min(lo_r[3], hi_r[3]))
             if rect_r[0] >= rect_r[2] or rect_r[1] >= rect_r[3]:
                 rect_r = _frame_rect(cam_v, r, 1.0)   # disjoint slices
-            if fitted_rects and (
-                    _cluster_pts_covered(rect_r, pts_clu, fitted_rects)
-                    or any(_rect_inside(vr, rect_r) for vr in row_rects)):
+            if _rect_covered_frac(rect_r, fitted_rects + row_rects) >= 0.25:
                 tilt_skipped += 1
                 continue
-            tilt_added += _fit_ground_rect(rect_r)
+            tilt_added += _fit_ground_rect(rect_r, source="tilt")
     if tilt_added or tilt_skipped:
         print(f"[ground] tilt recall views: {tilt_added} box(es) added, "
-              f"{tilt_skipped} rect(s) skipped (nadir-covered)")
+              f"{tilt_skipped} rect(s) skipped (touch nadir-grounded area)")
     if not boxes:
         print("[ground] no region survived the point-support guards")
         if out_dir:
@@ -1520,28 +1544,37 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         except Exception as e:
             print(f"[ground] cluster recall net failed "
                   f"({type(e).__name__}: {e}) -> skipped")
-    # DEDUPLICATE: the VLM often outlines the SAME device more than
-    # once (overlapping rects in one reply). Each rect fits its own
-    # near-identical box with a DIFFERENT box_id, and the per-box local
-    # refinement then renders mask_prompt_<id>_front.png per box --
-    # one device, several duplicate renders (user report). Drop a box
-    # when it overlaps a better-supported kept fit (IoU >= 0.5) OR is
-    # >= 85% CONTAINED in one: a small box nested inside a big row box
-    # has IoU = area ratio (< 0.5) but containment ~1.0 -- pure IoU let
-    # the nesting through (user report: big box with small boxes
-    # inside on the audit render). Containment also catches the
-    # cross-yaw nesting the adjacency merge cannot (different
-    # orientation buckets never enter it).
+    # DEDUPLICATE, TWO TIERS (user report: colored rects fine, red
+    # boxes merged). The old single tier sorted everything by n_pts
+    # and let the biggest fit win -- a perspective-inflated tilt box
+    # spanning two devices carries the most points, enters FIRST and
+    # eats both correct nadir boxes as 'contained duplicates'. Now:
+    #   * tier 1, NADIR (and cluster-net) boxes only: drop a box that
+    #     overlaps a better-supported kept fit (IoU >= 0.5) or is
+    #     >= 85% contained in one (nested rects: a small box inside a
+    #     big row box has IoU = area ratio but containment ~1.0);
+    #   * tier 2, TILT boxes: they may only fill EMPTY space -- any
+    #     overlap with a kept box (IoU >= 0.2 or containment >= 0.3)
+    #     drops the tilt box, however many points it carries. A tilt
+    #     box can never replace, out-support or span across a nadir
+    #     grounding.
+    nadir_boxes = [b for b in boxes if b.meta.get("view") != "tilt"]
+    tilt_boxes = [b for b in boxes if b.meta.get("view") == "tilt"]
     dedup = []
-    for b in sorted(boxes, key=lambda x: -int(x.meta.get("n_pts", 0))):
+    for b in sorted(nadir_boxes, key=lambda x: -int(x.meta.get("n_pts", 0))):
         if any(b.iou_2d(d) >= 0.5 or b.containment_2d(d) >= 0.85
                for d in dedup):
             continue
         dedup.append(b)
+    for b in sorted(tilt_boxes, key=lambda x: -int(x.meta.get("n_pts", 0))):
+        if any(b.iou_2d(d) >= 0.2 or b.containment_2d(d) >= 0.3
+               for d in dedup):
+            continue
+        dedup.append(b)
     if len(dedup) < len(boxes):
-        print(f"[ground] dropped {len(boxes) - len(dedup)} duplicate/contained "
-              f"box(es) (IoU >= 0.5 or >= 85% contained in a "
-              f"better-supported fit)")
+        print(f"[ground] dropped {len(boxes) - len(dedup)} duplicate/contained/"
+              f"overlapping box(es) (nadir tiers authoritative, tilt "
+              f"fill-only)")
     boxes = dedup
     # MERGE tightly-adjacent over-split pieces (user request): the VLM
     # sometimes outlines one physical structure as several tight rects;
