@@ -323,11 +323,10 @@ def test_fit_region_box_starved_back_face():
     assert span is not None and 3.4 < span[1] < 3.7, \
         f"haze extended the span to {span}"
 
-    # MESH mode (user directive: lower the denoising): a wide main
-    # body (span already >= 65% of extent, so the percentile floor
-    # does not fire) plus a detached thin section at 5% of the peak
-    # bin -- above the 2% mesh keep cut, below the 6% anti-haze cut:
-    # mesh keeps it, strict trims it
+    # MESH mode (user directive: NO denoising at all): a wide main
+    # body plus a detached thin section at 5% of the peak bin -- the
+    # anti-haze peel trims it in GS mode; mesh mode must keep the
+    # RAW min/max span
     v = np.concatenate([np.random.default_rng(9).uniform(2.0, 3.0, 20000),
                         np.full(50, 4.0)])
     span_mesh = _region_axis_span(v, mesh_mode=True)

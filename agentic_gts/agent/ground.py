@@ -601,11 +601,11 @@ def _region_axis_span(v: np.ndarray, cell: float = 0.05,
     tightens it later; a seed that under-covers the device has no
     recovery path.
 
-    mesh_mode (user directive): a mesh sampling has NO haze, so the
-    anti-haze cuts only ever bite REAL sparser sections (thin
-    dividers, starved face bands). Keep/connect drop to 2%/10% --
-    nearly everything connected counts, the percentile floor stays
-    as the backstop.
+    mesh_mode (user directive): NO denoising at all on a mesh input
+    -- there is no haze, every anti-haze cut only ever bit REAL
+    sparser sections (thin dividers, starved face bands, sparse tops
+    -- user report: fitted boxes SMALLER than the devices). The span
+    is simply the raw min/max.
 
     Safety floor: when the peeled span still covers < 65% of the
     P0.5-P99.5 extent, the structure is more heterogeneous than the
@@ -616,6 +616,8 @@ def _region_axis_span(v: np.ndarray, cell: float = 0.05,
     v = np.asarray(v, dtype=float)
     if len(v) < 30:
         return None
+    if mesh_mode:
+        return float(v.min()), float(v.max())
     p_lo, p_hi = (float(x) for x in np.percentile(v, [0.5, 99.5]))
     lo, hi = float(v.min()), float(v.max())
     nb = int(np.floor((hi - lo) / cell)) + 2
@@ -706,10 +708,17 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
     # so the density-connected run's top is the row's true tallest --
     # a percentile lets floating overhead clutter inside the rect drag
     # it higher (same failure the hint-free bootstrap z_top had)
-    from agentic_gts.agent.mask_refine import _anchored_top
-    _at = _anchored_top(dev[:, 2])
-    z_top = float(_at) if _at is not None \
-        else float(np.percentile(dev[:, 2], 99.5))
+    # MESH (user directive: no denoising): the top is the raw MAX of
+    # the device band -- the anchored walk exists to stop at 3DGS
+    # haze tails and only ever bit real sparse tops on a mesh. GS
+    # keeps the anchored run + P99.5 fallback.
+    if mesh_mode:
+        z_top = float(dev[:, 2].max())
+    else:
+        from agentic_gts.agent.mask_refine import _anchored_top
+        _at = _anchored_top(dev[:, 2])
+        z_top = float(_at) if _at is not None \
+            else float(np.percentile(dev[:, 2], 99.5))
     height = z_top - floor_z
     if height < 0.50:
         _reject(f"too short for a device (height={height:.2f}m "
@@ -727,6 +736,9 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
     sy = _region_axis_span(core[:, 1], mesh_mode=mesh_mode)
     if sx is not None and sy is not None:
         (x_lo, x_hi), (y_lo, y_hi) = sx, sy
+    elif mesh_mode:                  # sparse but clean: raw extent
+        x_lo, y_lo = dev[:, :2].min(axis=0)
+        x_hi, y_hi = dev[:, :2].max(axis=0)
     else:                            # too sparse to bin: percentile fit
         x_lo, y_lo = np.percentile(dev[:, :2], 0.5, axis=0)
         x_hi, y_hi = np.percentile(dev[:, :2], 99.5, axis=0)
