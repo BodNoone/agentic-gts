@@ -1207,6 +1207,100 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
 # ---------- grounding stage ----------
 
 
+def _ground_stage_mesh(scene, yaw: float,
+                       out_dir: str | None = None) -> bool:
+    """Geometry-first global proposal (user direction 2), MESH inputs.
+
+    With a mesh the recall source is the geometry ITSELF: devices are
+    closed / semi-closed rectangular structures in a clean cloud, so
+    EVERY density clump in the device band is proposed as a box --
+    no VLM call, no image detection to be unstable, no rect snap /
+    coverage / merge patches (the whole stack the VLM path needed
+    because its rects clipped and drifted). The VLM's role moves
+    entirely to the per-box LOCAL views: stageC's cheap front-view
+    type check culls non-devices BEFORE the SAM cost, and the SAM
+    refinement tightens imprecise fits. Wrong proposals are cheap; a
+    missed device is lost (user directive: recall-first).
+
+    Pools: the CLUSTER pool runs on the render cut (0.50 x z_top --
+    the mesh trays sit above it), because the fit pool (z_top + 0.10)
+    carries the trays, whose gapless strips span every aisle and seam
+    the whole room into ONE cluster; the FIT pool keeps the rack tops
+    (box height belongs in the box).
+    """
+    import os
+    from agentic_gts.output.gs_render import png_bytes
+    P = np.asarray(scene.points, dtype=np.float64)
+    fl = _floor_map(P, mesh_mode=True)
+    h_fit = P[:, 2] - fl(P[:, 0], P[:, 1])
+    fit_top = float(scene.meta.get("z_top", 2.5) or 2.5)
+    pts_fit = _rot_xy(P[(h_fit > 0.30) & (h_fit <= fit_top + 0.10)], -yaw)
+    if len(pts_fit) < 100:
+        pts_fit = _rot_xy(P[h_fit > 0.30], -yaw)
+    cc = _render_cut(fit_top, mesh_mode=True)
+    pts_clu = _rot_xy(
+        P[(h_fit > 0.30) & (h_fit <= (cc if np.isfinite(cc)
+                                      else fit_top))], -yaw)
+    try:
+        cands = _cluster_candidates(pts_clu)
+    except Exception as e:
+        print(f"[ground] mesh clustering failed ({type(e).__name__}: {e})")
+        cands = []
+    boxes = []
+    for cid, (rect, _npts) in enumerate(cands, start=1):
+        cw = _rot_xy(np.array(
+            [[(rect[0] + rect[2]) / 2.0,
+              (rect[1] + rect[3]) / 2.0, 0.0]]), yaw)[0]
+        for bb in _fit_region_boxes(
+                pts_fit, rect, floor_z=float(fl(cw[0], cw[1])),
+                max_depth=1.35, min_side=0.15):
+            # wall-thin fits never enter the pipeline: a wall blob
+            # OUT-SUPPORTS real device boxes on sheer point count and
+            # would eat them in the dedup (no device category is
+            # thinner than 0.35m; walls are 0.1-0.3m)
+            if bb.size[1] < 0.35:
+                continue
+            c = _rot_xy(np.array(
+                [[bb.center[0], bb.center[1], 0.0]]), yaw)[0]
+            boxes.append(OrientedBox(
+                center=(float(c[0]), float(c[1]), bb.center[2]),
+                size=bb.size, yaw=yaw + float(bb.yaw),
+                device_type=DeviceType.RACK,
+                meta={"grounded": True, "cluster": cid,
+                      "n_pts": bb.meta.get("n_pts", 0)}))
+    if not boxes:
+        print("[ground] mesh geometry proposal: no structure survived "
+              "the fit guards")
+        return False
+    # dedup: adjacent clusters whose fits bleed into each other
+    dedup = []
+    for b in sorted(boxes, key=lambda x: -int(x.meta.get("n_pts", 0))):
+        if any(b.iou_2d(d) >= 0.5 or b.containment_2d(d) >= 0.85
+               for d in dedup):
+            continue
+        dedup.append(b)
+    if len(dedup) < len(boxes):
+        print(f"[ground] dropped {len(boxes) - len(dedup)} duplicate/"
+              f"contained box(es)")
+    boxes = dedup
+    scene.boxes = boxes
+    print(f"[ground] MESH geometry-first: {len(cands)} cluster(s) -> "
+          f"{len(boxes)} proposed box(es) (no VLM; stageC local views "
+          f"type-confirm)")
+    # audit: same artifacts as the VLM path (plain view + proposals)
+    if out_dir:
+        try:
+            img, cam, _W, _H = _render_topdown(scene, yaw)
+            with open(os.path.join(out_dir, "groundview.png"), "wb") as f:
+                f.write(png_bytes(img))
+            _save_grounded_png(img, cam, boxes, [], out_dir,
+                               fname="grounded.png")
+        except Exception as e:
+            print(f"[ground] mesh audit render failed "
+                  f"({type(e).__name__}: {e})")
+    return True
+
+
 def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     """Replace scene.boxes with VLM-grounded per-region boxes.
 
@@ -1233,6 +1327,14 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
               "-> nothing to ground")
         return False
     yaw = float(scene.meta.get("yaw", 0.0) or 0.0)
+    # MESH (user direction 2, geometry-first): with a clean mesh the
+    # recall source is the geometry itself -- every density clump is
+    # proposed, deterministically, with NO VLM call in this stage.
+    # Only 3DGS-only scenes (no mesh) still need the VLM image
+    # grounding path below: theirs is the only recall source there,
+    # and the haze in those clouds makes direct fitting unreliable.
+    if bool(scene.meta.get("geometry_is_mesh")):
+        return _ground_stage_mesh(scene, yaw, out_dir)
     # ---- views: one nadir view, or TILES over a big layout ----
     # A single view must fit the whole layout; past ~25m of span the
     # camera climbs so high that cabinets render a dozen pixels wide

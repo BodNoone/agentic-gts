@@ -8,6 +8,7 @@ Covers:
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -40,6 +41,97 @@ def _bootstrap_meta(scene, footprint, z_top=2.1):
     """Fill scene.meta the way stage0's estimate_yaw_detailed does."""
     scene.meta["z_top"] = z_top
     scene.meta["device_footprint"] = footprint
+
+
+def test_ground_stage_mesh_geometry_first():
+    """MESH inputs take the geometry-first path (user direction 2):
+    every density clump in the device band is proposed as a box --
+    DETERMINISTICALLY, with NO VLM call (judge=None must work), no
+    rect snap / coverage / merge patches. A clean mesh room with two
+    rows across a real aisle, a 1m AC block, a thin wall band and a
+    tray strip above the cluster cut must yield exactly the three
+    devices: the wall's fit is thickness-rejected, the tray (above
+    the render cut) never stitches the rows into one cluster, and the
+    aisle keeps the rows as separate proposals."""
+    from agentic_gts.agent import ground
+
+    rng = np.random.default_rng(31)
+    rowA = _row_points(0.0, 6.0, y=0.0, rng=rng)
+    rowB = _row_points(0.0, 6.0, y=3.0, rng=rng)
+    ac = _row_points(8.0, 9.0, y=0.0, depth=1.0, height=1.0, rng=rng)
+    wall = np.column_stack([rng.uniform(-2.0, 10.0, 6000),
+                            6.0 + rng.uniform(-0.1, 0.1, 6000),
+                            rng.uniform(0.0, 2.5, 6000)])
+    tray = np.column_stack([rng.uniform(-2.0, 10.0, 4000),
+                            rng.uniform(-1.0, 4.0, 4000),
+                            rng.uniform(1.7, 1.9, 4000)])
+    scene = Scene(points=np.vstack([rowA, rowB, ac, wall, tray]))
+    scene.meta["yaw"] = 0.0
+    scene.meta["geometry_is_mesh"] = True
+    _bootstrap_meta(scene, (-2.5, -1.0, 10.0, 6.5), z_top=2.1)
+    scene.boxes = []
+
+    ok = ground.ground_stage(scene, judge=None)
+    assert ok, "geometry-first proposal must succeed without a judge"
+    assert len(scene.boxes) == 3, \
+        f"two rows + AC expected; got {len(scene.boxes)}: " \
+        + str([(round(b.center[0], 1), round(b.center[1], 1),
+                round(b.size[0], 1)) for b in scene.boxes])
+    # the thin wall (0.2m) is thickness-rejected: no long box
+    for b in scene.boxes:
+        assert max(b.size[0], b.size[1]) < 8.0, \
+            f"wall-thin fit leaked in: {b.size}"
+        assert b.meta.get("cluster"), "every mesh box must be a " \
+            "cluster proposal (stageC cheap type check keys on it)"
+    rows = sorted((b for b in scene.boxes
+                   if max(b.size[0], b.size[1]) > 4.0),
+                  key=lambda b: b.center[1])
+    assert len(rows) == 2, \
+        f"exactly the two 6m rows are long, got {len(rows)}"
+    assert abs(rows[0].center[1]) < 0.4, "rowA centred near y=0"
+    assert abs(rows[1].center[1] - 3.0) < 0.4, "rowB centred near y=3"
+    for b in rows:
+        assert 5.4 < max(b.size[0], b.size[1]) < 6.7, \
+            f"row length {b.size[0]:.2f}m, expected ~6m"
+    print("PASS mesh geometry-first (3 devices, wall rejected, "
+          "tray unstitched, judge=None)")
+
+
+def test_ground_stage_mesh_rotated_layout():
+    """The geometry-first path in a ROTATED room: clusters are found
+    in the row frame, fitted, and the boxes rotate back out -- two
+    rows at 17 deg must come out as ~6m boxes whose own yaw folds to
+    17 deg, and the recall must not depend on the room's rotation."""
+    from agentic_gts.agent import ground
+
+    rng = np.random.default_rng(37)
+    rowA = _row_points(0.0, 6.0, y=0.0, rng=rng)
+    rowB = _row_points(0.0, 6.0, y=3.0, rng=rng)
+    pts = np.vstack([rowA, rowB])
+    a = math.radians(17.0)
+    R = np.array([[math.cos(a), -math.sin(a), 0.0],
+                  [math.sin(a), math.cos(a), 0.0], [0.0, 0.0, 1.0]])
+    pts = pts @ R.T
+    scene = Scene(points=pts)
+    scene.meta["yaw"] = a
+    scene.meta["geometry_is_mesh"] = True
+    _bootstrap_meta(scene, tuple(float(v) for v in
+                                 pts[:, :2].min(axis=0)[:2])
+                    + tuple(float(v) for v in pts[:, :2].max(axis=0)[:2]),
+                    z_top=2.1)
+    scene.boxes = []
+
+    assert ground.ground_stage(scene, judge=None)
+    assert len(scene.boxes) == 2, \
+        f"both rows must be proposed at 17 deg, got {len(scene.boxes)}"
+    for b in scene.boxes:
+        assert 5.4 < max(b.size[0], b.size[1]) < 6.7, \
+            f"row length {b.size[0]:.2f}m at 17 deg, expected ~6m"
+        fold = math.degrees(math.remainder(float(b.yaw) - a, math.pi / 2))
+        assert abs(fold) < 2.0, \
+            f"box yaw must fold to the room yaw, off by {fold:.1f} deg"
+    print("PASS mesh geometry-first rotated (17 deg, both rows, "
+          "yaws fold home)")
 
 
 def test_unproject_ground_roundtrip():
