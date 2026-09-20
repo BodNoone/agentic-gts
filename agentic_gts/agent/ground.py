@@ -749,100 +749,6 @@ _MIN_DEVICE_DEPTH = 0.40
 _SPLIT_MIN_GAP = 0.30
 
 
-def _snap_rect_to_clump(points: np.ndarray, rect, cell: float = 0.30,
-                        min_cell_pts: int = 4, max_grow: float = 0.60,
-                        edge_frac: float = 0.25):
-    """Grow a VLM rect outward to the boundary of the density clump it
-    sits on (user insight: re-include the clump pixels the 2D grounding
-    left outside the box) -- NOT a blanket dilation, which bridged
-    closely spaced devices into one grounding (user report).
-
-    Two mechanisms, both cell-granular:
-      * EDGE-CELL COMPLETION: when the cell containing a rect edge is
-        itself occupied, the edge extends to that cell's far boundary
-        (the device continues inside the same cell the rect cuts
-        mid-way through);
-      * STRIP GROWTH: each side then grows one cell at a time while
-        the strip immediately outside holds real support (>= edge_frac
-        of the edge's cells occupied).
-    The empty strip of an inter-device gap stops the growth cold -- a
-    rect tracks its OWN device's boundary and never crosses a density
-    gap; max_grow bounds haze-driven runaway. The fit afterwards snaps
-    to actual points, so sub-cell overshoot is harmless."""
-    P = np.asarray(points, dtype=np.float64)
-    if len(P) < 100:
-        return rect
-    ix = np.floor(P[:, 0] / cell).astype(np.int64)
-    iy = np.floor(P[:, 1] / cell).astype(np.int64)
-    keys, inv = np.unique(np.column_stack([ix, iy]), axis=0,
-                          return_inverse=True)
-    counts = np.bincount(inv, minlength=len(keys))
-    occ = {(int(keys[k, 0]), int(keys[k, 1]))
-           for k in np.nonzero(counts >= min_cell_pts)[0]}
-    if not occ:
-        return rect
-
-    def _strip_x(i, j0, j1):
-        return sum(1 for j in range(j0, j1 + 1) if (i, j) in occ)
-
-    def _strip_y(j, i0, i1):
-        return sum(1 for i in range(i0, i1 + 1) if (i, j) in occ)
-
-    x0, y0, x1, y1 = rect
-    grown = [0.0, 0.0, 0.0, 0.0]                 # per side
-    while True:
-        moved = False
-        i0 = int(math.floor(x0 / cell))
-        i1 = int(math.floor(x1 / cell))
-        j0 = int(math.floor(y0 / cell))
-        j1 = int(math.floor(y1 / cell))
-        # edge-cell completion: the rect cuts mid-cell through its own
-        # device -- extend to the cell boundary first (once per side,
-        # it counts toward max_grow; the equality guard makes it fire
-        # exactly once)
-        if grown[0] < max_grow and x0 > i0 * cell and \
-                _strip_x(i0, j0, j1) >= 1:
-            x0 = i0 * cell
-            grown[0] += cell
-            moved = True
-        if grown[2] < max_grow and x1 < (i1 + 1) * cell and \
-                _strip_x(i1, j0, j1) >= 1:
-            x1 = (i1 + 1) * cell
-            grown[2] += cell
-            moved = True
-        if grown[1] < max_grow and y0 > j0 * cell and \
-                _strip_y(j0, i0, i1) >= 1:
-            y0 = j0 * cell
-            grown[1] += cell
-            moved = True
-        if grown[3] < max_grow and y1 < (j1 + 1) * cell and \
-                _strip_y(j1, i0, i1) >= 1:
-            y1 = (j1 + 1) * cell
-            grown[3] += cell
-            moved = True
-        # strip growth: continue only through real support
-        thr_y = max(1, int(edge_frac * (j1 - j0 + 1)))
-        thr_x = max(1, int(edge_frac * (i1 - i0 + 1)))
-        if grown[0] < max_grow and _strip_x(i0 - 1, j0, j1) >= thr_y:
-            x0 -= cell
-            grown[0] += cell
-            moved = True
-        if grown[2] < max_grow and _strip_x(i1 + 1, j0, j1) >= thr_y:
-            x1 += cell
-            grown[2] += cell
-            moved = True
-        if grown[1] < max_grow and _strip_y(j0 - 1, i0, i1) >= thr_x:
-            y0 -= cell
-            grown[1] += cell
-            moved = True
-        if grown[3] < max_grow and _strip_y(j1 + 1, i0, i1) >= thr_x:
-            y1 += cell
-            grown[3] += cell
-            moved = True
-        if not moved:
-            break
-    return (x0, y0, x1, y1)
-
 
 def _cross_gap_split(v: np.ndarray, peak_frac: float = 0.25,
                      min_side: float = _MIN_DEVICE_DEPTH) -> float | None:
@@ -1389,18 +1295,15 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         pts_fit = _rot_xy(P[h_fit > 0.30], -yaw)
 
     # RENDER-CUT pool (trays removed): every "what the groundview
-    # shows" judgement -- the rect snap, the cluster recall net, the
-    # adjacency-merge probe -- runs on THIS pool, never on pts_fit.
-    # pts_fit (0.30 .. z_top + 0.10) carries the CABLE TRAYS: dense,
-    # gapless, spanning every aisle, so its occupancy grid is occupied
-    # EVERYWHERE -- a rect snap on it grows every rect the full
-    # max_grow in every direction and swallows whatever sits within
-    # 0.6m: closely spaced devices merged into one grounding, wall
-    # strips framed into the boxes of devices not even near the wall
-    # (user reports -- and the groundview, whose render cuts the
-    # trays, correctly showed the devices fully separate). The render
-    # cut clears the trays; devices and walls remain, and an
-    # inter-device gap is EMPTY cells the growth cannot cross.
+    # shows" judgement -- the cluster recall net, the adjacency-merge
+    # probe -- runs on THIS pool, never on pts_fit. pts_fit (0.30 ..
+    # z_top + 0.10) carries the CABLE TRAYS: dense, gapless, spanning
+    # every aisle, so its density evidence is occupied EVERYWHERE and
+    # a tray strip in a junction passes the merge probe's density
+    # ratio like a real seam (user report: the render cut hides the
+    # trays, the probe does not see them). The render cut clears the
+    # trays; devices and walls remain, and an inter-device gap is
+    # EMPTY cells the evidence cannot cite.
     pts_clu = pts_fit
     try:
         cc = _render_cut(
@@ -1436,23 +1339,16 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     fitted_rects = []                # row-frame footprints of FITTED boxes
 
     def _fit_ground_rect(rect_r) -> int:
-        """Snap + fit one row-frame rect; append its boxes. Returns the
-        number of boxes appended."""
+        """Fit one row-frame rect; append its boxes. Returns the number
+        of boxes appended. (The old rect-to-clump SNAP is retired: the
+        L/R tilt views supply the recall it existed to patch -- user
+        directive.)"""
         # the rect's own LOCAL floor (stepped rooms): the section's
         # slab height, looked up at the rect's world centre
         cw = _rot_xy(np.array([[(rect_r[0] + rect_r[2]) / 2.0,
                                 (rect_r[1] + rect_r[3]) / 2.0, 0.0]]),
                      yaw)[0]
-        # Snap the rect to its density clump (user insight: re-include
-        # the clump pixels the 2D grounding left outside) on the
-        # RENDER-CUT pool: on the fit pool the cable trays occupy every
-        # cell, the growth condition is always satisfied and the rect
-        # swallows whatever sits within max_grow -- closely spaced
-        # devices merged, wall strips framed in (user report). On the
-        # render-cut pool an inter-device gap is empty cells the
-        # growth cannot cross.
-        rect_s = _snap_rect_to_clump(pts_clu, rect_r)
-        bbs = _fit_region_boxes(pts_fit, rect_s,
+        bbs = _fit_region_boxes(pts_fit, rect_r,
                                 floor_z=float(fl(cw[0], cw[1])))
         # _fit_region_boxes (plural): a deep fit -- the VLM drew ONE
         # rect around two opposing rows -- splits at the aisle here,
