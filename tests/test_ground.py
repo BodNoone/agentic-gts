@@ -466,6 +466,48 @@ def test_ground_stage_with_patched_vlm():
           f"row2 {b2.size[0]:.2f}x{b2.size[1]:.2f})")
 
 
+def test_fit_region_box_edge_snap_recovers_short_rect():
+    """The rect is a HARD CLIP in the fit: a rect edge ending 0.1-0.3m
+    INSIDE the device excludes the device's own edge points before any
+    estimator runs (user report: stage_G boxes stop short of the point
+    cloud on one side). The EDGE SNAP walks each fitted side outward
+    through contiguous support in the FULL pool: the short +x end
+    recovers to the true row end; aisle haze (~1% of sheet density)
+    does not continue the walk; the facing row across the aisle is
+    never reached."""
+    from agentic_gts.agent.ground import _fit_region_box
+    rng = np.random.default_rng(23)
+    row = _row_points(0.0, 6.0, rng=rng)
+    facing = _row_points(0.0, 6.0, y=3.0, rng=rng)
+    haze = np.column_stack([rng.uniform(-0.3, 6.5, 400),
+                            rng.uniform(-1.0, 1.0, 400),
+                            rng.uniform(0.4, 2.0, 400)])
+    pts = np.vstack([row, facing, haze])
+    # rect ends 0.30m short of the row end (x1=5.7 < 6.0)
+    bb = _fit_region_box(pts, (-0.3, -0.8, 5.7, 0.8))
+    assert bb is not None, "short rect must still fit"
+    x_hi = bb.center[0] + bb.size[0] / 2.0
+    x_lo = bb.center[0] - bb.size[0] / 2.0
+    y_hi = bb.center[1] + bb.size[1] / 2.0
+    y_lo = bb.center[1] - bb.size[1] / 2.0
+    # the +x edge snapped out to the TRUE row end (~6.0), not the
+    # rect's 5.7
+    assert x_hi > 5.90, \
+        f"+x must snap to the true end 6.0, stopped at {x_hi:.2f}"
+    assert x_hi <= 6.10, f"+x overshot the row end: {x_hi:.2f}"
+    # the -x side: the fit's ~-0.23 is PRE-EXISTING haze creep inside
+    # the rect (the peel's generous low cuts accept a weak haze cluster
+    # -- same tolerance as test_fit_region_box_haze_immune); the snap
+    # must not extend it any FURTHER (no chasing haze outward)
+    assert x_lo > -0.35, f"-x wrongly extended to {x_lo:.2f}"
+    # thickness: haze outside the faces did not extend the y span,
+    # and the facing row (y 2.45..3.55) was never reached
+    assert -0.75 < y_lo < -0.35, f"y_lo {y_lo:.2f} (want ~-0.55)"
+    assert 0.35 < y_hi < 0.75, f"y_hi {y_hi:.2f} (want ~0.55, no haze)"
+    print(f"PASS edge snap recovers short rect "
+          f"(x_hi {x_hi:.2f} -> true end 6.0; haze did not extend y)")
+
+
 def test_fit_region_box_row_along_y():
     """A row running along the ROTATED-Y axis: the fit must ride the
     long side on the yaw axis (yaw = pi/2, size = (length, depth)). A
@@ -1535,6 +1577,7 @@ if __name__ == "__main__":
     test_fit_region_box_full_depth()
     test_fit_region_box_haze_immune()
     test_fit_region_box_starved_back_face()
+    test_fit_region_box_edge_snap_recovers_short_rect()
     test_floor_map_stepped()
     test_fit_region_box_stepped_floor()
     test_render_cut_mesh_mode()

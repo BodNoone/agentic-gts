@@ -657,6 +657,40 @@ def _region_axis_span(v: np.ndarray, cell: float = 0.05,
     return s_lo, s_hi
 
 
+_EDGE_SNAP_MAX = 0.40   # m, outward snap per fitted side
+_EDGE_SNAP_BIN = 3      # pts, absolute contiguous-support floor per bin
+_EDGE_SNAP_FRAC = 0.10  # of the structure's own peak bin (haze floor)
+
+
+def _snap_edge_out(vals: np.ndarray, edge: float, sign: float,
+                   min_pts: float, cell: float = 0.05) -> float:
+    """Extend one fitted span edge OUTWARD through contiguous support.
+
+    The grounded rect is a HARD CLIP in _fit_region_box: a rect edge
+    that ends 0.1-0.3m INSIDE the device excludes the device's own
+    edge points before any estimator runs (user report: fitted boxes
+    stop short of the point cloud on one side). Walk outward in 5cm
+    bins through the FULL fit pool: every bin must carry structure
+    (>= max(_EDGE_SNAP_BIN, _EDGE_SNAP_FRAC x the structure's own
+    peak bin) -- a face sheet's continuation passes easily, aisle
+    haze at ~1% of the sheet density does not), capped at
+    _EDGE_SNAP_MAX (< one cabinet width: a joined neighbour is never
+    swallowed whole; over-coverage is the local refine's job to
+    tighten, while under-coverage has no recovery path)."""
+    for b in range(int(_EDGE_SNAP_MAX / cell)):
+        if sign > 0:
+            lo, hi = edge + b * cell, edge + (b + 1) * cell
+            cnt = int(((vals > lo) & (vals <= hi)).sum())
+        else:
+            lo, hi = edge - (b + 1) * cell, edge - b * cell
+            cnt = int(((vals >= lo) & (vals < hi)).sum())
+        if cnt < min_pts:
+            break
+    else:
+        return edge + sign * _EDGE_SNAP_MAX
+    return edge + sign * (b * cell)
+
+
 def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
                     floor_z: float = 0.0, mesh_mode: bool = False,
                     seed_top: float | None = None):
@@ -754,6 +788,35 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
     else:                            # too sparse to bin: percentile fit
         x_lo, y_lo = np.percentile(dev[:, :2], 0.5, axis=0)
         x_hi, y_hi = np.percentile(dev[:, :2], 99.5, axis=0)
+    # EDGE SNAP (user report: fitted boxes stop a little short of the
+    # device cloud on one side): the rect is a hard clip, so a rect
+    # edge ending 0.1-0.3m inside the device can never recover its
+    # own edge from the clipped points. Walk each fitted side outward
+    # through CONTIGUOUS support in the full fit pool (windowed on the
+    # fitted other-axis span so a distant structure at the same
+    # coordinate cannot continue the run), capped at 0.40m. Bin floor
+    # is RELATIVE to the structure's own peak bin -- aisle haze at
+    # ~1% of the sheet density must not continue the walk. Thickness
+    # (y) snaps first; the x windows then use the snapped y range.
+    def _axis_peak(v: np.ndarray, lo: float, hi: float) -> float:
+        nb = int((hi - lo) / 0.05) + 2
+        hist, _ = np.histogram(v, bins=lo + 0.05 * np.arange(nb + 1))
+        return float(hist.max()) if len(hist) else 0.0
+
+    mrg = _EDGE_SNAP_MAX + 0.05
+    near = points[((points[:, 0] >= x0 - mrg) & (points[:, 0] <= x1 + mrg) &
+                   (points[:, 1] >= y0 - mrg) & (points[:, 1] <= y1 + mrg))]
+    if len(near):
+        px = max(_EDGE_SNAP_BIN,
+                 _EDGE_SNAP_FRAC * _axis_peak(core[:, 0], x_lo, x_hi))
+        py = max(_EDGE_SNAP_BIN,
+                 _EDGE_SNAP_FRAC * _axis_peak(core[:, 1], y_lo, y_hi))
+        wy = near[(near[:, 0] >= x_lo) & (near[:, 0] <= x_hi)]
+        y_lo = _snap_edge_out(wy[:, 1], y_lo, -1.0, py)
+        y_hi = _snap_edge_out(wy[:, 1], y_hi, +1.0, py)
+        wx = near[(near[:, 1] >= y_lo) & (near[:, 1] <= y_hi)]
+        x_lo = _snap_edge_out(wx[:, 0], x_lo, -1.0, px)
+        x_hi = _snap_edge_out(wx[:, 0], x_hi, +1.0, px)
     dx, dy = float(x_hi - x_lo), float(y_hi - y_lo)
     if dx < 0.30 or dy < 0.20:
         _reject(f"sliver (span {dx:.2f} x {dy:.2f}m; "
