@@ -41,6 +41,14 @@ _QUALITY_RE = re.compile(
 # extents, so the camera tilt adds no measurement error.
 _SIDE_OBLIQUE_DEG = 15.0
 
+# Radius of the ladder-occluder exclusion volume in the side-view retry
+# (user report: the 0.15m cut also shaved the cabinet's own surface near
+# a flush ladder). The ladder's own splats sit within a few cm of its
+# back-projected surface, so a tighter radius still removes the occluder
+# while sparing the device behind it. Tune here -- too small leaves
+# ladder residue and the re-grounding sees only the ladder again.
+_LADDER_CUT_R = 0.10
+
 
 def reply_view_quality(text: str) -> str:
     """Parse the VLM's per-view quality verdict ('good' | 'poor').
@@ -1823,8 +1831,8 @@ def _side_ladder_retry(scene: Scene, box: OrientedBox, side: dict,
     LOCATION: the subtractive masks back-project (z-BUFFERED -- the
     nearest surface per pixel, which the ladder occludes, so this is
     the ladder itself, never the device behind it through the rung
-    gaps) to 3D, every gaussian within 0.15m of that surface is cut
-    from the render pool, the SAME camera re-renders, and the VLM is
+    gaps) to 3D, every gaussian within _LADDER_CUT_R of that surface is
+    cut from the render pool, the SAME camera re-renders, and the VLM is
     asked again on the cut render. One extra render + one extra VLM
     call, ONLY on the failing path.
 
@@ -1873,7 +1881,7 @@ def _side_ladder_retry(scene: Scene, box: OrientedBox, side: dict,
             return None
         idx = np.where(keep)[0]
         d, _ = cKDTree(lp[:, :3]).query(means[idx], k=1)
-        near = idx[d <= 0.15]
+        near = idx[d <= _LADDER_CUT_R]
         if not len(near):
             return None
         keep2 = keep.copy()
