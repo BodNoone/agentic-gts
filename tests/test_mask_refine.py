@@ -1894,11 +1894,13 @@ def test_adjudicate_side_pick_parses_letter():
 def test_side_view_vlm_arbitration_overrides_rule():
     """SIDE view candidate arbitration (user direction: the placement
     rules keep misjudging which end is clear -- let the VLM look at
-    the renders). Candidate order: A = rule free end, B/C = +/-15 deg
-    oblique variants (peek past an occluding cable ladder), D = the
-    opposite end. All render clean here; the fake VLM replies 'D', so
-    the chosen side camera must stand at the opposite end from the
-    rule pick. Without a judge the rule pick stands."""
+    the renders; the straight perpendicular profile is RETIRED -- it
+    is the view a long cable ladder or clutter blocks). Candidate
+    order: A/B = +/-15 deg oblique at the rule free end, C/D = +/-15
+    deg oblique at the opposite end. All render clean here; the fake
+    VLM replies 'D', so the chosen side camera must stand at the
+    opposite end from the rule pick. Without a judge the rule order
+    stands."""
     from agentic_gts.agent import mask_refine as mr
     from agentic_gts.agent.judge import VLMJudge
     from agentic_gts.agent.mask_refine import (_free_row_end, _front_azim,

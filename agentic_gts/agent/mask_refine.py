@@ -609,13 +609,14 @@ def render_local_views(scene: Scene, box: OrientedBox,
         a big low-opacity floater).
 
     SIDE view (user direction: rules keep misjudging which end is
-    clear, fog persists -- let the VLM look): several CANDIDATE
-    placements are rendered (the rule-picked free end, two slightly
-    OBLIQUE variants of it that peek past an occluding ladder, the
-    opposite end), each passes the cheap gradient-energy gate, and the
-    survivors are composited into one labeled A/B/C... panel image
-    for ONE tiny VLM call that picks the clearest. No judge / call
-    failure / one survivor -> rule order.
+    clear, fog persists -- let the VLM look): several OBLIQUE
+    candidates are rendered (+/- 15 deg at the rule-picked free end,
+    +/- 15 deg at the opposite end -- the straight perpendicular
+    profile is retired: it is the view a long cable ladder or clutter
+    beside the device blocks), each passes the cheap gradient-energy
+    gate, and the survivors are composited into one labeled A/B/C...
+    panel image for ONE tiny VLM call that picks the clearest. No
+    judge / call failure / one survivor -> rule order.
     """
     gs_ply = scene.meta.get("gs_ply")
     if not gs_ply:
@@ -760,21 +761,20 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # a small candidate set instead and let the EVIDENCE decide: the
     # cheap gradient gate kills any candidate that rendered a veil,
     # then one tiny VLM call picks the clearest survivor.
-    # OBLIQUE variants (user report: a long cable ladder standing
-    # beside a low device completely occluded the straight profile --
-    # the VLM saw only ladder): +/- 15 deg off the free-end azimuth
-    # peeks past the occluder while staying a profile view. Safe for
-    # the thickness read: it comes from the 3D back-projected points'
-    # cross-axis span, not from pixel extents, so the obliquity cannot
-    # bias it. They replace the old nearer-standoff candidate (the
-    # oblique lateral displacement likewise exits local floaters).
-    side_cands = [(azim_side, standoff_side),
-                  (azim_side + _SIDE_OBLIQUE_DEG, standoff_side),
-                  (azim_side - _SIDE_OBLIQUE_DEG, standoff_side)]
+    # ALL candidates are OBLIQUE (user direction: the STRAIGHT profile,
+    # exactly perpendicular to the row, is precisely the view a long
+    # cable ladder or clutter beside the device blocks, so it is
+    # retired): each end contributes a +/- 15 deg variant that peeks
+    # past the occluder. Safe for the thickness read: it comes from
+    # the 3D back-projected points' cross-axis span, not from pixel
+    # extents, so the obliquity cannot bias it.
     alt_azim = (azim_front + 90.0
                 if abs(azim_side - (azim_front - 90.0)) < 1e-6
                 else azim_front - 90.0)
-    side_cands.append((alt_azim, standoff_side))
+    side_cands = [(azim_side + _SIDE_OBLIQUE_DEG, standoff_side),
+                  (azim_side - _SIDE_OBLIQUE_DEG, standoff_side),
+                  (alt_azim + _SIDE_OBLIQUE_DEG, standoff_side),
+                  (alt_azim - _SIDE_OBLIQUE_DEG, standoff_side)]
     survivors = []
     for ci, (sa, ss) in enumerate(side_cands):
         raw, prompt_img, cam = _render_one(18.0, sa, ss)
