@@ -770,6 +770,69 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
     else:                            # too sparse to bin: percentile fit
         x_lo, y_lo = np.percentile(dev[:, :2], 0.5, axis=0)
         x_hi, y_hi = np.percentile(dev[:, :2], 99.5, axis=0)
+    # USER DIRECTIVE (every edge must HUG the device): the peel
+    # estimator's connect cut (20% of the pass peak) stops its walk
+    # at STARVED end bins -- 3DGS renders a row's end caps / side
+    # sheets far sparser than its front faces, so the fitted edge
+    # lands INSIDE the true device end even though the relaxed
+    # window already holds its points. Inside the window the relaxed
+    # rect itself is the guard (a near device / wall beyond it is
+    # unreachable -- the failure mode of the earlier outward walk),
+    # so each edge extends to the nearest CONTIGUOUS support. The
+    # bin floor is RELATIVE to the axis's own peak (2%): the faces
+    # concentrate on the thickness axis (huge peak -> haze at ~1%
+    # never passes) while the along-row axis spreads its peak (a
+    # 2-3 pt starved sheet clears the low bar) -- a single absolute
+    # floor cannot separate the two (test failures: haze inflated
+    # the thickness to the window edge). Bounded by the relaxed rect
+    # on each side; over-coverage inside the window is the local
+    # refine's job to tighten.
+    def _axis_peak_bin(vals: np.ndarray, lo: float, hi: float) -> float:
+        nb = max(1, int((hi - lo) / 0.05) + 2)
+        hist, _ = np.histogram(vals, bins=lo + 0.05 * np.arange(nb + 1))
+        return float(hist.max()) if len(hist) else 0.0
+
+    def _snug(vals: np.ndarray, edge: float, sign: float,
+              cap: float, floor: float) -> float:
+        if mesh_mode or cap <= 0.05:
+            return edge
+        cell = 0.05
+        nb = int(cap / cell)
+        b = 0
+        while b < nb:                 # skip leading void bins
+            if sign > 0:
+                lo, hi = edge + b * cell, edge + (b + 1) * cell
+                cnt = int(((vals > lo) & (vals <= hi)).sum())
+            else:
+                lo, hi = edge - (b + 1) * cell, edge - b * cell
+                cnt = int(((vals >= lo) & (vals < hi)).sum())
+            if cnt >= floor:
+                break
+            b += 1
+        if b >= nb:
+            return edge
+        ext = (b + 1) * cell          # walk through the contiguous run
+        while ext < nb * cell:
+            k = int(ext / cell)
+            if sign > 0:
+                lo, hi = edge + k * cell, edge + (k + 1) * cell
+                cnt = int(((vals > lo) & (vals <= hi)).sum())
+            else:
+                lo, hi = edge - (k + 1) * cell, edge - k * cell
+                cnt = int(((vals >= lo) & (vals < hi)).sum())
+            if cnt < floor:
+                break
+            ext = (k + 1) * cell
+        return edge + sign * ext
+
+    y_win = core[(core[:, 1] >= y_lo) & (core[:, 1] <= y_hi)]
+    fx = max(2.0, 0.02 * _axis_peak_bin(y_win[:, 0], x_lo, x_hi))
+    x_lo = _snug(y_win[:, 0], x_lo, -1.0, x_lo - (x0 - _RECT_RELAX), fx)
+    x_hi = _snug(y_win[:, 0], x_hi, +1.0, (x1 + _RECT_RELAX) - x_hi, fx)
+    x_win = core[(core[:, 0] >= x_lo) & (core[:, 0] <= x_hi)]
+    fy = max(2.0, 0.02 * _axis_peak_bin(x_win[:, 1], y_lo, y_hi))
+    y_lo = _snug(x_win[:, 1], y_lo, -1.0, y_lo - (y0 - _RECT_RELAX), fy)
+    y_hi = _snug(x_win[:, 1], y_hi, +1.0, (y1 + _RECT_RELAX) - y_hi, fy)
     # (edge recovery lives in the relaxed clip above: the 10cm window
     # IS the search envelope for each edge's snug line)
     dx, dy = float(x_hi - x_lo), float(y_hi - y_lo)

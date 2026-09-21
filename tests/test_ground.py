@@ -509,6 +509,50 @@ def test_fit_region_box_rect_relax_recovers_short_edge():
           f"(x_hi {x_hi:.2f} within [5.7, 5.8]; haze/facing row trimmed)")
 
 
+def test_fit_region_box_snug_edge_starved_end():
+    """The peel estimator's keep_thr max(6% peak, 3) rejects STARVED
+    end bins -- 3DGS renders a row's end caps / side sheets far
+    sparser than its front faces, so the fitted edge stops INSIDE
+    the true device end even though the relaxed window holds its
+    points (user report: some edges never found the device line).
+    The snug walk extends each edge to the nearest CONTIGUOUS support
+    at a 2-pt floor inside the window: a 3-pt-per-bin side sheet
+    recovers to the true end 6.0; a single haze stray in the window
+    does not extend the edge (floor 2)."""
+    from agentic_gts.agent.ground import _fit_region_box
+    rng = np.random.default_rng(31)
+    row = _row_points(0.0, 5.4, rng=rng)          # dense body
+    # starved side sheet 5.4..6.0: exactly 3 pts per 5cm bin (below
+    # peel's keep_thr, above the snug floor)
+    sheet = []
+    for b in range(12):
+        xc = 5.4 + 0.05 * b + 0.025
+        for zc in (1.0, 1.2, 1.4):
+            sheet.append([xc, rng.uniform(-0.3, 0.3), zc])
+    sheet = np.asarray(sheet)
+    # single haze stray inside the relaxed window (rect x1=6.05 ->
+    # window to 6.15): floor 2 must reject it
+    stray = np.array([[6.10, 0.1, 1.2]])
+    pts = np.vstack([row, sheet, stray])
+    bb = _fit_region_box(pts, (-0.3, -0.8, 6.05, 0.8))
+    assert bb is not None, "row with starved end must still fit"
+    x_hi = bb.center[0] + bb.size[0] / 2.0
+    # the sheet's contiguous 3-pt run carries the edge to the true
+    # end ~6.0 (NOT the stray's 6.10, NOT peel's 5.4)
+    assert x_hi > 5.93, \
+        f"+x must hug the starved sheet end (~6.0), stopped at {x_hi:.2f}"
+    assert x_hi <= 6.05, \
+        f"+x must not run past the sheet onto the stray: {x_hi:.2f}"
+    # and WITHOUT the sheet (dense body only) the same rect's edge
+    # stays at the body end: the walk never chases the stray alone
+    bb2 = _fit_region_box(row, (-0.3, -0.8, 6.05, 0.8))
+    x_hi2 = bb2.center[0] + bb2.size[0] / 2.0
+    assert x_hi2 <= 5.55, \
+        f"no sheet -> edge must stay at the body end, ran to {x_hi2:.2f}"
+    print(f"PASS snug edge hugs starved sheet end "
+          f"(x_hi {x_hi:.2f}; stray rejected; bare body {x_hi2:.2f})")
+
+
 def test_fit_region_box_row_along_y():
     """A row running along the ROTATED-Y axis: the fit must ride the
     long side on the yaw axis (yaw = pi/2, size = (length, depth)). A
@@ -1579,6 +1623,7 @@ if __name__ == "__main__":
     test_fit_region_box_haze_immune()
     test_fit_region_box_starved_back_face()
     test_fit_region_box_rect_relax_recovers_short_edge()
+    test_fit_region_box_snug_edge_starved_end()
     test_floor_map_stepped()
     test_fit_region_box_stepped_floor()
     test_render_cut_mesh_mode()
