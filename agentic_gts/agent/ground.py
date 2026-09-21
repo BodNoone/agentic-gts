@@ -657,7 +657,7 @@ def _region_axis_span(v: np.ndarray, cell: float = 0.05,
     return s_lo, s_hi
 
 
-_EDGE_SNAP_MAX = 0.40   # m, outward snap per fitted side
+_EDGE_SNAP_MAX = 0.25   # m, hard cap on the outward snap per side
 _EDGE_SNAP_BIN = 3      # pts, absolute contiguous-support floor per bin
 _EDGE_SNAP_FRAC = 0.10  # of the structure's own peak bin (haze floor)
 
@@ -674,9 +674,13 @@ def _snap_edge_out(vals: np.ndarray, edge: float, sign: float,
     (>= max(_EDGE_SNAP_BIN, _EDGE_SNAP_FRAC x the structure's own
     peak bin) -- a face sheet's continuation passes easily, aisle
     haze at ~1% of the sheet density does not), capped at
-    _EDGE_SNAP_MAX (< one cabinet width: a joined neighbour is never
-    swallowed whole; over-coverage is the local refine's job to
-    tighten, while under-coverage has no recovery path)."""
+    _EDGE_SNAP_MAX. The cap was 0.40m first and the user rejected it:
+    a NEARBY device or wall only ~0.2m past the fit -- close enough
+    that the between-gap bins still catch support -- got pasted
+    onto the edge. 0.25m keeps the recovery of a typical 0.1-0.3m
+    rect shortfall while bounding that overreach (over-coverage is
+    the local refine's job to tighten; under-coverage has no
+    recovery path)."""
     for b in range(int(_EDGE_SNAP_MAX / cell)):
         if sign > 0:
             lo, hi = edge + b * cell, edge + (b + 1) * cell
@@ -794,10 +798,12 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
     # own edge from the clipped points. Walk each fitted side outward
     # through CONTIGUOUS support in the full fit pool (windowed on the
     # fitted other-axis span so a distant structure at the same
-    # coordinate cannot continue the run), capped at 0.40m. Bin floor
-    # is RELATIVE to the structure's own peak bin -- aisle haze at
-    # ~1% of the sheet density must not continue the walk. Thickness
-    # (y) snaps first; the x windows then use the snapped y range.
+    # coordinate cannot continue the run), capped at 0.25m -- a NEAR
+    # device/wall ~0.2m past the fit must not be pasted on (user
+    # report on the original 0.40m cap). Bin floor is RELATIVE to
+    # the structure's own peak bin -- aisle haze at ~1% of the sheet
+    # density must not continue the walk. Thickness (y) snaps first;
+    # the x windows then use the snapped y range.
     def _axis_peak(v: np.ndarray, lo: float, hi: float) -> float:
         nb = int((hi - lo) / 0.05) + 2
         hist, _ = np.histogram(v, bins=lo + 0.05 * np.arange(nb + 1))

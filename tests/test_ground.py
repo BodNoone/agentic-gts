@@ -483,18 +483,19 @@ def test_fit_region_box_edge_snap_recovers_short_rect():
                             rng.uniform(-1.0, 1.0, 400),
                             rng.uniform(0.4, 2.0, 400)])
     pts = np.vstack([row, facing, haze])
-    # rect ends 0.30m short of the row end (x1=5.7 < 6.0)
+    # rect ends 0.30m short of the row end (x1=5.7 < 6.0); the 0.25m
+    # cap recovers to ~5.95 (user: 0.40m walked onto near devices/walls)
     bb = _fit_region_box(pts, (-0.3, -0.8, 5.7, 0.8))
     assert bb is not None, "short rect must still fit"
     x_hi = bb.center[0] + bb.size[0] / 2.0
     x_lo = bb.center[0] - bb.size[0] / 2.0
     y_hi = bb.center[1] + bb.size[1] / 2.0
     y_lo = bb.center[1] - bb.size[1] / 2.0
-    # the +x edge snapped out to the TRUE row end (~6.0), not the
-    # rect's 5.7
-    assert x_hi > 5.90, \
-        f"+x must snap to the true end 6.0, stopped at {x_hi:.2f}"
-    assert x_hi <= 6.10, f"+x overshot the row end: {x_hi:.2f}"
+    # the +x edge snapped out by the capped walk (~5.95), well past
+    # the rect's 5.7 but never past the true end
+    assert x_hi > 5.85, \
+        f"+x must snap past 5.85 toward the true end, stopped at {x_hi:.2f}"
+    assert x_hi <= 6.00, f"+x overshot the row end: {x_hi:.2f}"
     # the -x side: the fit's ~-0.23 is PRE-EXISTING haze creep inside
     # the rect (the peel's generous low cuts accept a weak haze cluster
     # -- same tolerance as test_fit_region_box_haze_immune); the snap
