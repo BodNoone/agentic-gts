@@ -493,14 +493,25 @@ def _draw_raw_regions(img: np.ndarray, raw_rects: list) -> np.ndarray:
     return np.asarray(pil, dtype=np.float32) / 255.0
 
 
-def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
+def _draw_result_boxes(img: np.ndarray, cam, boxes,
+                       z_draw: float | None = None) -> np.ndarray:
     """Solid outlines for the grounded result boxes, COLOR-CODED by
     provenance (result-only audit: the VLM answered on the clean base,
     the fit is shown apart). Red = nadir-grounded; ORANGE = tilt-view
     fit; CYAN = cluster recall net. When a result box looks wrong, the
     color says WHICH stage produced it -- a merged box that is orange
     is tilt-perspective inflation, cyan is the recall net's cluster
-    spanning devices, red is the nadir fit itself (user debugging)."""
+    spanning devices, red is the nadir fit itself (user debugging).
+
+    z_draw: draw every wireframe at ONE height -- the top of the
+    rendered device band (the cut the groundview itself shows). The
+    old default (each box's own TOP, z_top) was a PERSPECTIVE TRAP
+    (user report: red boxes read as the relaxed rect, "the fit never
+    ran"): the groundview cloud is cut at 0.50 (mesh) / 0.70 (GS) of
+    z_top, and a wireframe drawn at z_top projects radially outward
+    (f/(H-z)) well past the visible cloud surface the eye compares
+    against -- the larger and the more off-camera-axis the box, the
+    wider the gap."""
     from PIL import Image, ImageDraw
     u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3].copy()
     pil = Image.fromarray(u8)
@@ -508,7 +519,8 @@ def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
     colors = {"nadir": (255, 60, 60), "tilt": (255, 170, 40),
               "cluster": (40, 200, 230)}
     for b in boxes:
-        z = b.center[2] + b.size[2] / 2.0
+        z = (b.center[2] + b.size[2] / 2.0 if z_draw is None
+             else float(z_draw))
         cs = b.corners_2d()
         uv = cam.project_cv(np.column_stack([cs, np.full(len(cs), z)]))
         pts = [(int(round(p[0])), int(round(p[1]))) for p in uv]
@@ -520,7 +532,8 @@ def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
 
 
 def _save_grounded_png(base_img, cam, boxes, raw_rects, out_dir,
-                       fname: str = "grounded.png") -> None:
+                       fname: str = "grounded.png",
+                       z_draw: float | None = None) -> None:
     """The grounding audit image, drawn the way the official 2d_grounding
     cookbook plots its answers.
 
@@ -538,7 +551,7 @@ def _save_grounded_png(base_img, cam, boxes, raw_rects, out_dir,
     try:
         from agentic_gts.output.gs_render import png_bytes
         img = _draw_result_boxes(_draw_raw_regions(base_img, raw_rects),
-                                 cam, boxes)
+                                 cam, boxes, z_draw=z_draw)
         path = os.path.join(out_dir, fname)
         with open(path, "wb") as f:
             f.write(png_bytes(img))
@@ -1529,6 +1542,14 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         bbs = _fit_region_boxes(pts_fit, rect_r,
                                 floor_z=float(fl(cw[0], cw[1])),
                                 mesh_mode=is_mesh, seed_top=fit_top)
+        # fit audit (user question "did the fit even run?"): rect the
+        # VLM drew vs the fitted span over its points, per side
+        for bb in bbs:
+            cs = np.asarray(bb.corners_2d())
+            print(f"[ground] fit[{source}] rect x[{rect_r[0]:.2f},"
+                  f"{rect_r[2]:.2f}] y[{rect_r[1]:.2f},{rect_r[3]:.2f}]"
+                  f" -> box x[{cs[:, 0].min():.2f},{cs[:, 0].max():.2f}]"
+                  f" y[{cs[:, 1].min():.2f},{cs[:, 1].max():.2f}]")
         # _fit_region_boxes (plural): a deep fit -- the VLM drew ONE
         # rect around two opposing rows -- splits at the aisle here,
         # before the box enters the pipeline (stageC can only split
@@ -1767,6 +1788,17 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # same camera. Tiled views draw ALL boxes (cross-tile ones project
     # outside the frame), so each tile's audit stays self-contained.
     if out_dir:
+        # draw the red wireframes at the TOP OF THE RENDERED BAND --
+        # the height the groundview cloud actually shows (mesh 0.50 /
+        # GS 0.70 of z_top via _render_cut). At each box's own z_top
+        # the wireframe projects radially OUTWARD past the cut cloud
+        # and reads as the relaxed rect (user report: "the fit never
+        # ran" -- it ran, the audit drew it at the wrong height).
+        try:
+            cc = _render_cut(fit_top, mesh_mode=is_mesh)
+        except Exception:
+            cc = float("nan")
+        z_draw = float(cc) if np.isfinite(cc) else None
         for idx, (img_v, cam_v, _, _, fname_v, rects_v) in enumerate(views):
             # non-tiled: views[0] (the NADIR view) owns grounded.png --
             # the before/after audit must compare the colored rects and
@@ -1777,5 +1809,6 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
             fname_out = ("grounded.png" if (tiles is None and idx == 0)
                          else fname_v.replace("groundview", "grounded"))
             _save_grounded_png(
-                img_v, cam_v, boxes, rects_v, out_dir, fname=fname_out)
+                img_v, cam_v, boxes, rects_v, out_dir, fname=fname_out,
+                z_draw=z_draw)
     return True
