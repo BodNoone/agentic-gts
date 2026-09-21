@@ -657,42 +657,7 @@ def _region_axis_span(v: np.ndarray, cell: float = 0.05,
     return s_lo, s_hi
 
 
-_EDGE_SNAP_MAX = 0.25   # m, hard cap on the outward snap per side
-_EDGE_SNAP_BIN = 3      # pts, absolute contiguous-support floor per bin
-_EDGE_SNAP_FRAC = 0.10  # of the structure's own peak bin (haze floor)
-
-
-def _snap_edge_out(vals: np.ndarray, edge: float, sign: float,
-                   min_pts: float, cell: float = 0.05) -> float:
-    """Extend one fitted span edge OUTWARD through contiguous support.
-
-    The grounded rect is a HARD CLIP in _fit_region_box: a rect edge
-    that ends 0.1-0.3m INSIDE the device excludes the device's own
-    edge points before any estimator runs (user report: fitted boxes
-    stop short of the point cloud on one side). Walk outward in 5cm
-    bins through the FULL fit pool: every bin must carry structure
-    (>= max(_EDGE_SNAP_BIN, _EDGE_SNAP_FRAC x the structure's own
-    peak bin) -- a face sheet's continuation passes easily, aisle
-    haze at ~1% of the sheet density does not), capped at
-    _EDGE_SNAP_MAX. The cap was 0.40m first and the user rejected it:
-    a NEARBY device or wall only ~0.2m past the fit -- close enough
-    that the between-gap bins still catch support -- got pasted
-    onto the edge. 0.25m keeps the recovery of a typical 0.1-0.3m
-    rect shortfall while bounding that overreach (over-coverage is
-    the local refine's job to tighten; under-coverage has no
-    recovery path)."""
-    for b in range(int(_EDGE_SNAP_MAX / cell)):
-        if sign > 0:
-            lo, hi = edge + b * cell, edge + (b + 1) * cell
-            cnt = int(((vals > lo) & (vals <= hi)).sum())
-        else:
-            lo, hi = edge - (b + 1) * cell, edge - b * cell
-            cnt = int(((vals >= lo) & (vals < hi)).sum())
-        if cnt < min_pts:
-            break
-    else:
-        return edge + sign * _EDGE_SNAP_MAX
-    return edge + sign * (b * cell)
+_RECT_RELAX = 0.10    # m, the rect relaxes by this before the clip
 
 
 def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
@@ -731,8 +696,21 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
               f"n_pts={len(pts)} n_dev={n_dev}")
 
     x0, y0, x1, y1 = rect
-    m = ((points[:, 0] >= x0) & (points[:, 0] <= x1) &
-         (points[:, 1] >= y0) & (points[:, 1] <= y1))
+    # USER DESIGN: relax the rect by 10cm before the clip. The rect
+    # is otherwise a HARD CLIP and an edge drawn 0.1-0.3m inside the
+    # device can never recover its own points (user report: stage_G
+    # boxes stop short of the cloud on one side). On the relaxed pool
+    # the projected 2D span estimators below find each edge's nearest
+    # snug line: a short edge extends -- bounded to +10cm, so a near
+    # device or wall past that is never pasted on (user rejection of
+    # the earlier 0.40m/0.25m caps) -- while an inflated edge still
+    # trims (peel / clean extent). The height crop is the existing
+    # one (the caller's device band); the projection is the XY
+    # histogram the estimators already run on.
+    m = ((points[:, 0] >= x0 - _RECT_RELAX) &
+         (points[:, 0] <= x1 + _RECT_RELAX) &
+         (points[:, 1] >= y0 - _RECT_RELAX) &
+         (points[:, 1] <= y1 + _RECT_RELAX))
     pts = points[m]
     if len(pts) < min_pts:
         _reject(f"no point support (<{min_pts})")
@@ -792,37 +770,8 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
     else:                            # too sparse to bin: percentile fit
         x_lo, y_lo = np.percentile(dev[:, :2], 0.5, axis=0)
         x_hi, y_hi = np.percentile(dev[:, :2], 99.5, axis=0)
-    # EDGE SNAP (user report: fitted boxes stop a little short of the
-    # device cloud on one side): the rect is a hard clip, so a rect
-    # edge ending 0.1-0.3m inside the device can never recover its
-    # own edge from the clipped points. Walk each fitted side outward
-    # through CONTIGUOUS support in the full fit pool (windowed on the
-    # fitted other-axis span so a distant structure at the same
-    # coordinate cannot continue the run), capped at 0.25m -- a NEAR
-    # device/wall ~0.2m past the fit must not be pasted on (user
-    # report on the original 0.40m cap). Bin floor is RELATIVE to
-    # the structure's own peak bin -- aisle haze at ~1% of the sheet
-    # density must not continue the walk. Thickness (y) snaps first;
-    # the x windows then use the snapped y range.
-    def _axis_peak(v: np.ndarray, lo: float, hi: float) -> float:
-        nb = int((hi - lo) / 0.05) + 2
-        hist, _ = np.histogram(v, bins=lo + 0.05 * np.arange(nb + 1))
-        return float(hist.max()) if len(hist) else 0.0
-
-    mrg = _EDGE_SNAP_MAX + 0.05
-    near = points[((points[:, 0] >= x0 - mrg) & (points[:, 0] <= x1 + mrg) &
-                   (points[:, 1] >= y0 - mrg) & (points[:, 1] <= y1 + mrg))]
-    if len(near):
-        px = max(_EDGE_SNAP_BIN,
-                 _EDGE_SNAP_FRAC * _axis_peak(core[:, 0], x_lo, x_hi))
-        py = max(_EDGE_SNAP_BIN,
-                 _EDGE_SNAP_FRAC * _axis_peak(core[:, 1], y_lo, y_hi))
-        wy = near[(near[:, 0] >= x_lo) & (near[:, 0] <= x_hi)]
-        y_lo = _snap_edge_out(wy[:, 1], y_lo, -1.0, py)
-        y_hi = _snap_edge_out(wy[:, 1], y_hi, +1.0, py)
-        wx = near[(near[:, 1] >= y_lo) & (near[:, 1] <= y_hi)]
-        x_lo = _snap_edge_out(wx[:, 0], x_lo, -1.0, px)
-        x_hi = _snap_edge_out(wx[:, 0], x_hi, +1.0, px)
+    # (edge recovery lives in the relaxed clip above: the 10cm window
+    # IS the search envelope for each edge's snug line)
     dx, dy = float(x_hi - x_lo), float(y_hi - y_lo)
     if dx < 0.30 or dy < 0.20:
         _reject(f"sliver (span {dx:.2f} x {dy:.2f}m; "

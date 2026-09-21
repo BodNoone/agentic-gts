@@ -466,15 +466,16 @@ def test_ground_stage_with_patched_vlm():
           f"row2 {b2.size[0]:.2f}x{b2.size[1]:.2f})")
 
 
-def test_fit_region_box_edge_snap_recovers_short_rect():
-    """The rect is a HARD CLIP in the fit: a rect edge ending 0.1-0.3m
-    INSIDE the device excludes the device's own edge points before any
-    estimator runs (user report: stage_G boxes stop short of the point
-    cloud on one side). The EDGE SNAP walks each fitted side outward
-    through contiguous support in the FULL pool: the short +x end
-    recovers to the true row end; aisle haze (~1% of sheet density)
-    does not continue the walk; the facing row across the aisle is
-    never reached."""
+def test_fit_region_box_rect_relax_recovers_short_edge():
+    """USER DESIGN: the rect relaxes by 10cm before the clip -- the
+    rect is otherwise a HARD CLIP and an edge drawn 0.1-0.3m inside
+    the device can never recover its own points (user report: stage_G
+    boxes stop short of the cloud on one side). On the relaxed pool
+    the span estimators find each edge's nearest snug line: the short
+    +x end recovers up to rect+10cm (~5.8; the rest is the local
+    refine's job); haze and the facing row across the aisle are
+    trimmed as before; a neighbour beyond the 10cm window is never
+    reached (user rejection of the earlier 0.40/0.25m caps)."""
     from agentic_gts.agent.ground import _fit_region_box
     rng = np.random.default_rng(23)
     row = _row_points(0.0, 6.0, rng=rng)
@@ -483,30 +484,29 @@ def test_fit_region_box_edge_snap_recovers_short_rect():
                             rng.uniform(-1.0, 1.0, 400),
                             rng.uniform(0.4, 2.0, 400)])
     pts = np.vstack([row, facing, haze])
-    # rect ends 0.30m short of the row end (x1=5.7 < 6.0); the 0.25m
-    # cap recovers to ~5.95 (user: 0.40m walked onto near devices/walls)
+    # rect ends 0.30m short of the row end (x1=5.7 < 6.0); the 10cm
+    # relaxation recovers to ~5.8
     bb = _fit_region_box(pts, (-0.3, -0.8, 5.7, 0.8))
     assert bb is not None, "short rect must still fit"
     x_hi = bb.center[0] + bb.size[0] / 2.0
     x_lo = bb.center[0] - bb.size[0] / 2.0
     y_hi = bb.center[1] + bb.size[1] / 2.0
     y_lo = bb.center[1] - bb.size[1] / 2.0
-    # the +x edge snapped out by the capped walk (~5.95), well past
-    # the rect's 5.7 but never past the true end
-    assert x_hi > 5.85, \
-        f"+x must snap past 5.85 toward the true end, stopped at {x_hi:.2f}"
-    assert x_hi <= 6.00, f"+x overshot the row end: {x_hi:.2f}"
-    # the -x side: the fit's ~-0.23 is PRE-EXISTING haze creep inside
-    # the rect (the peel's generous low cuts accept a weak haze cluster
-    # -- same tolerance as test_fit_region_box_haze_immune); the snap
-    # must not extend it any FURTHER (no chasing haze outward)
-    assert x_lo > -0.35, f"-x wrongly extended to {x_lo:.2f}"
+    # the +x edge recovered past the rect's 5.7 toward the row end,
+    # bounded by the +10cm window
+    assert x_hi > 5.72, \
+        f"+x must recover past the rect edge 5.7, stopped at {x_hi:.2f}"
+    assert x_hi <= 5.82, \
+        f"+x must stay within the 10cm window (<=5.8): {x_hi:.2f}"
+    # the -x side stays bounded by the relaxed rect (-0.4); haze must
+    # not run to the window edge unchecked
+    assert x_lo > -0.45, f"-x ran to the window edge: {x_lo:.2f}"
     # thickness: haze outside the faces did not extend the y span,
     # and the facing row (y 2.45..3.55) was never reached
     assert -0.75 < y_lo < -0.35, f"y_lo {y_lo:.2f} (want ~-0.55)"
     assert 0.35 < y_hi < 0.75, f"y_hi {y_hi:.2f} (want ~0.55, no haze)"
-    print(f"PASS edge snap recovers short rect "
-          f"(x_hi {x_hi:.2f} -> true end 6.0; haze did not extend y)")
+    print(f"PASS rect relaxation recovers short edge "
+          f"(x_hi {x_hi:.2f} within [5.7, 5.8]; haze/facing row trimmed)")
 
 
 def test_fit_region_box_row_along_y():
@@ -1578,7 +1578,7 @@ if __name__ == "__main__":
     test_fit_region_box_full_depth()
     test_fit_region_box_haze_immune()
     test_fit_region_box_starved_back_face()
-    test_fit_region_box_edge_snap_recovers_short_rect()
+    test_fit_region_box_rect_relax_recovers_short_edge()
     test_floor_map_stepped()
     test_fit_region_box_stepped_floor()
     test_render_cut_mesh_mode()
