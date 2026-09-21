@@ -1895,12 +1895,11 @@ def test_side_view_vlm_arbitration_overrides_rule():
     """SIDE view candidate arbitration (user direction: the placement
     rules keep misjudging which end is clear -- let the VLM look at
     the renders; the straight perpendicular profile is RETIRED -- it
-    is the view a long cable ladder or clutter blocks). Candidate
-    order: A/B = +/-15 deg oblique at the rule free end, C/D = +/-15
-    deg oblique at the opposite end. All render clean here; the fake
-    VLM replies 'D', so the chosen side camera must stand at the
-    opposite end from the rule pick. Without a judge the rule order
-    stands."""
+    is the view a long cable ladder or clutter blocks). TWO oblique
+    candidates: A = +15 deg at the rule free end, B = +15 deg at the
+    opposite end. Both render clean here; the fake VLM replies 'B',
+    so the chosen side camera must stand at the opposite end from the
+    rule pick. Without a judge the rule order stands."""
     from agentic_gts.agent import mask_refine as mr
     from agentic_gts.agent.judge import VLMJudge
     from agentic_gts.agent.mask_refine import (_free_row_end, _front_azim,
@@ -1962,7 +1961,7 @@ def test_side_view_vlm_arbitration_overrides_rule():
     gio.read_gaussian_ply = lambda p: gs
 
     judge = VLMJudge(backend="qwen")
-    judge._qwen_image_call = lambda png, prompt, *a, **k: "D"
+    judge._qwen_image_call = lambda png, prompt, *a, **k: "B"
     try:
         views = mr.render_local_views(scene, box, None, judge=judge)
         names = [v["name"] for v in views]
@@ -1970,7 +1969,7 @@ def test_side_view_vlm_arbitration_overrides_rule():
         side = next(v for v in views if v["name"] == "side")
         eye_c = np.asarray(side["cam"].eye)
         assert eye_c[0] * eye_rule[0] < 0, \
-            (f"VLM pick 'D' (opposite end) must flip the side camera: "
+            (f"VLM pick 'B' (opposite end) must flip the side camera: "
              f"rule eye {eye_rule[:2]}, chosen eye {eye_c[:2]}")
         # no judge -> the rule order stands (eye on the rule end)
         views2 = mr.render_local_views(scene, box, None)
