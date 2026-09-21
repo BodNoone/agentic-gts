@@ -840,7 +840,13 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
         mw = ((points[:, 0] >= x0 - walk) & (points[:, 0] <= x1 + walk) &
               (points[:, 1] >= y0 - walk) & (points[:, 1] <= y1 + walk))
         wpool = points[mw]
-        wpool = wpool[wpool[:, 2] > floor_z + 0.30]
+        # USER DIRECTIVE: the mesh walk pool is the LOW band only
+        # (0.30-1.00m) -- the same band the fit itself runs on. The
+        # bare >0.30 cut let tray / tall remnants in on the pts_fit
+        # FALLBACK path (pool < 100 pts -> everything above 0.30) and
+        # those span XY far past the device, dragging edges wide.
+        wpool = wpool[(wpool[:, 2] > floor_z + 0.30) &
+                      (wpool[:, 2] <= floor_z + 1.00)]
     else:
         walk = _RECT_RELAX
         wpool = core
