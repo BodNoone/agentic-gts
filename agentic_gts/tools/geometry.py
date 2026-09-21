@@ -206,3 +206,79 @@ def complete_row_gaps(scene: Scene, width_unit: float = 0.6,
                     if len(added) == before:
                         break   # no support -> stop walking this end
     return added
+
+
+# ---------- split-seam regularisation ----------
+
+
+def snap_row_seams(boxes: list[OrientedBox], yaw: float,
+                   seam_tol: float = 0.12, cross_tol: float = 0.12,
+                   depth_tol: float = 0.15) -> int:
+    """Snap the facing edges of adjacent cabinets in a row together.
+
+    A joined row split into single cabinets gets each piece's along-row
+    extent from its OWN measured span, so the seam between two
+    neighbours can come out a few centimetres apart (mask bleed cut at
+    slightly different places per view, the cross-view union, the
+    per-piece side thickness correction). The result reads as a row of
+    DISCONNECTED boxes. This walks the pieces sorted along the row axis
+    and, wherever two facing edges sit within `seam_tol` (a small gap
+    OR overlap), sets both to their average along coordinate -- the
+    "average the vertices" rule. When the two pieces' cross centres and
+    depths are also within `cross_tol` / `depth_tol`, those are averaged
+    too, so the shared edge becomes ONE collinear edge (a full shared
+    face, not a touching point).
+
+    Boxes are assumed to share the row frame (`yaw`); the split pieces
+    of one seed always do (they copy the seed's yaw and carry the along
+    extent in size[0]). Facing edges must also overlap laterally by at
+    least half the thinner body -- two different sub-rows are never
+    snapped. Mutates in place; returns the number of seams snapped.
+    """
+    if len(boxes) < 2:
+        return 0
+    axis = np.array([math.cos(yaw), math.sin(yaw)])
+    cross = np.array([-math.sin(yaw), math.cos(yaw)])
+
+    def _span(b: OrientedBox):
+        c = np.asarray(b.center, dtype=float)
+        a = float(c[:2] @ axis)
+        x = float(c[:2] @ cross)
+        half = float(b.size[0]) / 2.0
+        return a - half, a + half, x, float(b.size[1])
+
+    def _rebuild(b: OrientedBox, lo: float, hi: float,
+                 cross_c: float, depth: float) -> None:
+        mid = 0.5 * (lo + hi)
+        xy = axis * mid + cross * cross_c
+        b.center = (float(xy[0]), float(xy[1]), float(b.center[2]))
+        b.size = (float(hi - lo), float(depth), float(b.size[2]))
+
+    order = sorted(range(len(boxes)), key=lambda i: _span(boxes[i])[0])
+    snapped = 0
+    for i, j in zip(order[:-1], order[1:]):
+        a, b = boxes[i], boxes[j]
+        a_lo, a_hi, a_x, a_d = _span(a)
+        b_lo, b_hi, b_x, b_d = _span(b)
+        gap = b_lo - a_hi
+        if abs(gap) > seam_tol:
+            continue
+        # the facing edges must overlap laterally, or they are two
+        # different sub-rows rather than neighbours
+        a_clo, a_chi = a_x - a_d / 2.0, a_x + a_d / 2.0
+        b_clo, b_chi = b_x - b_d / 2.0, b_x + b_d / 2.0
+        if min(a_chi, b_chi) - max(a_clo, b_clo) < 0.5 * min(a_d, b_d):
+            continue
+        seam = 0.5 * (a_hi + b_lo)
+        # average the shared edge's CROSS vertices too when the pieces
+        # agree on where the body is; otherwise only the along seam is
+        # normalised and each side keeps its own cross extent
+        if abs(a_x - b_x) <= cross_tol and abs(a_d - b_d) <= depth_tol:
+            cx, d = 0.5 * (a_x + b_x), 0.5 * (a_d + b_d)
+            _rebuild(a, a_lo, seam, cx, d)
+            _rebuild(b, seam, b_hi, cx, d)
+        else:
+            _rebuild(a, a_lo, seam, a_x, a_d)
+            _rebuild(b, seam, b_hi, b_x, b_d)
+        snapped += 1
+    return snapped

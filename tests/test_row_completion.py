@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agentic_gts.core.models import (BoxSource, Confidence, OrientedBox,
                                       Scene)
-from agentic_gts.tools.geometry import complete_row_gaps
+from agentic_gts.tools.geometry import complete_row_gaps, snap_row_seams
 
 
 def _cabinet(cx, cy=0.0, rng=None, w=0.6, d=1.1, h=2.1, n=1500):
@@ -135,9 +135,63 @@ def test_rotated_frame():
     print("PASS rotated frame (fill follows the row axis)")
 
 
+def test_snap_row_seams_closes_small_gap():
+    """Two split pieces whose seam landed 6cm apart -> snapped to the
+    average, so the neighbours share ONE edge."""
+    a = OrientedBox(center=(0.0, 0.0, 1.05), size=(0.6, 1.1, 2.1), yaw=0.0)
+    b = OrientedBox(center=(0.66, 0.0, 1.05), size=(0.6, 1.1, 2.1), yaw=0.0)
+    n = snap_row_seams([a, b], 0.0)
+    assert n == 1, f"expected one snapped seam, got {n}"
+    a_hi = a.center[0] + a.size[0] / 2.0
+    b_lo = b.center[0] - b.size[0] / 2.0
+    assert abs(a_hi - b_lo) < 1e-9, f"seam not shared ({a_hi:.3f} vs {b_lo:.3f})"
+    assert abs(a_hi - 0.33) < 1e-9, f"seam must be the average, got {a_hi:.3f}"
+    print("PASS snap row seams (small gap averaged to a shared edge)")
+
+
+def test_snap_row_seams_overlap_averaged():
+    """A slight overlap (mask bleed) is normalised to the midpoint too."""
+    a = OrientedBox(center=(0.0, 0.0, 1.05), size=(0.6, 1.1, 2.1), yaw=0.0)
+    b = OrientedBox(center=(0.55, 0.0, 1.05), size=(0.6, 1.1, 2.1), yaw=0.0)
+    n = snap_row_seams([a, b], 0.0)
+    assert n == 1
+    a_hi = a.center[0] + a.size[0] / 2.0
+    b_lo = b.center[0] - b.size[0] / 2.0
+    assert abs(a_hi - b_lo) < 1e-9
+    assert abs(a_hi - 0.275) < 1e-9, f"seam must be the midpoint, got {a_hi:.3f}"
+    print("PASS snap row seams (overlap averaged)")
+
+
+def test_snap_row_seams_leaves_real_aisle():
+    """A 0.5m aisle between two cabinets is NOT a seam: untouched."""
+    a = OrientedBox(center=(0.0, 0.0, 1.05), size=(0.6, 1.1, 2.1), yaw=0.0)
+    b = OrientedBox(center=(1.1, 0.0, 1.05), size=(0.6, 1.1, 2.1), yaw=0.0)
+    n = snap_row_seams([a, b], 0.0)
+    assert n == 0, f"a real aisle must not be snapped, got {n}"
+    assert abs(a.center[0]) < 1e-9 and abs(b.center[0] - 1.1) < 1e-9
+    print("PASS snap row seams (real aisle left alone)")
+
+
+def test_snap_row_seams_unifies_cross_vertices():
+    """Pieces that agree on the body (cross centre / depth close) get
+    their shared edge's cross vertices averaged too -> one collinear
+    edge, not a touching point."""
+    a = OrientedBox(center=(0.0, 0.0, 1.05), size=(0.6, 1.1, 2.1), yaw=0.0)
+    b = OrientedBox(center=(0.6, 0.08, 1.05), size=(0.6, 1.0, 2.1), yaw=0.0)
+    n = snap_row_seams([a, b], 0.0)
+    assert n == 1
+    assert abs(a.center[1] - 0.04) < 1e-9 and abs(b.center[1] - 0.04) < 1e-9
+    assert abs(a.size[1] - 1.05) < 1e-9 and abs(b.size[1] - 1.05) < 1e-9
+    print("PASS snap row seams (cross vertices averaged, collinear edge)")
+
+
 if __name__ == "__main__":
     test_interior_gap_filled()
     test_row_end_walk()
     test_empty_gap_not_filled()
     test_wall_past_row_end_not_filled()
     test_rotated_frame()
+    test_snap_row_seams_closes_small_gap()
+    test_snap_row_seams_overlap_averaged()
+    test_snap_row_seams_leaves_real_aisle()
+    test_snap_row_seams_unifies_cross_vertices()

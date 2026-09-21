@@ -2204,6 +2204,20 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         audit["reason"] = "no front span and no side depth measurement"
         return [], audit
 
+    # ---- pass 4: regularise the split seams ----
+    # The pieces' along-row extents come from their own spans, so the
+    # seam between neighbours can land a few cm apart (per-view mask-
+    # bleed cuts, the cross-view union, the per-piece side correction)
+    # and the row reads as DISCONNECTED boxes. Snap near seams to their
+    # average so adjacent cabinets share one edge (user request).
+    from agentic_gts.tools.geometry import snap_row_seams
+    n_seams = snap_row_seams([e["fitted"] for e in instances],
+                             float(box.yaw))
+    if n_seams:
+        print(f"[mask-refine] seam regularisation: {n_seams} split "
+              f"seam(s) snapped")
+    audit["seams_snapped"] = n_seams
+
     instances.sort(key=lambda e: e["score"], reverse=True)
     audit.update({"accepted": True,
                   "instances": [
