@@ -33,6 +33,14 @@ _QUALITY_RE = re.compile(
     r"quality\s*[:：]\s*[\"']?(good|poor|true|false|yes|no)\b",
     re.IGNORECASE)
 
+# Side-view cameras stand 15 deg OFF the row-end perpendicular (user
+# direction: replace the straight profile -- a long cable ladder or
+# clutter beside a low device fully occludes the perpendicular view;
+# from 15 deg off, the device peeks past it). Thickness is unbiased:
+# it reads the 3D back-projected points' cross-axis span, not pixel
+# extents, so the camera tilt adds no measurement error.
+_SIDE_OBLIQUE_DEG = 15.0
+
 
 def reply_view_quality(text: str) -> str:
     """Parse the VLM's per-view quality verdict ('good' | 'poor').
@@ -549,14 +557,7 @@ _SIDE_LETTER_GLYPHS = {
     "B": ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
     "C": ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
     "D": ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
-    "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
-    "F": ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
 }
-
-# Oblique side-view offset (user report: a long cable ladder beside a
-# low device fully occluded the straight profile; a slight azimuth
-# offset peeks past it without biasing the 3D thickness read).
-_SIDE_OBLIQUE_DEG = 15.0
 
 
 def _side_panel_image(imgs: list, scale: int = 16,
@@ -609,15 +610,12 @@ def render_local_views(scene: Scene, box: OrientedBox,
         a big low-opacity floater).
 
     SIDE view (user direction: rules keep misjudging which end is
-    clear, fog persists -- let the VLM look): TWO oblique candidates
-    -- +15 deg at the rule-picked free end and +15 deg at the
-    opposite end (the ends differ by 180 deg, so the same offset
-    swings them to opposite lateral sides; the straight perpendicular
-    profile is retired: it is the view a long cable ladder or clutter
-    beside the device blocks), each passes the cheap gradient-energy
-    gate, and the survivors are composited into one labeled A/B
-    panel image for ONE tiny VLM call that picks the clearest. No
-    judge / call failure / one survivor -> rule order.
+    clear, fog persists -- let the VLM look): several CANDIDATE
+    placements are rendered (the rule-picked free end, a nearer
+    standoff at the same end, the opposite end), each passes the cheap
+    gradient-energy gate, and the survivors are composited into one
+    labeled A/B/C panel image for ONE tiny VLM call that picks the
+    clearest. No judge / call failure / one survivor -> rule order.
     """
     gs_ply = scene.meta.get("gs_ply")
     if not gs_ply:
@@ -755,27 +753,27 @@ def render_local_views(scene: Scene, box: OrientedBox,
                     else raw,
                     "cam": cam, "path": path, "prompt_path": prompt_path})
 
-    # ---- SIDE view: candidates + VLM arbitration ----
+    # ---- SIDE view: oblique candidates + VLM arbitration ----
     # The side slot looks along the row from beyond one end; every
     # geometric pick so far (blind azim, free-end corridor, wall-masked
     # slack) still fogged on real scenes (user reports, twice). Render
     # a small candidate set instead and let the EVIDENCE decide: the
     # cheap gradient gate kills any candidate that rendered a veil,
     # then one tiny VLM call picks the clearest survivor.
-    # TWO OBLIQUE candidates only (user direction: one per end is
-    # enough -- the straight perpendicular profile is retired, it is
-    # the view a long cable ladder or clutter beside the device
-    # blocks). The ends' azimuths differ by 180 deg, so the SAME
-    # +15 deg offset on each swings them to OPPOSITE lateral sides:
-    # the pair covers both ends AND both peek directions at once.
-    # Safe for the thickness read: it comes from the 3D
-    # back-projected points' cross-axis span, not from pixel extents,
-    # so the obliquity cannot bias it.
+    # The candidates are OBLIQUE (user direction: replace the straight
+    # perpendicular profile -- a long cable ladder or clutter beside a
+    # low device fully occludes it; from 15 deg off, the device peeks
+    # past it). Both ends carry the SAME +15 deg offset: the ends
+    # differ by 180 deg, so the same offset swings the two cameras to
+    # OPPOSITE lateral sides -- the pair covers both ends and both
+    # peek directions at two renders. Thickness stays unbiased: it
+    # reads the 3D back-projected points' cross-axis span, not pixel
+    # extents.
+    side_cands = [(azim_side + _SIDE_OBLIQUE_DEG, standoff_side)]
     alt_azim = (azim_front + 90.0
                 if abs(azim_side - (azim_front - 90.0)) < 1e-6
                 else azim_front - 90.0)
-    side_cands = [(azim_side + _SIDE_OBLIQUE_DEG, standoff_side),
-                  (alt_azim + _SIDE_OBLIQUE_DEG, standoff_side)]
+    side_cands.append((alt_azim + _SIDE_OBLIQUE_DEG, standoff_side))
     survivors = []
     for ci, (sa, ss) in enumerate(side_cands):
         raw, prompt_img, cam = _render_one(18.0, sa, ss)
@@ -951,18 +949,27 @@ def _absorb_single(single: dict, fines: list, axis, along0: float) -> bool:
     grounds SEVERAL -> the several stand; the row is one whole and the
     single box is that whole unresolved).
 
-    NOTHING of the single survives (user report: the back view's
-    unresolved whole-row box swallowed the top cable connections into
-    its SAM mask, and the point contribution dragged the pieces'
-    P97.5 height to the cable bundle even after the extent was
-    dropped) -- extent dropped, points dropped, only the collision
-    flag returned. Returns True when the single overlapped any fine
-    span (absorbed); False when it overlapped none (the caller keeps
-    it -- recall: a region the multi face never grounded)."""
+    The single's back-projected points are REAL surface points: they
+    are clipped into whichever fine span contains them (more evidence
+    for the piece's point support / height). Its EXTENT is dropped --
+    unioning it would stretch a piece across the seam. Returns True
+    when the single touched any fine span (absorbed); False when it
+    overlapped none (the caller keeps it -- recall: a region the
+    multi face never grounded)."""
+    hit = False
     for f in fines:
         if min(single["hi"], f["hi"]) - max(single["lo"], f["lo"]) > 0:
-            return True
-    return False
+            hit = True
+    if single["pts"] is not None and axis is not None:
+        al = single["pts"][:, :2] @ axis - along0
+        for f in fines:
+            if f["pts"] is None:
+                continue
+            m = (al >= f["lo"]) & (al <= f["hi"])
+            if m.any():
+                f["pts"] = np.vstack([f["pts"], single["pts"][m]])
+                hit = True
+    return hit
 
 
 def _merge_cross_view(spans: list, axis=None, along0: float = 0.0) -> list:
@@ -977,10 +984,10 @@ def _merge_cross_view(spans: list, axis=None, along0: float = 0.0) -> list:
     USER RULE -- instance COUNT decides first: when one face grounds
     ONE instance while the other grounds SEVERAL, the several stand
     (the row is one whole; the single box is that whole unresolved).
-    The single face's span is fully DISCARDED -- extent dropped AND
-    points dropped (user report: the single face's whole-row mask
-    carried the top cable connections into the pieces' point pools
-    and the P97.5 height read the cable bundle).
+    The single face's span is ABSORBED (_absorb_single): points
+    clipped into the fine spans, extent dropped -- even a PARTIAL
+    single (covering cabinet A and half of B) must not union with A
+    and stretch it across the seam.
 
     Graph merge handles the rest: mutual single-overlap pairs union
     (both faces saw one cabinet), a span bridging TWO OR MORE spans
@@ -1046,34 +1053,6 @@ def _merge_cross_view(spans: list, axis=None, along0: float = 0.0) -> list:
     return out
 
 
-def _pix_iou(a, b) -> float:
-    """2D IoU of two pixel boxes (x1, y1, x2, y2)."""
-    if not a or not b:
-        return 0.0
-    ix = min(a[2], b[2]) - max(a[0], b[0])
-    iy = min(a[3], b[3]) - max(a[1], b[1])
-    if ix <= 0 or iy <= 0:
-        return 0.0
-    inter = ix * iy
-    aa = (a[2] - a[0]) * (a[3] - a[1])
-    ab = (b[2] - b[0]) * (b[3] - b[1])
-    return inter / (aa + ab - inter)
-
-
-def _pix_contained(a, b) -> float:
-    """How much of the SMALLER pixel box lies inside the bigger one."""
-    if not a or not b:
-        return 0.0
-    ix = min(a[2], b[2]) - max(a[0], b[0])
-    iy = min(a[3], b[3]) - max(a[1], b[1])
-    if ix <= 0 or iy <= 0:
-        return 0.0
-    inter = ix * iy
-    aa = (a[2] - a[0]) * (a[3] - a[1])
-    ab = (b[2] - b[0]) * (b[3] - b[1])
-    return inter / min(aa, ab)
-
-
 def _merge_spans(spans: list) -> list:
     """Reconcile along-row spans: duplicates merge, seams normalise.
 
@@ -1082,12 +1061,7 @@ def _merge_spans(spans: list) -> list:
 
     * DUPLICATE -- the VLM double-boxed the SAME cabinet. Detected on
       the VLM's OWN pixel boxes (2D IoU >= 0.5), which the mask spans
-      cannot provide: masks bleed. A second gate catches the BIG/SMALL
-      double-box (user report: many duplicates survived) -- a tight box
-      and a loose wider box over the same cabinet score IoU 0.3-0.45,
-      below the IoU gate, but the SMALL box is ~fully CONTAINED in the
-      big one (containment >= 0.8): also a duplicate. Union into one
-      span.
+      cannot provide: masks bleed. Union into one span.
     * MASK BLEED -- two DISTINCT VLM instances whose SAM masks each
       overshoot the cabinet seam by a few centimetres (joined cabinets
       have no visual gap, so each mask edge lands inside the
@@ -1097,14 +1071,23 @@ def _merge_spans(spans: list) -> list:
       happened (user report: joined rows stayed joined).
     """
 
+    def _iou(a, b):
+        if not a or not b:
+            return 0.0
+        ix = min(a[2], b[2]) - max(a[0], b[0])
+        iy = min(a[3], b[3]) - max(a[1], b[1])
+        if ix <= 0 or iy <= 0:
+            return 0.0
+        inter = ix * iy
+        aa = (a[2] - a[0]) * (a[3] - a[1])
+        ab = (b[2] - b[0]) * (b[3] - b[1])
+        return inter / (aa + ab - inter)
+
     out = []
     for s in sorted(spans, key=lambda t: t["lo"]):
         dup = next((p for p in out
                     if s["lo"] < p["hi"]
-                    and (_pix_iou(p.get("pix"), s.get("pix")) >= 0.5
-                         or _pix_contained(p.get("pix"),
-                                           s.get("pix")) >= 0.8)),
-                   None)
+                    and _iou(p.get("pix"), s.get("pix")) >= 0.5), None)
         if dup is not None:
             # same instance double-boxed by the VLM: union
             if len(s["pts"]) > len(dup["pts"]):
@@ -1728,29 +1711,19 @@ def _is_ladder(label) -> bool:
     return "ladder" in l or "cable tray" in l
 
 
-def _is_top_cable(label) -> bool:
-    """The top-cable positive class: a bundle of cables running across
-    or connected to the TOP of the device (user report: the FRONT view
-    grounded them inside the device box -- the back view did not --
-    and the multi-view mask union dragged the P97.5 height to the
-    cable bundle). Like the door and the ladder, the cable pixels are
-    SUBTRACTED from every device back-projection."""
-    return "cable" in str(label or "").lower()
-
-
 def _is_subtractive(label) -> bool:
     """Subtractive classes: labelled structures whose SAM masks are
     pixel-REMOVED from every device back-projection -- the device
     spans, thickness pools and height reads never see them."""
-    return _is_door(label) or _is_ladder(label) or _is_top_cable(label)
+    return _is_door(label) or _is_ladder(label)
 
 
 def _door_union(image: np.ndarray, groups: list, sam: SamPredictorAdapter
                 ) -> np.ndarray | None:
     """Pixel union of the SAM masks of every SUBTRACTIVE-class box
-    (open cabinet door, cable ladder, top cable) -- the subtractive
-    layer for device back-projection. None when the VLM found none
-    in this view (the common case)."""
+    (open cabinet door, cable ladder) -- the subtractive layer for
+    device back-projection. None when the VLM found none in this view
+    (the common case)."""
     u: np.ndarray | None = None
     for g in groups:
         if not _is_subtractive(g.get("hypothesis")):
@@ -1767,31 +1740,6 @@ def _door_union(image: np.ndarray, groups: list, sam: SamPredictorAdapter
         m = masks[int(np.argmax(scores))]
         u = m.copy() if u is None else (u | m)
     return u
-
-
-def _dedupe_groups(groups: list, W: int, H: int) -> list:
-    """Drop duplicate VLM boxes BEFORE SAM (user report: one reply
-    double/triple-boxes the same cabinet -- g11/g16/g21 were all one
-    instance): every duplicate costs a full SAM multimask call and a
-    debug render. Same gates as _merge_spans -- IoU >= 0.5 or the
-    big/small containment >= 0.8 -- applied to the pixel boxes.
-    SUBTRACTIVE classes are exempt: a door/ladder/cable box sits
-    INSIDE the device box by design -- containment against the device
-    box would kill the subtraction.
-    """
-    uniq = []
-    for g in groups:
-        sub = _is_subtractive(g.get("hypothesis"))
-        pix = tuple(float(v) for v in BoxGroup(
-            tuple(g["bbox"]), g.get("hypothesis", "rack"),
-            0.5).pixel_box(W, H))
-        if not sub and any(
-                (not us) and (_pix_iou(u, pix) >= 0.5
-                              or _pix_contained(u, pix) >= 0.8)
-                for u, _g, us in uniq):
-            continue
-        uniq.append((pix, g, sub))
-    return [g for _, g, _ in uniq]
 
 
 def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
@@ -1829,11 +1777,6 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
         va["role"] = "voter-dropped"
         va["groups"] = groups = []
     H, W = voter["image"].shape[:2]
-    n_raw = len(groups)
-    groups = _dedupe_groups(groups, W, H)
-    if len(groups) < n_raw:
-        print(f"[mask-refine] {voter['name']}: dropped "
-              f"{n_raw - len(groups)} duplicate VLM box(es) before SAM")
     yaw = float(box.yaw)
     axis = np.array([math.cos(yaw), math.sin(yaw)])
     along0 = float(np.asarray(box.center, dtype=float)[:2] @ axis)
@@ -1858,21 +1801,17 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
             # span (user report: door interference on box size)
             pts3 = _mask_to_points(scene, box, mask, voter["cam"],
                                     exclude=doors)
+            if out_dir:
+                _save_sam_debug(voter, box_pix, mask, pts3, box,
+                                None, out_dir,
+                                f"{box.box_id}_{voter['name']}_g{gi}_m{mi}")
             if len(pts3) < 20:
                 continue
             if best is None or ms > best[0]:
-                best = (float(ms), pts3, mi, mask)
-        # debug save AFTER the pick (user report: three near-identical
-        # debug renders per box -- the multimask granularities -- read
-        # as duplicated segmentations): only the WINNING candidate's
-        # overlay is kept on disk
-        if best is not None and out_dir:
-            _save_sam_debug(voter, box_pix, best[3], best[1], box,
-                            None, out_dir,
-                            f"{box.box_id}_{voter['name']}_g{gi}")
+                best = (float(ms), pts3)
         if best is None:
             continue
-        ms, pts3 = best[0], best[1]
+        ms, pts3 = best
         along = pts3[:, :2] @ axis - along0
         lo, hi = np.percentile(along, [2.0, 98.0])
         spans.append({"lo": float(lo), "hi": float(hi), "pts": pts3,
@@ -2004,7 +1943,6 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
             dva["role"] = "depth_profile-dropped"
             dva["groups"] = groups = []
         H, W = side["image"].shape[:2]
-        groups = _dedupe_groups(groups, W, H)
         # the side view is where an open door sticks out HORIZONTALLY
         # beyond the body -- subtract its mask before any thickness
         # point enters the pool (belt and braces on top of the

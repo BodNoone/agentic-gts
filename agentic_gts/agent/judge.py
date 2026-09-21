@@ -446,13 +446,6 @@ class VLMJudge:
         "beside or behind the device) is its OWN instance labelled "
         "\"cable ladder\" -- the box covers ONLY the ladder itself, "
         "never any part of a rack or cabinet.\n"
-        # NO 'top cable' class (user report: a 3x slowdown -- the
-        # category made the model box EVERY cable run in every local
-        # view, and the max_tokens=6000 generation ballooned). The
-        # height pollution it addressed is now handled by the
-        # cross-view 1-vs-N rule (a single-instance whole-row face is
-        # fully discarded); a spontaneous "cable" label still gets
-        # subtracted downstream via _is_subtractive.
         "Each box must cover the whole visible instance it belongs to.\n"
         "Report bbox coordinates in JSON format like this: "
         '{"bbox_2d": [x1, y1, x2, y2], "label": "rack"}'

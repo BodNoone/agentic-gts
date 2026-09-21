@@ -192,17 +192,6 @@ def test_sam_box_prompt_construction():
         "the cable ladder must be a positive detection class"
     assert "never any part of a rack or cabinet" in prompt, \
         "the ladder box must exclude the device itself"
-    # NO 'top cable' class (user report: a 3x slowdown -- the model
-    # boxed every cable run in every local view and the 6000-token
-    # generation ballooned; the height issue is covered by the
-    # cross-view 1-vs-N rule instead)
-    assert "top cable" not in prompt, \
-        "the top-cable class must stay retired (generation cost)"
-    # the subtractive PATH stays: a spontaneous 'cable' label is
-    # still pixel-subtracted downstream
-    from agentic_gts.agent.mask_refine import _is_subtractive
-    assert _is_subtractive("top cable"), \
-        "a spontaneous cable label must still subtract"
     # VLM quality verdict (user direction: judged TOGETHER with the
     # grounding in the same call, garbage views dropped)
     assert "quality: good" in prompt and "quality: poor" in prompt, \
@@ -362,71 +351,6 @@ def test_merge_spans_dedupes_but_keeps_seams():
     assert abs(out[1]["lo"] - 0.62) < 1e-6 and abs(out[1]["hi"] - 1.20) < 1e-6
     assert len(out[0]["pts"]) == 80      # points merged
     print("PASS span merging (duplicates union, seams survive)")
-
-
-def test_dedupe_groups_before_sam():
-    """The VLM's own reply double/triple-boxes one cabinet (user
-    report: sam_debug g11/g16/g21 all the SAME instance -- each
-    duplicate cost a full SAM multimask call and a debug render).
-    _dedupe_groups drops them BEFORE SAM on the same gates as
-    _merge_spans (IoU >= 0.5, big/small containment >= 0.8);
-    SUBTRACTIVE boxes are exempt -- a door/ladder box sits inside the
-    device box by design and must survive."""
-    from agentic_gts.agent.mask_refine import _dedupe_groups
-    W = H = 768
-    # big loose box + tight box (contained) + near-identical box
-    # (IoU) over cabinet 1; distinct neighbour; a door INSIDE the
-    # big box; a ladder overlapping the neighbour
-    groups = [
-        {"bbox": (117, 154, 400, 461), "hypothesis": "rack"},
-        {"bbox": (156, 192, 374, 422), "hypothesis": "rack"},
-        {"bbox": (120, 158, 403, 464), "hypothesis": "rack"},
-        {"bbox": (484, 154, 768, 461), "hypothesis": "rack"},
-        {"bbox": (200, 300, 350, 430), "hypothesis": "open cabinet door"},
-        {"bbox": (600, 154, 740, 461), "hypothesis": "cable ladder"},
-    ]
-    out = _dedupe_groups(groups, W, H)
-    labels = [(g["hypothesis"], g["bbox"]) for g in out]
-    assert len(out) == 4, \
-        f"3 duplicate racks must collapse to 1; got {len(out)}: {labels}"
-    racks = [g for g in out if g["hypothesis"] == "rack"]
-    assert len(racks) == 2, "cabinet 1 + neighbour survive"
-    # the door inside the big rack box is NOT eaten by containment
-    assert any(g["hypothesis"] == "open cabinet door" for g in out), \
-        "the subtractive door box must survive containment dedup"
-    # the ladder overlapping the neighbour rack is kept too
-    assert any(g["hypothesis"] == "cable ladder" for g in out)
-    print("PASS group dedupe before SAM (duplicates drop, "
-          "subtractives exempt)")
-
-
-def test_merge_spans_containment_dedup():
-    """The BIG/SMALL double-box (user report: many duplicate spans
-    survived in the front view): a tight box and a loose wider box
-    over the SAME cabinet score 2D IoU below the 0.5 gate, but the
-    small box is ~fully contained in the big one -- containment
-    >= 0.8 catches it. A box merely OVERLAPPING a neighbour cabinet
-    (containment well under 0.8) must stay a distinct instance."""
-    from agentic_gts.agent.mask_refine import _merge_spans
-    spans = [
-        # big loose box over cabinet 1
-        {"lo": 0.00, "hi": 0.70, "pts": np.zeros((50, 3)),
-         "ms": 0.8, "label": "rack", "pix": (90, 190, 520, 610)},
-        # tight box over the SAME cabinet: IoU ~0.42 but contained
-        {"lo": 0.02, "hi": 0.60, "pts": np.zeros((30, 3)),
-         "ms": 0.7, "label": "rack", "pix": (120, 220, 480, 580)},
-        # neighbour cabinet: pixel overlap low, containment ~0.1
-        {"lo": 0.75, "hi": 1.40, "pts": np.zeros((50, 3)),
-         "ms": 0.8, "label": "rack", "pix": (540, 200, 900, 600)},
-    ]
-    out = _merge_spans(spans)
-    assert len(out) == 2, \
-        f"contained double-box must dedupe: got {len(out)} spans"
-    assert abs(out[0]["lo"]) < 1e-6 and abs(out[0]["hi"] - 0.70) < 1e-6
-    assert len(out[0]["pts"]) == 80, "duplicate's points union in"
-    assert abs(out[1]["lo"] - 0.75) < 1e-6, "neighbour stays distinct"
-    print("PASS containment dedupe (big/small double-box merges, "
-          "neighbour keeps)")
 
 
 def test_merge_spans_mask_bleed_keeps_instances():
@@ -860,11 +784,8 @@ def test_cross_view_single_face_yields_to_multi():
     SEVERAL -> the several stand (the row is one whole; the single box
     is that whole unresolved). Even a PARTIAL single (the poor face's
     one box covering cabinet A and half of B) must NOT union with A --
-    that would stretch A's piece across the seam. NOTHING of the
-    single survives: its extent is dropped AND its points are dropped
-    (user report: the single face's whole-row mask carried the top
-    cable connections into the pieces' point pools and the P97.5
-    height read the cable bundle)."""
+    that would stretch A's piece across the seam. Its points are
+    clipped into the fine spans; its extent is dropped."""
     from agentic_gts.agent.mask_refine import _merge_cross_view
     axis = np.array([1.0, 0.0])
     mk = lambda xs: np.column_stack(
@@ -884,10 +805,9 @@ def test_cross_view_single_face_yields_to_multi():
     assert abs(a["lo"]) < 1e-9 and abs(a["hi"] - 1.0) < 1e-9, \
         "A's extent must NOT stretch to the absorbed single's 1.3"
     assert abs(b["lo"] - 1.05) < 1e-9 and abs(b["hi"] - 2.05) < 1e-9
-    # the single's points are NOT contributed to the fines: the
-    # whole-row mask's top-cable z would drag the P97.5 height
-    assert len(a["pts"]) == 1, "A keeps ONLY its own 0.5 point"
-    assert len(b["pts"]) == 1, "B keeps ONLY its own 1.5 point"
+    # the single's real surface points were clipped into the fines
+    assert len(a["pts"]) == 3, "A keeps its 0.5 + the single's 0.2/0.8"
+    assert len(b["pts"]) == 2, "B keeps its 1.5 + the single's 1.2"
     print("PASS single-instance face yields to the multi face")
 
 
@@ -1316,21 +1236,6 @@ def test_door_class_subtracts_from_device_points():
         "only the ladder box hits the subtractive SAM"
     assert ul is not None and ul[30, 40], \
         "the ladder mask must enter the subtractive union"
-
-    # the TOP CABLE joins the subtractive classes (user report: the
-    # FRONT view grounded top cable connections inside the device box
-    # -- the back view did not -- and the multi-view mask union read
-    # the height at the cable bundle)
-    assert _is_subtractive("top cable")
-    assert _is_subtractive("Top Cable Bundle")
-    cab = _FakeSam()
-    groups_c = [{"bbox": (100, 100, 400, 500), "hypothesis": "rack"},
-                {"bbox": (500, 100, 700, 900), "hypothesis": "top cable"}]
-    uc = _door_union(IMG, groups_c, cab)
-    assert len(cab.calls) == 1, \
-        "only the top-cable box hits the subtractive SAM"
-    assert uc is not None and uc[30, 40], \
-        "the top-cable mask must enter the subtractive union"
 
     # _mask_to_points: points projecting into the door mask are dropped
     box = OrientedBox(center=(0.0, 0.0, 1.0), size=(2.0, 1.0, 2.0),
@@ -1960,12 +1865,10 @@ def test_adjudicate_side_pick_parses_letter():
 def test_side_view_vlm_arbitration_overrides_rule():
     """SIDE view candidate arbitration (user direction: the placement
     rules keep misjudging which end is clear -- let the VLM look at
-    the renders; the straight perpendicular profile is RETIRED -- it
-    is the view a long cable ladder or clutter blocks). TWO oblique
-    candidates: A = +15 deg at the rule free end, B = +15 deg at the
-    opposite end. Both render clean here; the fake VLM replies 'B',
-    so the chosen side camera must stand at the opposite end from the
-    rule pick. Without a judge the rule order stands."""
+    the renders). Both ends render clean here; the fake VLM replies
+    'B' (the OPPOSITE-end oblique candidate), so the chosen side
+    camera must stand at the opposite end from the rule pick. Without
+    a judge the rule pick stands."""
     from agentic_gts.agent import mask_refine as mr
     from agentic_gts.agent.judge import VLMJudge
     from agentic_gts.agent.mask_refine import (_free_row_end, _front_azim,
@@ -2006,7 +1909,12 @@ def test_side_view_vlm_arbitration_overrides_rule():
     import agentic_gts.tools.gs_io as gio
     _real = (gsr.rasterize_gs, gsr.render_gs_view, gsr.png_bytes,
              gio.read_gaussian_ply)
-    # clean render everywhere except cameras on the -y (wall) side
+    # clean render everywhere except cameras standing at the BACK
+    # face (on the -y wall side, near the row centre -- |x| small).
+    # The oblique side candidates sit AT THE ROW ENDS (|x| ~ 4.1 m)
+    # with a lateral swing ~ +-1.1 m, so a bare y threshold would fog
+    # candidate B together with the back view; the |x| guard keeps
+    # the oblique pair clean and the back view fogged.
     img = np.full((768, 768, 3), 0.01, np.float32)
     flat = img.reshape(-1, 3)
     idx = np.random.default_rng(0).choice(len(flat), 768 * 768 // 3,
@@ -2014,12 +1922,9 @@ def test_side_view_vlm_arbitration_overrides_rule():
     flat[idx] = 0.85
     fog = np.full((768, 768, 3), 0.42, np.float32)
 
-    # clean render everywhere except cameras deep on the -y (wall)
-    # side; the boundary sits BEYOND the oblique candidates' swing
-    # (the eye swings ~4.2*sin(15deg) ~ 1.09 around the box centre)
-    # so all four candidates reach the panel
     def fake_raster(sub, cam):
-        return fog if float(np.asarray(cam.eye)[1]) < -1.2 else img
+        e = np.asarray(cam.eye)
+        return fog if (e[1] < -0.8 and abs(e[0]) < 2.0) else img
 
     gsr.rasterize_gs = fake_raster
     gsr.render_gs_view = lambda *a, **k: img
@@ -2046,7 +1951,7 @@ def test_side_view_vlm_arbitration_overrides_rule():
     finally:
         (gsr.rasterize_gs, gsr.render_gs_view, gsr.png_bytes,
          gio.read_gaussian_ply) = _real
-    print("PASS side VLM arbitration (C flips the end; no-judge "
+    print("PASS side VLM arbitration (B flips the end; no-judge "
           "fallback keeps the rule pick)")
 
 
