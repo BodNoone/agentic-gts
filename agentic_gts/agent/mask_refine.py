@@ -949,27 +949,17 @@ def _absorb_single(single: dict, fines: list, axis, along0: float) -> bool:
     grounds SEVERAL -> the several stand; the row is one whole and the
     single box is that whole unresolved).
 
-    The single's back-projected points are REAL surface points: they
-    are clipped into whichever fine span contains them (more evidence
-    for the piece's point support / height). Its EXTENT is dropped --
-    unioning it would stretch a piece across the seam. Returns True
-    when the single touched any fine span (absorbed); False when it
-    overlapped none (the caller keeps it -- recall: a region the
-    multi face never grounded)."""
-    hit = False
+    The single face is discarded ENTIRELY -- extent AND points (user
+    report: the back view's whole-row SAM mask, cabinets
+    indistinguishable, carried the top-cable z into the pieces' point
+    pools and dragged the P97.5 height even after the extent was
+    dropped). Returns True when the single touched any fine span
+    (absorbed); False when it overlapped none (the caller keeps it --
+    recall: a region the multi face never grounded)."""
     for f in fines:
         if min(single["hi"], f["hi"]) - max(single["lo"], f["lo"]) > 0:
-            hit = True
-    if single["pts"] is not None and axis is not None:
-        al = single["pts"][:, :2] @ axis - along0
-        for f in fines:
-            if f["pts"] is None:
-                continue
-            m = (al >= f["lo"]) & (al <= f["hi"])
-            if m.any():
-                f["pts"] = np.vstack([f["pts"], single["pts"][m]])
-                hit = True
-    return hit
+            return True
+    return False
 
 
 def _merge_cross_view(spans: list, axis=None, along0: float = 0.0) -> list:

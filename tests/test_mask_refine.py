@@ -784,14 +784,22 @@ def test_cross_view_single_face_yields_to_multi():
     SEVERAL -> the several stand (the row is one whole; the single box
     is that whole unresolved). Even a PARTIAL single (the poor face's
     one box covering cabinet A and half of B) must NOT union with A --
-    that would stretch A's piece across the seam. Its points are
-    clipped into the fine spans; its extent is dropped."""
+    that would stretch A's piece across the seam. The single face is
+    discarded ENTIRELY -- extent AND points (user report: the back
+    view's whole-row SAM mask carried the top-cable z into the pieces'
+    point pools and dragged the P97.5 height even after the extent was
+    dropped)."""
     from agentic_gts.agent.mask_refine import _merge_cross_view
     axis = np.array([1.0, 0.0])
     mk = lambda xs: np.column_stack(
         [np.asarray(xs, float), np.zeros(len(xs)), np.ones(len(xs))])
-    # front (poor): ONE partial box [0, 1.3] -- A plus part of B
-    front = {"lo": 0.0, "hi": 1.3, "pts": mk([0.2, 0.8, 1.2]),
+    # front (poor): ONE partial box [0, 1.3] -- A plus part of B,
+    # its points include HIGH z (the whole-row mask grabbed the
+    # top cable above the cabinets)
+    front = {"lo": 0.0, "hi": 1.3,
+             "pts": np.column_stack(
+                 [np.asarray([0.2, 0.8, 1.2], float), np.zeros(3),
+                  np.full(3, 3.8)]),
              "ms": 0.6, "label": "rack", "view": "front"}
     # back (open): the true two cabinets
     backA = {"lo": 0.0, "hi": 1.0, "pts": mk([0.5]),
@@ -805,10 +813,16 @@ def test_cross_view_single_face_yields_to_multi():
     assert abs(a["lo"]) < 1e-9 and abs(a["hi"] - 1.0) < 1e-9, \
         "A's extent must NOT stretch to the absorbed single's 1.3"
     assert abs(b["lo"] - 1.05) < 1e-9 and abs(b["hi"] - 2.05) < 1e-9
-    # the single's real surface points were clipped into the fines
-    assert len(a["pts"]) == 3, "A keeps its 0.5 + the single's 0.2/0.8"
-    assert len(b["pts"]) == 2, "B keeps its 1.5 + the single's 1.2"
-    print("PASS single-instance face yields to the multi face")
+    # the single's points are NOT clipped into the fines -- the
+    # whole-row mask's high-z (cable) points must not reach any piece
+    assert len(a["pts"]) == 1, \
+        "A keeps only its own point; the single's 0.2/0.8 stay out"
+    assert len(b["pts"]) == 1, \
+        "B keeps only its own point; the single's 1.2 stays out"
+    assert all(p[2] < 2.0 for s in out for p in s["pts"]), \
+        "the cable-height z must not leak into any piece's points"
+    print("PASS single-instance face yields to the multi face "
+          "(extent and points)")
 
 
 def test_height_ignores_truncated_mask_points():
