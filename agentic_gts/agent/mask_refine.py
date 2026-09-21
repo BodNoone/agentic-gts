@@ -1054,7 +1054,12 @@ def _merge_spans(spans: list) -> list:
 
     * DUPLICATE -- the VLM double-boxed the SAME cabinet. Detected on
       the VLM's OWN pixel boxes (2D IoU >= 0.5), which the mask spans
-      cannot provide: masks bleed. Union into one span.
+      cannot provide: masks bleed. A second gate catches the BIG/SMALL
+      double-box (user report: many duplicates survived) -- a tight box
+      and a loose wider box over the same cabinet score IoU 0.3-0.45,
+      below the IoU gate, but the SMALL box is ~fully CONTAINED in the
+      big one (containment >= 0.8): also a duplicate. Union into one
+      span.
     * MASK BLEED -- two DISTINCT VLM instances whose SAM masks each
       overshoot the cabinet seam by a few centimetres (joined cabinets
       have no visual gap, so each mask edge lands inside the
@@ -1076,11 +1081,26 @@ def _merge_spans(spans: list) -> list:
         ab = (b[2] - b[0]) * (b[3] - b[1])
         return inter / (aa + ab - inter)
 
+    def _contained(a, b):
+        """How much of the SMALLER box lies inside the bigger one."""
+        if not a or not b:
+            return 0.0
+        ix = min(a[2], b[2]) - max(a[0], b[0])
+        iy = min(a[3], b[3]) - max(a[1], b[1])
+        if ix <= 0 or iy <= 0:
+            return 0.0
+        inter = ix * iy
+        aa = (a[2] - a[0]) * (a[3] - a[1])
+        ab = (b[2] - b[0]) * (b[3] - b[1])
+        return inter / min(aa, ab)
+
     out = []
     for s in sorted(spans, key=lambda t: t["lo"]):
         dup = next((p for p in out
                     if s["lo"] < p["hi"]
-                    and _iou(p.get("pix"), s.get("pix")) >= 0.5), None)
+                    and (_iou(p.get("pix"), s.get("pix")) >= 0.5
+                         or _contained(p.get("pix"), s.get("pix")) >= 0.8)),
+                   None)
         if dup is not None:
             # same instance double-boxed by the VLM: union
             if len(s["pts"]) > len(dup["pts"]):
@@ -1804,17 +1824,21 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
             # span (user report: door interference on box size)
             pts3 = _mask_to_points(scene, box, mask, voter["cam"],
                                     exclude=doors)
-            if out_dir:
-                _save_sam_debug(voter, box_pix, mask, pts3, box,
-                                None, out_dir,
-                                f"{box.box_id}_{voter['name']}_g{gi}_m{mi}")
             if len(pts3) < 20:
                 continue
             if best is None or ms > best[0]:
-                best = (float(ms), pts3)
+                best = (float(ms), pts3, mi, mask)
+        # debug save AFTER the pick (user report: three near-identical
+        # debug renders per box -- the multimask granularities -- read
+        # as duplicated segmentations): only the WINNING candidate's
+        # overlay is kept on disk
+        if best is not None and out_dir:
+            _save_sam_debug(voter, box_pix, best[3], best[1], box,
+                            None, out_dir,
+                            f"{box.box_id}_{voter['name']}_g{gi}")
         if best is None:
             continue
-        ms, pts3 = best
+        ms, pts3 = best[0], best[1]
         along = pts3[:, :2] @ axis - along0
         lo, hi = np.percentile(along, [2.0, 98.0])
         spans.append({"lo": float(lo), "hi": float(hi), "pts": pts3,

@@ -363,6 +363,35 @@ def test_merge_spans_dedupes_but_keeps_seams():
     print("PASS span merging (duplicates union, seams survive)")
 
 
+def test_merge_spans_containment_dedup():
+    """The BIG/SMALL double-box (user report: many duplicate spans
+    survived in the front view): a tight box and a loose wider box
+    over the SAME cabinet score 2D IoU below the 0.5 gate, but the
+    small box is ~fully contained in the big one -- containment
+    >= 0.8 catches it. A box merely OVERLAPPING a neighbour cabinet
+    (containment well under 0.8) must stay a distinct instance."""
+    from agentic_gts.agent.mask_refine import _merge_spans
+    spans = [
+        # big loose box over cabinet 1
+        {"lo": 0.00, "hi": 0.70, "pts": np.zeros((50, 3)),
+         "ms": 0.8, "label": "rack", "pix": (90, 190, 520, 610)},
+        # tight box over the SAME cabinet: IoU ~0.42 but contained
+        {"lo": 0.02, "hi": 0.60, "pts": np.zeros((30, 3)),
+         "ms": 0.7, "label": "rack", "pix": (120, 220, 480, 580)},
+        # neighbour cabinet: pixel overlap low, containment ~0.1
+        {"lo": 0.75, "hi": 1.40, "pts": np.zeros((50, 3)),
+         "ms": 0.8, "label": "rack", "pix": (540, 200, 900, 600)},
+    ]
+    out = _merge_spans(spans)
+    assert len(out) == 2, \
+        f"contained double-box must dedupe: got {len(out)} spans"
+    assert abs(out[0]["lo"]) < 1e-6 and abs(out[0]["hi"] - 0.70) < 1e-6
+    assert len(out[0]["pts"]) == 80, "duplicate's points union in"
+    assert abs(out[1]["lo"] - 0.75) < 1e-6, "neighbour stays distinct"
+    print("PASS containment dedupe (big/small double-box merges, "
+          "neighbour keeps)")
+
+
 def test_merge_spans_mask_bleed_keeps_instances():
     """SAM masks bleed a few cm across the seam between joined cabinets
     (user report: the VLM grounds DISTINCT instances but the spans
