@@ -553,6 +553,35 @@ def test_fit_region_box_snug_edge_starved_end():
           f"(x_hi {x_hi:.2f}; stray rejected; bare body {x_hi2:.2f})")
 
 
+def test_fit_region_box_mesh_snug_walk():
+    """MESH (user report: edges still not hugging on mesh input): the
+    span is raw min/max, which reaches every point IN THE POOL -- the
+    binding constraint was the 10cm clip window. The walk envelope
+    widens to 0.30m: a rect 0.30m short recovers to the TRUE end;
+    a near structure across a clean void is never crossed onto."""
+    from agentic_gts.agent.ground import _fit_region_box
+    rng = np.random.default_rng(41)
+    # 1) rect ends 0.30m short (x1=5.7 < 6.0): the clip recovers to
+    # ~5.8, the mesh walk carries the edge to the true end 6.0
+    row = _row_points(0.0, 6.0, rng=rng)
+    bb = _fit_region_box(row, (-0.3, -0.8, 5.7, 0.8), mesh_mode=True)
+    assert bb is not None, "mesh short rect must still fit"
+    x_hi = bb.center[0] + bb.size[0] / 2.0
+    assert 5.93 < x_hi <= 6.05, \
+        f"mesh +x must hug the true end 6.0, stopped at {x_hi:.2f}"
+    # 2) device ends 5.85, a near row starts 5.95 (clean void between):
+    # the walk stops AT the void, never onto the near row
+    near = _row_points(5.95, 6.4, rng=rng)
+    pts = np.vstack([_row_points(0.0, 5.85, rng=rng), near])
+    bb2 = _fit_region_box(pts, (-0.3, -0.8, 5.7, 0.8), mesh_mode=True)
+    assert bb2 is not None
+    x_hi2 = bb2.center[0] + bb2.size[0] / 2.0
+    assert x_hi2 <= 5.95, \
+        f"mesh walk crossed the void onto the near row: {x_hi2:.2f}"
+    print(f"PASS mesh snug walk (true end {x_hi:.2f}; void-guard "
+          f"{x_hi2:.2f} <= 5.95)")
+
+
 def test_fit_region_box_row_along_y():
     """A row running along the ROTATED-Y axis: the fit must ride the
     long side on the yaw axis (yaw = pi/2, size = (length, depth)). A
@@ -1624,6 +1653,7 @@ if __name__ == "__main__":
     test_fit_region_box_starved_back_face()
     test_fit_region_box_rect_relax_recovers_short_edge()
     test_fit_region_box_snug_edge_starved_end()
+    test_fit_region_box_mesh_snug_walk()
     test_floor_map_stepped()
     test_fit_region_box_stepped_floor()
     test_render_cut_mesh_mode()
