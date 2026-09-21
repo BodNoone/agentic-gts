@@ -192,16 +192,17 @@ def test_sam_box_prompt_construction():
         "the cable ladder must be a positive detection class"
     assert "never any part of a rack or cabinet" in prompt, \
         "the ladder box must exclude the device itself"
-    # the top cable is the THIRD subtractive class (user report: the
-    # FRONT view grounded top cable connections inside the device box
-    # -- the back view did not -- and the multi-view mask union read
-    # the height at the cable bundle)
-    assert "top cable" in prompt, \
-        "the top cable must be a positive detection class"
-    assert "cable connections above the rack tops" in prompt, \
-        "the top-cable rule must say where the cables sit"
-    assert "the box covers ONLY the cable bundle" in prompt, \
-        "the top-cable box must exclude the device itself"
+    # NO 'top cable' class (user report: a 3x slowdown -- the model
+    # boxed every cable run in every local view and the 6000-token
+    # generation ballooned; the height issue is covered by the
+    # cross-view 1-vs-N rule instead)
+    assert "top cable" not in prompt, \
+        "the top-cable class must stay retired (generation cost)"
+    # the subtractive PATH stays: a spontaneous 'cable' label is
+    # still pixel-subtracted downstream
+    from agentic_gts.agent.mask_refine import _is_subtractive
+    assert _is_subtractive("top cable"), \
+        "a spontaneous cable label must still subtract"
     # VLM quality verdict (user direction: judged TOGETHER with the
     # grounding in the same call, garbage views dropped)
     assert "quality: good" in prompt and "quality: poor" in prompt, \

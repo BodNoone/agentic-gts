@@ -434,7 +434,7 @@ class VLMJudge:
         "frame). Minor rendering imperfections are NOT poor.\n"
         "Locate every instance that belongs to the following categories: "
         '"server rack / IT cabinet, air-conditioning unit, '
-        'open cabinet door, cable ladder, top cable".\n'
+        'open cabinet door, cable ladder".\n'
         "Instance rules: cabinets joined side by side in one row are "
         "DIFFERENT instances when they differ in height or in color -- "
         "give each its own box at its own boundary; truly identical "
@@ -446,10 +446,13 @@ class VLMJudge:
         "beside or behind the device) is its OWN instance labelled "
         "\"cable ladder\" -- the box covers ONLY the ladder itself, "
         "never any part of a rack or cabinet.\n"
-        "A bundle of cables running across or connected to the TOP of "
-        "the device (cable connections above the rack tops) is its OWN "
-        "instance labelled \"top cable\" -- the box covers ONLY the "
-        "cable bundle, never any part of a rack or cabinet.\n"
+        # NO 'top cable' class (user report: a 3x slowdown -- the
+        # category made the model box EVERY cable run in every local
+        # view, and the max_tokens=6000 generation ballooned). The
+        # height pollution it addressed is now handled by the
+        # cross-view 1-vs-N rule (a single-instance whole-row face is
+        # fully discarded); a spontaneous "cable" label still gets
+        # subtracted downstream via _is_subtractive.
         "Each box must cover the whole visible instance it belongs to.\n"
         "Report bbox coordinates in JSON format like this: "
         '{"bbox_2d": [x1, y1, x2, y2], "label": "rack"}'
