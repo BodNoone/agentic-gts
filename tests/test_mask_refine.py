@@ -31,6 +31,31 @@ def _column(bins: list[tuple[float, float, int]], seed: int = 0):
     return np.concatenate(out) if out else np.zeros(0)
 
 
+def _quality_image(H: int = 768, W: int = 768) -> np.ndarray:
+    """A render that passes the gradient-energy gate: bright speckle
+    on a dark canvas (coverage well over 2%, edge energy orders above
+    the 1e-5 veil threshold)."""
+    img = np.full((H, W, 3), 0.02, np.float32)
+    flat = img.reshape(-1, 3)
+    idx = np.random.default_rng(0).choice(len(flat), H * W // 3,
+                                          replace=False)
+    flat[idx] = 0.85
+    return img
+
+
+def _fake_gs(means: np.ndarray):
+    """A minimal GaussianData over the given means (solid, tiny)."""
+    from agentic_gts.tools.gs_io import GaussianData
+    n = len(means)
+    return GaussianData(
+        means=np.asarray(means, dtype=np.float32),
+        log_scales=np.full((n, 3), -6.0, dtype=np.float32),
+        quats=np.tile(np.array([[1.0, 0, 0, 0]], np.float32), (n, 1)),
+        raw_opacity=np.full(n, 2.0, dtype=np.float32),
+        f_dc=np.zeros((n, 3), dtype=np.float32),
+    )
+
+
 def test_anchored_top_haze_tail_does_not_extend_body():
     """3DGS haze diffuses through the whole column: bins ABOVE the
     cabinet stay non-empty at a fraction of the body density. The old
@@ -2077,6 +2102,262 @@ def test_mask_overlay_is_rgb_plus_tint():
     assert out[0, 0, 2] > out[0, 0, 0], "blue channel must dominate"
     # 3D SAM2 mask shape (1, H, W) handled by the caller's squeeze
     print("PASS mask overlay (rgb + tint, no uint8 wraparound)")
+
+
+def test_side_view_z_cap_and_gs_keep():
+    """Side-only z cap (user report: a SHORT device beside a tall
+    structure -- the seed carries the SCENE-level z_top, so the side
+    frame would reach the occluder's full height): the side renders
+    must be drawn from a z-capped gaussian pool (the device's own
+    anchored top + 0.15m) while the front/back renders keep the seed
+    height, and the side view dict must carry the capped gs_keep for
+    the ladder retry."""
+    from agentic_gts.agent import mask_refine as mr
+
+    rng = np.random.default_rng(9)
+    # device body: short (z to ~0.95), dense
+    dev = np.column_stack([rng.uniform(-2.0, 2.0, 900),
+                           rng.uniform(-0.5, 0.5, 900),
+                           rng.uniform(0.05, 0.95, 900)])
+    # a tall thin pole INSIDE the OBB (y=0.45) reaching 1.9m: sparse,
+    # so the anchored walk stops at the device top -- the pole is in
+    # the box-only pool, so ONLY the z cap can remove it
+    pole = np.column_stack([rng.uniform(-1.0, 1.0, 40),
+                            np.full(40, 0.45),
+                            rng.uniform(1.20, 1.90, 40)])
+    means = np.vstack([dev, pole])
+    pole_i = np.arange(len(dev), len(dev) + 40)
+
+    scene = Scene(points=means.astype(np.float64))
+    scene.meta["gs_ply"] = "fake.ply"
+    box = OrientedBox(center=(0.0, 0.0, 1.05), size=(4.0, 1.0, 2.1),
+                     yaw=0.0)
+    gs = _fake_gs(means)
+
+    import agentic_gts.output.gs_render as gsr
+    import agentic_gts.tools.gs_io as gio
+    _real = (gsr.rasterize_gs, gsr.render_gs_view, gsr.png_bytes,
+             gio.read_gaussian_ply)
+    img = _quality_image()
+    calls = []
+
+    def fake_raster(sub, cam):
+        e = np.asarray(cam.eye, dtype=float)
+        calls.append((np.asarray(sub.means, dtype=float).copy(),
+                      float(e[0]), float(e[1])))
+        return img
+
+    gsr.rasterize_gs = fake_raster
+    gsr.render_gs_view = lambda *a, **k: img
+    gsr.png_bytes = lambda a: b"png"
+    gio.read_gaussian_ply = lambda p: gs
+    try:
+        views = mr.render_local_views(scene, box, None, judge=None)
+    finally:
+        (gsr.rasterize_gs, gsr.render_gs_view, gsr.png_bytes,
+         gio.read_gaussian_ply) = _real
+
+    side = next(v for v in views if v["name"] == "side")
+    assert "gs_keep" in side, "the side view must carry its render pool"
+    gk = np.asarray(side["gs_keep"])
+    assert len(gk) == len(means)
+    assert not gk[pole_i].any(), \
+        "the tall structure must be z-capped out of the side pool"
+    assert gk[:len(dev)].mean() > 0.9, "the device body must stay"
+    # side RENDER calls used the capped pool; front/back kept the seed
+    side_calls = [c for c in calls if abs(c[1]) > abs(c[2])]
+    face_calls = [c for c in calls if abs(c[1]) <= abs(c[2])]
+    assert side_calls, "the oblique side candidates must have rendered"
+    for m, _, _ in side_calls:
+        assert m[:, 2].max() < 1.30, \
+            f"side render reached z={m[:, 2].max():.2f} (cap ~1.10)"
+    assert any(m[:, 2].max() > 1.5 for m, _, _ in face_calls), \
+        "front/back renders must keep the full seed height"
+    print("PASS side view z cap (side pool cut at the device top, "
+          "front/back full height, gs_keep stored)")
+
+
+def test_side_ladder_retry_cuts_ladder_and_regrounds():
+    """The ladder-domination retry (user report: a short device beside
+    a long cable ladder -- the side view grounds ONLY the ladder): the
+    subtractive mask back-projects to the ladder's 3D location, those
+    gaussians are cut from the render pool, the SAME camera re-renders
+    and the VLM re-grounds -- the device appears and the thickness
+    pool carries device points, never ladder points."""
+    from agentic_gts.agent import mask_refine as mr
+    from agentic_gts.agent.judge import Verdict, VLMJudge
+    from agentic_gts.output.gs_render import Cam
+
+    rng = np.random.default_rng(11)
+    dev = np.column_stack([rng.uniform(-2.0, 2.0, 1500),
+                           rng.uniform(-0.5, 0.5, 1500),
+                           rng.uniform(0.05, 0.95, 1500)])
+    ladder = np.column_stack([rng.uniform(-2.0, 2.0, 1200),
+                              np.full(1200, 0.65),
+                              rng.uniform(0.05, 1.90, 1200)])
+    pts = np.vstack([dev, ladder])
+    scene = Scene(points=pts)
+    scene.meta["gs_ply"] = "fake.ply"
+    box = OrientedBox(center=(0.0, 0.0, 1.05), size=(4.0, 1.0, 2.1),
+                     yaw=0.0)
+    gs = _fake_gs(pts)
+
+    cam = Cam(eye=np.array([6.0, 0.8, 1.1]),
+              target=np.array([0.0, 0.0, 0.95]),
+              up=np.array([0.0, 0.0, 1.0]), fovy_deg=75.0, W=768, H=768)
+    uv_dev, uv_lad = cam.project_cv(dev), cam.project_cv(ladder)
+    for uv in (uv_dev, uv_lad):
+        assert ((uv[:, 0] >= 1) & (uv[:, 0] < 767)
+                & (uv[:, 1] >= 1) & (uv[:, 1] < 767)).all(), \
+            "the whole device+ladder must project inside the frame"
+
+    def _rel_bbox(uv):
+        return (float(uv[:, 0].min() / 767 * 1000),
+                float(uv[:, 1].min() / 767 * 1000),
+                float(uv[:, 0].max() / 767 * 1000),
+                float(uv[:, 1].max() / 767 * 1000))
+
+    def _pix_bbox(uv):
+        return np.array([uv[:, 0].min(), uv[:, 1].min(),
+                         uv[:, 0].max(), uv[:, 1].max()], dtype=float)
+
+    def _dot_mask(uv):
+        m = np.zeros((768, 768), bool)
+        m[np.rint(uv[:, 1]).astype(int),
+          np.rint(uv[:, 0]).astype(int)] = True
+        return m
+
+    lad_mask, dev_mask = _dot_mask(uv_lad), _dot_mask(uv_dev)
+    lad_pix, dev_pix = _pix_bbox(uv_lad), _pix_bbox(uv_dev)
+
+    sam = SamPredictorAdapter(checkpoint="fake.pt")
+
+    def fake_predict(self, image, box_pix):
+        bp = np.asarray(box_pix, dtype=float)
+        if abs(bp - lad_pix).sum() < abs(bp - dev_pix).sum():
+            return [lad_mask], [0.9]
+        return [dev_mask], [0.95]
+
+    judge = VLMJudge(backend="mock")
+    grounded = []
+
+    def fake_ground(image, box, view_name, png_path=None):
+        grounded.append(view_name)
+        groups = [{"bbox": _rel_bbox(uv_dev),
+                   "hypothesis": "server rack", "confidence": 0.9}]
+        return Verdict(action="segment", params={"groups": groups},
+                       confidence=0.9, detail="fake")
+
+    judge.adjudicate_sam_boxes = fake_ground
+    keep = mr._box_only_mask(gs, box)
+    side = {"name": "side", "image": _quality_image(), "cam": cam,
+            "path": None, "prompt_path": None, "gs_keep": keep}
+    groups = [{"bbox": _rel_bbox(uv_lad),
+               "hypothesis": "cable ladder", "confidence": 0.9}]
+
+    import agentic_gts.output.gs_render as gsr
+    import agentic_gts.tools.gs_io as gio
+    _real = (gsr.rasterize_gs, gsr.png_bytes, gio.read_gaussian_ply,
+             SamPredictorAdapter.predict)
+    img = _quality_image()
+    rendered = []
+
+    def fake_raster(sub, cam_):
+        rendered.append(np.asarray(sub.means, dtype=float).copy())
+        return img
+
+    gsr.rasterize_gs = fake_raster
+    gsr.png_bytes = lambda a: b"png"
+    gio.read_gaussian_ply = lambda p: gs
+    SamPredictorAdapter.predict = fake_predict
+    try:
+        r = mr._side_ladder_retry(scene, box, side, groups, sam,
+                                  judge, None)
+    finally:
+        (gsr.rasterize_gs, gsr.png_bytes, gio.read_gaussian_ply,
+         SamPredictorAdapter.predict) = _real
+
+    assert r is not None, "the retry must succeed"
+    assert grounded == ["side_retry"], grounded
+    # the cut render no longer carries the ladder body (y ~ 0.65)
+    assert rendered, "the retry must have re-rendered"
+    frac_lad = float((rendered[0][:, 1] > 0.60).mean())
+    assert frac_lad < 0.02, \
+        f"the ladder must be cut from the retry render ({frac_lad:.1%} left)"
+    assert (rendered[0][:, 1] < 0.5).mean() > 0.8, \
+        "the device must survive the cut"
+    # the thickness pool is DEVICE points: no ladder band in y
+    retry_view, groups2, pool, pool_ms = r
+    assert pool and len(groups2) == 1
+    p = np.vstack(pool)
+    assert len(p) > 100, f"pool too small ({len(p)})"
+    assert float((p[:, 1] > 0.60).mean()) < 0.02, \
+        "ladder points must never reach the thickness pool"
+    print("PASS side ladder retry (ladder cut, device re-grounded, "
+          "pool device-only)")
+
+
+def test_side_ladder_fallback_marks_unavailable():
+    """Graceful degradation (user direction: the failure must be
+    VISIBLE, not silent): a side view that grounds ONLY the ladder and
+    cannot retry (no stored render pool) leaves the audit marked
+    depth_profile-unavailable; refine_box returns no instances so the
+    caller keeps the seed box with its thickness."""
+    from agentic_gts.agent import mask_refine as mr
+    from agentic_gts.agent.judge import Verdict, VLMJudge
+    from agentic_gts.output.gs_render import Cam
+
+    rng = np.random.default_rng(13)
+    dev = np.column_stack([rng.uniform(-2.0, 2.0, 500),
+                           rng.uniform(-0.5, 0.5, 500),
+                           rng.uniform(0.05, 0.95, 500)])
+    ladder = np.column_stack([rng.uniform(-2.0, 2.0, 200),
+                              np.full(200, 0.65),
+                              rng.uniform(0.05, 1.90, 200)])
+    pts = np.vstack([dev, ladder])
+    scene = Scene(points=pts)
+    box = OrientedBox(center=(0.0, 0.0, 1.05), size=(4.0, 1.0, 2.1),
+                     yaw=0.0)
+    cam = Cam(eye=np.array([6.0, 0.8, 1.1]),
+              target=np.array([0.0, 0.0, 0.95]),
+              up=np.array([0.0, 0.0, 1.0]), fovy_deg=75.0, W=768, H=768)
+    uv_lad = cam.project_cv(ladder)
+    lad_rel = (float(uv_lad[:, 0].min() / 767 * 1000),
+               float(uv_lad[:, 1].min() / 767 * 1000),
+               float(uv_lad[:, 0].max() / 767 * 1000),
+               float(uv_lad[:, 1].max() / 767 * 1000))
+
+    def fake_predict(self, image, box_pix):
+        m = np.zeros(image.shape[:2], bool)
+        x1, y1, x2, y2 = (int(round(float(v))) for v in box_pix)
+        m[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)] = True
+        return [m], [0.9]
+
+    judge = VLMJudge(backend="mock")
+
+    def fake_ground(image, box, view_name, png_path=None):
+        groups = [{"bbox": lad_rel, "hypothesis": "cable ladder",
+                   "confidence": 0.9}]
+        return Verdict(action="segment", params={"groups": groups},
+                       confidence=0.9, detail="fake")
+
+    judge.adjudicate_sam_boxes = fake_ground
+    sam = SamPredictorAdapter(checkpoint="fake.pt")
+    # no gs_keep on the view: the retry has no stored render pool and
+    # bails out after the ladder lift
+    views = [{"name": "side", "cam": cam, "path": None,
+              "prompt_path": None, "image": _quality_image()}]
+    _real = SamPredictorAdapter.predict
+    SamPredictorAdapter.predict = fake_predict
+    try:
+        instances, audit = refine_box(scene, box, judge, sam, None,
+                                      views=views)
+    finally:
+        SamPredictorAdapter.predict = _real
+    assert instances == [], "nothing was measured: the seed must stand"
+    roles = [v.get("role") for v in audit["views"]]
+    assert "depth_profile-unavailable" in roles, roles
+    print("PASS side ladder fallback (audit marked unavailable)")
 
 
 if __name__ == "__main__":

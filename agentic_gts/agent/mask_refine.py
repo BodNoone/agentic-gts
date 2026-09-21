@@ -691,13 +691,47 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # (plus slack; the WALLED lateral side's slack shrunk to 0.03m --
     # occluders and fog sources alike) is hidden. One subset serves
     # every view (the mask does not depend on the camera).
-    sub = _subset_or_none(gs, _box_only_mask(
-        gs, box, wall_vec=wall_vec, face_half=face_half))
+    keep = _box_only_mask(gs, box, wall_vec=wall_vec,
+                          face_half=face_half)
+    sub = _subset_or_none(gs, keep)
+    # SIDE-ONLY z cap (user report: a SHORT device beside a tall cable
+    # ladder -- the seed carries the SCENE-level z_top, so the side
+    # frame reaches the ladder's full height and the VLM grounds only
+    # the ladder, killing the thickness correction): the side view
+    # measures THICKNESS, never height, so its render may cut at the
+    # device's OWN anchored top + 0.15m wherever that sits clearly
+    # below the seed top. The front/back views keep the seed height --
+    # they vote on height. The cap only ever TIGHTENS: a ladder dense
+    # enough to drag the anchored walk up leaves it high, i.e. the
+    # render is unchanged, never worse.
+    sub_side, keep_side = sub, keep
+    try:
+        means = np.asarray(gs.means, dtype=float)
+        local = box.world_to_local(means)
+        half = np.asarray(box.size, dtype=float) / 2.0
+        strict = keep & np.all(np.abs(local[:, :2]) <= half[:2], axis=1) \
+            & (local[:, 2] <= half[2])
+        if int(strict.sum()) >= 60:
+            top = _anchored_top(means[strict, 2])
+            seed_top = float(box.center[2]) + float(half[2])
+            if top is not None and float(top) + 0.15 < seed_top - 0.30:
+                ks = keep & (means[:, 2] <= float(top) + 0.15)
+                s2 = _subset_or_none(gs, ks)
+                if s2 is not None:
+                    sub_side, keep_side = s2, ks
+                    print(f"[mask-refine] side view z capped at "
+                          f"{float(top) + 0.15:.2f}m (seed top "
+                          f"{seed_top:.2f}m): tall occluders out of the "
+                          f"side frame")
+    except Exception as e:
+        print(f"[mask-refine] side z-cap failed "
+              f"({type(e).__name__}: {e}) -> full-height side render")
 
-    def _render_one(elev: float, azim: float, so: float):
+    def _render_one(elev: float, azim: float, so: float, s=None):
         cam = make_local_cam([box], W=768, H=768, elev_deg=elev,
                              azim_deg=azim, standoff=so)
-        raw = rasterize_gs(sub, cam) if sub is not None else None
+        pool_gs = sub if s is None else s
+        raw = rasterize_gs(pool_gs, cam) if pool_gs is not None else None
         if raw is None:
             raw = render_gs_view(gs, [box], cam, overlay=None,
                                  isolate_boxes=True, isolate_margin=0.8)
@@ -776,7 +810,7 @@ def render_local_views(scene: Scene, box: OrientedBox,
     side_cands.append((alt_azim + _SIDE_OBLIQUE_DEG, standoff_side))
     survivors = []
     for ci, (sa, ss) in enumerate(side_cands):
-        raw, prompt_img, cam = _render_one(18.0, sa, ss)
+        raw, prompt_img, cam = _render_one(18.0, sa, ss, sub_side)
         if raw is None:
             continue
         ok, why = _view_quality(raw)
@@ -829,10 +863,15 @@ def render_local_views(scene: Scene, box: OrientedBox,
                     f"{chr(65 + ci)}_unused.png"), "wb") as f:
                 f.write(png_bytes(r_))
     path, prompt_path = _save_view(raw, "side", prompt_img)
+    # gs_keep: the boolean over the GS the side renders were drawn
+    # from (z-capped when the cap fired) -- the ladder-retry in
+    # refine_box re-renders this view from the SAME camera minus the
+    # ladder's gaussians, and must start from exactly this pool
     out.append({"name": "side", "image": raw,
                 "prompt_image": prompt_img if prompt_img is not None
                 else raw,
-                "cam": cam, "path": path, "prompt_path": prompt_path})
+                "cam": cam, "path": path, "prompt_path": prompt_path,
+                "gs_keep": keep_side})
     return out
 
 
@@ -1732,6 +1771,162 @@ def _door_union(image: np.ndarray, groups: list, sam: SamPredictorAdapter
     return u
 
 
+def _side_thickness_pool(scene: Scene, box: OrientedBox, view: dict,
+                         groups: list, doors, sam: SamPredictorAdapter,
+                         out_dir: str | None, tag: str) -> tuple:
+    """Side-view SAM back-projection pool: every non-subtractive VLM
+    box -> best-scoring SAM mask -> points lifted WITHOUT the z-buffer
+    (from along the row every piece overlaps in projection -- all of
+    them must contribute). Returns (pool, pool_ms); an EMPTY pool means
+    the view grounded no device (all-subtractive or every mask lifted
+    <20 points).
+    """
+    pool, pool_ms = [], 0.0
+    H, W = view["image"].shape[:2]
+    for gi, g in enumerate(groups):
+        if _is_subtractive(g.get("hypothesis")):
+            continue          # subtraction only, never a pool
+        group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
+                         float(g.get("confidence", 0.5)))
+        box_pix = group.pixel_box(W, H)
+        if not (box_pix[2] - box_pix[0] > 4
+                and box_pix[3] - box_pix[1] > 4):
+            continue                  # degenerate/absent box
+        masks, scores = sam.predict(view["image"], box_pix)
+        best = None
+        for mi, (mask, ms) in enumerate(zip(masks, scores)):
+            # NO z-buffer: from along the row, every piece overlaps
+            # in projection -- all of them must contribute points
+            pts3 = _mask_to_points(scene, box, mask, view["cam"],
+                                   z_buffer=False, exclude=doors)
+            if out_dir:
+                _save_sam_debug(view, box_pix, mask, pts3, box,
+                                None, out_dir,
+                                f"{box.box_id}_{tag}_g{gi}_m{mi}")
+            if len(pts3) < 20:
+                continue
+            if best is None or ms > best[1]:
+                best = (pts3, float(ms))
+        if best is not None:
+            pool.append(best[0])
+            pool_ms = max(pool_ms, best[1])
+    return pool, pool_ms
+
+
+def _side_ladder_retry(scene: Scene, box: OrientedBox, side: dict,
+                       groups: list, sam: SamPredictorAdapter, judge,
+                       out_dir: str | None):
+    """Ladder-domination retry for the side view (user report: a SHORT
+    device beside a LONG cable ladder -- the side render shows mostly
+    ladder, the VLM grounds ONLY the ladder and the thickness
+    correction dies). The failed call already paid for the ladder's
+    LOCATION: the subtractive masks back-project (z-BUFFERED -- the
+    nearest surface per pixel, which the ladder occludes, so this is
+    the ladder itself, never the device behind it through the rung
+    gaps) to 3D, every gaussian within 0.15m of that surface is cut
+    from the render pool, the SAME camera re-renders, and the VLM is
+    asked again on the cut render. One extra render + one extra VLM
+    call, ONLY on the failing path.
+
+    Returns (retry_view, groups2, pool2, pool_ms2), or None (no
+    subtractive points / no stored render pool / the cut render or its
+    re-grounding produced nothing).
+    """
+    H, W = side["image"].shape[:2]
+    ladder_pts = []
+    for g in groups:
+        if not _is_subtractive(g.get("hypothesis")):
+            continue
+        group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "ladder"),
+                         float(g.get("confidence", 0.5)))
+        box_pix = group.pixel_box(W, H)
+        if not (box_pix[2] - box_pix[0] > 4 and box_pix[3] - box_pix[1] > 4):
+            continue
+        masks, scores = sam.predict(side["image"], box_pix)
+        if not len(masks):
+            continue
+        m = masks[int(np.argmax(scores))]
+        # z_buffer=True (the ladder is the OCCLUDER -- nearest per
+        # pixel) and margin=0.60 (the lift feeds an EXCLUSION volume,
+        # never a fit, so reaching past the seed is safe: only the
+        # render pool's own gaussians are ever queried against it)
+        pts3 = _mask_to_points(scene, box, m, side["cam"], margin=0.60)
+        if len(pts3):
+            ladder_pts.append(pts3)
+    if not ladder_pts:
+        return None
+    lp = np.vstack(ladder_pts)
+    if len(lp) < 20:
+        return None
+    keep = side.get("gs_keep")
+    gs_ply = scene.meta.get("gs_ply")
+    if keep is None or not gs_ply:
+        return None
+    near = None
+    try:
+        from scipy.spatial import cKDTree
+        from agentic_gts.tools.gs_io import read_gaussian_ply
+        from agentic_gts.output.gs_render import rasterize_gs
+        gs = read_gaussian_ply(gs_ply)
+        means = np.asarray(gs.means, dtype=float)
+        if len(means) != len(keep):
+            return None
+        idx = np.where(keep)[0]
+        d, _ = cKDTree(lp[:, :3]).query(means[idx], k=1)
+        near = idx[d <= 0.15]
+        if not len(near):
+            return None
+        keep2 = keep.copy()
+        keep2[near] = False
+        sub2 = _subset_or_none(gs, keep2)
+        if sub2 is None:
+            return None
+        raw = rasterize_gs(sub2, side["cam"])
+    except Exception as e:
+        print(f"[mask-refine] side ladder retry render failed "
+              f"({type(e).__name__}: {e})")
+        return None
+    if raw is None:
+        return None
+    ok, why = _view_quality(raw)
+    if not ok:
+        print(f"[mask-refine] side ladder retry dropped: {why}")
+        return None
+    path = None
+    if out_dir:
+        try:
+            from agentic_gts.output.gs_render import png_bytes
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(out_dir,
+                                f"mask_{box.box_id}_side_retry.png")
+            with open(path, "wb") as f:
+                f.write(png_bytes(raw))
+        except Exception as e:
+            print(f"[mask-refine] retry png save failed "
+                  f"({type(e).__name__}: {e})")
+            path = None
+    print(f"[mask-refine] side view retry: ladder cut "
+          f"({len(near)} gaussians removed), re-grounding")
+    verdict = judge.adjudicate_sam_boxes(raw, box, "side_retry",
+                                         png_path=path)
+    groups2 = verdict.params.get("groups", []) if verdict.params else []
+    quality2 = (verdict.params.get("view_quality", "good")
+                if verdict.params else "good")
+    if quality2 == "poor":
+        return None
+    if not any(not _is_subtractive(g.get("hypothesis")) for g in groups2):
+        return None
+    retry_view = {"name": "side_retry", "image": raw, "prompt_image": raw,
+                  "cam": side["cam"], "path": path, "prompt_path": path}
+    doors2 = _door_union(raw, groups2, sam)
+    pool2, pool_ms2 = _side_thickness_pool(scene, box, retry_view,
+                                           groups2, doors2, sam,
+                                           out_dir, "side_retry")
+    if not pool2:
+        return None
+    return retry_view, groups2, pool2, pool_ms2
+
+
 def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
                  sam: SamPredictorAdapter, out_dir: str | None,
                  audit: dict) -> list[dict]:
@@ -1932,40 +2127,28 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                   f"VLM judges the render quality poor")
             dva["role"] = "depth_profile-dropped"
             dva["groups"] = groups = []
-        H, W = side["image"].shape[:2]
         # the side view is where an open door sticks out HORIZONTALLY
         # beyond the body -- subtract its mask before any thickness
         # point enters the pool (belt and braces on top of the
         # strong-bin estimator)
         doors = _door_union(side["image"], groups, sam)
-        pool, pool_ms = [], 0.0
-        for gi, g in enumerate(groups):
-            if _is_subtractive(g.get("hypothesis")):
-                continue          # subtraction only, never a pool
-            group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
-                             float(g.get("confidence", 0.5)))
-            box_pix = group.pixel_box(W, H)
-            if not (box_pix[2] - box_pix[0] > 4
-                    and box_pix[3] - box_pix[1] > 4):
-                continue                  # degenerate/absent box
-            masks, scores = sam.predict(side["image"], box_pix)
-            best = None
-            for mi, (mask, ms) in enumerate(zip(masks, scores)):
-                # NO z-buffer: from along the row, every piece overlaps
-                # in projection -- all of them must contribute points
-                pts3 = _mask_to_points(scene, box, mask, side["cam"],
-                                      z_buffer=False, exclude=doors)
-                if out_dir:
-                    _save_sam_debug(side, box_pix, mask, pts3, box,
-                                    None, out_dir,
-                                    f"{box.box_id}_{side['name']}_g{gi}_m{mi}")
-                if len(pts3) < 20:
-                    continue
-                if best is None or ms > best[1]:
-                    best = (pts3, float(ms))
-            if best is not None:
-                pool.append(best[0])
-                pool_ms = max(pool_ms, best[1])
+        pool, pool_ms = _side_thickness_pool(
+            scene, box, side, groups, doors, sam, out_dir, side["name"])
+        # LADDER-DOMINATION RETRY (user report: a short device beside a
+        # long cable ladder -- the side view grounds ONLY the ladder,
+        # no device instance, and the thickness correction dies): the
+        # ladder the VLM DID find is cut from the render and the VLM is
+        # asked again. Triggered ONLY on the failing path -- a pool
+        # from the first pass skips it entirely.
+        ladder_dom = (not pool and any(_is_subtractive(g.get("hypothesis"))
+                                       for g in groups))
+        if ladder_dom:
+            r = _side_ladder_retry(scene, box, side, groups, sam,
+                                   judge, out_dir)
+            if r is not None:
+                retry_view, groups, pool, pool_ms = r
+                dva["retry"] = {"image": retry_view["path"],
+                                "groups": len(groups)}
         if pool:
             instances = _build_split_pieces(spans, box)
             recs = _apply_depth_from_side(
@@ -1980,6 +2163,14 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                 inst["score"] = min(inst["score"] + 0.08, 1.0)
         else:
             instances = _build_split_pieces(spans, box)
+            if ladder_dom:
+                # graceful degradation (user direction: the failure
+                # must be VISIBLE, not silent): the side view could not
+                # see the device past the ladder even after the retry --
+                # the seed's thickness stands
+                print("[mask-refine] side view unavailable "
+                      "(ladder dominates), thickness kept from seed")
+                dva["role"] = "depth_profile-unavailable"
         if out_dir:
             try:
                 with open(os.path.join(
