@@ -1046,6 +1046,34 @@ def _merge_cross_view(spans: list, axis=None, along0: float = 0.0) -> list:
     return out
 
 
+def _pix_iou(a, b) -> float:
+    """2D IoU of two pixel boxes (x1, y1, x2, y2)."""
+    if not a or not b:
+        return 0.0
+    ix = min(a[2], b[2]) - max(a[0], b[0])
+    iy = min(a[3], b[3]) - max(a[1], b[1])
+    if ix <= 0 or iy <= 0:
+        return 0.0
+    inter = ix * iy
+    aa = (a[2] - a[0]) * (a[3] - a[1])
+    ab = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / (aa + ab - inter)
+
+
+def _pix_contained(a, b) -> float:
+    """How much of the SMALLER pixel box lies inside the bigger one."""
+    if not a or not b:
+        return 0.0
+    ix = min(a[2], b[2]) - max(a[0], b[0])
+    iy = min(a[3], b[3]) - max(a[1], b[1])
+    if ix <= 0 or iy <= 0:
+        return 0.0
+    inter = ix * iy
+    aa = (a[2] - a[0]) * (a[3] - a[1])
+    ab = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / min(aa, ab)
+
+
 def _merge_spans(spans: list) -> list:
     """Reconcile along-row spans: duplicates merge, seams normalise.
 
@@ -1069,37 +1097,13 @@ def _merge_spans(spans: list) -> list:
       happened (user report: joined rows stayed joined).
     """
 
-    def _iou(a, b):
-        if not a or not b:
-            return 0.0
-        ix = min(a[2], b[2]) - max(a[0], b[0])
-        iy = min(a[3], b[3]) - max(a[1], b[1])
-        if ix <= 0 or iy <= 0:
-            return 0.0
-        inter = ix * iy
-        aa = (a[2] - a[0]) * (a[3] - a[1])
-        ab = (b[2] - b[0]) * (b[3] - b[1])
-        return inter / (aa + ab - inter)
-
-    def _contained(a, b):
-        """How much of the SMALLER box lies inside the bigger one."""
-        if not a or not b:
-            return 0.0
-        ix = min(a[2], b[2]) - max(a[0], b[0])
-        iy = min(a[3], b[3]) - max(a[1], b[1])
-        if ix <= 0 or iy <= 0:
-            return 0.0
-        inter = ix * iy
-        aa = (a[2] - a[0]) * (a[3] - a[1])
-        ab = (b[2] - b[0]) * (b[3] - b[1])
-        return inter / min(aa, ab)
-
     out = []
     for s in sorted(spans, key=lambda t: t["lo"]):
         dup = next((p for p in out
                     if s["lo"] < p["hi"]
-                    and (_iou(p.get("pix"), s.get("pix")) >= 0.5
-                         or _contained(p.get("pix"), s.get("pix")) >= 0.8)),
+                    and (_pix_iou(p.get("pix"), s.get("pix")) >= 0.5
+                         or _pix_contained(p.get("pix"),
+                                           s.get("pix")) >= 0.8)),
                    None)
         if dup is not None:
             # same instance double-boxed by the VLM: union
@@ -1765,6 +1769,31 @@ def _door_union(image: np.ndarray, groups: list, sam: SamPredictorAdapter
     return u
 
 
+def _dedupe_groups(groups: list, W: int, H: int) -> list:
+    """Drop duplicate VLM boxes BEFORE SAM (user report: one reply
+    double/triple-boxes the same cabinet -- g11/g16/g21 were all one
+    instance): every duplicate costs a full SAM multimask call and a
+    debug render. Same gates as _merge_spans -- IoU >= 0.5 or the
+    big/small containment >= 0.8 -- applied to the pixel boxes.
+    SUBTRACTIVE classes are exempt: a door/ladder/cable box sits
+    INSIDE the device box by design -- containment against the device
+    box would kill the subtraction.
+    """
+    uniq = []
+    for g in groups:
+        sub = _is_subtractive(g.get("hypothesis"))
+        pix = tuple(float(v) for v in BoxGroup(
+            tuple(g["bbox"]), g.get("hypothesis", "rack"),
+            0.5).pixel_box(W, H))
+        if not sub and any(
+                (not us) and (_pix_iou(u, pix) >= 0.5
+                              or _pix_contained(u, pix) >= 0.8)
+                for u, _g, us in uniq):
+            continue
+        uniq.append((pix, g, sub))
+    return [g for _, g, _ in uniq]
+
+
 def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
                  sam: SamPredictorAdapter, out_dir: str | None,
                  audit: dict) -> list[dict]:
@@ -1800,6 +1829,11 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
         va["role"] = "voter-dropped"
         va["groups"] = groups = []
     H, W = voter["image"].shape[:2]
+    n_raw = len(groups)
+    groups = _dedupe_groups(groups, W, H)
+    if len(groups) < n_raw:
+        print(f"[mask-refine] {voter['name']}: dropped "
+              f"{n_raw - len(groups)} duplicate VLM box(es) before SAM")
     yaw = float(box.yaw)
     axis = np.array([math.cos(yaw), math.sin(yaw)])
     along0 = float(np.asarray(box.center, dtype=float)[:2] @ axis)
@@ -1970,6 +2004,7 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
             dva["role"] = "depth_profile-dropped"
             dva["groups"] = groups = []
         H, W = side["image"].shape[:2]
+        groups = _dedupe_groups(groups, W, H)
         # the side view is where an open door sticks out HORIZONTALLY
         # beyond the body -- subtract its mask before any thickness
         # point enters the pool (belt and braces on top of the

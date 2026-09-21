@@ -363,6 +363,42 @@ def test_merge_spans_dedupes_but_keeps_seams():
     print("PASS span merging (duplicates union, seams survive)")
 
 
+def test_dedupe_groups_before_sam():
+    """The VLM's own reply double/triple-boxes one cabinet (user
+    report: sam_debug g11/g16/g21 all the SAME instance -- each
+    duplicate cost a full SAM multimask call and a debug render).
+    _dedupe_groups drops them BEFORE SAM on the same gates as
+    _merge_spans (IoU >= 0.5, big/small containment >= 0.8);
+    SUBTRACTIVE boxes are exempt -- a door/ladder box sits inside the
+    device box by design and must survive."""
+    from agentic_gts.agent.mask_refine import _dedupe_groups
+    W = H = 768
+    # big loose box + tight box (contained) + near-identical box
+    # (IoU) over cabinet 1; distinct neighbour; a door INSIDE the
+    # big box; a ladder overlapping the neighbour
+    groups = [
+        {"bbox": (117, 154, 400, 461), "hypothesis": "rack"},
+        {"bbox": (156, 192, 374, 422), "hypothesis": "rack"},
+        {"bbox": (120, 158, 403, 464), "hypothesis": "rack"},
+        {"bbox": (484, 154, 768, 461), "hypothesis": "rack"},
+        {"bbox": (200, 300, 350, 430), "hypothesis": "open cabinet door"},
+        {"bbox": (600, 154, 740, 461), "hypothesis": "cable ladder"},
+    ]
+    out = _dedupe_groups(groups, W, H)
+    labels = [(g["hypothesis"], g["bbox"]) for g in out]
+    assert len(out) == 4, \
+        f"3 duplicate racks must collapse to 1; got {len(out)}: {labels}"
+    racks = [g for g in out if g["hypothesis"] == "rack"]
+    assert len(racks) == 2, "cabinet 1 + neighbour survive"
+    # the door inside the big rack box is NOT eaten by containment
+    assert any(g["hypothesis"] == "open cabinet door" for g in out), \
+        "the subtractive door box must survive containment dedup"
+    # the ladder overlapping the neighbour rack is kept too
+    assert any(g["hypothesis"] == "cable ladder" for g in out)
+    print("PASS group dedupe before SAM (duplicates drop, "
+          "subtractives exempt)")
+
+
 def test_merge_spans_containment_dedup():
     """The BIG/SMALL double-box (user report: many duplicate spans
     survived in the front view): a tight box and a loose wider box
