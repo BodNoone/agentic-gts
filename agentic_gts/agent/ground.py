@@ -493,25 +493,14 @@ def _draw_raw_regions(img: np.ndarray, raw_rects: list) -> np.ndarray:
     return np.asarray(pil, dtype=np.float32) / 255.0
 
 
-def _draw_result_boxes(img: np.ndarray, cam, boxes,
-                       z_draw: float | None = None) -> np.ndarray:
+def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
     """Solid outlines for the grounded result boxes, COLOR-CODED by
     provenance (result-only audit: the VLM answered on the clean base,
     the fit is shown apart). Red = nadir-grounded; ORANGE = tilt-view
     fit; CYAN = cluster recall net. When a result box looks wrong, the
     color says WHICH stage produced it -- a merged box that is orange
     is tilt-perspective inflation, cyan is the recall net's cluster
-    spanning devices, red is the nadir fit itself (user debugging).
-
-    z_draw: draw every wireframe at ONE height -- the top of the
-    rendered device band (the cut the groundview itself shows). The
-    old default (each box's own TOP, z_top) was a PERSPECTIVE TRAP
-    (user report: red boxes read as the relaxed rect, "the fit never
-    ran"): the groundview cloud is cut at 0.50 (mesh) / 0.70 (GS) of
-    z_top, and a wireframe drawn at z_top projects radially outward
-    (f/(H-z)) well past the visible cloud surface the eye compares
-    against -- the larger and the more off-camera-axis the box, the
-    wider the gap."""
+    spanning devices, red is the nadir fit itself (user debugging)."""
     from PIL import Image, ImageDraw
     u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3].copy()
     pil = Image.fromarray(u8)
@@ -519,8 +508,7 @@ def _draw_result_boxes(img: np.ndarray, cam, boxes,
     colors = {"nadir": (255, 60, 60), "tilt": (255, 170, 40),
               "cluster": (40, 200, 230)}
     for b in boxes:
-        z = (b.center[2] + b.size[2] / 2.0 if z_draw is None
-             else float(z_draw))
+        z = b.center[2] + b.size[2] / 2.0
         cs = b.corners_2d()
         uv = cam.project_cv(np.column_stack([cs, np.full(len(cs), z)]))
         pts = [(int(round(p[0])), int(round(p[1]))) for p in uv]
@@ -532,8 +520,7 @@ def _draw_result_boxes(img: np.ndarray, cam, boxes,
 
 
 def _save_grounded_png(base_img, cam, boxes, raw_rects, out_dir,
-                       fname: str = "grounded.png",
-                       z_draw: float | None = None) -> None:
+                       fname: str = "grounded.png") -> None:
     """The grounding audit image, drawn the way the official 2d_grounding
     cookbook plots its answers.
 
@@ -551,7 +538,7 @@ def _save_grounded_png(base_img, cam, boxes, raw_rects, out_dir,
     try:
         from agentic_gts.output.gs_render import png_bytes
         img = _draw_result_boxes(_draw_raw_regions(base_img, raw_rects),
-                                 cam, boxes, z_draw=z_draw)
+                                 cam, boxes)
         path = os.path.join(out_dir, fname)
         with open(path, "wb") as f:
             f.write(png_bytes(img))
@@ -670,16 +657,6 @@ def _region_axis_span(v: np.ndarray, cell: float = 0.05,
     return s_lo, s_hi
 
 
-_RECT_RELAX = 0.10    # m, the rect relaxes by this before the clip
-# MESH walk envelope: mesh voids are clean (no haze), so a contiguous
-# walk stops at REAL gaps and the envelope widens past the clip relax
-# (the clip must stay at _RECT_RELAX for mesh too: the span estimator
-# is raw min/max and a wider CLIP would jump the voids onto whatever
-# lies beyond). 3DGS keeps the clip window for the walk -- haze fills
-# the gaps there and contiguity lies.
-_SNUG_WALK_MESH = 0.30
-
-
 def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
                     floor_z: float = 0.0, mesh_mode: bool = False,
                     seed_top: float | None = None):
@@ -716,21 +693,8 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
               f"n_pts={len(pts)} n_dev={n_dev}")
 
     x0, y0, x1, y1 = rect
-    # USER DESIGN: relax the rect by 10cm before the clip. The rect
-    # is otherwise a HARD CLIP and an edge drawn 0.1-0.3m inside the
-    # device can never recover its own points (user report: stage_G
-    # boxes stop short of the cloud on one side). On the relaxed pool
-    # the projected 2D span estimators below find each edge's nearest
-    # snug line: a short edge extends -- bounded to +10cm, so a near
-    # device or wall past that is never pasted on (user rejection of
-    # the earlier 0.40m/0.25m caps) -- while an inflated edge still
-    # trims (peel / clean extent). The height crop is the existing
-    # one (the caller's device band); the projection is the XY
-    # histogram the estimators already run on.
-    m = ((points[:, 0] >= x0 - _RECT_RELAX) &
-         (points[:, 0] <= x1 + _RECT_RELAX) &
-         (points[:, 1] >= y0 - _RECT_RELAX) &
-         (points[:, 1] <= y1 + _RECT_RELAX))
+    m = ((points[:, 0] >= x0) & (points[:, 0] <= x1) &
+         (points[:, 1] >= y0) & (points[:, 1] <= y1))
     pts = points[m]
     if len(pts) < min_pts:
         _reject(f"no point support (<{min_pts})")
@@ -790,76 +754,6 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
     else:                            # too sparse to bin: percentile fit
         x_lo, y_lo = np.percentile(dev[:, :2], 0.5, axis=0)
         x_hi, y_hi = np.percentile(dev[:, :2], 99.5, axis=0)
-    # USER DIRECTIVE (every edge must HUG the device): the fitted edge
-    # must land on the device's own boundary, not on the clip window.
-    # Two failure layers, two modes:
-    #   * 3DGS: the peel estimator's connect cut (20% of the pass
-    #     peak) stops at STARVED end bins -- end caps / side sheets
-    #     render far sparser than front faces. The snug walk extends
-    #     each edge to the nearest CONTIGUOUS support inside the
-    #     relaxed window (the window itself is the guard against
-    #     pasting onto near devices / walls -- the failure of the
-    #     earlier unbounded outward walk).
-    #   * MESH (user report: edges still not hugging on mesh input):
-    #     the span is raw min/max, which already reaches every point
-    #     IN THE POOL -- the binding constraint is the 10cm clip
-    #     window (a VLM rect 0.2-0.3m short leaves the edge short).
-    #     Mesh voids are clean, so the WALK envelope widens to
-    #     _SNUG_WALK_MESH: contiguity stops at real gaps, and a near
-    #     structure across a void is never crossed onto. The bin
-    #     floor is RELATIVE to the axis's own peak (2%) in both modes.
-    # No leading-void skip: a structure separated from the fit edge
-    # by a void is NOT this device -- the nearest snug line (user's
-    # design) never crosses a gap.
-    def _axis_peak_bin(vals: np.ndarray, lo: float, hi: float) -> float:
-        nb = max(1, int((hi - lo) / 0.05) + 2)
-        hist, _ = np.histogram(vals, bins=lo + 0.05 * np.arange(nb + 1))
-        return float(hist.max()) if len(hist) else 0.0
-
-    def _snug(vals: np.ndarray, edge: float, sign: float,
-              cap: float, floor: float) -> float:
-        if cap <= 0.05:
-            return edge
-        cell = 0.05
-        nb = int(cap / cell)
-        b = 0
-        while b < nb:
-            if sign > 0:
-                lo, hi = edge + b * cell, edge + (b + 1) * cell
-                cnt = int(((vals > lo) & (vals <= hi)).sum())
-            else:
-                lo, hi = edge - (b + 1) * cell, edge - b * cell
-                cnt = int(((vals >= lo) & (vals < hi)).sum())
-            if cnt < floor:
-                break
-            b += 1
-        return edge + sign * (b * cell)
-
-    if mesh_mode:
-        walk = _SNUG_WALK_MESH
-        mw = ((points[:, 0] >= x0 - walk) & (points[:, 0] <= x1 + walk) &
-              (points[:, 1] >= y0 - walk) & (points[:, 1] <= y1 + walk))
-        wpool = points[mw]
-        # USER DIRECTIVE: the mesh walk pool is the LOW band only
-        # (0.30-1.00m) -- the same band the fit itself runs on. The
-        # bare >0.30 cut let tray / tall remnants in on the pts_fit
-        # FALLBACK path (pool < 100 pts -> everything above 0.30) and
-        # those span XY far past the device, dragging edges wide.
-        wpool = wpool[(wpool[:, 2] > floor_z + 0.30) &
-                      (wpool[:, 2] <= floor_z + 1.00)]
-    else:
-        walk = _RECT_RELAX
-        wpool = core
-    y_win = wpool[(wpool[:, 1] >= y_lo) & (wpool[:, 1] <= y_hi)]
-    fx = max(2.0, 0.02 * _axis_peak_bin(y_win[:, 0], x_lo, x_hi))
-    x_lo = _snug(y_win[:, 0], x_lo, -1.0, x_lo - (x0 - walk), fx)
-    x_hi = _snug(y_win[:, 0], x_hi, +1.0, (x1 + walk) - x_hi, fx)
-    x_win = wpool[(wpool[:, 0] >= x_lo) & (wpool[:, 0] <= x_hi)]
-    fy = max(2.0, 0.02 * _axis_peak_bin(x_win[:, 1], y_lo, y_hi))
-    y_lo = _snug(x_win[:, 1], y_lo, -1.0, y_lo - (y0 - walk), fy)
-    y_hi = _snug(x_win[:, 1], y_hi, +1.0, (y1 + walk) - y_hi, fy)
-    # (edge recovery lives in the relaxed clip above: the 10cm window
-    # IS the search envelope for each edge's snug line)
     dx, dy = float(x_hi - x_lo), float(y_hi - y_lo)
     if dx < 0.30 or dy < 0.20:
         _reject(f"sliver (span {dx:.2f} x {dy:.2f}m; "
@@ -1200,8 +1094,7 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
                           density_ratio: float = 0.30,
                           floor_at=None,
                           probe_pool: np.ndarray | None = None,
-                          seed_top: float | None = None,
-                          mesh_mode: bool = False) -> list:
+                          seed_top: float | None = None) -> list:
     """Merge tightly-ADJACENT grounded boxes; splitting is stageC's job.
 
     The VLM sometimes over-splits ONE physical structure into several
@@ -1336,12 +1229,7 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
         # the union refit must NOT re-split it across that bridge (the
         # deep-split belongs to the per-RECT path, where the rect
         # itself is the only evidence)
-        # MESH BUG FIX: this refit used to run WITHOUT mesh_mode -- the
-        # 3DGS peel thresholds (connect 20% of pass peak) then bit real
-        # mesh structure and the union refit came out SMALLER than the
-        # members it merged (user report: mesh edges not hugging)
-        bb = _fit_region_box(pts_fit, u, floor_z=fz, seed_top=seed_top,
-                             mesh_mode=mesh_mode)
+        bb = _fit_region_box(pts_fit, u, floor_z=fz, seed_top=seed_top)
         if bb is None:
             out.extend(boxes[i] for i in members)   # keep the pieces
             continue
@@ -1548,14 +1436,6 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         bbs = _fit_region_boxes(pts_fit, rect_r,
                                 floor_z=float(fl(cw[0], cw[1])),
                                 mesh_mode=is_mesh, seed_top=fit_top)
-        # fit audit (user question "did the fit even run?"): rect the
-        # VLM drew vs the fitted span over its points, per side
-        for bb in bbs:
-            cs = np.asarray(bb.corners_2d())
-            print(f"[ground] fit[{source}] rect x[{rect_r[0]:.2f},"
-                  f"{rect_r[2]:.2f}] y[{rect_r[1]:.2f},{rect_r[3]:.2f}]"
-                  f" -> box x[{cs[:, 0].min():.2f},{cs[:, 0].max():.2f}]"
-                  f" y[{cs[:, 1].min():.2f},{cs[:, 1].max():.2f}]")
         # _fit_region_boxes (plural): a deep fit -- the VLM drew ONE
         # rect around two opposing rows -- splits at the aisle here,
         # before the box enters the pipeline (stageC can only split
@@ -1786,25 +1666,13 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # ratio like a real seam, merging devices that look fully separate
     # on the groundview (user report).
     boxes = _merge_adjacent_boxes(boxes, pts_fit, yaw, floor_at=fl,
-                                  probe_pool=pts_clu, seed_top=fit_top,
-                                  mesh_mode=is_mesh)
+                                  probe_pool=pts_clu, seed_top=fit_top)
     scene.boxes = boxes
     # result audit: one image per view -- the view's own raw VLM rects
     # (colored) plus the final fitted boxes (red) projected through the
     # same camera. Tiled views draw ALL boxes (cross-tile ones project
     # outside the frame), so each tile's audit stays self-contained.
     if out_dir:
-        # draw the red wireframes at the TOP OF THE RENDERED BAND --
-        # the height the groundview cloud actually shows (mesh 0.50 /
-        # GS 0.70 of z_top via _render_cut). At each box's own z_top
-        # the wireframe projects radially OUTWARD past the cut cloud
-        # and reads as the relaxed rect (user report: "the fit never
-        # ran" -- it ran, the audit drew it at the wrong height).
-        try:
-            cc = _render_cut(fit_top, mesh_mode=is_mesh)
-        except Exception:
-            cc = float("nan")
-        z_draw = float(cc) if np.isfinite(cc) else None
         for idx, (img_v, cam_v, _, _, fname_v, rects_v) in enumerate(views):
             # non-tiled: views[0] (the NADIR view) owns grounded.png --
             # the before/after audit must compare the colored rects and
@@ -1815,6 +1683,5 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
             fname_out = ("grounded.png" if (tiles is None and idx == 0)
                          else fname_v.replace("groundview", "grounded"))
             _save_grounded_png(
-                img_v, cam_v, boxes, rects_v, out_dir, fname=fname_out,
-                z_draw=z_draw)
+                img_v, cam_v, boxes, rects_v, out_dir, fname=fname_out)
     return True

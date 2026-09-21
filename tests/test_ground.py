@@ -466,122 +466,6 @@ def test_ground_stage_with_patched_vlm():
           f"row2 {b2.size[0]:.2f}x{b2.size[1]:.2f})")
 
 
-def test_fit_region_box_rect_relax_recovers_short_edge():
-    """USER DESIGN: the rect relaxes by 10cm before the clip -- the
-    rect is otherwise a HARD CLIP and an edge drawn 0.1-0.3m inside
-    the device can never recover its own points (user report: stage_G
-    boxes stop short of the cloud on one side). On the relaxed pool
-    the span estimators find each edge's nearest snug line: the short
-    +x end recovers up to rect+10cm (~5.8; the rest is the local
-    refine's job); haze and the facing row across the aisle are
-    trimmed as before; a neighbour beyond the 10cm window is never
-    reached (user rejection of the earlier 0.40/0.25m caps)."""
-    from agentic_gts.agent.ground import _fit_region_box
-    rng = np.random.default_rng(23)
-    row = _row_points(0.0, 6.0, rng=rng)
-    facing = _row_points(0.0, 6.0, y=3.0, rng=rng)
-    haze = np.column_stack([rng.uniform(-0.3, 6.5, 400),
-                            rng.uniform(-1.0, 1.0, 400),
-                            rng.uniform(0.4, 2.0, 400)])
-    pts = np.vstack([row, facing, haze])
-    # rect ends 0.30m short of the row end (x1=5.7 < 6.0); the 10cm
-    # relaxation recovers to ~5.8
-    bb = _fit_region_box(pts, (-0.3, -0.8, 5.7, 0.8))
-    assert bb is not None, "short rect must still fit"
-    x_hi = bb.center[0] + bb.size[0] / 2.0
-    x_lo = bb.center[0] - bb.size[0] / 2.0
-    y_hi = bb.center[1] + bb.size[1] / 2.0
-    y_lo = bb.center[1] - bb.size[1] / 2.0
-    # the +x edge recovered past the rect's 5.7 toward the row end,
-    # bounded by the +10cm window
-    assert x_hi > 5.72, \
-        f"+x must recover past the rect edge 5.7, stopped at {x_hi:.2f}"
-    assert x_hi <= 5.82, \
-        f"+x must stay within the 10cm window (<=5.8): {x_hi:.2f}"
-    # the -x side stays bounded by the relaxed rect (-0.4); haze must
-    # not run to the window edge unchecked
-    assert x_lo > -0.45, f"-x ran to the window edge: {x_lo:.2f}"
-    # thickness: haze outside the faces did not extend the y span,
-    # and the facing row (y 2.45..3.55) was never reached
-    assert -0.75 < y_lo < -0.35, f"y_lo {y_lo:.2f} (want ~-0.55)"
-    assert 0.35 < y_hi < 0.75, f"y_hi {y_hi:.2f} (want ~0.55, no haze)"
-    print(f"PASS rect relaxation recovers short edge "
-          f"(x_hi {x_hi:.2f} within [5.7, 5.8]; haze/facing row trimmed)")
-
-
-def test_fit_region_box_snug_edge_starved_end():
-    """The peel estimator's keep_thr max(6% peak, 3) rejects STARVED
-    end bins -- 3DGS renders a row's end caps / side sheets far
-    sparser than its front faces, so the fitted edge stops INSIDE
-    the true device end even though the relaxed window holds its
-    points (user report: some edges never found the device line).
-    The snug walk extends each edge to the nearest CONTIGUOUS support
-    at a 2-pt floor inside the window: a 3-pt-per-bin side sheet
-    recovers to the true end 6.0; a single haze stray in the window
-    does not extend the edge (floor 2)."""
-    from agentic_gts.agent.ground import _fit_region_box
-    rng = np.random.default_rng(31)
-    row = _row_points(0.0, 5.4, rng=rng)          # dense body
-    # starved side sheet 5.4..6.0: exactly 3 pts per 5cm bin (below
-    # peel's keep_thr, above the snug floor)
-    sheet = []
-    for b in range(12):
-        xc = 5.4 + 0.05 * b + 0.025
-        for zc in (1.0, 1.2, 1.4):
-            sheet.append([xc, rng.uniform(-0.3, 0.3), zc])
-    sheet = np.asarray(sheet)
-    # single haze stray inside the relaxed window (rect x1=6.05 ->
-    # window to 6.15): floor 2 must reject it
-    stray = np.array([[6.10, 0.1, 1.2]])
-    pts = np.vstack([row, sheet, stray])
-    bb = _fit_region_box(pts, (-0.3, -0.8, 6.05, 0.8))
-    assert bb is not None, "row with starved end must still fit"
-    x_hi = bb.center[0] + bb.size[0] / 2.0
-    # the sheet's contiguous 3-pt run carries the edge to the true
-    # end ~6.0 (NOT the stray's 6.10, NOT peel's 5.4)
-    assert x_hi > 5.93, \
-        f"+x must hug the starved sheet end (~6.0), stopped at {x_hi:.2f}"
-    assert x_hi <= 6.05, \
-        f"+x must not run past the sheet onto the stray: {x_hi:.2f}"
-    # and WITHOUT the sheet (dense body only) the same rect's edge
-    # stays at the body end: the walk never chases the stray alone
-    bb2 = _fit_region_box(row, (-0.3, -0.8, 6.05, 0.8))
-    x_hi2 = bb2.center[0] + bb2.size[0] / 2.0
-    assert x_hi2 <= 5.55, \
-        f"no sheet -> edge must stay at the body end, ran to {x_hi2:.2f}"
-    print(f"PASS snug edge hugs starved sheet end "
-          f"(x_hi {x_hi:.2f}; stray rejected; bare body {x_hi2:.2f})")
-
-
-def test_fit_region_box_mesh_snug_walk():
-    """MESH (user report: edges still not hugging on mesh input): the
-    span is raw min/max, which reaches every point IN THE POOL -- the
-    binding constraint was the 10cm clip window. The walk envelope
-    widens to 0.30m: a rect 0.30m short recovers to the TRUE end;
-    a near structure across a clean void is never crossed onto."""
-    from agentic_gts.agent.ground import _fit_region_box
-    rng = np.random.default_rng(41)
-    # 1) rect ends 0.30m short (x1=5.7 < 6.0): the clip recovers to
-    # ~5.8, the mesh walk carries the edge to the true end 6.0
-    row = _row_points(0.0, 6.0, rng=rng)
-    bb = _fit_region_box(row, (-0.3, -0.8, 5.7, 0.8), mesh_mode=True)
-    assert bb is not None, "mesh short rect must still fit"
-    x_hi = bb.center[0] + bb.size[0] / 2.0
-    assert 5.93 < x_hi <= 6.05, \
-        f"mesh +x must hug the true end 6.0, stopped at {x_hi:.2f}"
-    # 2) device ends 5.85, a near row starts 5.95 (clean void between):
-    # the walk stops AT the void, never onto the near row
-    near = _row_points(5.95, 6.4, rng=rng)
-    pts = np.vstack([_row_points(0.0, 5.85, rng=rng), near])
-    bb2 = _fit_region_box(pts, (-0.3, -0.8, 5.7, 0.8), mesh_mode=True)
-    assert bb2 is not None
-    x_hi2 = bb2.center[0] + bb2.size[0] / 2.0
-    assert x_hi2 <= 5.95, \
-        f"mesh walk crossed the void onto the near row: {x_hi2:.2f}"
-    print(f"PASS mesh snug walk (true end {x_hi:.2f}; void-guard "
-          f"{x_hi2:.2f} <= 5.95)")
-
-
 def test_fit_region_box_row_along_y():
     """A row running along the ROTATED-Y axis: the fit must ride the
     long side on the yaw axis (yaw = pi/2, size = (length, depth)). A
@@ -1651,9 +1535,6 @@ if __name__ == "__main__":
     test_fit_region_box_full_depth()
     test_fit_region_box_haze_immune()
     test_fit_region_box_starved_back_face()
-    test_fit_region_box_rect_relax_recovers_short_edge()
-    test_fit_region_box_snug_edge_starved_end()
-    test_fit_region_box_mesh_snug_walk()
     test_floor_map_stepped()
     test_fit_region_box_stepped_floor()
     test_render_cut_mesh_mode()
