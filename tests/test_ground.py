@@ -1661,6 +1661,65 @@ def test_fit_region_box_seed_top_is_local_height():
     print("PASS fit region box seed_top is a local height (slab + height)")
 
 
+def test_floor_at_local_rotates_back():
+    """floor_at_local must map ROTATED (row-frame) coords back to WORLD
+    before the floor lookup. Regression for the bug that lifted
+    stepped-floor boxes: the fit evaluated the world floor at the local
+    coords, hitting the wrong step (flat rooms hid it, every lookup ~0)."""
+    from agentic_gts.agent.ground import _floor_at_local
+    yaw = math.radians(30.0)
+
+    def fl(wx, wy):
+        return np.where(np.asarray(wx, dtype=float) > 0.0, 0.6, 0.0)
+
+    f = _floor_at_local(fl, yaw)
+    assert abs(float(f(1.0, 0.0)) - 0.6) < 1e-9, "local +x -> world +x"
+    assert abs(float(f(-1.0, 0.0)) - 0.0) < 1e-9, "local -x -> world -x"
+    # this local point rotates into world +x: the buggy direct lookup
+    # (fl at local coords) would return 0, the correct one 0.6
+    assert abs(float(f(-0.5, -1.0)) - 0.6) < 1e-9, \
+        "local -> world rotation must be applied before the lookup"
+    print("PASS floor_at_local rotates local -> world before lookup")
+
+
+def test_fit_region_box_rotated_stepped_floor():
+    """Regression for the wrong-frame floor lookup: with a nonzero yaw
+    and a stepped floor, a device on the LOW side must not be lifted
+    onto the high step. The device sits where its LOCAL coords fall on
+    the high step but its WORLD coords are on the low floor -- only the
+    local->world wrapper (_floor_at_local) gets it right."""
+    import math
+    from agentic_gts.agent.ground import _fit_region_box, _floor_at_local
+    yaw = math.radians(30.0)
+
+    def fl_world(wx, wy):
+        return np.where(np.asarray(wx, dtype=float) > 0.0, 0.6, 0.0)
+
+    rng = np.random.default_rng(9)
+    n = 3000
+    half = 0.55
+    # device row on the LOW floor (world x < 0), far in +y so that its
+    # ROTATED coords land in world x > 0 (the high step)
+    wpts = []
+    for face in (+half, -half):
+        wpts.append(np.column_stack([rng.uniform(-2.0, -0.5, n),
+                                     np.full(n, 4.0 + face),
+                                     rng.uniform(0.0, 2.1, n)]))
+    wpts = np.vstack(wpts)
+    c, s = math.cos(-yaw), math.sin(-yaw)          # world -> local
+    lpts = np.column_stack([c * wpts[:, 0] - s * wpts[:, 1],
+                            s * wpts[:, 0] + c * wpts[:, 1], wpts[:, 2]])
+    rect = (lpts[:, 0].min() - 0.1, lpts[:, 1].min() - 0.1,
+            lpts[:, 0].max() + 0.1, lpts[:, 1].max() + 0.1)
+    fl_local = _floor_at_local(fl_world, yaw)
+    bb = _fit_region_box(lpts, rect, seed_top=2.1, floor_at=fl_local)
+    assert bb is not None, "region must produce a box"
+    bottom = bb.center[2] - bb.size[2] / 2.0
+    assert abs(bottom) < 0.05, \
+        f"bottom must be the LOW floor (0), got {bottom:.2f} (wrong-step bug)"
+    print("PASS rotated stepped floor (local->world floor lookup in the fit)")
+
+
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
@@ -1679,6 +1738,8 @@ if __name__ == "__main__":
     test_ground_stage_drops_oversized_blob()
     test_fit_region_box_uses_own_points_floor()
     test_fit_region_box_seed_top_is_local_height()
+    test_floor_at_local_rotates_back()
+    test_fit_region_box_rotated_stepped_floor()
     test_robust_span_bin_boundary()
     test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()

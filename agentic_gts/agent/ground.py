@@ -136,6 +136,27 @@ def _floor_map(points: np.ndarray, grid: float = 1.5, band: float = 1.0,
     return _fl
 
 
+def _floor_at_local(fl, yaw: float):
+    """Wrap a WORLD-frame floor callable so it accepts ROTATED-frame
+    (row-frame) xy.
+
+    The fit functions receive points rotated by -yaw into the row frame,
+    while _floor_map is a function of world xy. Without the inverse
+    rotation the lookup hits the WRONG location -- a flat floor hid the
+    bug (every lookup returned ~0) while a stepped room looked up the
+    wrong step and lifted the box onto it (bottom off the ground, top
+    off too). Rotating local -> world first restores the correct step.
+    """
+    c, s = math.cos(yaw), math.sin(yaw)
+
+    def _f(lx, ly):
+        lx = np.asarray(lx, dtype=float)
+        ly = np.asarray(ly, dtype=float)
+        return fl(c * lx - s * ly, s * lx + c * ly)
+
+    return _f
+
+
 def _layout_frame(scene, yaw: float):
     """Rotated-frame AABB of the bootstrap layout (device cells /
     footprint), or None. The kept CELLS are rotated by the ACTUAL yaw
@@ -1432,6 +1453,11 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     P = np.asarray(scene.points, dtype=np.float64)
     is_mesh = bool(scene.meta.get("geometry_is_mesh"))
     fl = _floor_map(P, mesh_mode=is_mesh)
+    # floor_at for the FIT functions: they receive points in the ROTATED
+    # (row) frame, while _floor_map is a function of WORLD xy -- wrap it
+    # so the lookup rotates local -> world first (see _floor_at_local).
+    # The render cut / fit pool below keep the world `fl`.
+    fl_local = _floor_at_local(fl, yaw)
     h_fit = P[:, 2] - fl(P[:, 0], P[:, 1])
     fit_top = float(scene.meta.get("z_top", 2.5) or 2.5)
     pts_fit = _rot_xy(P[(h_fit > 0.30) & (h_fit <= 1.00)], -yaw)
@@ -1491,7 +1517,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         # the rect's own LOCAL floor (stepped rooms) comes from ITS OWN
         # points via floor_at (per-point median) -- not a scalar at the
         # rect centre, which lifted the box onto the wrong step
-        bbs = _fit_region_boxes(pts_fit, rect_r, floor_at=fl,
+        bbs = _fit_region_boxes(pts_fit, rect_r, floor_at=fl_local,
                                 mesh_mode=is_mesh, seed_top=fit_top)
         # _fit_region_boxes (plural): a deep fit -- the VLM drew ONE
         # rect around two opposing rows -- splits at the aisle here,
@@ -1652,7 +1678,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                           f"({type(e).__name__})")
             for cid, (rect, _npts) in enumerate(missed, start=1):
                 for bb in _fit_region_boxes(
-                        pts_fit, rect, floor_at=fl,
+                        pts_fit, rect, floor_at=fl_local,
                         max_depth=1.35, min_side=0.15,
                         mesh_mode=is_mesh, seed_top=fit_top):
                     # wall-thin fits never enter the pipeline: a wall
@@ -1719,7 +1745,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # gapless strips bridge adjacent device tops and pass the density
     # ratio like a real seam, merging devices that look fully separate
     # on the groundview (user report).
-    boxes = _merge_adjacent_boxes(boxes, pts_fit, yaw, floor_at=fl,
+    boxes = _merge_adjacent_boxes(boxes, pts_fit, yaw, floor_at=fl_local,
                                   probe_pool=pts_clu, seed_top=fit_top)
     # drop "fat blob" boxes (user report: a huge box covering aisles and
     # junk): cheap geometric guard BEFORE the expensive local refine --
