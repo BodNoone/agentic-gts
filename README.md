@@ -49,10 +49,6 @@ pip install -r requirements.txt
 ```bash
 # 从点云直接跑（box 全部来自 VLM grounding，无需任何初始输入）
 python -m agentic_gts.cli run --point-cloud room.ply --out runs/room1
-
-# 带真值评测
-python -m agentic_gts.cli run --point-cloud room.ply \
-    --gt gt_boxes.json --edge-thr 0.05 --out runs/room1
 ```
 
 ### 2. 接入 Qwen3-VL 裁判
@@ -115,10 +111,10 @@ runs/xxx/
 ├── layout.svg            矢量布局图（按置信度着色）
 ├── layout.png            布局预览图
 ├── overlay.png           点云 + 检测框叠加图（点云按高度着色；框按置信度着色；
-│                         提供 --gt 时真值框以蓝色虚线叠加，可直观对比偏差）
+│                         库接口传 gt_boxes 时真值框以蓝色虚线叠加，可直观对比偏差）
 ├── cloud_with_boxes.ply  点云 + box 线框合并 PLY（CloudCompare/MeshLab 直接打开做 3D 检查）
 ├── agent_report.json     agent 决策记录（issue → 动作 → 结果）
-└── eval.json             分阶段评测（提供 --gt 时）
+└── eval.json             分阶段评测（库接口传 gt_boxes 时）
 ```
 
 ### 3D 交互查看
@@ -133,7 +129,7 @@ python -m agentic_gts.cli view --point-cloud room.ply --boxes runs/room1/boxes.j
 
 ## 评测指标
 
-按验收标准实现：**贴边准确率** = 预测 box 边与匹配真值 box 边的垂直误差 < 阈值（默认 5cm，`--edge-thr` 可调）的边占比。同时报告 recall / precision / mean / p90 边误差。
+按验收标准实现：**贴边准确率** = 预测 box 边与匹配真值 box 边的垂直误差 < 阈值（默认 5cm）的边占比。同时报告 recall / precision / mean / p90 边误差。评测走库接口（`agentic_gts.eval.metrics.evaluate` / `run_pipeline(gt_boxes=...)`），CLI `run` 不再接受 `--gt`。
 
 ## 代码结构
 
