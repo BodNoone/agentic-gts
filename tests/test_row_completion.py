@@ -173,16 +173,32 @@ def test_snap_row_seams_leaves_real_aisle():
 
 
 def test_snap_row_seams_unifies_cross_vertices():
-    """Pieces that agree on the body (cross centre / depth close) get
-    their shared edge's cross vertices averaged too -> one collinear
-    edge, not a touching point."""
+    """Pieces whose facing CORNER PAIRS are each close get their shared
+    edge's cross vertices averaged -> one collinear edge."""
     a = OrientedBox(center=(0.0, 0.0, 1.05), size=(0.6, 1.1, 2.1), yaw=0.0)
-    b = OrientedBox(center=(0.6, 0.08, 1.05), size=(0.6, 1.0, 2.1), yaw=0.0)
+    b = OrientedBox(center=(0.6, 0.06, 1.05), size=(0.6, 1.06, 2.1), yaw=0.0)
     n = snap_row_seams([a, b], 0.0)
     assert n == 1
-    assert abs(a.center[1] - 0.04) < 1e-9 and abs(b.center[1] - 0.04) < 1e-9
-    assert abs(a.size[1] - 1.05) < 1e-9 and abs(b.size[1] - 1.05) < 1e-9
+    # a corners: -0.55 / +0.55 ; b corners: -0.47 / +0.59 -> merged
+    assert abs(a.center[1] - 0.03) < 1e-9 and abs(b.center[1] - 0.03) < 1e-9
+    assert abs(a.size[1] - 1.08) < 1e-9 and abs(b.size[1] - 1.08) < 1e-9
     print("PASS snap row seams (cross vertices averaged, collinear edge)")
+
+
+def test_snap_row_seams_keeps_far_cross():
+    """When one facing corner pair is far apart, the cross extent is
+    NOT merged -- only the along seam is normalised, and the different
+    heights are irrelevant to this 2D edge rule."""
+    a = OrientedBox(center=(0.0, 0.0, 1.05), size=(0.6, 1.1, 2.1), yaw=0.0)
+    b = OrientedBox(center=(0.6, 0.0, 1.05), size=(0.6, 0.6, 2.1), yaw=0.0)
+    n = snap_row_seams([a, b], 0.0)
+    assert n == 1
+    assert abs(a.size[1] - 1.1) < 1e-9 and abs(b.size[1] - 0.6) < 1e-9, \
+        "a far corner pair must not be merged"
+    a_hi = a.center[0] + a.size[0] / 2.0
+    b_lo = b.center[0] - b.size[0] / 2.0
+    assert abs(a_hi - b_lo) < 1e-9, "the along seam is still shared"
+    print("PASS snap row seams (far cross kept, along edge still normalised)")
 
 
 if __name__ == "__main__":
@@ -195,3 +211,4 @@ if __name__ == "__main__":
     test_snap_row_seams_overlap_averaged()
     test_snap_row_seams_leaves_real_aisle()
     test_snap_row_seams_unifies_cross_vertices()
+    test_snap_row_seams_keeps_far_cross()

@@ -212,8 +212,7 @@ def complete_row_gaps(scene: Scene, width_unit: float = 0.6,
 
 
 def snap_row_seams(boxes: list[OrientedBox], yaw: float,
-                   seam_tol: float = 0.12, cross_tol: float = 0.12,
-                   depth_tol: float = 0.15) -> int:
+                   seam_tol: float = 0.12, vertex_tol: float = 0.12) -> int:
     """Snap the facing edges of adjacent cabinets in a row together.
 
     A joined row split into single cabinets gets each piece's along-row
@@ -224,10 +223,12 @@ def snap_row_seams(boxes: list[OrientedBox], yaw: float,
     DISCONNECTED boxes. This walks the pieces sorted along the row axis
     and, wherever two facing edges sit within `seam_tol` (a small gap
     OR overlap), sets both to their average along coordinate -- the
-    "average the vertices" rule. When the two pieces' cross centres and
-    depths are also within `cross_tol` / `depth_tol`, those are averaged
-    too, so the shared edge becomes ONE collinear edge (a full shared
-    face, not a touching point).
+    "average the vertices" rule. The shared edge's CROSS vertices are
+    merged only where the two facing corner pairs are EACH within
+    `vertex_tol` ("merge vertices only when close"); otherwise only the
+    along seam is normalised and each side keeps its own cross extent.
+    Heights never enter: the top vertices may sit far apart in z, the
+    edge is normalised regardless.
 
     Boxes are assumed to share the row frame (`yaw`); the split pieces
     of one seed always do (they copy the seed's yaw and carry the along
@@ -270,11 +271,16 @@ def snap_row_seams(boxes: list[OrientedBox], yaw: float,
         if min(a_chi, b_chi) - max(a_clo, b_clo) < 0.5 * min(a_d, b_d):
             continue
         seam = 0.5 * (a_hi + b_lo)
-        # average the shared edge's CROSS vertices too when the pieces
-        # agree on where the body is; otherwise only the along seam is
-        # normalised and each side keeps its own cross extent
-        if abs(a_x - b_x) <= cross_tol and abs(a_d - b_d) <= depth_tol:
-            cx, d = 0.5 * (a_x + b_x), 0.5 * (a_d + b_d)
+        # merge the shared edge's CROSS vertices only where the two
+        # facing corner pairs are EACH within vertex_tol ("merge
+        # vertices only when close"); otherwise only the along seam is
+        # normalised and each side keeps its own cross extent. Heights
+        # never enter -- the top vertices may sit far apart in z.
+        if (abs(a_clo - b_clo) <= vertex_tol
+                and abs(a_chi - b_chi) <= vertex_tol):
+            new_clo = 0.5 * (a_clo + b_clo)
+            new_chi = 0.5 * (a_chi + b_chi)
+            cx, d = 0.5 * (new_clo + new_chi), new_chi - new_clo
             _rebuild(a, a_lo, seam, cx, d)
             _rebuild(b, seam, b_hi, cx, d)
         else:
