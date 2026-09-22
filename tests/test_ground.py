@@ -1720,6 +1720,37 @@ def test_fit_region_box_rotated_stepped_floor():
     print("PASS rotated stepped floor (local->world floor lookup in the fit)")
 
 
+def test_floor_map_mesh_step_fine():
+    """A stepped MESH: a FINE floor tile must return the RAISED floor on
+    the raised section (not the low floor of a straddling coarse tile),
+    so the raised slab reads h~0 and never renders as structure."""
+    from agentic_gts.agent.ground import _floor_map
+    rng = np.random.default_rng(21)
+    n = 200000
+    x = rng.uniform(-6, 6, n)
+    y = rng.uniform(-6, 6, n)
+    z = np.where(x > 0, 0.5, 0.0)          # low 0, raised 0.5
+    floor = np.column_stack([x, y, z])
+    rack = np.column_stack([rng.uniform(2.0, 4.0, n // 4),
+                            rng.uniform(1.0, 3.0, n // 4),
+                            rng.uniform(0.5, 2.5, n // 4)])
+    P = np.vstack([floor, rack])
+    fl = _floor_map(P, mesh_mode=True)
+    hi = np.column_stack([rng.uniform(2.5, 4.5, 3000),
+                          rng.uniform(1.5, 2.5, 3000),
+                          np.full(3000, 0.5)])
+    h_hi = hi[:, 2] - fl(hi[:, 0], hi[:, 1])
+    assert abs(float(np.median(h_hi))) < 0.05, \
+        f"raised floor must read h~0, got {np.median(h_hi):.2f}"
+    lo = np.column_stack([rng.uniform(-5.0, -2.0, 3000),
+                          rng.uniform(-3.0, 3.0, 3000),
+                          np.zeros(3000)])
+    h_lo = lo[:, 2] - fl(lo[:, 0], lo[:, 1])
+    assert abs(float(np.median(h_lo))) < 0.05, \
+        f"low floor must read h~0, got {np.median(h_lo):.2f}"
+    print("PASS mesh floor map step (raised floor reads h~0, fine tiles)")
+
+
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
@@ -1740,6 +1771,7 @@ if __name__ == "__main__":
     test_fit_region_box_seed_top_is_local_height()
     test_floor_at_local_rotates_back()
     test_fit_region_box_rotated_stepped_floor()
+    test_floor_map_mesh_step_fine()
     test_robust_span_bin_boundary()
     test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()

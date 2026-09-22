@@ -66,6 +66,12 @@ def _render_cut(top: float | None, mesh_mode: bool = False) -> float:
     return min(top - 0.10, max(frac * top, 1.0))
 
 
+# MESH floor-map tile size: FINE, so a tile straddling a step does not
+# take the lower floor for the whole (coarse) cell. ~0.3m localises the
+# step to a sub-grid strip; a mesh is dense enough for the >=3-pt guard.
+_MESH_FLOOR_GRID = 0.3
+
+
 def _floor_map(points: np.ndarray, grid: float = 1.5, band: float = 1.0,
                min_pts: int = 30, mesh_mode: bool = False):
     """Per-tile LOCAL floor z for stepped rooms (small level changes).
@@ -92,7 +98,12 @@ def _floor_map(points: np.ndarray, grid: float = 1.5, band: float = 1.0,
     mesh_mode (geometry from a discretized MESH): no haze / floaters
     / under-floor diffusion exist, so a tile's floor is simply its
     MINIMUM z -- no near-ground band, no percentile, no support
-    threshold (user simplification).
+    threshold (user simplification). Mesh tiles are FINE
+    (_MESH_FLOOR_GRID): a COARSE tile straddling a step takes the
+    LOWER floor, so the raised section inside it reads h = step and
+    renders as structure (user report: floor gaussians back in the
+    groundview on a stepped mesh). A fine tile localises the step to a
+    sub-grid strip; tiles are dense so the >=3-point guard still holds.
 
     Returns a callable f(x, y) -> floor z (scalar or array input).
     """
@@ -112,27 +123,59 @@ def _floor_map(points: np.ndarray, grid: float = 1.5, band: float = 1.0,
         else (lambda z: float(np.percentile(z, 2)))
     if len(near) < (10 if mesh_mode else 100):
         return lambda x, y: base
-    ix = np.floor(near[:, 0] / grid).astype(np.int64)
-    iy = np.floor(near[:, 1] / grid).astype(np.int64)
-    keys, inv = np.unique(np.column_stack([ix, iy]), axis=0,
-                          return_inverse=True)
-    order = np.lexsort((near[:, 2], inv))
-    inv_s, z_s = inv[order], near[order][:, 2]
-    starts = np.searchsorted(inv_s, np.arange(len(keys)))
-    ends = np.searchsorted(inv_s, np.arange(len(keys)), side="right")
-    fz = np.array([stat(z_s[s:e]) if e - s >= min_pts_eff
-                   else base for s, e in zip(starts, ends)])
-    i0, j0 = keys[:, 0].min(), keys[:, 1].min()
-    G = np.full((keys[:, 0].max() - i0 + 1, keys[:, 1].max() - j0 + 1),
-                base, dtype=np.float64)
-    G[keys[:, 0] - i0, keys[:, 1] - j0] = fz
 
-    def _fl(x, y):
-        i = np.clip(np.floor(np.asarray(x, dtype=np.float64) / grid
+    def _build(g):
+        """Tile map at resolution g; NaN where a tile is under-supported."""
+        ix = np.floor(near[:, 0] / g).astype(np.int64)
+        iy = np.floor(near[:, 1] / g).astype(np.int64)
+        keys, inv = np.unique(np.column_stack([ix, iy]), axis=0,
+                              return_inverse=True)
+        order = np.lexsort((near[:, 2], inv))
+        inv_s, z_s = inv[order], near[order][:, 2]
+        starts = np.searchsorted(inv_s, np.arange(len(keys)))
+        ends = np.searchsorted(inv_s, np.arange(len(keys)), side="right")
+        i0, j0 = int(keys[:, 0].min()), int(keys[:, 1].min())
+        G = np.full((int(keys[:, 0].max()) - i0 + 1,
+                     int(keys[:, 1].max()) - j0 + 1), np.nan,
+                    dtype=np.float64)
+        for k, (s, e) in enumerate(zip(starts, ends)):
+            if e - s >= min_pts_eff:
+                G[keys[k, 0] - i0, keys[k, 1] - j0] = stat(z_s[s:e])
+        return G, i0, j0
+
+    def _lookup(G, i0, j0, g, x, y):
+        i = np.clip(np.floor(np.asarray(x, dtype=np.float64) / g
                              ).astype(np.int64) - i0, 0, G.shape[0] - 1)
-        j = np.clip(np.floor(np.asarray(y, dtype=np.float64) / grid
+        j = np.clip(np.floor(np.asarray(y, dtype=np.float64) / g
                              ).astype(np.int64) - j0, 0, G.shape[1] - 1)
         return G[i, j]
+
+    if mesh_mode:
+        # FINE tiles resolve a step (a COARSE tile straddling it takes
+        # the lower floor and the raised section reads h=step); the
+        # COARSE map fills fine tiles too sparse to support, so a
+        # sparsely sampled slab still reads its OWN floor instead of
+        # falling to the global base.
+        Gc, i0c, j0c = _build(grid)
+        Gf, i0f, j0f = _build(_MESH_FLOOR_GRID)
+        Gc = np.where(np.isnan(Gc), base, Gc)
+
+        def _fl(x, y):
+            v = _lookup(Gf, i0f, j0f, _MESH_FLOOR_GRID, x, y)
+            if np.ndim(v) == 0:
+                if not np.isnan(v):
+                    return float(v)
+                return float(_lookup(Gc, i0c, j0c, grid, x, y))
+            v = np.asarray(v, dtype=np.float64)
+            cv = _lookup(Gc, i0c, j0c, grid, x, y)
+            return np.where(np.isnan(v), cv, v)
+        return _fl
+
+    G, i0, j0 = _build(grid)
+    G = np.where(np.isnan(G), base, G)
+
+    def _fl(x, y):
+        return _lookup(G, i0, j0, grid, x, y)
     return _fl
 
 
@@ -397,8 +440,8 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
     gs_ply = scene.meta.get("gs_ply")
     if gs_ply:
         try:
-            from agentic_gts.tools.gs_io import read_gaussian_ply
-            gs = read_gaussian_ply(gs_ply)
+            from agentic_gts.tools.gs_io import read_scene_gaussian_ply
+            gs = read_scene_gaussian_ply(scene)
             # OPACITY-AWARE dual-band floor cut (user report: part of
             # the floor back in the groundview, yet sub-1m devices --
             # AC banks, low cabinets -- must not be cut by a blanket

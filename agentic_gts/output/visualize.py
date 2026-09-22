@@ -240,8 +240,14 @@ def export_ply(scene: Scene, path: str,
     pts, colors = None, None
     if gs_ply:
         try:
-            from agentic_gts.tools.gs_io import read_gaussian_ply
-            gs = read_gaussian_ply(gs_ply)
+            from agentic_gts.tools.gs_io import (apply_align_transform,
+                                                read_gaussian_ply)
+            # the raw gaussian file is in the RAW frame; the boxes below
+            # are in the ALIGNED frame -- map the cloud through the same
+            # align transform or the boxes float above the cloud (user
+            # report: a stepped/big-shift scene).
+            gs = apply_align_transform(read_gaussian_ply(gs_ply),
+                                       scene.meta.get("align_tf"))
             if len(gs.means) > max_points:
                 sel = np.random.default_rng(0).choice(
                     len(gs.means), max_points, replace=False)
