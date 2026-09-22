@@ -205,39 +205,6 @@ def read_gaussian_ply(path: str, use_cache: bool = True) -> GaussianData:
     return gs
 
 
-def apply_align_transform(gs: GaussianData, tf) -> GaussianData:
-    """Return a COPY of `gs` whose means are mapped by an align transform
-    ({"R", "shift"}: p' = p @ R.T + shift), or `gs` unchanged when tf is
-    falsy.
-
-    The pipeline aligns the GEOMETRY cloud (mesh / gaussian means) but the
-    evidence renders and the PLY export read the RAW gaussian file, so
-    without this they render in the raw frame while the boxes live in the
-    aligned frame (boxes float above the cloud). Means are copied so the
-    read cache is never mutated; the other attributes are shared (a
-    near-level tilt leaves the gaussian orientations essentially
-    unchanged).
-    """
-    if not tf:
-        return gs
-    R = np.asarray(tf["R"], dtype=np.float64)
-    shift = np.asarray(tf["shift"], dtype=np.float64)
-    means = np.asarray(gs.means, dtype=np.float64) @ R.T + shift
-    return GaussianData(means=means.astype(gs.means.dtype),
-                        log_scales=gs.log_scales, quats=gs.quats,
-                        raw_opacity=gs.raw_opacity, f_dc=gs.f_dc)
-
-
-def read_scene_gaussian_ply(scene) -> "GaussianData | None":
-    """Read `scene.meta['gs_ply']` and apply the scene's align transform
-    (`scene.meta['align_tf']`), or None when no gs_ply is set."""
-    path = scene.meta.get("gs_ply")
-    if not path:
-        return None
-    return apply_align_transform(read_gaussian_ply(path),
-                                 scene.meta.get("align_tf"))
-
-
 def write_gaussian_ply(path: str, gs: GaussianData) -> None:
     """Write a minimal 3DGS ply (used by tests)."""
     n = len(gs)

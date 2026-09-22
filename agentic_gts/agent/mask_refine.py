@@ -628,10 +628,10 @@ def render_local_views(scene: Scene, box: OrientedBox,
     gs_ply = scene.meta.get("gs_ply")
     if not gs_ply:
         return []
-    from agentic_gts.tools.gs_io import read_scene_gaussian_ply
+    from agentic_gts.tools.gs_io import read_gaussian_ply
     from agentic_gts.output.gs_render import (make_local_cam, rasterize_gs,
                                               render_gs_view, png_bytes)
-    gs = read_scene_gaussian_ply(scene)
+    gs = read_gaussian_ply(gs_ply)
     # camera side: the open corridor (aisle), not whichever way local +y
     # points. FRONT must additionally face the big face: perpendicular to
     # the long edge (a yaw running along the row, or a 90-deg flip from
@@ -1873,9 +1873,9 @@ def _side_ladder_retry(scene: Scene, box: OrientedBox, side: dict,
     near = None
     try:
         from scipy.spatial import cKDTree
-        from agentic_gts.tools.gs_io import read_scene_gaussian_ply
+        from agentic_gts.tools.gs_io import read_gaussian_ply
         from agentic_gts.output.gs_render import rasterize_gs
-        gs = read_scene_gaussian_ply(scene)
+        gs = read_gaussian_ply(gs_ply)
         means = np.asarray(gs.means, dtype=float)
         if len(means) != len(keep):
             return None
