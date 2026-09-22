@@ -264,10 +264,6 @@ def run_pipeline(scene: Scene,
     input anymore: boxes come ONLY from the VLM grounding.
     """
     opts = opts or {}
-    # recall-tilt policy: None (unset) = auto (single-view only), True/False
-    # forces it -- threaded to ground_stage via scene.meta for A/B tests
-    if "recall_tilts" in opts:
-        scene.meta["recall_tilts"] = bool(opts["recall_tilts"])
     os.makedirs(out_dir, exist_ok=True)
     evals: dict = {}
     t0 = time.time()
