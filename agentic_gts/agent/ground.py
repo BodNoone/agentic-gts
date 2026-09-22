@@ -787,6 +787,21 @@ _MAX_DEVICE_DEPTH = 1.8
 _MIN_DEVICE_DEPTH = 0.40
 _SPLIT_MIN_GAP = 0.30
 
+# a box whose SHORTER horizontal axis exceeds this is a "fat blob" (user
+# report: a huge box covering aisles and junk), not a device row. No
+# device row is that deep; a joined row is long but thin and passes.
+# Sits above the back-to-back double-row depth (~2.2m) so those survive.
+_MAX_DEVICE_SPAN = 2.5
+
+
+def _oversized_blob(b, max_span: float = _MAX_DEVICE_SPAN) -> bool:
+    """True when a fitted box is far too 'fat' to be a device row: the
+    SHORTER horizontal axis exceeds any plausible device depth. Long
+    thin rows are unaffected (the long axis is unbounded); a big blob
+    spanning aisles/junk in BOTH axes is caught. Cheap geometry, runs
+    BEFORE the expensive local refine."""
+    return min(float(b.size[0]), float(b.size[1])) > max_span
+
 
 
 def _cross_gap_split(v: np.ndarray, peak_frac: float = 0.25,
@@ -1679,6 +1694,18 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # on the groundview (user report).
     boxes = _merge_adjacent_boxes(boxes, pts_fit, yaw, floor_at=fl,
                                   probe_pool=pts_clu, seed_top=fit_top)
+    # drop "fat blob" boxes (user report: a huge box covering aisles and
+    # junk): cheap geometric guard BEFORE the expensive local refine --
+    # no device row is deeper than _MAX_DEVICE_SPAN on its SHORTER axis.
+    # Long joined rows are long but thin, so they pass untouched. Each
+    # drop is printed (visible, not silent).
+    blobs = [b for b in boxes if _oversized_blob(b)]
+    if blobs:
+        for b in blobs:
+            print(f"[ground] oversized blob dropped: short axis "
+                  f"{min(b.size[0], b.size[1]):.2f}m > {_MAX_DEVICE_SPAN}m "
+                  f"(size {b.size[0]:.2f} x {b.size[1]:.2f} m)")
+        boxes = [b for b in boxes if not _oversized_blob(b)]
     scene.boxes = boxes
     # result audit: one image per view -- the view's own raw VLM rects
     # (colored) plus the final fitted boxes (red) projected through the

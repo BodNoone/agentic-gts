@@ -1563,6 +1563,50 @@ def test_ground_stage_tiled_skips_tilts():
     print(f"PASS tiled skips tilts ({len(calls)} nadir calls, no tilt views)")
 
 
+def test_oversized_blob_guard():
+    """A box far too 'fat' on its SHORTER axis is a blob, not a device
+    row: dropped before the local refine. Long thin rows and back-to-back
+    double rows survive."""
+    from agentic_gts.agent.ground import _oversized_blob
+    from agentic_gts.core.models import OrientedBox
+    fat = OrientedBox(center=(0.0, 0.0, 1.0), size=(4.0, 3.5, 2.0), yaw=0.0)
+    assert _oversized_blob(fat), "a 4x3.5m blob must be rejected"
+    row = OrientedBox(center=(0.0, 0.0, 1.0), size=(40.0, 1.1, 2.0), yaw=0.0)
+    assert not _oversized_blob(row), "a long thin row must survive"
+    dbl = OrientedBox(center=(0.0, 0.0, 1.0), size=(10.0, 2.2, 2.0), yaw=0.0)
+    assert not _oversized_blob(dbl), "back-to-back double row must survive"
+    print("PASS oversized blob guard (fat dropped, long row kept)")
+
+
+def test_ground_stage_drops_oversized_blob():
+    """End-to-end: a VLM rect around a big supported field fits a fat
+    blob -> dropped in stageG (before stageC), leaving no oversized box."""
+    import json as _json
+    import tempfile
+    from agentic_gts.agent import ground
+    from agentic_gts.agent.judge import VLMJudge
+
+    rng = np.random.default_rng(51)
+    n = 40000
+    field = np.column_stack([rng.uniform(-3.0, 3.0, n),
+                             rng.uniform(-3.0, 3.0, n),
+                             rng.uniform(0.30, 1.00, n)])
+    scene = Scene(points=field)
+    scene.meta["yaw"] = 0.0
+    _bootstrap_meta(scene, (-3.2, -3.2, 3.2, 3.2))
+    scene.boxes = []
+    reply = ("Big blob.\n" + _json.dumps(
+        [{"bbox_2d": [0, 0, 1000, 1000], "label": "blob"}]))
+    judge = VLMJudge(backend="qwen")
+    judge._qwen_image_call = lambda png, prompt, *a, **k: reply
+    with tempfile.TemporaryDirectory() as td:
+        ground.ground_stage(scene, judge, out_dir=td)
+    assert all(min(b.size[0], b.size[1]) <= 2.5 for b in scene.boxes), \
+        "oversized blob must be dropped, got " \
+        f"{[(round(b.size[0], 1), round(b.size[1], 1)) for b in scene.boxes]}"
+    print("PASS ground stage drops oversized blob")
+
+
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
@@ -1577,6 +1621,8 @@ if __name__ == "__main__":
     test_tile_frames()
     test_ground_stage_tiled_views()
     test_ground_stage_tiled_skips_tilts()
+    test_oversized_blob_guard()
+    test_ground_stage_drops_oversized_blob()
     test_robust_span_bin_boundary()
     test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()
