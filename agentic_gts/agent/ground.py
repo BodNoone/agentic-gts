@@ -659,7 +659,7 @@ def _region_axis_span(v: np.ndarray, cell: float = 0.05,
 
 def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
                     floor_z: float = 0.0, mesh_mode: bool = False,
-                    seed_top: float | None = None):
+                    seed_top: float | None = None, floor_at=None):
     """Fit a full-depth OBB (yaw=0; points already in the row-aligned
     frame) to the points inside a grounded 2D rect.
 
@@ -672,12 +672,20 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
     low plateau that percentile trimming cannot cut (haze is often >
     the 0.5% a P0.5-P99.5 removes) while keeping starved occluded
     faces that a global-peak threshold would cut. z comes from the
-    device band: devices stand ON the ground, so the box BOTTOM is
-    the local floor (floor_z; 0 = the dominant level, the raised-slab
-    height over a stepped section) and the top is the anchored
-    density-connected run's top; the box HEIGHT is the difference --
-    without floor_z a stepped-section box would run a step too deep
-    and a step too tall.
+    device band: devices stand ON the ground, so the box BOTTOM is the
+    local floor and the top is the anchored density-connected run's
+    top.
+
+    floor_at (the _floor_map callable): the local floor is the MEDIAN
+    of the per-point local floor over the rect's OWN points -- a
+    scalar sampled at the rect CENTRE lifted the box onto the wrong
+    step when the centre sat a level above the device (user report:
+    raised-floor boxes came out shifted). Consistent with the
+    per-point render cut / fit-pool bands. Without it the scalar
+    `floor_z` is used (direct unit calls). seed_top (scene-level
+    bootstrap) is a HEIGHT above the DOMINANT floor, so the local top
+    is floor_z + seed_top and the local HEIGHT is seed_top -- not
+    seed_top - floor_z, which sank the top a step on a raised section.
 
     Guards reject hallucinated regions (no support) and floor patches
     (no height): a VLM box drawn over empty floor never becomes a real
@@ -699,8 +707,19 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
     if len(pts) < min_pts:
         _reject(f"no point support (<{min_pts})")
         return None
+    # LOCAL floor from the rect's OWN points (user report: a scalar
+    # sampled at the rect CENTRE lifted the box onto the wrong step when
+    # the centre sat a level above the device). Median of the per-point
+    # local floor -- consistent with the per-point render cut / fit-pool
+    # bands (h = z - floor(x, y)). Falls back to the scalar `floor_z`.
+    if floor_at is not None:
+        local_fl = np.asarray(floor_at(pts[:, 0], pts[:, 1]), dtype=float)
+        floor_z = float(np.median(local_fl))
+        h_local = pts[:, 2] - local_fl
+    else:
+        h_local = pts[:, 2] - floor_z
     # device band, floor-relative: exclude that section's floor texture
-    dev = pts[pts[:, 2] > floor_z + 0.30]
+    dev = pts[h_local > 0.30]
     if len(dev) < max(30, min_pts // 2):
         _reject("floor patch, no structure above 0.30m", n_dev=len(dev))
         return None
@@ -715,19 +734,26 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
     # re-measures it per box. Without seed_top (direct unit calls /
     # tests) the top comes from the band itself.
     if seed_top is not None:
+        # seed_top is a HEIGHT above the DOMINANT floor (scene-level
+        # bootstrap): the local top is floor_z + seed_top, so the local
+        # HEIGHT is seed_top -- NOT seed_top - floor_z, which sank the
+        # top a whole step on a raised section (user report: raised-
+        # floor boxes came out shifted).
         z_top = float(seed_top)
-    elif mesh_mode:
-        # MESH (user directive: no denoising): the top is the raw MAX
-        # of the device band -- the anchored walk exists to stop at
-        # 3DGS haze tails and only ever bit real sparse tops on a
-        # mesh.
-        z_top = float(dev[:, 2].max())
+        height = z_top
     else:
-        from agentic_gts.agent.mask_refine import _anchored_top
-        _at = _anchored_top(dev[:, 2])
-        z_top = float(_at) if _at is not None \
-            else float(np.percentile(dev[:, 2], 99.5))
-    height = z_top - floor_z
+        if mesh_mode:
+            # MESH (user directive: no denoising): the top is the raw MAX
+            # of the device band -- the anchored walk exists to stop at
+            # 3DGS haze tails and only ever bit real sparse tops on a
+            # mesh.
+            z_top = float(dev[:, 2].max())
+        else:
+            from agentic_gts.agent.mask_refine import _anchored_top
+            _at = _anchored_top(dev[:, 2])
+            z_top = float(_at) if _at is not None \
+                else float(np.percentile(dev[:, 2], 99.5))
+        height = z_top - floor_z          # absolute top - local floor
     if height < 0.50:
         _reject(f"too short for a device (height={height:.2f}m "
                 f"over floor {floor_z:.2f})")
@@ -871,7 +897,8 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
                       max_depth: float = _MAX_DEVICE_DEPTH,
                       min_side: float = _MIN_DEVICE_DEPTH,
                       mesh_mode: bool = False,
-                      seed_top: float | None = None) -> list:
+                      seed_top: float | None = None,
+                      floor_at=None) -> list:
     """Fit one rect, then split DEEP fits: a rect the VLM drew around
     TWO opposing rows (front + back, an aisle between) fits as ONE box
     with the union depth, and nothing downstream can split across the
@@ -891,9 +918,21 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
     device; the split's min-side rule (_MIN_DEVICE_DEPTH 0.40) then
     discards the wall side and keeps the clean device box."""
     bb = _fit_region_box(points, rect, min_pts, floor_z,
-                         mesh_mode=mesh_mode, seed_top=seed_top)
+                         mesh_mode=mesh_mode, seed_top=seed_top,
+                         floor_at=floor_at)
     if bb is None:
         return []
+
+    def _dev_of(rect_):
+        x0, y0, x1, y1 = rect_
+        m = ((points[:, 0] >= x0) & (points[:, 0] <= x1) &
+             (points[:, 1] >= y0) & (points[:, 1] <= y1))
+        d = points[m]
+        if floor_at is not None:
+            d = d[(d[:, 2] - np.asarray(floor_at(d[:, 0], d[:, 1]))) > 0.30]
+        else:
+            d = d[d[:, 2] > floor_z + 0.30]
+        return d
     axis = 1 if abs(float(bb.yaw)) < 1e-6 else 0   # cross axis of the fit
     if bb.size[1] <= max_depth:
         # LOW-BAND contract (seed_top set): a rect over a row AND a
@@ -909,10 +948,7 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
             return [bb]
         rax = 1 - axis                # the ROW (long) axis
         x0, y0, x1, y1 = rect
-        m = ((points[:, 0] >= x0) & (points[:, 0] <= x1) &
-             (points[:, 1] >= y0) & (points[:, 1] <= y1))
-        dev = points[m]
-        dev = dev[dev[:, 2] > floor_z + 0.30]
+        dev = _dev_of(rect)
         s = _cross_gap_split(dev[:, rax], min_side=0.30)
         if s is None:
             return [bb]
@@ -926,13 +962,11 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
                                          max_depth=max_depth,
                                          min_side=min_side,
                                          mesh_mode=mesh_mode,
-                                         seed_top=seed_top))
+                                         seed_top=seed_top,
+                                         floor_at=floor_at))
         return out or [bb]
     x0, y0, x1, y1 = rect
-    m = ((points[:, 0] >= x0) & (points[:, 0] <= x1) &
-         (points[:, 1] >= y0) & (points[:, 1] <= y1))
-    dev = points[m]
-    dev = dev[dev[:, 2] > floor_z + 0.30]
+    dev = _dev_of(rect)
     s = _cross_gap_split(dev[:, axis], min_side=min_side)
     if s is None:
         print(f"[ground] deep fit (depth {bb.size[1]:.2f}m) with no "
@@ -949,7 +983,8 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
                                      max_depth=max_depth,
                                      min_side=min_side,
                                      mesh_mode=mesh_mode,
-                                     seed_top=seed_top))
+                                     seed_top=seed_top,
+                                     floor_at=floor_at))
     return out or [bb]
 
 
@@ -1236,15 +1271,13 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
         rs = [rects[i] for i in members]
         u = (min(r[0] for r in rs), min(r[1] for r in rs),
              max(r[2] for r in rs), max(r[3] for r in rs))
-        uw = _rot_xy(np.array([[(u[0] + u[2]) / 2.0,
-                                (u[1] + u[3]) / 2.0, 0.0]]), yaw)[0]
-        fz = float(floor_at(uw[0], uw[1])) if floor_at is not None else 0.0
         # SINGULAR fit on purpose: these members were bridged by a
         # dense device band -- one verified continuous structure -- so
         # the union refit must NOT re-split it across that bridge (the
         # deep-split belongs to the per-RECT path, where the rect
         # itself is the only evidence)
-        bb = _fit_region_box(pts_fit, u, floor_z=fz, seed_top=seed_top)
+        bb = _fit_region_box(pts_fit, u, seed_top=seed_top,
+                             floor_at=floor_at)
         if bb is None:
             out.extend(boxes[i] for i in members)   # keep the pieces
             continue
@@ -1455,13 +1488,10 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         on it -- a tilt box may never eat or chain onto a nadir one
         (user report: red result boxes merging devices the colored
         rects showed apart)."""
-        # the rect's own LOCAL floor (stepped rooms): the section's
-        # slab height, looked up at the rect's world centre
-        cw = _rot_xy(np.array([[(rect_r[0] + rect_r[2]) / 2.0,
-                                (rect_r[1] + rect_r[3]) / 2.0, 0.0]]),
-                     yaw)[0]
-        bbs = _fit_region_boxes(pts_fit, rect_r,
-                                floor_z=float(fl(cw[0], cw[1])),
+        # the rect's own LOCAL floor (stepped rooms) comes from ITS OWN
+        # points via floor_at (per-point median) -- not a scalar at the
+        # rect centre, which lifted the box onto the wrong step
+        bbs = _fit_region_boxes(pts_fit, rect_r, floor_at=fl,
                                 mesh_mode=is_mesh, seed_top=fit_top)
         # _fit_region_boxes (plural): a deep fit -- the VLM drew ONE
         # rect around two opposing rows -- splits at the aisle here,
@@ -1621,11 +1651,8 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                     print(f"[ground] cluster png save failed "
                           f"({type(e).__name__})")
             for cid, (rect, _npts) in enumerate(missed, start=1):
-                cw = _rot_xy(np.array(
-                    [[(rect[0] + rect[2]) / 2.0,
-                      (rect[1] + rect[3]) / 2.0, 0.0]]), yaw)[0]
                 for bb in _fit_region_boxes(
-                        pts_fit, rect, floor_z=float(fl(cw[0], cw[1])),
+                        pts_fit, rect, floor_at=fl,
                         max_depth=1.35, min_side=0.15,
                         mesh_mode=is_mesh, seed_top=fit_top):
                     # wall-thin fits never enter the pipeline: a wall

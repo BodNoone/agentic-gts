@@ -1607,6 +1607,60 @@ def test_ground_stage_drops_oversized_blob():
     print("PASS ground stage drops oversized blob")
 
 
+def test_fit_region_box_uses_own_points_floor():
+    """floor_at (per-point): the box bottom comes from the rect's OWN
+    points, not the rect CENTRE. A rect whose centre sits on a raised
+    step but whose device stands on the lower floor must NOT be lifted
+    (user report: raised-floor boxes came out shifted)."""
+    from agentic_gts.agent.ground import _fit_region_box
+    rng = np.random.default_rng(7)
+    n = 3000
+    half = 0.55
+    pts = []
+    for face in (+half, -half):
+        pts.append(np.column_stack([rng.uniform(-1.0, 0.2, n),
+                                    np.full(n, face),
+                                    rng.uniform(0.0, 2.1, n)]))
+    pts = np.vstack(pts)
+    fl = lambda x, y: np.where(np.asarray(x, dtype=float) > 0.1, 0.4, 0.0)
+    rect = (-1.0, -0.8, 1.5, 0.8)      # centre x=0.25 -> on the raised step
+    bb = _fit_region_box(pts, rect, seed_top=2.1, floor_at=fl)
+    assert bb is not None, "region must produce a box"
+    bottom = bb.center[2] - bb.size[2] / 2.0
+    assert abs(bottom) < 0.05, \
+        f"bottom must sit on the DEVICE's floor (~0), got {bottom:.2f}"
+    assert abs(bb.size[2] - 2.1) < 0.05, f"height {bb.size[2]:.2f}"
+    print("PASS fit region box uses its OWN points' floor (not the centre)")
+
+
+def test_fit_region_box_seed_top_is_local_height():
+    """On a raised slab (floor_at = 0.4 everywhere) the box bottom sits
+    on the slab and the top is slab + seed_top -- seed_top is a HEIGHT
+    above the dominant floor, not an absolute z (user report: the top
+    sank a step on a raised section)."""
+    from agentic_gts.agent.ground import _fit_region_box
+    rng = np.random.default_rng(8)
+    n = 3000
+    half = 0.55
+    pts = []
+    for face in (+half, -half):
+        pts.append(np.column_stack([rng.uniform(-0.6, 0.6, n),
+                                    np.full(n, face),
+                                    rng.uniform(0.4, 2.5, n)]))
+    pts = np.vstack(pts)
+    fl = lambda x, y: np.full(np.shape(np.asarray(x, dtype=float)), 0.4)
+    rect = (-0.8, -0.8, 0.8, 0.8)
+    bb = _fit_region_box(pts, rect, seed_top=2.1, floor_at=fl)
+    assert bb is not None
+    bottom = bb.center[2] - bb.size[2] / 2.0
+    top = bb.center[2] + bb.size[2] / 2.0
+    assert abs(bottom - 0.4) < 0.05, \
+        f"bottom must sit on the slab (0.4), got {bottom:.2f}"
+    assert abs(top - 2.5) < 0.05, \
+        f"top = slab + seed_top = 2.5, got {top:.2f}"
+    print("PASS fit region box seed_top is a local height (slab + height)")
+
+
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
@@ -1623,6 +1677,8 @@ if __name__ == "__main__":
     test_ground_stage_tiled_skips_tilts()
     test_oversized_blob_guard()
     test_ground_stage_drops_oversized_blob()
+    test_fit_region_box_uses_own_points_floor()
+    test_fit_region_box_seed_top_is_local_height()
     test_robust_span_bin_boundary()
     test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()
