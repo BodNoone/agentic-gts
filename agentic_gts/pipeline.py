@@ -84,7 +84,7 @@ def denoise_cloud(points: np.ndarray, nb_neighbors: int = 20,
     return kept
 
 
-def align_to_ground(points: np.ndarray) -> np.ndarray:
+def align_to_ground(points: np.ndarray, return_transform: bool = False):
     """Stage -1b: level the cloud so the floor plane is horizontal at z=0.
 
     Two decoupled steps, because in big 3DGS scenes the *largest* horizontal
@@ -99,9 +99,20 @@ def align_to_ground(points: np.ndarray) -> np.ndarray:
          as "floor", shifting the device height band onto the ceiling.
 
     Falls back to the 2nd z-percentile as floor when no bottom plane fits.
+
+    return_transform: also return {"R", "shift"} where an aligned point is
+    `p @ R.T + shift`. The 3DGS evidence renders and the PLY export read
+    the RAW gaussian file, so they must apply the SAME transform or they
+    land in a different frame than the aligned geometry (a big-shift
+    scene exposed this: exported boxes floated above the cloud).
     """
+    _IDENT = {"R": np.eye(3), "shift": np.zeros(3)}
+
+    def _ret(p):
+        return (p, _IDENT) if return_transform else p
+
     if len(points) < 100:
-        return points
+        return _ret(points)
     import open3d as o3d
     # Pin open3d's global RNG before the RANSAC loop: segment_plane
     # draws random triplets, and on a knife-edged scene (floor partly
@@ -125,7 +136,7 @@ def align_to_ground(points: np.ndarray) -> np.ndarray:
             (a, b, c, d), inliers = pcd.segment_plane(0.05, 3, 1000)
         except Exception as e:
             print(f"[diag][ground] plane fit failed ({type(e).__name__}) -> skip alignment")
-            return points
+            return _ret(points)
         if c < 0:  # normal must point up
             a, b, c, d = -a, -b, -c, -d
         tilt_deg = math.degrees(math.acos(min(1.0, abs(c))))
@@ -140,7 +151,7 @@ def align_to_ground(points: np.ndarray) -> np.ndarray:
         pcd = pcd.select_by_index(inliers, invert=True)
     if tilt_n is None:
         print("[diag][ground] no horizontal plane found -> skip alignment")
-        return points
+        return _ret(points)
 
     # Rodrigues rotation mapping the reference normal to +z
     z_axis = np.array([0.0, 0.0, 1.0])
@@ -194,6 +205,8 @@ def align_to_ground(points: np.ndarray) -> np.ndarray:
     pts[:, 2] -= floor_z
     print(f"[diag][ground] aligned: tilt corrected, floor set to z=0 "
           f"(shift={-floor_z:+.2f} m)")
+    if return_transform:
+        return pts, {"R": R, "shift": np.array([0.0, 0.0, -floor_z])}
     return pts
 
 

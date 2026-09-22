@@ -397,8 +397,8 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
     gs_ply = scene.meta.get("gs_ply")
     if gs_ply:
         try:
-            from agentic_gts.tools.gs_io import read_gaussian_ply
-            gs = read_gaussian_ply(gs_ply)
+            from agentic_gts.tools.gs_io import read_scene_gaussian_ply
+            gs = read_scene_gaussian_ply(scene)
             # OPACITY-AWARE dual-band floor cut (user report: part of
             # the floor back in the groundview, yet sub-1m devices --
             # AC banks, low cabinets -- must not be cut by a blanket

@@ -627,8 +627,53 @@ def test_yaw_mesh_reconstruction_beyond_room():
     print(f"PASS mesh beyond room (yaw {math.degrees(yaw):.1f} deg, rows at 8)")
 
 
+def test_align_transform_roundtrip():
+    """align_to_ground(return_transform=True) must return a transform that
+    reproduces the aligned cloud: raw @ R.T + shift == aligned. The 3DGS
+    evidence renders / PLY export apply it to the RAW gaussian file."""
+    rng = np.random.default_rng(7)
+    n = 40000
+    floor = np.column_stack([rng.uniform(-6, 6, n), rng.uniform(-6, 6, n),
+                             np.full(n, -0.6)])
+    racks = []
+    for cx in np.arange(-5.0, 5.5, 1.0):
+        racks.append(np.column_stack([rng.uniform(cx - 0.3, cx + 0.3, n // 8),
+                                      rng.uniform(-1, 1, n // 8),
+                                      rng.uniform(-0.6, 2.0, n // 8)]))
+    raw = np.vstack([floor] + racks)
+    aligned, tf = align_to_ground(raw, return_transform=True)
+    R = np.asarray(tf["R"])
+    shift = np.asarray(tf["shift"])
+    assert np.allclose(raw @ R.T + shift, aligned, atol=1e-6), \
+        "transform must reproduce the aligned points"
+    assert abs(float(np.median(aligned[:, 2]))) < 0.6
+    print("PASS align transform roundtrip (raw @ R.T + shift == aligned)")
+
+
+def test_apply_align_transform_shifts_gs_and_spares_cache():
+    """apply_align_transform must shift a GaussianData's means WITHOUT
+    mutating the input (the read cache must stay raw)."""
+    from agentic_gts.tools.gs_io import GaussianData, apply_align_transform
+    n = 5
+    gs = GaussianData(
+        means=np.arange(n * 3, dtype=np.float32).reshape(n, 3),
+        log_scales=np.zeros((n, 3), dtype=np.float32),
+        quats=np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (n, 1)),
+        raw_opacity=np.zeros(n, dtype=np.float32),
+        f_dc=np.zeros((n, 3), dtype=np.float32))
+    before = gs.means.copy()
+    tf = {"R": np.eye(3), "shift": np.array([1.0, 2.0, 3.0])}
+    out = apply_align_transform(gs, tf)
+    assert np.allclose(out.means, before + [1, 2, 3]), "means must shift"
+    assert np.allclose(gs.means, before), "input gs must NOT be mutated"
+    assert apply_align_transform(gs, None) is gs, "no tf -> unchanged"
+    print("PASS apply_align_transform (shifted, input/cache untouched)")
+
+
 if __name__ == "__main__":
     test_align_and_yaw_on_adversarial_cloud()
     print("PASS  test_align_and_yaw_on_adversarial_cloud")
     test_align_with_subfloor_noise()
     print("PASS  test_align_with_subfloor_noise")
+    test_align_transform_roundtrip()
+    test_apply_align_transform_shifts_gs_and_spares_cache()

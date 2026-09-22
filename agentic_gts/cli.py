@@ -46,11 +46,18 @@ def cmd_run(args):
         # ground-truth boxes share the cloud's coordinate frame; transforming
         # the cloud alone would desynchronize them. Caller must pre-align.
         print("[diag][ground] gt boxes given -> skipping auto ground alignment")
+        align_tf = None
     else:
         from agentic_gts.pipeline import align_to_ground, denoise_cloud
         pts = denoise_cloud(pts)
-        pts = align_to_ground(pts)
+        pts, align_tf = align_to_ground(pts, return_transform=True)
     scene = Scene(points=pts)
+    if align_tf is not None:
+        # 3DGS evidence renders / PLY export read the RAW gaussian file, so
+        # they must apply the SAME transform or they land in a different
+        # frame than the aligned geometry (a big-shift scene exposed this:
+        # the exported boxes floated above the raw cloud).
+        scene.meta["align_tf"] = align_tf
     # geometry-source flag: a mesh sampling has no haze / floaters /
     # under-floor diffusion -- every "robust" estimator downstream can
     # take its simple (min / percentile) form when this is set
