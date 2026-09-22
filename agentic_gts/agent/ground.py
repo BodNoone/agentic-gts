@@ -1251,6 +1251,25 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
 # ---------- grounding stage ----------
 
 
+def _want_recall_tilts(tiles, override=None) -> bool:
+    """Whether the per-view recall tilt cameras run.
+
+    User insight: once the layout is TILED the per-tile tilts are
+    largely redundant. Tiling already lowers the camera (resolution),
+    and the nadir camera is PERSPECTIVE (fovy 60, framed so the rack-top
+    footprint just reaches the frame edge) -- so a device near a tile
+    edge is rendered obliquely, up to ~30 deg vertical / ~36 deg
+    horizontal off-axis, MORE than the 20 deg tilt. With the 2.5m tile
+    overlap every device lands off-centre (oblique) in some tile, so the
+    tiling itself is a free multi-angle scan. Tilts therefore run only
+    for a SINGLE view; `override` (True/False) forces them for A/B tests
+    (override None = auto).
+    """
+    if override is None:
+        return tiles is None
+    return bool(override)
+
+
 def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     """Replace scene.boxes with VLM-grounded per-region boxes.
 
@@ -1293,10 +1312,17 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     views = []                       # (img, cam, W, H, fname, rects)
     view_specs = [("groundview.png", None)] if tiles is None else \
         [(f"groundview_t{i}.png", fr) for i, fr in enumerate(tiles)]
+    # recall tilts: auto = single-view only (see _want_recall_tilts)
+    want_tilts = _want_recall_tilts(tiles, scene.meta.get("recall_tilts"))
     if tiles is not None:
         print(f"[ground] layout exceeds a single nadir view "
               f"(>{_MAX_SINGLE_SPAN:.0f}m span) -> {len(tiles)} tiled "
-              f"views ({len(tiles)} VLM calls)")
+              f"views ({len(tiles)} VLM call(s), recall tilts "
+              f"{'on' if want_tilts else 'skipped'})")
+    if not want_tilts:
+        print("[ground] recall tilts skipped: tiling already renders "
+              "edge devices obliquely (perspective nadir + overlap) "
+              "[set recall_tilts=True to force]")
     for fname, fr in view_specs:
         try:
             img, cam, W, H = _render_topdown(scene, yaw, frame=fr)
@@ -1325,6 +1351,11 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         # boxes, and each tilted rect back-projects through its own
         # camera (unproject_ground), so no geometry is shared with the
         # nadir frame by mistake.
+        # SKIPPED for tiled layouts (user insight): tiling already gives
+        # the oblique edge views these exist to add -- see
+        # _want_recall_tilts.
+        if not want_tilts:
+            continue
         stem = fname[:-4] if fname.endswith(".png") else fname
         for tag, d in (("L", -1), ("R", +1)):
             try:

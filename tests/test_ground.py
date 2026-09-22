@@ -1530,6 +1530,67 @@ def test_ground_stage_merges_over_split_regions():
           f"(over-split row healed to {rows[0].size[0]:.2f}m)")
 
 
+def test_want_recall_tilts_policy():
+    """Recall-tilt policy: auto runs the tilts only for a SINGLE view;
+    a tiled layout skips them (tiling already gives oblique edge views).
+    An explicit override forces them for A/B tests."""
+    from agentic_gts.agent.ground import _want_recall_tilts
+    assert _want_recall_tilts(None) is True, "single view -> tilts"
+    assert _want_recall_tilts([(0, 0, 1, 1)]) is False, "tiled -> no tilts"
+    assert _want_recall_tilts([(0, 0, 1, 1)], True) is True
+    assert _want_recall_tilts(None, False) is False
+    print("PASS recall tilt policy (auto single-view only; override forces)")
+
+
+def test_ground_stage_tiled_skips_tilts():
+    """End-to-end: a TILED layout renders one nadir call per tile and NO
+    tilt views (user insight); setting recall_tilts=True restores them
+    (3 calls per tile) -- the A/B knob."""
+    import json as _json
+    import os as _os
+    import tempfile
+    from agentic_gts.agent import ground
+    from agentic_gts.agent.judge import VLMJudge
+
+    rng = np.random.default_rng(41)
+    pts = _row_points(0.0, 40.0, y=0.0, rng=rng, n=20000)
+    reply = ("One long joined row.\n" + _json.dumps(
+        [{"bbox_2d": [0, 0, 1000, 1000], "label": "row"}]))
+    judge = VLMJudge(backend="qwen")
+
+    def _mk_scene():
+        s = Scene(points=pts)
+        s.meta["yaw"] = 0.0
+        _bootstrap_meta(s, (-0.5, -0.8, 40.5, 0.8))
+        s.boxes = []
+        return s
+
+    with tempfile.TemporaryDirectory() as td:
+        calls = []
+        judge._qwen_image_call = lambda png, prompt, *a, **k: (
+            calls.append(1) or reply)
+        assert ground.ground_stage(_mk_scene(), judge, out_dir=td)
+        assert not any(f.endswith(("_L.png", "_R.png"))
+                       for f in _os.listdir(td)), \
+            "tiled layout must skip the recall tilts"
+        n_nadir = len(calls)
+        assert n_nadir >= 2, f"40m layout must tile, got {n_nadir}"
+
+    scene2 = _mk_scene()
+    scene2.meta["recall_tilts"] = True
+    with tempfile.TemporaryDirectory() as td2:
+        calls2 = []
+        judge._qwen_image_call = lambda png, prompt, *a, **k: (
+            calls2.append(1) or reply)
+        assert ground.ground_stage(scene2, judge, out_dir=td2)
+        assert any(f.endswith("_L.png") for f in _os.listdir(td2)), \
+            "recall_tilts=True must restore the tilt views"
+        assert len(calls2) == 3 * n_nadir, \
+            f"forced tilts -> 3x calls ({len(calls2)} vs {n_nadir})"
+    print(f"PASS tiled skips tilts ({n_nadir} nadir calls); "
+          f"override -> {len(calls2)} calls")
+
+
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
@@ -1543,6 +1604,8 @@ if __name__ == "__main__":
     test_fit_region_boxes_solid_deep_structure_kept()
     test_tile_frames()
     test_ground_stage_tiled_views()
+    test_want_recall_tilts_policy()
+    test_ground_stage_tiled_skips_tilts()
     test_robust_span_bin_boundary()
     test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()

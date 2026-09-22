@@ -88,6 +88,10 @@ def cmd_run(args):
         import math as _math
         opts["yaw"] = _math.radians(args.yaw)
         print(f"[cli] yaw pinned by user: {args.yaw} deg")
+    rt = getattr(args, "recall_tilts", "auto")
+    if rt != "auto":
+        opts["recall_tilts"] = (rt == "on")
+        print(f"[cli] recall tilt views forced {rt}")
     if getattr(args, "sam_checkpoint", None):
         opts["sam_checkpoint"] = args.sam_checkpoint
         if getattr(args, "sam_model_cfg", None):
@@ -225,6 +229,11 @@ def main():
     r.add_argument("--edge-thr", type=float, default=0.05)
     r.add_argument("--yaw", type=float, default=None,
                    help="pin device row yaw in degrees (skips estimation)")
+    r.add_argument("--recall-tilts", default="auto",
+                   choices=["auto", "on", "off"],
+                   help="recall tilt views: auto = single-view only (tiled "
+                        "layouts skip them -- tiling already renders edge "
+                        "devices obliquely); on/off force it for A/B tests")
     r.set_defaults(fn=cmd_run)
 
     g = sub.add_parser("diagnose", help="preprocess + yaw check visualization")
