@@ -179,24 +179,23 @@ def test_ground_stage_tilt_views_add_recall():
           "recovered both, spanning rect skipped)")
 
 
-def test_render_topdown_mesh_framing_room_centre():
-    """MESH input (user directive): the sampling is clean, the cloud
-    IS the room -- the nadir camera must sit over the WHOLE-cloud
-    centre (the room's centre), not the bootstrap layout's. The
-    3DGS branch keeps the layout framing (outer haze must stay out
-    of frame). Devices shoved into one corner of a 12x8 room make
-    the two centres 3m+ apart, so the branch taken is unambiguous."""
+def test_render_topdown_mesh_framing_layout():
+    """Groundview framing uses the DEVICE LAYOUT (bootstrap) for a MESH
+    too -- not the whole-cloud bbox. Long-tail mesh noise (background
+    captured outside the room) otherwise inflates the frame, the camera
+    climbs and the room shrinks to a corner with lots of empty space and
+    non-room structure (user report). Devices shoved into one corner of a
+    12x8 room make the room centre and the layout centre 3m+ apart, so
+    the branch taken is unambiguous."""
     from agentic_gts.agent import ground
 
     rng = np.random.default_rng(23)
-    # room walls: four thin bands around a 12x8 footprint
     wall = []
     for _x0, _x1, _y0, _y1 in ((-6, 6, -4, -3.8), (-6, 6, 3.8, 4),
                                (-6, -5.8, -3.8, 3.8), (5.8, 6, -3.8, 3.8)):
         wall.append(np.column_stack([
             rng.uniform(_x0, _x1, 3000), rng.uniform(_y0, _y1, 3000),
             rng.uniform(0.0, 3.0, 3000)]))
-    # devices crammed into the room's +x/+y corner
     dev = np.vstack([_row_points(3.0, 5.6, y=1.0, rng=rng),
                      _row_points(3.0, 5.6, y=2.8, rng=rng)])
     pts = np.vstack(wall + [dev])
@@ -205,25 +204,18 @@ def test_render_topdown_mesh_framing_room_centre():
 
     scene = Scene(points=pts)
     scene.meta["yaw"] = 0.0
-    _bootstrap_meta(scene, (2.8, 0.6, 5.8, 3.2))
+    _bootstrap_meta(scene, (2.8, 0.6, 5.8, 3.2))     # layout centre (4.3, 1.9)
     scene.meta["geometry_is_mesh"] = True
     _, cam_m, _, _ = ground._render_topdown(scene, 0.0)
-    assert (abs(float(cam_m.eye[0]) - room_c[0]) < 0.3
-            and abs(float(cam_m.eye[1]) - room_c[1]) < 0.3), \
-        (f"mesh camera must centre on the ROOM ({room_c}), got eye "
+    # MESH now centres on the LAYOUT (4.3, 1.9), NOT the room centre (0,0)
+    assert (abs(float(cam_m.eye[0]) - 4.3) < 0.4
+            and abs(float(cam_m.eye[1]) - 1.9) < 0.4), \
+        (f"mesh camera must centre on the LAYOUT (4.3, 1.9), got eye "
          f"({cam_m.eye[0]:.2f}, {cam_m.eye[1]:.2f})")
-
-    # the 3DGS branch (no mesh flag) keeps the layout framing: eye
-    # near the layout centre, NOT the room centre
-    scene.meta["geometry_is_mesh"] = False
-    _, cam_g, _, _ = ground._render_topdown(scene, 0.0)
-    assert abs(float(cam_g.eye[0]) - 4.3) < 0.4 \
-        and abs(float(cam_g.eye[1]) - 1.9) < 0.4, \
-        ("3DGS camera must keep the layout framing, got eye "
-         f"({cam_g.eye[0]:.2f}, {cam_g.eye[1]:.2f})")
-    print(f"PASS mesh framing: room centre ({room_c[0]:.1f},"
-          f"{room_c[1]:.1f}) vs 3DGS layout "
-          f"({cam_g.eye[0]:.1f},{cam_g.eye[1]:.1f})")
+    assert abs(float(cam_m.eye[0]) - room_c[0]) > 2.0, \
+        "mesh framing must NOT use the whole-cloud room centre"
+    print(f"PASS mesh framing uses the layout (layout (4.3,1.9) vs room "
+          f"({room_c[0]:.1f},{room_c[1]:.1f}))")
 
 
 def test_unproject_ground_roundtrip():
@@ -1170,10 +1162,11 @@ def test_nadir_framing_tight_for_rotated_layout():
     uv = cam.project_cv(np.column_stack([cells, np.full(len(cells), 1.9)]))
     fill_w = (uv[:, 0].max() - uv[:, 0].min()) / W
     fill_h = (uv[:, 1].max() - uv[:, 1].min()) / H
-    # tight framing: with the fix the top ring fills most of the frame;
-    # the double-inflated framing showed it at ~39% width / ~48% height
-    assert fill_w > 0.6, f"cells fill only {fill_w:.0%} of the width"
-    assert fill_h > 0.85, f"cells fill only {fill_h:.0%} of the height"
+    # tight framing: with the fix (+ a small _FRAME_MARGIN) the top ring
+    # fills most of the frame; the double-inflated framing showed it at
+    # ~39% width / ~48% height
+    assert fill_w > 0.55, f"cells fill only {fill_w:.0%} of the width"
+    assert fill_h > 0.70, f"cells fill only {fill_h:.0%} of the height"
     print(f"PASS rotated-layout framing tight (fill {fill_w:.0%} x {fill_h:.0%})")
 
 
@@ -1751,6 +1744,29 @@ def test_floor_map_mesh_step_fine():
     print("PASS mesh floor map step (raised floor reads h~0, fine tiles)")
 
 
+def test_grounding_frame_hugs_layout_not_cloud():
+    """Long-tail mesh noise (background far outside the room) must NOT
+    inflate the grounding frame: framing uses the bootstrap device
+    layout (+ a small margin), not the whole-cloud AABB."""
+    from agentic_gts.agent.ground import _FRAME_MARGIN, _grounding_frame
+    rng = np.random.default_rng(31)
+    dev = np.column_stack([rng.uniform(-3, 3, 5000),
+                           rng.uniform(-2, 2, 5000),
+                           rng.uniform(0, 2, 5000)])
+    bg = np.column_stack([rng.uniform(98, 102, 3000),
+                          rng.uniform(78, 82, 3000),
+                          rng.uniform(0, 3, 3000)])
+    scene = Scene(points=np.vstack([dev, bg]))
+    scene.meta["yaw"] = 0.0
+    scene.meta["device_footprint"] = (-3.0, -2.0, 3.0, 2.0)
+    lo, hi = _grounding_frame(scene, 0.0)
+    assert hi[0] < 10.0 and hi[1] < 10.0, \
+        f"frame must hug the layout, not the whole cloud, got hi={hi}"
+    assert abs(lo[0] - (-3.0 - _FRAME_MARGIN)) < 1e-6
+    assert abs(hi[0] - (3.0 + _FRAME_MARGIN)) < 1e-6
+    print("PASS grounding frame hugs the layout (far background ignored)")
+
+
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
@@ -1772,6 +1788,7 @@ if __name__ == "__main__":
     test_floor_at_local_rotates_back()
     test_fit_region_box_rotated_stepped_floor()
     test_floor_map_mesh_step_fine()
+    test_grounding_frame_hugs_layout_not_cloud()
     test_robust_span_bin_boundary()
     test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()

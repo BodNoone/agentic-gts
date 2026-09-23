@@ -228,6 +228,10 @@ def _layout_frame(scene, yaw: float):
 _MAX_SINGLE_SPAN = 25.0
 _TILE_OVERLAP = 2.5
 
+# groundview framing: expand the device-layout AABB by this margin so edge
+# devices stay inside while far background does not inflate the camera.
+_FRAME_MARGIN = 0.5
+
 # recall tilt views (user direction 1): the extra L/R cameras deviate
 # from vertical by this much -- small enough to keep the nadir's
 # layout fidelity (rows stay near-axis-aligned, rects back-project
@@ -238,18 +242,23 @@ _RECALL_TILT_DEG = 20.0
 def _grounding_frame(scene, yaw: float):
     """Rotated-frame AABB the grounding views are framed on.
 
-    MESH input (user directive): the sampling is CLEAN -- no diffuse
-    outer gaussians to crop out -- and the cloud IS the room (outer
-    walls included). Frame the WHOLE cloud so the camera sits at the
-    ROOM centre; the bootstrap-layout framing exists for 3DGS, where
-    outer haze swamps the raw bbox and the hugging frame keeps the
-    racks big.
+    Frame the DEVICE LAYOUT (bootstrap device_cells / footprint), for a
+    MESH too -- not the raw cloud bbox. Long-tail mesh noise (background
+    captured OUTSIDE the room) inflates a whole-cloud AABB: the camera
+    climbs to fit it and the room shrinks to a corner with lots of empty
+    space and non-room structure in frame (user report). A small margin
+    keeps edge devices in. Falls back to a ROBUST (percentile) cloud AABB
+    when the bootstrap layout is unavailable, so a long tail is still
+    trimmed.
     """
-    if bool(scene.meta.get("geometry_is_mesh")):
-        all_rot = _rot_xy(np.asarray(scene.points, dtype=np.float64),
-                          -yaw)
-        return all_rot[:, :2].min(axis=0), all_rot[:, :2].max(axis=0)
-    return _layout_frame(scene, yaw)
+    lh = _layout_frame(scene, yaw)
+    if lh is not None:
+        lo = np.asarray(lh[0], dtype=np.float64) - _FRAME_MARGIN
+        hi = np.asarray(lh[1], dtype=np.float64) + _FRAME_MARGIN
+        return lo, hi
+    all_rot = _rot_xy(np.asarray(scene.points, dtype=np.float64), -yaw)
+    return (np.percentile(all_rot[:, :2], 1.0, axis=0),
+            np.percentile(all_rot[:, :2], 99.0, axis=0))
 
 
 def _tile_frames(layout):
@@ -401,6 +410,19 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
             center=(float(c[0]), float(c[1]), 1.0),
             size=(float(hi[0] - lo[0]), float(hi[1] - lo[1]), 2.0),
             yaw=0.0))
+    # crop the render to the framing region + a margin (row frame):
+    # background beyond the layout -- long-tail mesh noise captured
+    # outside the room -- must not render or inflate the camera (user
+    # report: lots of empty space and non-room structure in the view).
+    crop = None
+    if lo is not None:
+        pad = _TILE_OVERLAP
+        crop = (np.asarray(lo, dtype=float) - pad,
+                np.asarray(hi, dtype=float) + pad)
+        m = ((pts_rot[:, 0] >= crop[0][0]) & (pts_rot[:, 0] <= crop[1][0]) &
+             (pts_rot[:, 1] >= crop[0][1]) & (pts_rot[:, 1] <= crop[1][1]))
+        band = band[m]
+        pts_rot = pts_rot[m]
     cam_r = make_godview_cam(pts_rot, boxes_rot, nadir=True, W=W, H=H)
     if tilt_deg and tilt_dir:
         # recall tilt (user direction 1): shift the eye along +/-y in
@@ -456,6 +478,11 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
                 keep = hg > 0.30
                 if np.isfinite(cut):
                     keep &= hg < cut
+            if crop is not None:
+                # drop background gaussians outside the layout (row frame)
+                gr = _rot_xy(gm, -yaw)
+                keep &= ((gr[:, 0] >= crop[0][0]) & (gr[:, 0] <= crop[1][0])
+                         & (gr[:, 1] >= crop[0][1]) & (gr[:, 1] <= crop[1][1]))
             img = render_gs_view(gs, (), cam,
                                  cut_z=float("inf"),
                                  cut_z_low=float("-inf"),
