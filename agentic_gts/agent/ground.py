@@ -245,6 +245,11 @@ _TILE_OVERLAP = 2.5
 # devices stay inside while far background does not inflate the camera.
 _FRAME_MARGIN = 0.5
 
+# groundview zoom: shrink the framing span around its centre so the camera
+# sits LOWER and the room fills more of the frame (user request: the nadir
+# view rendered too high). <1 zooms in; content past the zoom is cropped.
+_GROUNDVIEW_ZOOM = 0.85
+
 # recall tilt views (user direction 1): the extra L/R cameras deviate
 # from vertical by this much -- small enough to keep the nadir's
 # layout fidelity (rows stay near-axis-aligned, rects back-project
@@ -417,6 +422,15 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
         lh = _grounding_frame(scene, yaw)
         if lh is not None:
             lo, hi = lh
+        if lo is not None:
+            # zoom IN: shrink the framing span around its centre -> a
+            # LOWER camera and a bigger room in frame (user request: the
+            # nadir view rendered too high). SINGLE view only -- a tiled
+            # frame is already bounded, and shrinking it could open gaps.
+            _c = (lo + hi) / 2.0
+            _half = (np.asarray(hi, float) - np.asarray(lo, float)) / 2.0 \
+                * _GROUNDVIEW_ZOOM
+            lo, hi = _c - _half, _c + _half
     if lo is not None:
         c = (lo + hi) / 2.0
         boxes_rot.append(OrientedBox(
