@@ -1857,6 +1857,24 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                   f"(size {b.size[0]:.2f} x {b.size[1]:.2f} m)")
         boxes = [b for b in boxes if not _oversized_blob(b)]
     scene.boxes = boxes
+    # DIAG (temporary): the local-floor map's range + each box's bottom /
+    # top vs the floor map at its centre -- pinpoints a uniform "raised by
+    # the step" offset (floor-map level vs the cloud's own floor).
+    try:
+        _fv = np.asarray(fl(P[:, 0], P[:, 1]), dtype=float)
+        print(f"[diag][floor] map over cloud: min={np.min(_fv):.2f} "
+              f"med={np.median(_fv):.2f} max={np.max(_fv):.2f} | "
+              f"cloud z p2={np.percentile(P[:, 2], 2):.2f} "
+              f"mesh={is_mesh}")
+        for b in boxes[:12]:
+            c = np.asarray(b.center, dtype=float)
+            fvb = float(fl(c[0], c[1]))
+            print(f"[diag][floor] box {b.box_id[:6]} "
+                  f"bottom={c[2] - b.size[2] / 2:.2f} "
+                  f"top={c[2] + b.size[2] / 2:.2f} fl(centre)={fvb:.2f} "
+                  f"xy=({c[0]:.1f},{c[1]:.1f})")
+    except Exception as e:
+        print(f"[diag][floor] failed: {type(e).__name__}: {e}")
     # result audit: one image per view -- the view's own raw VLM rects
     # (colored) plus the final fitted boxes (red) projected through the
     # same camera. Tiled views draw ALL boxes (cross-tile ones project
