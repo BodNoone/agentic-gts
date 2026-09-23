@@ -43,6 +43,15 @@ def _bootstrap_meta(scene, footprint, z_top=2.1):
     scene.meta["device_footprint"] = footprint
 
 
+def _vlm_px(uv, W, H, off=(0, 0)):
+    """Full-frame pixel coords -> the (possibly CROPPED) view's pixel
+    rect, clamped like a real VLM reply (projections through the cam
+    land in full-frame pixels; the VLM answered on the crop)."""
+    x = np.clip(np.asarray(uv)[:, 0] - off[0], 0, W)
+    y = np.clip(np.asarray(uv)[:, 1] - off[1], 0, H)
+    return (float(x.min()), float(y.min()), float(x.max()), float(y.max()))
+
+
 def test_render_topdown_tilt_camera_geometry():
     """Recall tilt views (user direction 1): the L/R cameras deviate
     from vertical by ~tilt_deg along the ROW-frame cross axis (eye on
@@ -58,11 +67,13 @@ def test_render_topdown_tilt_camera_geometry():
     scene = Scene(points=pts)
     scene.meta["yaw"] = 0.0
     _bootstrap_meta(scene, (-0.5, -0.8, 6.5, 3.8))
-    _, cam0, W, H = ground._render_topdown(scene, 0.0)
-    _, camL, _, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
-                                           tilt_dir=-1)
-    _, camR, _, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
-                                           tilt_dir=+1)
+    _, cam0, _, _, _ = ground._render_topdown(scene, 0.0)
+    # W/H from a TILT render: tilt views keep the full frame, so the
+    # roundtrip bounds below test against the real frame dims
+    _, camL, W, H, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
+                                              tilt_dir=-1)
+    _, camR, _, _, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
+                                              tilt_dir=+1)
     # eyes sit on opposite sides of the layout, across the rows
     assert camL.eye[1] < cam0.eye[1] - 0.5, "L eye must sit toward -y"
     assert camR.eye[1] > cam0.eye[1] + 0.5, "R eye must sit toward +y"
@@ -112,11 +123,15 @@ def test_ground_stage_tilt_views_add_recall():
     _bootstrap_meta(scene, (-0.5, -0.8, 9.5, 3.8))
     scene.boxes = []
 
-    _, cam0, W, H = ground._render_topdown(scene, 0.0)
-    _, camL, _, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
-                                           tilt_dir=-1)
-    _, camR, _, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
-                                           tilt_dir=+1)
+    _, cam0, _, _, off0 = ground._render_topdown(scene, 0.0)
+    _, camL, _, _, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
+                                              tilt_dir=-1)
+    _, camR, _, _, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
+                                              tilt_dir=+1)
+    # the nadir view may be CROPPED to the tile footprint; tilt views
+    # keep the full frame -- the fake reply must carry each view's crop
+    view_offs = {"groundview.png": off0,
+                 "groundview_L.png": (0, 0), "groundview_R.png": (0, 0)}
     view_rects = {
         "groundview.png": (cam0, [((-0.2, 6.2), (-0.6, 0.6))]),
         # the L view repeats the nadir rect (a duplicate): the recall
@@ -139,14 +154,15 @@ def test_ground_stage_tilt_views_add_recall():
     def _fake_ground(png, W_, H_, png_path=None):
         name = os.path.basename(png_path or "groundview.png")
         cam, specs = view_rects[name]
+        o = view_offs[name]
         rects = []
         for (xa, xb), (ya, yb) in specs:
             uv = cam.project_cv(np.column_stack(
                 [[xa, xb, xb, xa], [ya, ya, yb, yb], np.full(4, 1.0)]))
-            rects.append((float(np.clip(uv[:, 0].min(), 0, W_)),
-                          float(np.clip(uv[:, 1].min(), 0, H_)),
-                          float(np.clip(uv[:, 0].max(), 0, W_)),
-                          float(np.clip(uv[:, 1].max(), 0, H_))))
+            rects.append((float(np.clip(uv[:, 0].min() - o[0], 0, W_)),
+                          float(np.clip(uv[:, 1].min() - o[1], 0, H_)),
+                          float(np.clip(uv[:, 0].max() - o[0], 0, W_)),
+                          float(np.clip(uv[:, 1].max() - o[1], 0, H_))))
         return rects
 
     judge = VLMJudge(backend="qwen")
@@ -206,7 +222,7 @@ def test_render_topdown_mesh_framing_layout():
     scene.meta["yaw"] = 0.0
     _bootstrap_meta(scene, (2.8, 0.6, 5.8, 3.2))     # layout centre (4.3, 1.9)
     scene.meta["geometry_is_mesh"] = True
-    _, cam_m, _, _ = ground._render_topdown(scene, 0.0)
+    _, cam_m, _, _, _ = ground._render_topdown(scene, 0.0)
     # MESH now centres on the LAYOUT (4.3, 1.9), NOT the room centre (0,0)
     assert (abs(float(cam_m.eye[0]) - 4.3) < 0.4
             and abs(float(cam_m.eye[1]) - 1.9) < 0.4), \
@@ -385,7 +401,7 @@ def test_ground_stage_with_patched_vlm():
     _bootstrap_meta(scene, (-1.5, -0.8, 6.5, 3.8))
     scene.boxes = []
     # build the same deterministic render to fabricate the VLM answer
-    _, cam, W, H = ground._render_topdown(scene, 0.0)
+    _, cam, W, H, off = ground._render_topdown(scene, 0.0)
     true_rects = [((-0.5, 6.5), (-0.8, 0.8)),      # row 1 XY
                   ((-0.5, 6.5), (-0.8, 0.8)),      # row 1 AGAIN: the VLM
                   # often outlines one device twice (user report:
@@ -398,8 +414,7 @@ def test_ground_stage_with_patched_vlm():
             [xa, xb, xb, xa], [ya, ya, yb, yb], np.full(4, 1.0)]))
         # clamp to the image like a real reply: the official 0-1000
         # relative grid cannot express coordinates beyond the frame
-        px = (np.clip(uv[:, 0].min(), 0, W), np.clip(uv[:, 1].min(), 0, H),
-              np.clip(uv[:, 0].max(), 0, W), np.clip(uv[:, 1].max(), 0, H))
+        px = _vlm_px(uv, W, H, off)
         regions.append({"bbox_2d": [
             int(round(px[0] / W * 1000)),
             int(round(px[1] / H * 1000)),
@@ -788,13 +803,12 @@ def test_ground_stage_cluster_recall():
     scene.meta["yaw"] = 0.0
     _bootstrap_meta(scene, (-1.5, -0.8, 8.5, 6.5))
     scene.boxes = []
-    _, cam, W, H = ground._render_topdown(scene, 0.0)
+    _, cam, W, H, off = ground._render_topdown(scene, 0.0)
     # the VLM grounds ONLY row 1 -- row 2 is the missed device
     uv = cam.project_cv(np.column_stack(
         [[-0.5, 6.5, 6.5, -0.5], [-0.8, -0.8, 0.8, 0.8],
          np.full(4, 1.0)]))
-    px = (max(float(uv[:, 0].min()), 0.0), max(float(uv[:, 1].min()), 0.0),
-          min(float(uv[:, 0].max()), W), min(float(uv[:, 1].max()), H))
+    px = _vlm_px(uv, W, H, off)
     import json as _json
     reply = ("One row visible.\n" + _json.dumps(
         [{"bbox_2d": [int(round(px[0] / W * 1000)),
@@ -854,14 +868,13 @@ def test_ground_stage_adjacent_clump_recall():
     scene.meta["yaw"] = 0.0
     _bootstrap_meta(scene, (-1.5, -0.9, 9.5, 0.9))
     scene.boxes = []
-    _, cam, W, H = ground._render_topdown(scene, 0.0)
+    _, cam, W, H, off = ground._render_topdown(scene, 0.0)
     # ONE generous rect: the row plus the whole clump (the fit snaps
     # to the row's denser run; the clump's points stay unfitted)
     uv = cam.project_cv(np.column_stack(
         [[-0.6, 8.6, 8.6, -0.6], [-0.8, -0.8, 0.8, 0.8],
          np.full(4, 1.0)]))
-    px = (max(float(uv[:, 0].min()), 0.0), max(float(uv[:, 1].min()), 0.0),
-          min(float(uv[:, 0].max()), W), min(float(uv[:, 1].max()), H))
+    px = _vlm_px(uv, W, H, off)
     import json as _json
     reply = ("Row and unit.\n" + _json.dumps(
         [{"bbox_2d": [int(round(px[0] / W * 1000)),
@@ -999,12 +1012,11 @@ def test_ground_stage_row_along_y():
     scene.meta["yaw"] = 0.0
     _bootstrap_meta(scene, (-0.8, -0.5, 0.8, 6.5))
     scene.boxes = []
-    _, cam, W, H = ground._render_topdown(scene, 0.0)
+    _, cam, W, H, off = ground._render_topdown(scene, 0.0)
     # true rect: depth on x, length on y
     uv = cam.project_cv(np.column_stack(
         [[-0.8, 0.8, 0.8, -0.8], [-0.5, -0.5, 6.5, 6.5], np.full(4, 1.0)]))
-    px = (np.clip(uv[:, 0].min(), 0, W), np.clip(uv[:, 1].min(), 0, H),
-          np.clip(uv[:, 0].max(), 0, W), np.clip(uv[:, 1].max(), 0, H))
+    px = _vlm_px(uv, W, H, off)
     reply = ('[{"bbox_2d": [%d, %d, %d, %d], "label": "row"}]'
              % (round(px[0] / W * 1000), round(px[1] / H * 1000),
                 round(px[2] / W * 1000), round(px[3] / H * 1000)))
@@ -1087,7 +1099,7 @@ def test_ground_stage_bootstrap_driven():
     scene.meta["yaw"] = 0.0
     _bootstrap_meta(scene, (-0.5, -0.8, 6.5, 3.8))
     scene.boxes = []
-    _, cam, W, H = ground._render_topdown(scene, 0.0)
+    _, cam, W, H, off = ground._render_topdown(scene, 0.0)
     true_rects = [(( -0.5, 6.5), (-0.8, 0.8)),
                   ((-1.5, 5.5), (2.2, 3.8))]
     import json as _json
@@ -1095,8 +1107,7 @@ def test_ground_stage_bootstrap_driven():
     for (xa, xb), (ya, yb) in true_rects:
         uv = cam.project_cv(np.column_stack([
             [xa, xb, xb, xa], [ya, ya, yb, yb], np.full(4, 1.0)]))
-        px = (np.clip(uv[:, 0].min(), 0, W), np.clip(uv[:, 1].min(), 0, H),
-              np.clip(uv[:, 0].max(), 0, W), np.clip(uv[:, 1].max(), 0, H))
+        px = _vlm_px(uv, W, H, off)
         regions.append({"bbox_2d": [
             int(round(px[0] / W * 1000)), int(round(px[1] / H * 1000)),
             int(round(px[2] / W * 1000)), int(round(px[3] / H * 1000))],
@@ -1155,11 +1166,12 @@ def test_nadir_framing_tight_for_rotated_layout():
     scene.meta["device_footprint"] = (
         float(cells[:, 0].min()), float(cells[:, 1].min()),
         float(cells[:, 0].max()), float(cells[:, 1].max()))
-    _, cam, W, H = ground._render_topdown(scene, yaw)
+    _, cam, W, H, off = ground._render_topdown(scene, yaw)
     # measure at the TOP of the band: the perspective nadir camera is
     # fitted so the rack-top ring fills the frame (it is closest to the
     # eye and spreads most); the floor ring is necessarily smaller
     uv = cam.project_cv(np.column_stack([cells, np.full(len(cells), 1.9)]))
+    uv = uv - np.asarray(off, dtype=float)   # into the cropped frame
     fill_w = (uv[:, 0].max() - uv[:, 0].min()) / W
     fill_h = (uv[:, 1].max() - uv[:, 1].min()) / H
     # tight framing: with the fix (+ a small _FRAME_MARGIN) the top ring
@@ -1437,7 +1449,7 @@ def test_ground_stage_nested_region_dropped():
     scene.meta["yaw"] = 0.0
     _bootstrap_meta(scene, (-1.5, -0.8, 6.5, 3.8))
     scene.boxes = []
-    _, cam, W, H = ground._render_topdown(scene, 0.0)
+    _, cam, W, H, off = ground._render_topdown(scene, 0.0)
     # whole row 1, a cross-ways SUB-rect of row 1 (nested), whole row 2
     true_rects = [((-0.5, 6.5), (-0.8, 0.8)),
                   ((2.4, 3.6), (-0.8, 0.8)),
@@ -1446,8 +1458,7 @@ def test_ground_stage_nested_region_dropped():
     for (xa, xb), (ya, yb) in true_rects:
         uv = cam.project_cv(np.column_stack([
             [xa, xb, xb, xa], [ya, ya, yb, yb], np.full(4, 1.0)]))
-        px = (np.clip(uv[:, 0].min(), 0, W), np.clip(uv[:, 1].min(), 0, H),
-              np.clip(uv[:, 0].max(), 0, W), np.clip(uv[:, 1].max(), 0, H))
+        px = _vlm_px(uv, W, H, off)
         regions.append({"bbox_2d": [
             int(round(px[0] / W * 1000)), int(round(px[1] / H * 1000)),
             int(round(px[2] / W * 1000)), int(round(px[3] / H * 1000))],
@@ -1488,7 +1499,7 @@ def test_ground_stage_merges_over_split_regions():
     scene.meta["yaw"] = 0.0
     _bootstrap_meta(scene, (-1.5, -0.8, 6.5, 3.8))
     scene.boxes = []
-    _, cam, W, H = ground._render_topdown(scene, 0.0)
+    _, cam, W, H, off = ground._render_topdown(scene, 0.0)
     # row 1 over-split into two rects TOUCHING at x=3.0; row 2 whole
     true_rects = [((-0.5, 3.0), (-0.8, 0.8)),
                   ((3.0, 6.5), (-0.8, 0.8)),
@@ -1497,8 +1508,7 @@ def test_ground_stage_merges_over_split_regions():
     for (xa, xb), (ya, yb) in true_rects:
         uv = cam.project_cv(np.column_stack([
             [xa, xb, xb, xa], [ya, ya, yb, yb], np.full(4, 1.0)]))
-        px = (np.clip(uv[:, 0].min(), 0, W), np.clip(uv[:, 1].min(), 0, H),
-              np.clip(uv[:, 0].max(), 0, W), np.clip(uv[:, 1].max(), 0, H))
+        px = _vlm_px(uv, W, H, off)
         regions.append({"bbox_2d": [
             int(round(px[0] / W * 1000)), int(round(px[1] / H * 1000)),
             int(round(px[2] / W * 1000)), int(round(px[3] / H * 1000))],
@@ -1799,6 +1809,46 @@ def test_floor_map_mesh_rejects_overhead_only_tiles():
     print("PASS mesh floor map rejects overhead-only tiles")
 
 
+def test_render_topdown_crops_to_tile_footprint():
+    """Long-thin layouts: the nadir camera is driven by the LONG axis,
+    so the room fills only a thin band and the rest of the frame is
+    empty (user report: huge whitespace -> VLM misjudgement). The nadir
+    render is now CROPPED to the tile's projected footprint, and the
+    crop offset round-trips the VLM rect coordinates."""
+    from agentic_gts.agent import ground
+    from agentic_gts.output.gs_render import unproject_ground
+    rng = np.random.default_rng(51)
+    # a 30 x 4 m layout (aspect ~8): the vertical fills only ~15%
+    pts = np.vstack([_row_points(0.0, 30.0, y=-1.0, rng=rng),
+                     _row_points(0.0, 30.0, y=1.0, rng=rng)])
+    scene = Scene(points=pts)
+    scene.meta["yaw"] = 0.0
+    _bootstrap_meta(scene, (-0.5, -1.8, 30.5, 1.8))
+    img, cam, W, H, off = ground._render_topdown(scene, 0.0)
+    assert (W, H) != (1280, 1024), "the long-thin layout must be cropped"
+    assert img.shape[0] == H and img.shape[1] == W, \
+        "image dims must match the returned W/H"
+    assert off[1] > 100, f"vertical whitespace must be cropped, off={off}"
+    assert H < 700, f"cropped height {H} must be the room band, not 1024"
+    # all layout content lands INSIDE the crop
+    world = np.column_stack([rng.uniform(0.0, 30.0, 200),
+                             rng.uniform(-1.5, 1.5, 200),
+                             np.full(200, 1.0)])
+    uv = cam.project_cv(world) - np.asarray(off, dtype=float)
+    assert (uv[:, 0] >= -1).all() and (uv[:, 0] <= W + 1).all(), \
+        "content must stay inside the cropped width"
+    assert (uv[:, 1] >= -1).all() and (uv[:, 1] <= H + 1).all(), \
+        "content must stay inside the cropped height"
+    # the offset round-trips a VLM rect: cropped px + off -> unproject
+    # -> the same world point (the ground_stage _shift_rect contract)
+    back = unproject_ground(cam, uv + np.asarray(off, dtype=float),
+                            z_plane=1.0)
+    assert np.allclose(back[:, :2], world[:, :2], atol=0.01), \
+        "rect + offset must back-project to the world point"
+    print(f"PASS nadir crop to the tile footprint "
+          f"({W}x{H}, off={off}, roundtrip closed)")
+
+
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
@@ -1823,6 +1873,7 @@ if __name__ == "__main__":
     test_floor_map_mesh_rejects_overhead_only_tiles()
     test_grounding_frame_hugs_layout_not_cloud()
     test_huge_rect_guard()
+    test_render_topdown_crops_to_tile_footprint()
     test_robust_span_bin_boundary()
     test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()

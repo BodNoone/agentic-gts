@@ -352,7 +352,10 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
     nadir's layout fidelity, and each rect still back-projects through
     ITS OWN camera (unproject_ground handles non-nadir rays).
 
-    Returns (img_float, cam, W, H).
+    Returns (img_float, cam, W, H, off): the (possibly CROPPED) image,
+    the camera, the image dims and the CROP ORIGIN in full-frame pixels
+    (VLM rects must ADD `off` before unprojecting through `cam`, which
+    still maps world -> full-frame pixels).
     """
     from agentic_gts.output.gs_render import (Cam, make_godview_cam,
                                               render_gs_view)
@@ -505,14 +508,52 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
                   f"-> scatter")
     if img is None:
         img = _projected_scatter(band, cam, W, H)
-    return img, cam, W, H
+    # ---- crop the NADIR view to the tile's projected footprint ----
+    # The camera is fitted so the tile at z_top_ring FITS the frame; on
+    # the non-binding axis the tile fills only ~1.19/a of the image and
+    # the rest is empty (user report: long-thin tiles rendered with a
+    # very high camera, the room a thin band, the VLM misjudging).
+    # Cropping the image to the tile's projected bbox removes exactly
+    # that whitespace; all tile content (at or below z_top_ring) stays
+    # inside. Tilt views keep the full frame (their ground footprint
+    # projects to a trapezoid an AABB crop cannot tighten). `off` is the
+    # crop origin in FULL-frame pixels: callers ADD it to VLM rects
+    # before unprojecting through cam (cam still maps world ->
+    # full-frame pixels).
+    off = (0, 0)
+    if lo is not None and not (tilt_deg and tilt_dir):
+        try:
+            zr = max(2.0, float(pts_rot[:, 2].max())) if len(pts_rot) else 2.0
+            corners_r = np.array([[lo[0], lo[1]], [hi[0], lo[1]],
+                                  [hi[0], hi[1]], [lo[0], hi[1]]])
+            cw = _rot_xy(np.column_stack([corners_r, np.full(4, zr)]), yaw)
+            uv = cam.project_cv(cw)
+            _pad = 6
+            x0 = max(int(np.floor(uv[:, 0].min())) - _pad, 0)
+            x1 = min(int(np.ceil(uv[:, 0].max())) + _pad, W)
+            y0 = max(int(np.floor(uv[:, 1].min())) - _pad, 0)
+            y1 = min(int(np.ceil(uv[:, 1].max())) + _pad, H)
+            if (x1 - x0 >= 64 and y1 - y0 >= 64
+                    and (x1 - x0) * (y1 - y0) < W * H):
+                _ow, _oh = W, H
+                img = img[y0:y1, x0:x1]
+                off = (x0, y0)
+                W, H = int(x1 - x0), int(y1 - y0)
+                print(f"[ground] nadir view cropped to the tile footprint "
+                      f"{W}x{H} (was {_ow}x{_oh}), crop offset {off}")
+        except Exception as e:
+            print(f"[ground] nadir crop failed ({type(e).__name__}: {e}) "
+                  f"-> full frame")
+    return img, cam, W, H, off
 
 
 def _draw_cluster_candidates(img: np.ndarray, cam, cands, yaw: float,
-                              W: int, H: int) -> np.ndarray:
+                              W: int, H: int, off=(0, 0)) -> np.ndarray:
     """Yellow numbered boxes for the missed cluster candidates, drawn
     on the nadir view: the row-frame rect corners rotate back to world
-    at structure height and project through this view's own camera."""
+    at structure height and project through this view's own camera.
+    `off` is the view's crop origin: projections land in FULL-frame
+    pixels, the image is the crop."""
     from PIL import Image, ImageDraw, ImageFont
     u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3].copy()
     pil = Image.fromarray(u8)
@@ -528,7 +569,8 @@ def _draw_cluster_candidates(img: np.ndarray, cam, cands, yaw: float,
                              [x1, y1, 0.0], [x0, y1, 0.0]])
         cw = _rot_xy(corners, yaw)[:, :2]
         uv = cam.project_cv(np.column_stack([cw, np.full(4, 1.2)]))
-        pts = [(int(round(p[0])), int(round(p[1]))) for p in uv]
+        pts = [(int(round(p[0] - off[0])), int(round(p[1] - off[1])))
+               for p in uv]
         pts.append(pts[0])
         for a, b in zip(pts, pts[1:]):
             dr.line((a, b), fill=yellow, width=4)
@@ -597,14 +639,16 @@ def _draw_raw_regions(img: np.ndarray, raw_rects: list) -> np.ndarray:
     return np.asarray(pil, dtype=np.float32) / 255.0
 
 
-def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
+def _draw_result_boxes(img: np.ndarray, cam, boxes, off=(0, 0)) -> np.ndarray:
     """Solid outlines for the grounded result boxes, COLOR-CODED by
     provenance (result-only audit: the VLM answered on the clean base,
     the fit is shown apart). Red = nadir-grounded; ORANGE = tilt-view
     fit; CYAN = cluster recall net. When a result box looks wrong, the
     color says WHICH stage produced it -- a merged box that is orange
     is tilt-perspective inflation, cyan is the recall net's cluster
-    spanning devices, red is the nadir fit itself (user debugging)."""
+    spanning devices, red is the nadir fit itself (user debugging).
+    `off` is the view's crop origin: projections land in FULL-frame
+    pixels, the image is the crop."""
     from PIL import Image, ImageDraw
     u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3].copy()
     pil = Image.fromarray(u8)
@@ -615,7 +659,8 @@ def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
         z = b.center[2] + b.size[2] / 2.0
         cs = b.corners_2d()
         uv = cam.project_cv(np.column_stack([cs, np.full(len(cs), z)]))
-        pts = [(int(round(p[0])), int(round(p[1]))) for p in uv]
+        pts = [(int(round(p[0] - off[0])), int(round(p[1] - off[1])))
+               for p in uv]
         pts.append(pts[0])
         col = colors.get(str(b.meta.get("view", "nadir")), (255, 60, 60))
         for a, c in zip(pts, pts[1:]):
@@ -624,15 +669,16 @@ def _draw_result_boxes(img: np.ndarray, cam, boxes) -> np.ndarray:
 
 
 def _save_grounded_png(base_img, cam, boxes, raw_rects, out_dir,
-                       fname: str = "grounded.png") -> None:
+                       fname: str = "grounded.png", off=(0, 0)) -> None:
     """The grounding audit image, drawn the way the official 2d_grounding
     cookbook plots its answers.
 
     Two layers over the clean view base the VLM answered on:
       - COLORED 3-px rectangles with labels = the VLM's RAW regions
         for this view (one distinct color per region, official
-        plot_bounding_boxes style)
-      - RED 2-px wireframes = the geometry-fitted final row boxes
+        plot_bounding_boxes style) -- already in THIS image's pixels
+      - RED 2-px wireframes = the geometry-fitted final row boxes,
+        projected through the camera and shifted by the crop offset
     This separates WHAT the VLM said from what the point-support fit
     made of it -- when the result is wrong, the audit shows whether
     the VLM mis-boxed or the fit mangled it. One image per view
@@ -642,7 +688,7 @@ def _save_grounded_png(base_img, cam, boxes, raw_rects, out_dir,
     try:
         from agentic_gts.output.gs_render import png_bytes
         img = _draw_result_boxes(_draw_raw_regions(base_img, raw_rects),
-                                 cam, boxes)
+                                 cam, boxes, off=off)
         path = os.path.join(out_dir, fname)
         with open(path, "wb") as f:
             f.write(png_bytes(img))
@@ -1474,7 +1520,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
               "edge devices obliquely (perspective nadir + overlap)")
     for fname, fr in view_specs:
         try:
-            img, cam, W, H = _render_topdown(scene, yaw, frame=fr)
+            img, cam, W, H, off = _render_topdown(scene, yaw, frame=fr)
             png = png_bytes(img)     # CLEAN view: no overlays
         except Exception as e:
             print(f"[ground] nadir render failed ({type(e).__name__}: {e})")
@@ -1490,7 +1536,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                 png_path = None
         rects = judge.ground_regions(png, W, H, png_path=png_path)
         print(f"[ground] view {fname}: {len(rects)} regions")
-        views.append((img, cam, W, H, fname, rects))
+        views.append((img, cam, W, H, fname, rects, off))
         # ---- recall tilt views (user direction 1) ----
         # Two extra cameras slightly tilted toward +/- across-row, on
         # THIS view's frame: the flat nadir frame renders every device
@@ -1507,7 +1553,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         stem = fname[:-4] if fname.endswith(".png") else fname
         for tag, d in (("L", -1), ("R", +1)):
             try:
-                img_t, cam_t, W_t, H_t = _render_topdown(
+                img_t, cam_t, W_t, H_t, off_t = _render_topdown(
                     scene, yaw, frame=fr, tilt_deg=_RECALL_TILT_DEG,
                     tilt_dir=d)
                 png_t = png_bytes(img_t)
@@ -1529,7 +1575,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                                            png_path=pngp_t)
             print(f"[ground] view {stem}_{tag}: {len(rects_t)} regions")
             views.append((img_t, cam_t, W_t, H_t, f"{stem}_{tag}.png",
-                          rects_t))
+                          rects_t, off_t))
     if not views:
         return False                 # every render failed (logged above)
     if not any(v[5] for v in views):
@@ -1581,6 +1627,12 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     except Exception as e:
         print(f"[ground] render-cut pool failed ({type(e).__name__}: {e})"
               f" -> using the fit pool")
+
+    def _shift_rect(r, off):
+        """VLM rect in the (possibly cropped) view's pixels -> FULL-frame
+        pixels: the cam maps world -> full frame, the VLM answered on the
+        crop, so its rects carry the crop origin."""
+        return (r[0] + off[0], r[1] + off[1], r[2] + off[0], r[3] + off[1])
 
     def _frame_rect(cam, r, z_plane):
         uv = np.array([[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]],
@@ -1658,14 +1710,14 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     for v in views:
         if _is_tilt_view(v[4]):
             continue
-        cam_v, W_v, H_v, rects_v = v[1], v[2], v[3], v[5]
+        cam_v, W_v, H_v, rects_v, off_v = v[1], v[2], v[3], v[5], v[6]
         for r in rects_v:
             if _huge_rect(r, W_v, H_v):
                 print(f"[ground] huge VLM rect dropped "
                       f"({(r[2] - r[0]) * (r[3] - r[1]) / (W_v * H_v):.0%} "
                       f"of {v[4]}): hedge box, not a device row")
                 continue
-            rect_r = _frame_rect(cam_v, r, 1.0)
+            rect_r = _frame_rect(cam_v, _shift_rect(r, off_v), 1.0)
             row_rects.append(rect_r)
             _fit_ground_rect(rect_r)
     # PASS 2 -- the tilt views are RECALL-ONLY (user report: red
@@ -1705,16 +1757,16 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     for v in views:
         if not _is_tilt_view(v[4]):
             continue
-        cam_v, W_v, H_v, rects_v = v[1], v[2], v[3], v[5]
+        cam_v, W_v, H_v, rects_v, off_v = v[1], v[2], v[3], v[5], v[6]
         for r in rects_v:
             if _huge_rect(r, W_v, H_v):
                 continue
-            lo_r = _frame_rect(cam_v, r, 0.30)
-            hi_r = _frame_rect(cam_v, r, 1.00)
+            lo_r = _frame_rect(cam_v, _shift_rect(r, off_v), 0.30)
+            hi_r = _frame_rect(cam_v, _shift_rect(r, off_v), 1.00)
             rect_r = (max(lo_r[0], hi_r[0]), max(lo_r[1], hi_r[1]),
                       min(lo_r[2], hi_r[2]), min(lo_r[3], hi_r[3]))
             if rect_r[0] >= rect_r[2] or rect_r[1] >= rect_r[3]:
-                rect_r = _frame_rect(cam_v, r, 1.0)   # disjoint slices
+                rect_r = _frame_rect(cam_v, _shift_rect(r, off_v), 1.0)
             if _rect_covered_frac(rect_r, fitted_rects + row_rects) >= 0.25:
                 tilt_skipped += 1
                 continue
@@ -1777,7 +1829,8 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         try:
             W0, H0 = views[0][2], views[0][3]
             png_c = png_bytes(_draw_cluster_candidates(
-                views[0][0], views[0][1], missed, yaw, W0, H0))
+                views[0][0], views[0][1], missed, yaw, W0, H0,
+                off=views[0][6]))
             if out_dir:
                 try:
                     with open(os.path.join(out_dir,
@@ -1893,7 +1946,8 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # same camera. Tiled views draw ALL boxes (cross-tile ones project
     # outside the frame), so each tile's audit stays self-contained.
     if out_dir:
-        for idx, (img_v, cam_v, _, _, fname_v, rects_v) in enumerate(views):
+        for idx, (img_v, cam_v, _, _, fname_v, rects_v,
+                  off_v) in enumerate(views):
             # non-tiled: views[0] (the NADIR view) owns grounded.png --
             # the before/after audit must compare the colored rects and
             # the red boxes on the view whose rays ARE the footprints;
@@ -1903,5 +1957,6 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
             fname_out = ("grounded.png" if (tiles is None and idx == 0)
                          else fname_v.replace("groundview", "grounded"))
             _save_grounded_png(
-                img_v, cam_v, boxes, rects_v, out_dir, fname=fname_out)
+                img_v, cam_v, boxes, rects_v, out_dir, fname=fname_out,
+                off=off_v)
     return True
