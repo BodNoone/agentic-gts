@@ -1780,6 +1780,25 @@ def test_huge_rect_guard():
     print("PASS huge-rect guard (hedge boxes rejected, row bands kept)")
 
 
+def test_floor_map_mesh_rejects_overhead_only_tiles():
+    """A mesh tile with only overhead structure (no floor points) must
+    NOT report the structure's z as the floor (user report: floor map
+    max 4.6m -> boxes raised)."""
+    from agentic_gts.agent.ground import _floor_map
+    rng = np.random.default_rng(41)
+    n = 100000
+    floor = np.column_stack([rng.uniform(-6, 0, n), rng.uniform(-4, 4, n),
+                             rng.uniform(-0.02, 0.02, n)])
+    tray = np.column_stack([rng.uniform(0, 6, n), rng.uniform(-4, 4, n),
+                            rng.uniform(4.4, 4.6, n)])
+    fl = _floor_map(np.vstack([floor, tray]), mesh_mode=True)
+    v = float(fl(3.0, 0.0))          # over the tray-only region
+    assert v < 1.5, f"overhead-only tile must not read the tray z, got {v:.2f}"
+    vf = float(fl(-3.0, 0.0))        # over the real floor
+    assert abs(vf) < 0.1, f"real floor must read ~0, got {vf:.2f}"
+    print("PASS mesh floor map rejects overhead-only tiles")
+
+
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
@@ -1801,6 +1820,7 @@ if __name__ == "__main__":
     test_floor_at_local_rotates_back()
     test_fit_region_box_rotated_stepped_floor()
     test_floor_map_mesh_step_fine()
+    test_floor_map_mesh_rejects_overhead_only_tiles()
     test_grounding_frame_hugs_layout_not_cloud()
     test_huge_rect_guard()
     test_robust_span_bin_boundary()

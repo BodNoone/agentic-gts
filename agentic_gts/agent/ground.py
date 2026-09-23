@@ -71,6 +71,12 @@ def _render_cut(top: float | None, mesh_mode: bool = False) -> float:
 # step to a sub-grid strip; a mesh is dense enough for the >=3-pt guard.
 _MESH_FLOOR_GRID = 0.3
 
+# a MESH tile whose floor reads this far ABOVE the global floor has no
+# floor points -- only overhead structure (trays / ceiling / a device in
+# a floor-less cell) -- and must fall back, not report the structure's z
+# as the floor (user report: floor map max 4.6m, boxes raised).
+_MESH_FLOOR_BAND = 1.5
+
 
 def _floor_map(points: np.ndarray, grid: float = 1.5, band: float = 1.0,
                min_pts: int = 30, mesh_mode: bool = False):
@@ -139,8 +145,15 @@ def _floor_map(points: np.ndarray, grid: float = 1.5, band: float = 1.0,
                      int(keys[:, 1].max()) - j0 + 1), np.nan,
                     dtype=np.float64)
         for k, (s, e) in enumerate(zip(starts, ends)):
-            if e - s >= min_pts_eff:
-                G[keys[k, 0] - i0, keys[k, 1] - j0] = stat(z_s[s:e])
+            if e - s < min_pts_eff:
+                continue
+            v = stat(z_s[s:e])
+            # a MESH tile with NO floor points (only overhead structure)
+            # would read that structure's z as the floor; reject a tile
+            # whose floor is implausibly far above the global floor.
+            if mesh_mode and v > base + _MESH_FLOOR_BAND:
+                continue
+            G[keys[k, 0] - i0, keys[k, 1] - j0] = v
         return G, i0, j0
 
     def _lookup(G, i0, j0, g, x, y):
