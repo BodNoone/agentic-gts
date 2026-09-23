@@ -1387,6 +1387,21 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
     return out
 
 
+# a VLM rect covering more than this fraction of the view is a "hedge"
+# box (whole room / large empty floor / background), not a device row:
+# an 8B grounding model falls back to one big box when the frame is
+# ambiguous (user report). Rejected BEFORE the fit/dedup so it cannot
+# out-support and eat the correct boxes. A legit row band covers less.
+_MAX_RECT_FRAC = 0.8
+
+
+def _huge_rect(r, W: int, H: int, max_frac: float = _MAX_RECT_FRAC) -> bool:
+    """True when a pixel rect covers more than `max_frac` of the view."""
+    w = max(0.0, float(r[2]) - float(r[0]))
+    h = max(0.0, float(r[3]) - float(r[1]))
+    return (w * h) > max_frac * float(W) * float(H)
+
+
 # ---------- grounding stage ----------
 
 
@@ -1627,11 +1642,19 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # rays carry no perspective dilation, their rects ARE the foot-
     # prints, and every later coverage question is answered against
     # what they fitted.
-    for cam_v, r in [(v[1], r) for v in views
-                     if not _is_tilt_view(v[4]) for r in v[5]]:
-        rect_r = _frame_rect(cam_v, r, 1.0)
-        row_rects.append(rect_r)
-        _fit_ground_rect(rect_r)
+    for v in views:
+        if _is_tilt_view(v[4]):
+            continue
+        cam_v, W_v, H_v, rects_v = v[1], v[2], v[3], v[5]
+        for r in rects_v:
+            if _huge_rect(r, W_v, H_v):
+                print(f"[ground] huge VLM rect dropped "
+                      f"({(r[2] - r[0]) * (r[3] - r[1]) / (W_v * H_v):.0%} "
+                      f"of {v[4]}): hedge box, not a device row")
+                continue
+            rect_r = _frame_rect(cam_v, r, 1.0)
+            row_rects.append(rect_r)
+            _fit_ground_rect(rect_r)
     # PASS 2 -- the tilt views are RECALL-ONLY (user report: red
     # result boxes merging devices the colored rects showed apart).
     # A tilted camera's back-projection is perspective-INFLATED: the
@@ -1666,9 +1689,13 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         return float(cov.mean())
 
     tilt_added = tilt_skipped = 0
-    for cam_v, fname_v, rects_v in [(v[1], v[4], v[5]) for v in views
-                                    if _is_tilt_view(v[4])]:
+    for v in views:
+        if not _is_tilt_view(v[4]):
+            continue
+        cam_v, W_v, H_v, rects_v = v[1], v[2], v[3], v[5]
         for r in rects_v:
+            if _huge_rect(r, W_v, H_v):
+                continue
             lo_r = _frame_rect(cam_v, r, 0.30)
             hi_r = _frame_rect(cam_v, r, 1.00)
             rect_r = (max(lo_r[0], hi_r[0]), max(lo_r[1], hi_r[1]),

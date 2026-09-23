@@ -955,7 +955,7 @@ def test_ground_stage_tiled_views():
     scene.boxes = []
     # the VLM outlines the WHOLE tile (full-image rect) on every call
     reply = ("One long joined row.\n" + _json.dumps(
-        [{"bbox_2d": [0, 0, 1000, 1000], "label": "row"}]))
+        [{"bbox_2d": [0, 150, 1000, 850], "label": "row"}]))
     judge = VLMJudge(backend="qwen")
     judge._qwen_image_call = lambda png, prompt, *a, **k: reply
     with tempfile.TemporaryDirectory() as td:
@@ -1540,7 +1540,7 @@ def test_ground_stage_tiled_skips_tilts():
     _bootstrap_meta(scene, (-0.5, -0.8, 40.5, 0.8))
     scene.boxes = []
     reply = ("One long joined row.\n" + _json.dumps(
-        [{"bbox_2d": [0, 0, 1000, 1000], "label": "row"}]))
+        [{"bbox_2d": [0, 150, 1000, 850], "label": "row"}]))
     judge = VLMJudge(backend="qwen")
     with tempfile.TemporaryDirectory() as td:
         calls = []
@@ -1589,7 +1589,7 @@ def test_ground_stage_drops_oversized_blob():
     _bootstrap_meta(scene, (-3.2, -3.2, 3.2, 3.2))
     scene.boxes = []
     reply = ("Big blob.\n" + _json.dumps(
-        [{"bbox_2d": [0, 0, 1000, 1000], "label": "blob"}]))
+        [{"bbox_2d": [0, 150, 1000, 850], "label": "blob"}]))
     judge = VLMJudge(backend="qwen")
     judge._qwen_image_call = lambda png, prompt, *a, **k: reply
     with tempfile.TemporaryDirectory() as td:
@@ -1767,6 +1767,19 @@ def test_grounding_frame_hugs_layout_not_cloud():
     print("PASS grounding frame hugs the layout (far background ignored)")
 
 
+def test_huge_rect_guard():
+    """A VLM rect covering > half the view is a hedge box (whole room /
+    large floor / background), not a device row -- rejected before the
+    fit/dedup so it cannot eat the correct boxes."""
+    from agentic_gts.agent.ground import _huge_rect
+    W, H = 1280, 1024
+    assert _huge_rect((0, 0, 1280, 1024), W, H), "full-image box is huge"
+    assert _huge_rect((0, 0, 1250, 950), W, H), "~90% box is huge"
+    assert not _huge_rect((0, 150, 1280, 850), W, H), "a row band is not"
+    assert not _huge_rect((100, 400, 1180, 600), W, H), "a thin band is not"
+    print("PASS huge-rect guard (hedge boxes rejected, row bands kept)")
+
+
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
@@ -1789,6 +1802,7 @@ if __name__ == "__main__":
     test_fit_region_box_rotated_stepped_floor()
     test_floor_map_mesh_step_fine()
     test_grounding_frame_hugs_layout_not_cloud()
+    test_huge_rect_guard()
     test_robust_span_bin_boundary()
     test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()
