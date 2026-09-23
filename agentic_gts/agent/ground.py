@@ -326,6 +326,89 @@ def _render_keep_mask(hg: np.ndarray, op: np.ndarray,
     return keep
 
 
+# thin-structure (trail) removal for the groundview render: a voxel with
+# fewer than this many occupied 3x3x3 neighbours is on a 1-D streak, not
+# the 2-D surface sheet real render content is made of. A trail that
+# straddles a voxel boundary is 2 voxels thick and carries 5 neighbours
+# (2 along + 1 across + 2 diagonal) -- 6 kills it while a sheet's
+# interior still carries ~8 and its border is recovered by the dilate.
+_THIN_VOXEL = 0.3
+_THIN_MIN_NB = 6
+
+
+def _thin_structure_mask(points: np.ndarray, voxel: float = _THIN_VOXEL,
+                         min_nb: int = _THIN_MIN_NB) -> np.ndarray:
+    """True where a point's voxel is THICK (>= min_nb occupied 3x3x3
+    neighbours) or ADJACENT to a thick voxel -- the THIN-STRUCTURE
+    (trail) remover for the groundview render.
+
+    Trailing reconstruction artifacts (3DGS floater streaks, mesh
+    stretched triangles / captured background) are 1-D curves in voxel
+    space: a voxel on the curve carries at most its along-curve
+    neighbours (2, a few more at kinks) and NO voxel of a trail is ever
+    thick, so the dilate-back recovers nothing of it. Real render
+    content is SURFACE points -- device faces, walls, rack tops are 2-D
+    sheets whose interior voxels carry ~8 in-plane neighbours; the
+    erode marks them thick and the dilate recovers their border voxels,
+    so real structure keeps its FULL extent. Occupancy is
+    scale-normalized (a voxel is occupied or it is not), so the
+    threshold does not depend on point density. Returns all-True for
+    tiny inputs / absurd coordinate ranges / nothing thick (never nuke
+    the view).
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    n = len(pts)
+    if n < 500:
+        return np.ones(n, dtype=bool)
+    key = np.floor(pts / voxel).astype(np.int64)
+    key -= key.min(axis=0)
+    dims = key.max(axis=0) + 3          # +3: headroom for the +-1 shifts
+    if float(dims[0]) * float(dims[1]) * float(dims[2]) > 4.0e18:
+        return np.ones(n, dtype=bool)   # hash space overflow: skip
+    stride = np.array([int(dims[1]) * int(dims[2]), int(dims[2]), 1],
+                      dtype=np.int64)
+
+    def _h(k):
+        return (k + 1) @ stride         # +1: shifts may reach -1
+
+    ph = _h(key)                        # per-point voxel hash
+    uh = np.unique(ph)                  # occupied voxels
+    # decode the unique voxels back to coords for the 26 shifts
+    kz = uh % int(dims[2])
+    r = uh // int(dims[2])
+    ky = r % int(dims[1])
+    kx = r // int(dims[1])
+    ukey = np.column_stack([kx, ky, kz]) - 1
+    cnt = np.zeros(len(uh), dtype=np.int32)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                if dx == 0 and dy == 0 and dz == 0:
+                    continue
+                sh = _h(ukey + np.array([dx, dy, dz], dtype=np.int64))
+                i = np.clip(np.searchsorted(uh, sh), 0, len(uh) - 1)
+                cnt += (uh[i] == sh)
+    thick = uh[cnt >= min_nb]           # erode: definitely-thick voxels
+    if len(thick) == 0:
+        return np.ones(n, dtype=bool)   # nothing thick: do not nuke
+    # dilate back: keep voxels adjacent to a thick one (a sheet's border
+    # voxels are not thick themselves but sit next to its interior)
+    keep = np.zeros(len(uh), dtype=bool)
+    thick_sorted = thick
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                sh = _h(ukey + np.array([dx, dy, dz], dtype=np.int64))
+                i = np.clip(np.searchsorted(thick_sorted, sh),
+                            0, len(thick_sorted) - 1)
+                keep |= (thick_sorted[i] == sh)
+    keep_uh = uh[keep]
+    if len(keep_uh) == 0:
+        return np.ones(n, dtype=bool)
+    i = np.clip(np.searchsorted(keep_uh, ph), 0, len(keep_uh) - 1)
+    return keep_uh[i] == ph
+
+
 def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
                     frame=None, tilt_deg: float = 0.0, tilt_dir: int = 0):
     """Base top-down render, no overlays. Camera fitted over the
@@ -405,6 +488,28 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
         # the ceiling back into the view, which is exactly what the cut
         # exists to remove
         band = points[h > 0.30]
+    # THIN-STRUCTURE (trail) removal, render-only (user report: long
+    # trailing points -- 3DGS floater streaks / mesh stretched
+    # triangles -- occupied a large part of the groundview). The band
+    # feeds the scatter render and the camera's z_top_ring; the GS
+    # raster path applies the same filter to its keep mask below.
+    # Measurement pools are untouched (their fits have their own
+    # point-support guards). Guard: removing > 65% of the band means
+    # the scene itself is thin/sparse -- keep the raw band.
+    try:
+        _thin = _thin_structure_mask(band)
+        _frac = float(_thin.mean())
+        if _frac < 0.35:
+            print(f"[ground] band thin-structure removal skipped: would "
+                  f"drop {1.0 - _frac:.0%} of the render band "
+                  f"(sparse scene?)")
+        elif _frac < 1.0:
+            print(f"[ground] band thin-structure removal: "
+                  f"{1.0 - _frac:.0%} of {len(band)} pts (trails) dropped")
+            band = band[_thin]
+    except Exception as e:
+        print(f"[ground] band thin-structure removal failed "
+              f"({type(e).__name__}: {e}) -> raw band")
     pts_rot = _rot_xy(band, -yaw)
     # frame over the BOOTSTRAP layout, not the raw cloud bbox (user
     # directive: the cloud-framed version raised the camera to fit
@@ -494,6 +599,34 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
                 keep = hg > 0.30
                 if np.isfinite(cut):
                     keep &= hg < cut
+            # thin-structure (trail) removal on the RENDERED gaussians:
+            # the same filter as the band above, computed on the kept
+            # set BEFORE the per-tile xy crop so edge voxels keep their
+            # neighbours. Guards: > 65% removed or < 100 survivors ->
+            # keep uncleaned (never nuke the view).
+            try:
+                _idx = np.where(keep)[0]
+                if len(_idx) >= 500:
+                    _m = _thin_structure_mask(gm[_idx])
+                    _frac = float(_m.mean())
+                    if _frac < 0.35:
+                        print(f"[ground] GS thin-structure removal "
+                              f"skipped: would drop {1.0 - _frac:.0%} "
+                              f"(sparse scene?)")
+                    elif _frac < 1.0:
+                        _keep2 = np.zeros(len(keep), dtype=bool)
+                        _keep2[_idx[_m]] = True
+                        if int(_keep2.sum()) < 100:
+                            print("[ground] GS thin-structure removal "
+                                  "reverted: < 100 gaussians would remain")
+                        else:
+                            print(f"[ground] GS thin-structure removal: "
+                                  f"{1.0 - _frac:.0%} of {len(_idx)} "
+                                  f"gaussians (trails) dropped")
+                            keep = _keep2
+            except Exception as e:
+                print(f"[ground] GS thin-structure removal failed "
+                      f"({type(e).__name__}: {e}) -> uncleaned")
             if crop is not None:
                 # drop background gaussians outside the layout (row frame)
                 gr = _rot_xy(gm, -yaw)

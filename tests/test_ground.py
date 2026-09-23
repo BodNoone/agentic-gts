@@ -1849,6 +1849,35 @@ def test_render_topdown_crops_to_tile_footprint():
           f"({W}x{H}, off={off}, roundtrip closed)")
 
 
+def test_thin_structure_mask():
+    """Trails die, sheets keep their FULL extent: the groundview
+    thin-structure remover separates 1-D streaks from 2-D surface
+    content by occupied 3x3x3 neighbour count (user report: long
+    trailing points occupied a large part of the render)."""
+    from agentic_gts.agent.ground import _thin_structure_mask
+    rng = np.random.default_rng(61)
+    # a device face: a 3 x 2 m vertical sheet (2-D surface content)
+    face = np.column_stack([rng.uniform(0.0, 3.0, 20000),
+                            np.full(20000, 0.5),
+                            rng.uniform(0.2, 2.2, 20000)])
+    # a trail: a 20 m long, 1-2-voxel-wide streak at device height --
+    # z=1.2 STRADDLES a voxel boundary (1.2 = 4*0.3), so this is the
+    # hard 2-voxels-thick case a real scattered trail hits constantly
+    t = rng.uniform(0.0, 20.0, 20000)
+    trail = np.column_stack([t,
+                             2.5 + rng.normal(0.0, 0.02, 20000),
+                             1.2 + rng.normal(0.0, 0.02, 20000)])
+    m = _thin_structure_mask(np.vstack([face, trail]))
+    mf, mt = m[:len(face)], m[len(face):]
+    assert mf.mean() > 0.95, \
+        f"the face sheet must survive in full ({mf.mean():.0%})"
+    assert mt.mean() < 0.05, \
+        f"the trail must be removed ({mt.mean():.0%} kept)"
+    # tiny input: no cleaning (never nuke a sparse view)
+    assert _thin_structure_mask(np.zeros((10, 3))).all()
+    print("PASS thin-structure mask (trail removed, sheet intact)")
+
+
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
@@ -1874,6 +1903,7 @@ if __name__ == "__main__":
     test_grounding_frame_hugs_layout_not_cloud()
     test_huge_rect_guard()
     test_render_topdown_crops_to_tile_footprint()
+    test_thin_structure_mask()
     test_robust_span_bin_boundary()
     test_fit_region_box_row_along_y()
     test_ground_stage_with_patched_vlm()
