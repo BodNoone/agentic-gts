@@ -2061,7 +2061,8 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # the step" offset (floor-map level vs the cloud's own floor).
     try:
         _fv = np.asarray(fl(P[:, 0], P[:, 1]), dtype=float)
-        print(f"[diag][floor] map over cloud: min={np.min(_fv):.2f} "
+        print(f"[diag][floor] map over cloud (aligned frame): "
+              f"min={np.min(_fv):.2f} "
               f"med={np.median(_fv):.2f} max={np.max(_fv):.2f} | "
               f"cloud z p2={np.percentile(P[:, 2], 2):.2f} "
               f"mesh={is_mesh}")

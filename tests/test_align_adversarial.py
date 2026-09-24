@@ -670,6 +670,51 @@ def test_apply_align_transform_shifts_gs_and_spares_cache():
     print("PASS apply_align_transform (shifted, input/cache untouched)")
 
 
+def test_unalign_roundtrip_and_output_frame():
+    """The final-frame map: raw = (aligned - shift) @ R is the exact
+    inverse of the align transform, and _map_outputs_to_input_frame
+    moves the scene's boxes AND cloud back and drops align_tf (user
+    report: a stepped room's +0.51m align shift was long mistaken for
+    the floor step -- boxes.json laid over the ORIGINAL cloud always
+    looked raised by exactly it)."""
+    from agentic_gts.core.models import OrientedBox, Scene
+    from agentic_gts.pipeline import (_map_outputs_to_input_frame,
+                                      _unalign, align_to_ground)
+    rng = np.random.default_rng(9)
+    n = 40000
+    floor = np.column_stack([rng.uniform(-6, 6, n), rng.uniform(-6, 6, n),
+                             np.full(n, -0.45)])
+    racks = []
+    for cx in np.arange(-5.0, 5.5, 1.0):
+        racks.append(np.column_stack([rng.uniform(cx - 0.3, cx + 0.3, n // 8),
+                                      rng.uniform(-1, 1, n // 8),
+                                      rng.uniform(-0.45, 2.0, n // 8)]))
+    raw = np.vstack([floor] + racks)
+    aligned, tf = align_to_ground(raw, return_transform=True)
+    assert np.allclose(_unalign(aligned, tf), raw, atol=1e-9), \
+        "unalign must be the exact inverse of the align transform"
+
+    scene = Scene(points=aligned.copy())
+    scene.boxes = [OrientedBox(center=(1.0, 2.0, 1.2),
+                               size=(0.6, 1.1, 2.0), yaw=0.3)]
+    scene.meta["align_tf"] = tf
+    _map_outputs_to_input_frame(scene)
+    assert "align_tf" not in scene.meta, \
+        "align_tf must be dropped (render/export paths then use raw)"
+    assert np.allclose(scene.points, raw, atol=1e-9), \
+        "the scene cloud must return to the raw frame"
+    raw_c = _unalign(np.array([[1.0, 2.0, 1.2]]), tf)[0]
+    b = scene.boxes[0]
+    assert np.allclose(b.center, raw_c, atol=1e-9), \
+        "box centres must return to the raw frame"
+    assert abs(b.yaw - 0.3) < 1e-12, "yaw is kept (tilt is negligible)"
+    # no transform -> no-op (e.g. --gt runs are never aligned)
+    scene2 = Scene(points=raw.copy())
+    _map_outputs_to_input_frame(scene2)
+    assert np.allclose(scene2.points, raw)
+    print("PASS unalign roundtrip + output frame mapping")
+
+
 if __name__ == "__main__":
     test_align_and_yaw_on_adversarial_cloud()
     print("PASS  test_align_and_yaw_on_adversarial_cloud")
@@ -677,3 +722,4 @@ if __name__ == "__main__":
     print("PASS  test_align_with_subfloor_noise")
     test_align_transform_roundtrip()
     test_apply_align_transform_shifts_gs_and_spares_cache()
+    test_unalign_roundtrip_and_output_frame()

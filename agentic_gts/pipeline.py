@@ -210,6 +210,44 @@ def align_to_ground(points: np.ndarray, return_transform: bool = False):
     return pts
 
 
+def _unalign(pts: np.ndarray, tf) -> np.ndarray:
+    """Inverse of align_to_ground's transform (aligned = raw @ R.T +
+    shift):  raw = (aligned - shift) @ R  (R is orthonormal)."""
+    R = np.asarray(tf["R"], dtype=np.float64)
+    shift = np.asarray(tf["shift"], dtype=np.float64)
+    return (np.asarray(pts, dtype=np.float64) - shift) @ R
+
+
+def _map_outputs_to_input_frame(scene: Scene) -> None:
+    """Map the final boxes AND the scene cloud back to the RAW input
+    frame, and drop scene.meta['align_tf'].
+
+    The pipeline works in the aligned frame (floor at ~z=0); the user's
+    cloud, GT and every downstream tool live in the RAW input frame,
+    and the align shift is numerically arbitrary -- a stepped room's
+    +0.51m shift was long mistaken for the floor step itself, the boxes
+    "floating" whenever boxes.json was laid over the original cloud
+    (user report). After this, every output artifact (boxes.json,
+    boxes_objects.json, cloud_with_boxes.ply, overlay, the HTML report,
+    the `view` subcommand) shares the input's coordinates: the render /
+    export paths read scene.meta['align_tf'] and, with it dropped, use
+    the raw gaussian file unchanged. Box ORIENTATION is kept: the align
+    rotation's tilt is <= 10 deg (typically ~0.1), whose effect on a
+    box's yaw is sub-centimetre over a whole room."""
+    tf = scene.meta.pop("align_tf", None)
+    if tf is None:
+        return
+    if len(scene.points):
+        scene.points = _unalign(scene.points, tf)
+    for b in scene.boxes:
+        c = _unalign(np.asarray(b.center, dtype=np.float64).reshape(1, 3),
+                     tf)[0]
+        b.center = (float(c[0]), float(c[1]), float(c[2]))
+    print(f"[out] final boxes/cloud mapped back to the INPUT frame "
+          f"(align shift was {float(np.asarray(tf['shift'])[2]):+.2f} m "
+          f"on z)")
+
+
 def diag_point_cloud(points: np.ndarray) -> None:
     """Print stats to diagnose coordinate-system / scale / density problems."""
     if len(points) == 0:
@@ -575,6 +613,12 @@ def run_pipeline(scene: Scene,
                        if b.confidence != Confidence.LOW]
         print(f"[out] dropped {n_low} LOW-confidence box(es) "
               f"(geometry-only completions, no VLM confirmation)")
+
+    # --- final frame: back to the INPUT coordinates (user report) ---
+    # The pipeline works in the aligned frame; the user's cloud, GT and
+    # downstream tooling live in the RAW input frame. Map everything
+    # back so the outputs overlay the ORIGINAL cloud directly.
+    _map_outputs_to_input_frame(scene)
 
     # --- outputs ---
     scene.save_boxes(os.path.join(out_dir, "boxes.json"))
