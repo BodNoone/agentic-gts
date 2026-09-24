@@ -302,3 +302,136 @@ def snap_row_seams(boxes: list[OrientedBox], yaw: float,
             _rebuild(b, seam, b_hi, b_x, b_d)
         snapped += 1
     return snapped
+
+
+# ---------- per-box orientation refit (fan-shaped rooms) ----------
+
+
+def refit_box_orientations(scene, snap_deg: float = 5.0,
+                           min_pts: int = 150,
+                           min_area_gain: float = 0.10,
+                           min_side: float = 0.30, max_side: float = 2.5,
+                           band_lo: float = 0.30, band_hi: float = 1.00) -> int:
+    """Rotate clearly-ANGLED final boxes onto their own principal axis.
+
+    The whole pipeline fits row-frame AABBs (the Manhattan contract):
+    one yaw for the room, every box at yaw or yaw+90. In a fan-shaped
+    room the devices follow the arc, so a portion of them sit at an
+    angle to the dominant direction and their AABB footprints inflate
+    badly (a 0.6x1.1 cabinet at 20 deg pads to 0.94x1.24, +74% area --
+    every edge fails the 5cm acceptance; user report). This pass gives
+    each final box its OWN orientation from its OWN points:
+
+      * points: the device band (local-floor-relative 0.30..1.00m --
+        the same footprint slice the stageG fits use) inside the box;
+      * 2D PCA of the footprint -> principal axis, folded against the
+        frame yaw mod 90 (a box at yaw+90 IS aligned);
+      * |dyaw| < snap_deg -> UNTOUCHED: row-aligned boxes keep the
+        shared frame, and per-box PCA noise never wobbles a straight
+        row -- the common case pays nothing;
+      * otherwise re-measure both spans in the rotated frame with the
+        peak-peeling estimator, re-collect the points inside the
+        rotated candidate once (drops neighbour bleed caught in the
+        old AABB's corners), re-measure, rebuild -- long side rides
+        the new yaw (the _fit_region_box convention); height / bottom
+        / z are untouched (orientation is pure 2D);
+      * guards: enough points, the shorter side within [min_side,
+        max_side] (no device thinner/fatter than that), and the
+        footprint area must SHRINK by >= min_area_gain (a rotation
+        that does not tighten anything is noise, not structure).
+
+    Runs at the very END of the pipeline (after the LOW filter,
+    before the output-frame mapping): nothing downstream consumes the
+    new yaws except the artifacts. Mutates boxes in place; returns
+    the number refit.
+    """
+    P = np.asarray(scene.points, dtype=np.float64)
+    if len(P) < 200 or not scene.boxes:
+        return 0
+    frame_yaw = float(scene.meta.get("yaw", 0.0) or 0.0)
+    mesh_mode = bool(scene.meta.get("geometry_is_mesh"))
+    # device band on the LOCAL floor (stepped rooms included) -- the
+    # same slice the stageG fits measure the footprint on
+    from agentic_gts.agent.ground import _floor_map, _region_axis_span
+    fl = _floor_map(P, mesh_mode=mesh_mode)
+    h = P[:, 2] - fl(P[:, 0], P[:, 1])
+    band = P[(h > band_lo) & (h <= band_hi)]
+    if len(band) < 200:
+        band = P[h > band_lo]
+    if len(band) < 200:
+        return 0
+    snap = math.radians(snap_deg)
+    n_refit = 0
+    for b in scene.boxes:
+        pts = band[b.contains(band)]
+        if len(pts) < min_pts:
+            continue
+        # PCA principal axis of the footprint, folded mod 90 against
+        # the frame yaw (a box at yaw+90 is "aligned")
+        q = pts[:, :2] - pts[:, :2].mean(axis=0)
+        _, evecs = np.linalg.eigh(q.T @ q)
+        theta = math.atan2(evecs[1, -1], evecs[0, -1])
+        dyaw = math.remainder(theta - frame_yaw, math.pi / 2.0)
+        if abs(dyaw) < snap:
+            continue                      # aligned (mod 90): untouched
+        new_yaw = frame_yaw + dyaw
+        c, s = math.cos(new_yaw), math.sin(new_yaw)
+
+        def _spans(p):
+            lx = c * p[:, 0] + s * p[:, 1]
+            ly = -s * p[:, 0] + c * p[:, 1]
+            sx = _region_axis_span(lx, mesh_mode=mesh_mode)
+            sy = _region_axis_span(ly, mesh_mode=mesh_mode)
+            if sx is None or sy is None:
+                return None
+            return sx, sy
+
+        m1 = _spans(pts)
+        if m1 is None:
+            continue
+        (x_lo, x_hi), (y_lo, y_hi) = m1
+        # candidate in the rotated frame -> world box, then re-collect
+        # the points inside it once (drop neighbour bleed from the old
+        # AABB corners) and re-measure on the cleaner set
+        cx_l = 0.5 * (x_lo + x_hi)
+        cy_l = 0.5 * (y_lo + y_hi)
+        wx, wy = c * cx_l - s * cy_l, s * cx_l + c * cy_l
+        if y_hi - y_lo > x_hi - x_lo:
+            cand = OrientedBox(center=(wx, wy, b.center[2]),
+                               size=(y_hi - y_lo, x_hi - x_lo, b.size[2]),
+                               yaw=new_yaw + math.pi / 2.0)
+        else:
+            cand = OrientedBox(center=(wx, wy, b.center[2]),
+                               size=(x_hi - x_lo, y_hi - y_lo, b.size[2]),
+                               yaw=new_yaw)
+        pts2 = band[cand.contains(band)]
+        if len(pts2) >= min_pts:
+            m2 = _spans(pts2)
+            if m2 is not None:
+                (x_lo, x_hi), (y_lo, y_hi) = m2
+                cx_l = 0.5 * (x_lo + x_hi)
+                cy_l = 0.5 * (y_lo + y_hi)
+                wx, wy = c * cx_l - s * cy_l, s * cx_l + c * cy_l
+        dx, dy = x_hi - x_lo, y_hi - y_lo
+        if not (min_side <= min(dx, dy) <= max_side):
+            continue
+        old_area = float(b.size[0]) * float(b.size[1])
+        new_area = dx * dy
+        if new_area > (1.0 - min_area_gain) * old_area:
+            continue          # does not tighten: noise, not structure
+        # rebuild: long side rides the new yaw; z / height untouched
+        b.center = (float(wx), float(wy), float(b.center[2]))
+        if dy > dx:
+            b.yaw = new_yaw + math.pi / 2.0
+            b.size = (dy, dx, b.size[2])
+        else:
+            b.yaw = new_yaw
+            b.size = (dx, dy, b.size[2])
+        b.meta["orient_refit"] = {
+            "dyaw_deg": round(math.degrees(dyaw), 1),
+            "area_gain": round(1.0 - new_area / max(old_area, 1e-9), 3)}
+        n_refit += 1
+        print(f"[orient] box {b.box_id[:6]} refit "
+              f"{math.degrees(dyaw):+.1f} deg "
+              f"(footprint {old_area:.2f} -> {new_area:.2f} m2)")
+    return n_refit

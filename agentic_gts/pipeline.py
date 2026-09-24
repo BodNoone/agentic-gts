@@ -614,6 +614,18 @@ def run_pipeline(scene: Scene,
         print(f"[out] dropped {n_low} LOW-confidence box(es) "
               f"(geometry-only completions, no VLM confirmation)")
 
+    # --- final orientation refit: angled devices onto their own axis ---
+    # Fan-shaped rooms (user report): devices follow the arc, so a
+    # portion sit at an angle to the dominant yaw and their row-frame
+    # AABB footprints inflate (a 0.6x1.1 cabinet at 20 deg pads to
+    # 0.94x1.24, +74% area -- every edge fails the 5cm acceptance).
+    # Per-box OBB refit on each final box's OWN device-band points;
+    # row-aligned boxes (<5 deg from the frame, mod 90) stay untouched.
+    from agentic_gts.tools.geometry import refit_box_orientations
+    n_orient = refit_box_orientations(scene)
+    if n_orient:
+        _render_stage(scene, "stageO_orient", out_dir, gt_boxes)
+
     # --- final frame: back to the INPUT coordinates (user report) ---
     # The pipeline works in the aligned frame; the user's cloud, GT and
     # downstream tooling live in the RAW input frame. Map everything
