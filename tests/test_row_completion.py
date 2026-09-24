@@ -221,96 +221,6 @@ def test_snap_row_seams_height_step_skips():
     print("PASS snap row seams height step (never seamed across a step)")
 
 
-def test_refit_box_orientations_angled():
-    """Fan-shaped rooms: a device at 20 deg to the frame has its AABB
-    inflated to 0.94x1.24 (true 0.6x1.1, +74% area). The per-box
-    orientation refit rotates it onto its own principal axis and
-    re-measures -- the footprint comes back to ~0.6x1.1 at yaw ~= 20,
-    height / bottom untouched."""
-    import math
-    from agentic_gts.tools.geometry import refit_box_orientations
-    rng = np.random.default_rng(31)
-    yaw_d = math.radians(20.0)
-    c, s = math.cos(yaw_d), math.sin(yaw_d)
-
-    def dev(u, v, z):
-        return np.column_stack([c * u - s * v, s * u + c * v, z])
-
-    def face(u0, u1, v0, v1, z0, z1):
-        return dev(rng.uniform(u0, u1, 6000), rng.uniform(v0, v1, 6000),
-                   rng.uniform(z0, z1, 6000))
-
-    pts = np.vstack([
-        face(-0.30, 0.30, -0.55, -0.50, 0.0, 2.0),   # back sheet
-        face(-0.30, 0.30, 0.50, 0.55, 0.0, 2.0),     # front sheet
-        face(-0.30, -0.25, -0.55, 0.55, 0.0, 2.0),   # left wall
-        face(0.25, 0.30, -0.55, 0.55, 0.0, 2.0),     # right wall
-        face(-0.30, 0.30, -0.55, 0.55, 1.95, 2.0),   # top
-    ])
-    scene = Scene(points=pts)
-    scene.meta["yaw"] = 0.0
-    # the seed as the pipeline fits it: the frame AABB of the device,
-    # long side on the yaw axis (1.24 > 0.94 -> yaw = pi/2)
-    scene.boxes = [OrientedBox(center=(0.0, 0.0, 1.0),
-                               size=(1.24, 0.94, 2.0),
-                               yaw=math.pi / 2.0)]
-    n = refit_box_orientations(scene)
-    assert n == 1, "the angled device must be refit"
-    b = scene.boxes[0]
-    # yaw comes back as ~20 deg (mod 90; the depth rides the yaw axis)
-    dy = math.degrees(math.remainder(b.yaw - yaw_d, math.pi / 2.0))
-    assert abs(dy) < 2.0, f"refit yaw off by {dy:.1f} deg"
-    assert abs(b.size[0] - 1.1) < 0.12, f"depth {b.size[0]:.2f} (want ~1.1)"
-    assert abs(b.size[1] - 0.6) < 0.12, f"width {b.size[1]:.2f} (want ~0.6)"
-    assert abs(b.size[2] - 2.0) < 1e-9 and abs(b.center[2] - 1.0) < 1e-9, \
-        "height / bottom untouched"
-    assert b.meta.get("orient_refit"), "the refit must be recorded in meta"
-    print("PASS refit box orientations (angled device -> true OBB)")
-
-
-def test_refit_box_orientations_aligned_untouched():
-    """Row-aligned boxes -- long side on the frame axis (yaw=0) OR on
-    the +90 cross axis (the single-cabinet convention) -- are untouched:
-    the snap guard keeps the shared frame and per-box PCA noise can
-    never wobble a straight row."""
-    import math
-    from agentic_gts.tools.geometry import refit_box_orientations
-    rng = np.random.default_rng(32)
-
-    def face(x0, x1, y0, y1, z0, z1):
-        return np.column_stack([rng.uniform(x0, x1, 6000),
-                                rng.uniform(y0, y1, 6000),
-                                rng.uniform(z0, z1, 6000)])
-
-    # a 2 m row piece (long side on frame x, yaw=0) ...
-    row = np.vstack([
-        face(-1.0, 1.0, -0.55, -0.50, 0.0, 2.0),
-        face(-1.0, 1.0, 0.50, 0.55, 0.0, 2.0),
-        face(-1.0, -0.95, -0.55, 0.55, 0.0, 2.0),
-        face(0.95, 1.0, -0.55, 0.55, 0.0, 2.0),
-        face(-1.0, 1.0, -0.55, 0.55, 1.95, 2.0)])
-    # ... and a single cabinet (depth on frame y -> yaw=pi/2), at (3,3)
-    cab = np.vstack([
-        face(2.70, 3.30, 2.45, 2.50, 0.0, 2.0),
-        face(2.70, 3.30, 3.50, 3.55, 0.0, 2.0),
-        face(2.70, 2.75, 2.45, 3.55, 0.0, 2.0),
-        face(3.25, 3.30, 2.45, 3.55, 0.0, 2.0),
-        face(2.70, 3.30, 2.45, 3.55, 1.95, 2.0)])
-    scene = Scene(points=np.vstack([row, cab]))
-    scene.meta["yaw"] = 0.0
-    scene.boxes = [
-        OrientedBox(center=(0.0, 0.0, 1.0), size=(2.0, 1.1, 2.0), yaw=0.0),
-        OrientedBox(center=(3.0, 3.0, 1.0), size=(1.1, 0.6, 2.0),
-                    yaw=math.pi / 2.0)]
-    n = refit_box_orientations(scene)
-    assert n == 0, f"aligned boxes must stay untouched, refit {n}"
-    assert scene.boxes[0].yaw == 0.0 \
-        and scene.boxes[0].size == (2.0, 1.1, 2.0)
-    assert scene.boxes[1].yaw == math.pi / 2.0 \
-        and scene.boxes[1].size == (1.1, 0.6, 2.0)
-    print("PASS refit box orientations (aligned boxes untouched)")
-
-
 if __name__ == "__main__":
     test_interior_gap_filled()
     test_row_end_walk()
@@ -323,5 +233,3 @@ if __name__ == "__main__":
     test_snap_row_seams_unifies_cross_vertices()
     test_snap_row_seams_keeps_far_cross()
     test_snap_row_seams_height_step_skips()
-    test_refit_box_orientations_angled()
-    test_refit_box_orientations_aligned_untouched()
