@@ -1069,7 +1069,74 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
                 f"core={len(core)} pts, seed_top="
                 f"{seed_top if seed_top is not None else 'fit'})")
         return None                  # sliver, not a structure
-    c = np.array([(x_lo + x_hi) / 2.0, (y_lo + y_hi) / 2.0])
+    # ---- angled-structure seed refit (fan-shaped rooms, user request) ----
+    # The row-frame AABB inflates a structure angled to the frame (a
+    # 0.6x1.1 cabinet at 20 deg -> 0.94x1.24, +74% area -- every edge
+    # fails the 5cm acceptance). With the mesh geometry source
+    # guaranteed (user note), the rect's own points can carry their
+    # true orientation: PCA the core slice, and when the principal
+    # axis disagrees with the frame by more than _ORIENT_SNAP_DEG,
+    # re-measure the spans in the rotated frame. Guards:
+    #   * SINGLE STRUCTURE ONLY -- _cross_gap_split on both ROW-FRAME
+    #     profiles must find no device-scale interior gap: a hollow
+    #     cabinet's face sheets are thin (< _MIN_DEVICE_DEPTH) and do
+    #     not qualify, but a rect over TWO angled rows does, and
+    #     rotating the union would bypass the deep-split that should
+    #     separate them (the union box DOES shrink vs the fat AABB of
+    #     crossed rows, so the area guard alone cannot catch it);
+    #   * the rotated footprint must SHRINK >= _ORIENT_MIN_GAIN vs the
+    #     AABB -- for an aligned structure a wrong-angle rotation is
+    #     always LOOSER, so noise never fires;
+    #   * |dyaw| < snap -> untouched (per-rect PCA below that is
+    #     noise; the shared frame stands).
+    yaw_fit = 0.0
+    c_rot = None
+    if len(core) >= 150:
+        q = core[:, :2] - core[:, :2].mean(axis=0)
+        _, evecs = np.linalg.eigh(q.T @ q)
+        theta = math.atan2(evecs[1, -1], evecs[0, -1])
+        dyaw = math.remainder(theta, math.pi / 2.0)
+        if abs(dyaw) >= math.radians(_ORIENT_SNAP_DEG):
+            ct, st = math.cos(theta), math.sin(theta)
+            lx = ct * core[:, 0] + st * core[:, 1]
+            ly = -st * core[:, 0] + ct * core[:, 1]
+            sx2 = _region_axis_span(lx, mesh_mode=mesh_mode)
+            sy2 = _region_axis_span(ly, mesh_mode=mesh_mode)
+            if sx2 is not None and sy2 is not None:
+                dx2 = float(sx2[1] - sx2[0])
+                dy2 = float(sy2[1] - sy2[0])
+                # SINGLE STRUCTURE ONLY, checked on the ROW-FRAME
+                # profiles (angle-independent): a device-scale interior
+                # gap in either row-frame profile means multi-structure,
+                # whatever the PCA angle -- the union of two angled
+                # rows has a cross-dominated bimodal PCA (a garbage
+                # angle), and at that angle the ROTATED profiles
+                # smear the aisle below the gap threshold, so checking
+                # them there misses it. A hollow cabinet's face sheets
+                # are thin (< _MIN_DEVICE_DEPTH) and never qualify;
+                # a rect over two rows does -> stay on the AABB path
+                # so the deep-split machinery separates them (and each
+                # side's own refit then rotates).
+                one_structure = (
+                    _cross_gap_split(core[:, 0],
+                                     min_side=_MIN_DEVICE_DEPTH) is None
+                    and _cross_gap_split(core[:, 1],
+                                         min_side=_MIN_DEVICE_DEPTH)
+                    is None)
+                if (one_structure and dx2 >= 0.30 and dy2 >= 0.20
+                        and dx2 * dy2
+                        <= (1.0 - _ORIENT_MIN_GAIN) * dx * dy):
+                    mx = 0.5 * (sx2[0] + sx2[1])
+                    my = 0.5 * (sy2[0] + sy2[1])
+                    c_rot = np.array([ct * mx - st * my,
+                                      st * mx + ct * my])
+                    print(f"[ground] angled seed: rect fit rotated "
+                          f"{math.degrees(dyaw):+.1f} deg "
+                          f"(footprint {dx * dy:.2f} -> "
+                          f"{dx2 * dy2:.2f} m2)")
+                    dx, dy, yaw_fit = dx2, dy2, dyaw
+    c = (c_rot if c_rot is not None
+         else np.array([(x_lo + x_hi) / 2.0, (y_lo + y_hi) / 2.0]))
     # Ride the LONG side on the yaw axis (size[0]): a row that runs
     # along the rotated-y axis still fits here as (dx, dy) with
     # yaw=0 -- but then the box's yaw axis is its THICKNESS, and
@@ -1079,12 +1146,12 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
     if dy > dx:
         return OrientedBox(
             center=(float(c[0]), float(c[1]), floor_z + height / 2.0),
-            size=(dy, dx, height), yaw=math.pi / 2.0,
+            size=(dy, dx, height), yaw=math.pi / 2.0 + yaw_fit,
             device_type=DeviceType.RACK,
             meta={"n_pts": len(dev)})
     return OrientedBox(center=(float(c[0]), float(c[1]),
                                floor_z + height / 2.0),
-                       size=(dx, dy, height), yaw=0.0,
+                       size=(dx, dy, height), yaw=yaw_fit,
                        device_type=DeviceType.RACK,
                        meta={"n_pts": len(dev)})
 
@@ -1095,6 +1162,15 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
 _MAX_DEVICE_DEPTH = 1.8
 _MIN_DEVICE_DEPTH = 0.40
 _SPLIT_MIN_GAP = 0.30
+
+# angled-structure seed refit (fan-shaped rooms): the rect's own points
+# PCA their principal axis; below this snap the per-rect PCA is noise
+# (the shared frame stands), above it the seed rotates into its own
+# frame. The rotated footprint must also shrink at least _ORIENT_MIN_GAIN
+# vs the row-frame AABB, and both rotated profiles must be a SINGLE
+# structure (no device-scale interior gap) -- see _fit_region_box.
+_ORIENT_SNAP_DEG = 5.0
+_ORIENT_MIN_GAIN = 0.10
 
 # a box whose SHORTER horizontal axis exceeds this is a "fat blob" (user
 # report: a huge box covering aisles and junk), not a device row. No
@@ -1251,6 +1327,17 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
     x0, y0, x1, y1 = rect
     dev = _dev_of(rect)
     s = _cross_gap_split(dev[:, axis], min_side=min_side)
+    if s is None:
+        # the yaw-derived cross axis can be wrong for SQUARISH unions
+        # (two rows angled to the frame: the union AABB is nearly
+        # square, the dy>dx flip is noise, and the aisle gap sits in
+        # the OTHER profile) -- try it before giving up. The gap guards
+        # (>= 0.3 m interior weak run, both sides >= min_side) still
+        # validate whatever axis finds it.
+        s2 = _cross_gap_split(dev[:, 1 - axis], min_side=min_side)
+        if s2 is not None:
+            axis = 1 - axis
+            s = s2
     if s is None:
         print(f"[ground] deep fit (depth {bb.size[1]:.2f}m) with no "
               f"splittable aisle gap -> kept whole (back-to-back rows "

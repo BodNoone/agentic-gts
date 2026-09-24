@@ -1878,6 +1878,115 @@ def test_thin_structure_mask():
     print("PASS thin-structure mask (trail removed, sheet intact)")
 
 
+def test_fit_region_box_angled_ob():
+    """Fan-shaped rooms: a structure angled 20 deg to the frame fits as
+    an OBB seed in its own principal frame (footprint ~0.6x1.1 at yaw
+    ~20), not the inflated row-frame AABB (0.94x1.24, +74% area). The
+    rotation propagates into stageC (views/span/thickness on the true
+    axis) -- the whole point of the seed-level refit."""
+    import math
+    from agentic_gts.agent.ground import _fit_region_box
+    rng = np.random.default_rng(71)
+    yaw_d = math.radians(20.0)
+    c, s = math.cos(yaw_d), math.sin(yaw_d)
+
+    def dev(u, v, z):
+        return np.column_stack([c * u - s * v, s * u + c * v, z])
+
+    def face(u0, u1, v0, v1, z0, z1):
+        return dev(rng.uniform(u0, u1, 8000), rng.uniform(v0, v1, 8000),
+                   rng.uniform(z0, z1, 8000))
+
+    pts = np.vstack([
+        face(-0.30, 0.30, -0.55, -0.50, 0.0, 2.0),   # back sheet
+        face(-0.30, 0.30, 0.50, 0.55, 0.0, 2.0),     # front sheet
+        face(-0.30, -0.25, -0.55, 0.55, 0.0, 2.0),   # left wall
+        face(0.25, 0.30, -0.55, 0.55, 0.0, 2.0),     # right wall
+        face(-0.30, 0.30, -0.55, 0.55, 1.95, 2.0),   # top
+    ])
+    # the VLM rect: the inflated AABB it outlined on the groundview
+    rect = (-0.60, -0.75, 0.60, 0.75)
+    bb = _fit_region_box(pts, rect, seed_top=2.0)
+    assert bb is not None, "the angled device must fit"
+    dy = math.degrees(math.remainder(bb.yaw - yaw_d, math.pi / 2.0))
+    assert abs(dy) < 2.0, f"seed yaw off by {dy:.1f} deg"
+    assert abs(bb.size[0] - 1.1) < 0.12, f"long {bb.size[0]:.2f} (want ~1.1)"
+    assert abs(bb.size[1] - 0.6) < 0.12, f"short {bb.size[1]:.2f} (want ~0.6)"
+    print("PASS fit region box angled OBB (20 deg device -> true footprint)")
+
+
+def test_fit_region_box_aligned_flip_untouched():
+    """An ALIGNED single cabinet keeps the existing flip convention
+    (depth on the cross axis -> yaw = pi/2, size[0] = depth): the PCA
+    snaps back below 5 deg, and even a noise-driven rotation attempt is
+    always LOOSER than the AABB of an aligned structure, so the
+    area-gain guard rejects it."""
+    import math
+    from agentic_gts.agent.ground import _fit_region_box
+    rng = np.random.default_rng(72)
+
+    def face(x0, x1, y0, y1, z0, z1):
+        return np.column_stack([rng.uniform(x0, x1, 8000),
+                                rng.uniform(y0, y1, 8000),
+                                rng.uniform(z0, z1, 8000)])
+
+    pts = np.vstack([
+        face(-0.30, 0.30, -0.55, -0.50, 0.0, 2.0),
+        face(-0.30, 0.30, 0.50, 0.55, 0.0, 2.0),
+        face(-0.30, -0.25, -0.55, 0.55, 0.0, 2.0),
+        face(0.25, 0.30, -0.55, 0.55, 0.0, 2.0),
+        face(-0.30, 0.30, -0.55, 0.55, 1.95, 2.0)])
+    bb = _fit_region_box(pts, (-0.60, -0.75, 0.60, 0.75), seed_top=2.0)
+    assert bb is not None
+    assert abs(bb.yaw - math.pi / 2.0) < 1e-9, \
+        f"aligned cabinet keeps the pi/2 flip, got {bb.yaw:.3f}"
+    assert abs(bb.size[0] - 1.1) < 0.06 and abs(bb.size[1] - 0.6) < 0.06
+    print("PASS fit region box aligned flip untouched")
+
+
+def test_fit_region_boxes_two_angled_rows():
+    """A rect over TWO rows both angled 20 deg: the single-structure
+    guard rejects rotating the UNION (the aisle shows up as a
+    device-scale gap in the rotated cross profile), so the deep-split
+    separates them as before -- and EACH side's refit then rotates to
+    its own principal axis."""
+    import math
+    from agentic_gts.agent.ground import _fit_region_boxes
+    rng = np.random.default_rng(73)
+    yaw_d = math.radians(20.0)
+    c, s = math.cos(yaw_d), math.sin(yaw_d)
+
+    def dev(u, v, z):
+        return np.column_stack([c * u - s * v, s * u + c * v, z])
+
+    def face(u0, u1, v0, v1, z0, z1):
+        return dev(rng.uniform(u0, u1, 8000), rng.uniform(v0, v1, 8000),
+                   rng.uniform(z0, z1, 8000))
+
+    rows = []
+    # aisle 2.0 m: a long row at 20 deg carries 4*sin(20)=1.37 m of
+    # y-spread from its own length, so the aisle must exceed that for
+    # the row-frame y-profile to show a gap (below it the deep-split
+    # cannot separate them either -- pre-existing behavior)
+    for vc in (-1.55, 1.55):
+        rows.append(np.vstack([
+            face(-2.0, 2.0, vc - 0.55, vc - 0.50, 0.0, 2.0),
+            face(-2.0, 2.0, vc + 0.50, vc + 0.55, 0.0, 2.0),
+            face(-2.0, 2.0, vc - 0.55, vc + 0.55, 1.95, 2.0)]))
+    pts = np.vstack(rows)
+    rect = (-2.8, -3.0, 2.8, 3.0)
+    boxes = _fit_region_boxes(pts, rect, seed_top=2.0)
+    assert len(boxes) == 2, \
+        f"the deep-split must separate the two angled rows, " \
+        f"got {len(boxes)}"
+    for b in boxes:
+        dy = math.degrees(math.remainder(b.yaw - yaw_d, math.pi / 2.0))
+        assert abs(dy) < 2.5, f"row yaw off by {dy:.1f} deg"
+        assert abs(b.size[0] - 4.0) < 0.25, f"length {b.size[0]:.2f}"
+        assert abs(b.size[1] - 1.1) < 0.15, f"depth {b.size[1]:.2f}"
+    print("PASS fit region boxes two angled rows (split + per-row OBB)")
+
+
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
@@ -1898,6 +2007,9 @@ if __name__ == "__main__":
     test_fit_region_box_seed_top_is_local_height()
     test_floor_at_local_rotates_back()
     test_fit_region_box_rotated_stepped_floor()
+    test_fit_region_box_angled_ob()
+    test_fit_region_box_aligned_flip_untouched()
+    test_fit_region_boxes_two_angled_rows()
     test_floor_map_mesh_step_fine()
     test_floor_map_mesh_rejects_overhead_only_tiles()
     test_grounding_frame_hugs_layout_not_cloud()
