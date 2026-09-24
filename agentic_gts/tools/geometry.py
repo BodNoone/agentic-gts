@@ -213,8 +213,7 @@ def complete_row_gaps(scene: Scene, width_unit: float = 0.6,
 
 def snap_row_seams(boxes: list[OrientedBox], yaw: float,
                    seam_tol: float = 0.12, vertex_tol: float = 0.12,
-                   height_tol: float = 0.05,
-                   stepped_tol: float = 0.05) -> int:
+                   height_tol: float = 0.05) -> int:
     """Snap the facing edges of adjacent cabinets in a row together.
 
     A joined row split into single cabinets gets each piece's along-row
@@ -232,11 +231,10 @@ def snap_row_seams(boxes: list[OrientedBox], yaw: float,
 
     HEIGHT STEP (user directive): devices whose TOPS sit more than
     `height_tol` apart are NOT on one plane -- the split separated them
-    on purpose (different-height cabinets), so only a truly TOUCHING
-    seam may still snap: the tolerance tightens to `stepped_tol`.
-    Heights never enter the merge itself beyond this gate -- the top
-    vertices may sit far apart in z, the footprint edge is normalised
-    regardless.
+    on purpose (different-height cabinets), so they are NEVER seamed,
+    however small the gap. Heights never enter the merge itself beyond
+    this gate -- the top vertices may sit far apart in z, the footprint
+    edge is normalised regardless.
 
     Boxes are assumed to share the row frame (`yaw`); the split pieces
     of one seed always do (they copy the seed's yaw and carry the along
@@ -272,12 +270,13 @@ def snap_row_seams(boxes: list[OrientedBox], yaw: float,
         gap = b_lo - a_hi
         # devices on DIFFERENT height planes (> height_tol between their
         # tops) are distinct devices the split separated on purpose --
-        # only a truly TOUCHING seam may still snap (user directive:
-        # never forcibly seam boxes that are not on one plane)
+        # NEVER seam across a height step, however small the gap (user
+        # directive)
         a_top = float(a.center[2]) + float(a.size[2]) / 2.0
         b_top = float(b.center[2]) + float(b.size[2]) / 2.0
-        tol = stepped_tol if abs(a_top - b_top) > height_tol else seam_tol
-        if abs(gap) > tol:
+        if abs(a_top - b_top) > height_tol:
+            continue
+        if abs(gap) > seam_tol:
             continue
         # the facing edges must overlap laterally, or they are two
         # different sub-rows rather than neighbours

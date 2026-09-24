@@ -201,12 +201,10 @@ def test_snap_row_seams_keeps_far_cross():
     print("PASS snap row seams (far cross kept, along edge still normalised)")
 
 
-def test_snap_row_seams_height_step_tightens():
-    """Devices on different height planes (>5cm between their TOPS) only
-    seam when truly touching: the tolerance tightens from 0.12 to 0.05,
-    so a gap that would snap between same-height neighbours does NOT
-    snap across a height step (user directive: never forcibly seam
-    boxes that are not on one plane)."""
+def test_snap_row_seams_height_step_skips():
+    """Devices on different height planes (>5cm between their TOPS) are
+    NEVER seamed, however small the gap (user directive: the split
+    separated different-height cabinets on purpose)."""
     # tops 2.0 vs 2.2 (0.20m apart); gap 0.06m -- would snap at 0.12
     a = OrientedBox(center=(0.0, 0.0, 1.0), size=(0.6, 1.1, 2.0), yaw=0.0)
     b = OrientedBox(center=(0.66, 0.0, 1.1), size=(0.6, 1.1, 2.2), yaw=0.0)
@@ -214,15 +212,13 @@ def test_snap_row_seams_height_step_tightens():
     assert n == 0, "a 6cm gap across a 20cm height step must NOT snap"
     assert abs(a.center[0]) < 1e-9 and abs(b.center[0] - 0.66) < 1e-9, \
         "both boxes must stay untouched"
-    # truly touching (gap 0.04 <= 0.05) across the same step still snaps
+    # even a truly TOUCHING seam (gap 0.04) does not snap across a step
     c = OrientedBox(center=(0.0, 0.0, 1.0), size=(0.6, 1.1, 2.0), yaw=0.0)
     d = OrientedBox(center=(0.64, 0.0, 1.1), size=(0.6, 1.1, 2.2), yaw=0.0)
     n2 = snap_row_seams([c, d], 0.0)
-    assert n2 == 1, "a truly touching seam snaps even across a height step"
-    c_hi = c.center[0] + c.size[0] / 2.0
-    d_lo = d.center[0] - d.size[0] / 2.0
-    assert abs(c_hi - d_lo) < 1e-9, "the snapped seam must be shared"
-    print("PASS snap row seams height step (tightened, touching still snaps)")
+    assert n2 == 0, "no seam across a height step, even a touching one"
+    assert abs(c.center[0]) < 1e-9 and abs(d.center[0] - 0.64) < 1e-9
+    print("PASS snap row seams height step (never seamed across a step)")
 
 
 if __name__ == "__main__":
@@ -236,4 +232,4 @@ if __name__ == "__main__":
     test_snap_row_seams_leaves_real_aisle()
     test_snap_row_seams_unifies_cross_vertices()
     test_snap_row_seams_keeps_far_cross()
-    test_snap_row_seams_height_step_tightens()
+    test_snap_row_seams_height_step_skips()
