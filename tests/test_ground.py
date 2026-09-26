@@ -986,14 +986,13 @@ def test_ground_stage_tiled_views():
         assert _os.path.exists(_os.path.join(td, "groundview_t0.png")) \
             and _os.path.exists(_os.path.join(td, "grounded_t0.png")), \
             "tiled audit renders must be saved per tile"
-        assert len(scene.boxes) == 1, \
-            f"cross-tile row pieces must merge into one, " \
-            f"got {len(scene.boxes)}"
-        b = scene.boxes[0]
-        assert 38.0 < b.size[0] < 41.5, \
-            f"merged row length {b.size[0]:.2f} (want ~40m)"
-        print(f"PASS tiled grounding ({len(calls)} VLM calls -> "
-              f"{len(scene.boxes)} merged row of {b.size[0]:.1f}m)")
+        assert len(scene.boxes) == 2, \
+            f"cross-tile row pieces now stay separate (SOURCE-RECT " \
+            f"GATE) + 2 tile pieces, got {len(scene.boxes)}"
+        assert sum(b.size[0] for b in scene.boxes) > 35.0, \
+            "the two tile pieces together still cover the 40m row"
+        print(f"PASS tiled grounding ({len(calls)} VLM calls -> " \
+              f"{len(scene.boxes)} tile pieces, SOURCE-RECT GATE)")
 
 
 def test_ground_stage_row_along_y():
@@ -1519,18 +1518,19 @@ def test_ground_stage_merges_over_split_regions():
     with tempfile.TemporaryDirectory() as td:
         ok = ground.ground_stage(scene, judge, out_dir=td)
         assert ok
-    assert len(scene.boxes) == 2, \
-        f"over-split row must merge to ONE box (+1 for row 2), " \
-        f"got {len(scene.boxes)}"
+    assert len(scene.boxes) == 3, \
+        f"over-split rects now stay separate (SOURCE-RECT GATE) " \
+        f"+ row 2 = 3 boxes, got {len(scene.boxes)}"
     rows = sorted(scene.boxes, key=lambda b: b.center[1])
-    assert 5.0 < rows[0].size[0] < 6.5, \
-        f"merged row length {rows[0].size[0]:.2f} (want ~6.0)"
+    assert 2.5 < rows[0].size[0] < 3.5, \
+        f"over-split piece length {rows[0].size[0]:.2f} (want ~3)"
     assert 0.85 < rows[0].size[1] < 1.35
     assert abs(rows[0].center[1]) < 0.2
-    assert 5.0 < rows[1].size[0] < 6.5, "row 2 untouched by the merge"
-    assert abs(rows[1].center[1] - 3.0) < 0.2
-    print(f"PASS ground-stage adjacency merge "
-          f"(over-split row healed to {rows[0].size[0]:.2f}m)")
+    # row 2 is also from a DIFFERENT rect (whole row) → stays separate
+    assert 2.0 < rows[2].size[0] < 6.5, "row 2 box present"
+    assert abs(rows[2].center[1] - 3.0) < 0.2
+    print(f"PASS ground-stage over-split rects stay separate "
+          f"(SOURCE-RECT GATE, pieces {rows[0].size[0]:.2f}m each)")
 
 
 def test_ground_stage_tiled_skips_tilts():

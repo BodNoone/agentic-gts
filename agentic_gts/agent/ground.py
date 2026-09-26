@@ -281,10 +281,12 @@ def _tile_frames(layout):
     Tiling trades VLM calls for ground resolution (user directive:
     small rooms must NOT be tiled). Tiles overlap by _TILE_OVERLAP so
     every structure on a boundary appears WHOLE in at least one tile;
-    the cross-tile duplicates and seams heal downstream in the shared
-    world frame -- overlapping rects of one structure die in the
-    IoU/containment dedup, tile-cut row pieces rejoin in the
-    density-bridged adjacency merge.
+    the cross-tile duplicates die in the IoU/containment dedup. Tile-
+    cut row pieces no longer rejoin in the adjacency merge: the SOURCE-
+    RECT gate (user directive) blocks unions across different VLM
+    rects, so a structure straddling a tile boundary yields one box
+    from the tile where it appears whole (the duplicate drops in the
+    dedup).
     """
     if layout is None:
         return None
@@ -942,7 +944,8 @@ def _region_axis_span(v: np.ndarray, cell: float = 0.05,
 
 def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
                     floor_z: float = 0.0, mesh_mode: bool = False,
-                    seed_top: float | None = None, floor_at=None):
+                    seed_top: float | None = None, floor_at=None,
+                    rect_id=None):
     """Fit a full-depth OBB (yaw=0; points already in the row-aligned
     frame) to the points inside a grounded 2D rect.
 
@@ -1131,12 +1134,14 @@ def _fit_region_box(points: np.ndarray, rect, min_pts: int = 60,
             center=(float(c[0]), float(c[1]), floor_z + height / 2.0),
             size=(dy, dx, height), yaw=math.pi / 2.0 + yaw_fit,
             device_type=DeviceType.RACK,
-            meta={"n_pts": len(dev)})
+            meta={"n_pts": len(dev),
+                  **({"rect_id": rect_id} if rect_id is not None else {})})
     return OrientedBox(center=(float(c[0]), float(c[1]),
                                floor_z + height / 2.0),
-                       size=(dx, dy, height), yaw=yaw_fit,
-                       device_type=DeviceType.RACK,
-                       meta={"n_pts": len(dev)})
+                        size=(dx, dy, height), yaw=yaw_fit,
+                        device_type=DeviceType.RACK,
+                        meta={"n_pts": len(dev),
+                              **({"rect_id": rect_id} if rect_id is not None else {})})
 
 
 # a rect the VLM drew around TWO opposing rows (front + back, aisle
@@ -1240,7 +1245,7 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
                       min_side: float = _MIN_DEVICE_DEPTH,
                       mesh_mode: bool = False,
                       seed_top: float | None = None,
-                      floor_at=None) -> list:
+                      floor_at=None, rect_id=None) -> list:
     """Fit one rect, then split DEEP fits: a rect the VLM drew around
     TWO opposing rows (front + back, an aisle between) fits as ONE box
     with the union depth, and nothing downstream can split across the
@@ -1261,7 +1266,7 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
     discards the wall side and keeps the clean device box."""
     bb = _fit_region_box(points, rect, min_pts, floor_z,
                          mesh_mode=mesh_mode, seed_top=seed_top,
-                         floor_at=floor_at)
+                         floor_at=floor_at, rect_id=rect_id)
     if bb is None:
         return []
 
@@ -1310,7 +1315,8 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
                                          min_side=min_side,
                                          mesh_mode=mesh_mode,
                                          seed_top=seed_top,
-                                         floor_at=floor_at))
+                                         floor_at=floor_at,
+                                         rect_id=rect_id))
         return out or [bb]
     x0, y0, x1, y1 = rect
     dev = _dev_of(rect)
@@ -1342,7 +1348,8 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
                                      min_side=min_side,
                                      mesh_mode=mesh_mode,
                                      seed_top=seed_top,
-                                     floor_at=floor_at))
+                                     floor_at=floor_at,
+                                     rect_id=rect_id))
     return out or [bb]
 
 
@@ -1564,8 +1571,10 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
     n = len(boxes)
     if n < 2:
         return boxes
-    # row-frame AABB + orientation bucket (long side on x or on y)
-    rects, buckets, srcs = [], [], []
+    # row-frame AABB + orientation bucket (long side on x or on y) +
+    # source-rect fingerprint (boxes from DIFFERENT VLM rects never
+    # merge; over-split siblings of one rect share the same rect_id)
+    rects, buckets, srcs, rids = [], [], [], []
     for b in boxes:
         cs = _rot_xy(np.column_stack([b.corners_2d(),
                                       np.zeros(4)]), -yaw)
@@ -1573,6 +1582,7 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
                       float(cs[:, 0].max()), float(cs[:, 1].max())))
         buckets.append(int(round((b.yaw - yaw) / (math.pi / 2.0))) % 2)
         srcs.append(str(b.meta.get("view", "nadir")))
+        rids.append(b.meta.get("rect_id"))
     # per-box device-band density from the SAME pool the probe uses
     # (surfaces are dense, an inflated fit barely dilutes it)
     dens = []
@@ -1599,6 +1609,16 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
                 # over-split of one structure; cross-view pairs are
                 # by construction different devices (user report:
                 # merged red result boxes)
+            # SOURCE-RECT GATE (user directive): boxes from DIFFERENT
+            # VLM rects in the same view never merge -- the VLM's own
+            # "two rects = two instances" judgment outranks any density
+            # probe. The merge exists to heal over-split pieces of ONE
+            # rect (deep/long-split siblings share the rect_id);
+            # boxes without a rect_id (pre-split, cluster net)
+            # fall back to the OBB/probe gates.
+            if rids[i] is not None and rids[j] is not None \
+                    and rids[i] != rids[j]:
+                continue
             # OBB PROXIMITY GUARD (user report: fan edges): the
             # frame-AABB gap below is the cheap pre-filter, but two
             # devices angled DIFFERENTLY to the frame have inflated
@@ -1906,11 +1926,18 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         on it -- a tilt box may never eat or chain onto a nadir one
         (user report: red result boxes merging devices the colored
         rects showed apart)."""
+        # rect_id: fingerprint of the ORIGINAL VLM rect. The adjacency
+        # merge's SOURCE gate (user directive): boxes from DIFFERENT
+        # VLM rects never merge -- the VLM's own "two rects = two
+        # instances" judgment outranks any density probe. Only over-split
+        # pieces of ONE rect (deep/long-split siblings) may heal.
+        rect_id = "{:.2f},{:.2f},{:.2f},{:.2f}".format(*rect_r)
         # the rect's own LOCAL floor (stepped rooms) comes from ITS OWN
         # points via floor_at (per-point median) -- not a scalar at the
-        # rect centre, which lifted the box onto the wrong step
+        # rect CENTRE, which lifted the box onto the wrong step
         bbs = _fit_region_boxes(pts_fit, rect_r, floor_at=fl_local,
-                                mesh_mode=is_mesh, seed_top=fit_top)
+                                mesh_mode=is_mesh, seed_top=fit_top,
+                                rect_id=rect_id)
         # _fit_region_boxes (plural): a deep fit -- the VLM drew ONE
         # rect around two opposing rows -- splits at the aisle here,
         # before the box enters the pipeline (stageC can only split
@@ -1927,7 +1954,8 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                               size=bb.size, yaw=yaw + float(bb.yaw),
                               device_type=DeviceType.RACK,
                               meta={"grounded": True, "view": source,
-                                    "n_pts": bb.meta.get("n_pts", 0)})
+                                    "n_pts": bb.meta.get("n_pts", 0),
+                                    "rect_id": bb.meta.get("rect_id")})
             boxes.append(box)
             # the recall net judges coverage on what was ACTUALLY
             # detected: the fitted footprint (row-frame AABB; a pi/2
