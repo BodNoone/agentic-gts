@@ -1987,6 +1987,96 @@ def test_fit_region_boxes_two_angled_rows():
     print("PASS fit region boxes two angled rows (split + per-row OBB)")
 
 
+def test_merge_adjacent_obb_guard():
+    """The merge's OBB proximity guard (user report: fan edges): two
+    devices angled DIFFERENTLY to the frame have inflated frame-AABBs
+    whose edges slightly overlap, but the real footprints have NO
+    intersection -- such pairs must NOT merge. Controls: touching
+    ALIGNED boxes and touching PARALLEL-angled boxes (an over-split
+    angled row) still merge."""
+    import math
+    from agentic_gts.agent.ground import _merge_adjacent_boxes, _obb_sat_gap
+    from agentic_gts.core.models import OrientedBox
+    rng = np.random.default_rng(81)
+
+    # --- unit: the SAT gap discriminates by real orientation ---
+    # touching aligned: gap ~ 0
+    t1 = OrientedBox(center=(0.0, 0.0, 1.0), size=(1.1, 0.6, 2.0),
+                     yaw=0.0)
+    t2 = OrientedBox(center=(1.1, 0.0, 1.0), size=(1.1, 0.6, 2.0),
+                     yaw=0.0)
+    assert _obb_sat_gap(t1, t2) <= 0.01, "touching boxes: gap ~ 0"
+    # parallel angled touching (over-split angled row): gap ~ 0
+    yaw_d = math.radians(40.0)
+    dx, dy = math.cos(yaw_d) * 1.1, math.sin(yaw_d) * 1.1
+    p1 = OrientedBox(center=(0.0, 0.0, 1.0), size=(1.1, 0.6, 2.0),
+                     yaw=yaw_d)
+    p2 = OrientedBox(center=(dx, dy, 1.0), size=(1.1, 0.6, 2.0),
+                     yaw=yaw_d)
+    assert _obb_sat_gap(p1, p2) <= 0.01, \
+        "parallel angled touching: gap ~ 0 (the legit merge case)"
+    # angled DIFFERENTLY, frame-AABBs adjacent, real footprints >0.5m apart
+    a = OrientedBox(center=(0.0, 00, 1.0), size=(1.1, 0.6, 2.0),
+                    yaw=math.radians(40.0))
+    b = OrientedBox(center=(1.25, 0.85, 1.0), size=(1.1, 0.6, 2.0),
+                    yaw=math.radians(-40.0))
+    g = _obb_sat_gap(a, b)
+    assert g > 0.50, \
+        f"different-angle AABB artifact must exceed bridge_tol, gap {g:.2f}"
+    # their frame-AABBs ARE merge-eligible (the trap the guard exists
+    # for): adjacent on x within bridge_tol + a real shared y band
+    def _rect(box):
+        cs = box.corners_2d()
+        return (cs[:, 0].min(), cs[:, 1].min(),
+                cs[:, 0].max(), cs[:, 1].max())
+    ra, rb = _rect(a), _rect(b)
+    assert rb[0] - ra[2] <= 0.50, "precondition: frame-AABB x-gap within tol"
+    assert min(ra[3], rb[3]) - max(ra[1], rb[1]) >= 0.20, "precondition: shared y band"
+    assert g > 0.50, f"real footprint gap {g:.2f} must exceed bridge_tol"
+
+    # --- end-to-end: the different-angle pair is NOT merged ---
+    def device_pts(box, n=600):
+        # uniform interior points of the box footprint (density source)
+        c, s = math.cos(box.yaw), math.sin(box.yaw)
+        u = rng.uniform(-box.size[0] / 2, box.size[0] / 2, n)
+        v = rng.uniform(-box.size[1] / 2, box.size[1] / 2, n)
+        z = rng.uniform(0.4, 1.9, n)
+        return np.column_stack([box.center[0] + c * u - s * v,
+                               box.center[1] + s * u + c * v, z])
+
+    pts = np.vstack([device_pts(a), device_pts(b)])
+    out = _merge_adjacent_boxes([a, b], pts, 0.0, probe_pool=pts)
+    assert len(out) == 2, \
+        f"different-angle devices (AABB artifact overlap) must NOT " \
+        f"merge, got {len(out)}"
+
+    # --- control: touching ALIGNED boxes with a dense junction merge ---
+    jx = rng.uniform(0.5, 0.6, 200)
+    jy = rng.uniform(-0.25, 0.25, 200)
+    junction = np.column_stack([jx, jy, rng.uniform(0.4, 1.9, 200)])
+    pts2 = np.vstack([device_pts(t1), device_pts(t2), junction])
+    out2 = _merge_adjacent_boxes([t1, t2], pts2, 0.0, probe_pool=pts2)
+    assert len(out2) == 1, \
+        f"touching aligned boxes with a dense junction must merge, " \
+        f"got {len(out2)}"
+
+    # --- control: touching PARALLEL-angled boxes merge too ---
+    # points at the touching seam: midway between the centers, along
+    # the boxes' long-side direction (the shared edge)
+    mid = np.array([dx / 2, dy / 2])
+    along = np.array([-math.sin(yaw_d), math.cos(yaw_d)])
+    t = rng.uniform(-0.5, 0.5, 200)
+    seam = np.column_stack([mid[0] + along[0] * t,
+                            mid[1] + along[1] * t,
+                            rng.uniform(0.4, 1.9, 200)])
+    pts3 = np.vstack([device_pts(p1), device_pts(p2), seam])
+    out3 = _merge_adjacent_boxes([p1, p2], pts3, 0.0, probe_pool=pts3)
+    assert len(out3) == 1, \
+        f"parallel angled touching boxes must merge, got {len(out3)}"
+    print("PASS merge adjacent OBB guard (artifact rejected, "
+          "aligned/parallel touching still merged)")
+
+
 if __name__ == "__main__":
     test_unproject_ground_roundtrip()
     test_fit_region_box_full_depth()
@@ -2010,6 +2100,7 @@ if __name__ == "__main__":
     test_fit_region_box_angled_ob()
     test_fit_region_box_aligned_flip_untouched()
     test_fit_region_boxes_two_angled_rows()
+    test_merge_adjacent_obb_guard()
     test_floor_map_mesh_step_fine()
     test_floor_map_mesh_rejects_overhead_only_tiles()
     test_grounding_frame_hugs_layout_not_cloud()

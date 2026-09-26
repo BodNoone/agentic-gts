@@ -1496,6 +1496,29 @@ def _cluster_pts_covered(rect, pts: np.ndarray, fitted: list,
     return float(inside.mean()) >= thresh
 
 
+def _obb_sat_gap(a: "OrientedBox", b: "OrientedBox") -> float:
+    """Best separating-axis separation between two boxes' 2D footprints
+    (negative when the rotated rectangles overlap).
+
+    A lower bound on the true footprint distance. Orientation-correct
+    (each box contributes its own edge normals), unlike the frame-AABB
+    gap which INFLATES for angled boxes: two devices angled differently
+    to the frame can have AABB edges touching while the rotated
+    rectangles -- the real footprints -- are far apart (fan edges,
+    user report: 'edges slightly overlapping, no real-space
+    intersection')."""
+    ca, cb = a.corners_2d(), b.corners_2d()
+    best = -math.inf
+    for box in (a, b):
+        c, s = math.cos(box.yaw), math.sin(box.yaw)
+        for n in ((c, s), (-s, c)):
+            n = np.array(n)
+            pa, pb = ca @ n, cb @ n
+            sep = max(pb.min() - pa.max(), pa.min() - pb.max())
+            best = max(best, float(sep))
+    return best
+
+
 def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
                           bridge_tol: float = 0.50,
                           min_gap_pts: int = 15,
@@ -1576,6 +1599,17 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
                 # over-split of one structure; cross-view pairs are
                 # by construction different devices (user report:
                 # merged red result boxes)
+            # OBB PROXIMITY GUARD (user report: fan edges): the
+            # frame-AABB gap below is the cheap pre-filter, but two
+            # devices angled DIFFERENTLY to the frame have inflated
+            # AABBs whose edges touch while the REAL footprints have
+            # no intersection -- such pairs are different structures,
+            # and no density probe may union them. The ACTUAL rotated
+            # rectangles must come within the SAME bridge_tol budget
+            # (measured correctly, not on the inflated AABBs; for
+            # aligned boxes OBB = AABB and nothing changes).
+            if _obb_sat_gap(boxes[i], boxes[j]) > bridge_tol:
+                continue
             a, b = rects[i], rects[j]
             for axis in (0, 1):
                 o = 1 - axis
