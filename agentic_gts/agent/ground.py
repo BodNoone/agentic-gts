@@ -801,7 +801,8 @@ def _save_grounded_png(base_img, cam, boxes, raw_rects, out_dir,
 
     Two layers over the clean view base the VLM answered on:
       - COLORED 3-px rectangles with labels = the VLM's RAW regions
-        for this view (one distinct color per region, official
+        for this view (tower hallucinations already filtered out
+        upstream; one distinct color per region, official
         plot_bounding_boxes style) -- already in THIS image's pixels
       - RED 2-px wireframes = the geometry-fitted final row boxes,
         projected through the camera and shifted by the crop offset
@@ -1732,8 +1733,10 @@ def _tower_drops(rects, W: int, H: int) -> set[int]:
     more than the alignment noise is a DIFFERENT detection in the same
     column (user: may be valid) and never chains into the tower -- the
     chain links only on touching edges (hairline gap or overlap of a
-    few px). If a dropped tower did cover real devices, the cluster
-    recall net re-proposes them -- nothing is lost silently."""
+    few px). Dropped rects never reach the fits NOR the grounded.png
+    audit (user direction: the audit shows what survived). If a
+    dropped tower did cover real devices, the cluster recall net
+    re-proposes them -- nothing is lost silently."""
     n = len(rects)
     if n < 3:
         return set()
@@ -1841,6 +1844,15 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                 print(f"[ground] png save failed ({type(e).__name__})")
                 png_path = None
         rects = judge.ground_regions(png, W, H, png_path=png_path)
+        # tower hallucinations are dropped AT COLLECTION: neither the
+        # fits nor the grounded.png audit ever sees them (user
+        # direction: filtered rects must not clutter the audit view)
+        tower = _tower_drops(rects, W, H)
+        if tower:
+            print(f"[ground] tower hallucination dropped: {len(tower)} "
+                  f"same-size edge-to-edge rect(s) in a vertical "
+                  f"chain ({fname})")
+            rects = [r for i, r in enumerate(rects) if i not in tower]
         print(f"[ground] view {fname}: {len(rects)} regions")
         views.append((img, cam, W, H, fname, rects, off))
         # ---- recall tilt views (user direction 1) ----
@@ -1884,6 +1896,13 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                     pngp_t = None
             rects_t = judge.ground_regions(png_t, W_t, H_t,
                                            png_path=pngp_t)
+            tower_t = _tower_drops(rects_t, W_t, H_t)
+            if tower_t:
+                print(f"[ground] tower hallucination dropped: "
+                      f"{len(tower_t)} same-size edge-to-edge rect(s) in "
+                      f"a vertical chain ({stem}_{tag})")
+                rects_t = [r for i, r in enumerate(rects_t)
+                           if i not in tower_t]
             print(f"[ground] view {stem}_{tag}: {len(rects_t)} regions")
             views.append((img_t, cam_t, W_t, H_t, f"{stem}_{tag}.png",
                           rects_t, off_t))
@@ -2030,14 +2049,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         if _is_tilt_view(v[4]):
             continue
         cam_v, W_v, H_v, rects_v, off_v = v[1], v[2], v[3], v[5], v[6]
-        tower_v = _tower_drops(rects_v, W_v, H_v)
-        if tower_v:
-            print(f"[ground] tower hallucination dropped: "
-                  f"{len(tower_v)} same-size edge-to-edge rect(s) in a "
-                  f"vertical chain ({v[4]})")
-        for i, r in enumerate(rects_v):
-            if i in tower_v:
-                continue
+        for r in rects_v:
             if _huge_rect(r, W_v, H_v):
                 print(f"[ground] huge VLM rect dropped "
                       f"({(r[2] - r[0]) * (r[3] - r[1]) / (W_v * H_v):.0%} "
@@ -2083,14 +2095,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         if not _is_tilt_view(v[4]):
             continue
         cam_v, W_v, H_v, rects_v, off_v = v[1], v[2], v[3], v[5], v[6]
-        tower_v = _tower_drops(rects_v, W_v, H_v)
-        if tower_v:
-            print(f"[ground] tower hallucination dropped: "
-                  f"{len(tower_v)} same-size edge-to-edge rect(s) in a "
-                  f"vertical chain ({v[4]})")
-        for i, r in enumerate(rects_v):
-            if i in tower_v:
-                continue
+        for r in rects_v:
             if _huge_rect(r, W_v, H_v):
                 continue
             lo_r = _frame_rect(cam_v, _shift_rect(r, off_v), 0.30)

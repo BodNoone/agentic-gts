@@ -1703,6 +1703,34 @@ def test_tower_hallucination_dropped():
     print("PASS tower hallucination dropped (vertical identical chains), "
           "intersecting / over-split / aisle-separated boxes kept")
 
+
+def test_ground_stage_all_tower_reply_rejected():
+    """End-to-end: a reply that is ONLY a tower (4 identical full-width
+    rects stacked edge-to-edge from top to bottom) is a pure
+    hallucination -- every rect drops AT COLLECTION, the views carry no
+    usable regions and ground_stage fails loudly: no box, no audit
+    clutter (user direction: filtered rects must not show in the audit)."""
+    import json as _json
+    import tempfile
+    from agentic_gts.agent import ground
+    from agentic_gts.agent.judge import VLMJudge
+    rng = np.random.default_rng(43)
+    pts = _row_points(0.0, 8.0, y=0.0, rng=rng, n=4000)
+    scene = Scene(points=pts)
+    scene.meta["yaw"] = 0.0
+    _bootstrap_meta(scene, (-0.5, -0.8, 8.5, 0.8))
+    scene.boxes = []
+    tower = [{"bbox_2d": [100, k * 250, 900, k * 250 + 250],
+              "label": "row"} for k in range(4)]
+    reply = "Rows.\n" + _json.dumps(tower)
+    judge = VLMJudge(backend="qwen")
+    judge._qwen_image_call = lambda png, prompt, *a, **k: reply
+    with tempfile.TemporaryDirectory() as td:
+        ok = ground.ground_stage(scene, judge, out_dir=td)
+    assert not ok, "a pure-tower reply must leave no usable regions"
+    assert not scene.boxes, "no box may come from a tower hallucination"
+    print("PASS pure-tower reply rejected end-to-end (no boxes, no audit)")
+
 def test_floor_map_mesh_rejects_overhead_only_tiles():
     """A mesh tile with only overhead structure (no floor points) must
     NOT report the structure's z as the floor (user report: floor map
