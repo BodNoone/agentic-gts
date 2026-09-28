@@ -1794,7 +1794,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
             print(f"[ground] hallucination filter: "
                   f"{hdiag['n_dropped']} rect(s) dropped in {fname}")
             if out_dir:
-                save_debug_png(img, rects, hdiag, os.path.join(
+                save_debug_png(img, hdiag, os.path.join(
                     out_dir, f"hallucination_{fname}"))
         print(f"[ground] view {fname}: {len(rects)} regions")
         views.append((img, cam, W, H, fname, rects, off))
@@ -1848,7 +1848,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                       f"{hdiag_t['n_dropped']} rect(s) dropped in "
                       f"{stem}_{tag}")
                 if out_dir:
-                    save_debug_png(img_t, rects_t, hdiag_t, os.path.join(
+                    save_debug_png(img_t, hdiag_t, os.path.join(
                         out_dir, f"hallucination_{stem}_{tag}.png"))
             print(f"[ground] view {stem}_{tag}: {len(rects_t)} regions")
             views.append((img_t, cam_t, W_t, H_t, f"{stem}_{tag}.png",

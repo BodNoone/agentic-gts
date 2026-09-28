@@ -129,9 +129,13 @@ def test_grid_hallucination_dropped():
           f"score {g[0]['score']:.2f})")
 
 
-def test_debug_png_and_diag_shape():
-    """The debug render marks dropped chains red / kept green, and the
-    per-view diagnostic carries everything needed to audit a drop."""
+def test_debug_png_colours_match_the_verdict():
+    """The debug render colours must match the filter's ACTUAL verdict:
+    a KEPT rect's border renders GREEN, a dropped chain member's
+    border renders RED -- checked at pixel level (regression: an
+    earlier version indexed the post-filter list with pre-filter
+    drop indices and painted valid kept boxes red)."""
+    from PIL import Image
     tower = [_r(500, 20 + k * 240, 700, 20 + k * 240 + 240)
              for k in range(4)]
     valid = [_r(100, 800, 400, 990)]
@@ -139,16 +143,31 @@ def test_debug_png_and_diag_shape():
     kept, diag = filter_hallucination_rects(rects, W, H, view="gv.png")
     assert diag["n_dropped"] == 4 and diag["n_kept"] == 1
     assert diag["drop_indices"] == [0, 1, 2, 3]
+    assert diag["kept_rects"] == [[100.0, 800.0, 400.0, 990.0]]
     ch = diag["chains"][0]
-    assert (ch["view"] if "view" in ch else True) or True
     assert set(ch) >= {"axis", "n", "score", "threshold", "dropped",
                        "reason", "stats", "rects"}
-    img = np.full((H, W, 3), 0.4, dtype=np.float32)
+    img = np.zeros((H, W, 3), dtype=np.float32)
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "hallucination_gv.png")
-        out = save_debug_png(img, rects, diag, p)
-        assert out == p and os.path.exists(p) and os.path.getsize(p) > 0
-    print("PASS debug png + diagnostics shape")
+        out = save_debug_png(img, diag, p)
+        assert out == p and os.path.exists(p)
+        arr = np.asarray(Image.open(p).convert("RGB"))
+        # border sample: midpoint of each rect's top edge (PIL draws
+        # the width=3 outline just inside the bbox)
+        def _border_color(r):
+            cx = int((r[0] + r[2]) / 2)
+            return arr[int(r[1]) + 1, cx]
+        for r in diag["kept_rects"]:
+            c = _border_color(r)
+            assert c[1] > 150 and c[0] < 150 and c[2] < 150, \
+                f"kept rect border must be GREEN, got {c}"
+        for r in ch["rects"]:
+            c = _border_color(r)
+            assert c[0] > 150 and c[1] < 150, \
+                f"dropped chain border must be RED, got {c}"
+    print("PASS debug png colours match the verdict "
+          "(kept=green, dropped=red, pixel-checked)")
 
 
 def test_ground_stage_pure_hallucination_reply():

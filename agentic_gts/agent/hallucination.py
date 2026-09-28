@@ -255,26 +255,36 @@ def filter_hallucination_rects(rects, W: int, H: int, view: str = "view",
     diag["n_kept"] = len(kept)
     diag["n_dropped"] = len(rects) - len(kept)
     diag["drop_indices"] = sorted(drop)
+    # self-contained record for the debug render: the kept rects'
+    # coords travel WITH the verdict, so the colours can never drift
+    # out of sync with the filter's actual decision
+    diag["kept_rects"] = [[round(float(r[k]), 1) for k in range(4)]
+                          for r in kept]
     return kept, diag
 
 
-def save_debug_png(img, rects, diag, path: str):
-    """Debug render of one filtered view: RED = dropped hallucination
-    chains (with axis + score), GREEN = kept rects (best-effort)."""
+def save_debug_png(img, diag, path: str):
+    """Debug render of one filtered view, drawn purely from the
+    diagnostic record: RED = dropped chain members (labelled with
+    axis + score), GREEN = kept rects. Takes ONLY the diag (which
+    carries the kept rects' coords), so the colouring cannot be
+    misaligned by passing the pre- or post-filter list (best-effort)."""
     try:
         from PIL import Image, ImageDraw
         u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3].copy()
         pil = Image.fromarray(u8)
         dr = ImageDraw.Draw(pil)
-        drop = set(diag.get("drop_indices", ()))
-        for i, r in enumerate(rects):
-            color = (255, 50, 50) if i in drop else (60, 220, 60)
+        for r in diag.get("kept_rects", ()):
             dr.rectangle([float(r[0]), float(r[1]),
-                          float(r[2]), float(r[3])], outline=color, width=3)
+                          float(r[2]), float(r[3])],
+                         outline=(60, 220, 60), width=3)
         for ch in diag["chains"]:
             if not ch["dropped"]:
                 continue
             for r in ch["rects"]:
+                dr.rectangle([float(r[0]), float(r[1]),
+                              float(r[2]), float(r[3])],
+                             outline=(255, 50, 50), width=3)
                 dr.text((float(r[0]) + 3, float(r[1]) + 3),
                         f"{ch['axis']} {ch['score']:.2f}",
                         fill=(255, 255, 255))
