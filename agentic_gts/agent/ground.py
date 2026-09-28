@@ -1712,6 +1712,68 @@ def _huge_rect(r, W: int, H: int, max_frac: float = _MAX_RECT_FRAC) -> bool:
     return (w * h) > max_frac * float(W) * float(H)
 
 
+def _tower_drops(rects, W: int, H: int) -> set[int]:
+    """Indices of the 'tower' tiling hallucination (user report: a
+    column of IDENTICAL boxes running from the top of the godview to
+    the bottom, edges touching): a chain of >= 3 pixel rects with
+    near-identical width AND height, x-edges aligned, stacked
+    edge-to-edge VERTICALLY.
+
+    The godview renders the ROW frame axis-aligned (image x = row
+    axis, image y = the across-row axis), so a vertical tower reads
+    as 'neighbouring rows stacked with NO aisle between them' --
+    physically impossible: real adjacent rows always have an aisle
+    (>= 0.6 m, far above the touch tolerance at any frame scale) and a
+    back-to-back double is 2, never 3+. Genuine over-split cabinets
+    chain HORIZONTALLY along the row (edge-to-edge same-size boxes are
+    the over-split signature) and are never dropped.
+
+    STRICTLY edge-to-edge: a rect that INTERSECTS a tower member by
+    more than the alignment noise is a DIFFERENT detection in the same
+    column (user: may be valid) and never chains into the tower -- the
+    chain links only on touching edges (hairline gap or overlap of a
+    few px). If a dropped tower did cover real devices, the cluster
+    recall net re-proposes them -- nothing is lost silently."""
+    n = len(rects)
+    if n < 3:
+        return set()
+    tol = max(4.0, 0.008 * min(W, H))      # size / x-alignment match
+    touch = max(8.0, 0.012 * min(W, H))    # edge-to-edge (hairline gap)
+    b = [(float(r[0]), float(r[1]), float(r[2]), float(r[3])) for r in rects]
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        x0i, y0i, x1i, y1i = b[i]
+        for j in range(i + 1, n):
+            x0j, y0j, x1j, y1j = b[j]
+            if abs(x0i - x0j) > tol or abs(x1i - x1j) > tol:
+                continue          # not the same column
+            if abs((y1i - y0i) - (y1j - y0j)) > tol:
+                continue          # heights differ -> not the same tile
+            # vertical separation: only touching edges chain. A gap
+            # above `touch` is an aisle (real rows); an overlap beyond
+            # `tol` is another detection intersecting the column --
+            # keep it, it is not part of the tower
+            g = max(y0j - y1i, y0i - y1j)
+            if g > touch or g < -tol:
+                continue
+            parent[find(i)] = find(j)
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    drops = set()
+    for members in groups.values():
+        if len(members) >= 3:
+            drops.update(members)
+    return drops
+
+
 # ---------- grounding stage ----------
 
 
@@ -1970,7 +2032,14 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         if _is_tilt_view(v[4]):
             continue
         cam_v, W_v, H_v, rects_v, off_v = v[1], v[2], v[3], v[5], v[6]
-        for r in rects_v:
+        tower_v = _tower_drops(rects_v, W_v, H_v)
+        if tower_v:
+            print(f"[ground] tower hallucination dropped: "
+                  f"{len(tower_v)} same-size edge-to-edge rect(s) in a "
+                  f"vertical chain ({v[4]})")
+        for i, r in enumerate(rects_v):
+            if i in tower_v:
+                continue
             if _huge_rect(r, W_v, H_v):
                 print(f"[ground] huge VLM rect dropped "
                       f"({(r[2] - r[0]) * (r[3] - r[1]) / (W_v * H_v):.0%} "
@@ -2016,7 +2085,14 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         if not _is_tilt_view(v[4]):
             continue
         cam_v, W_v, H_v, rects_v, off_v = v[1], v[2], v[3], v[5], v[6]
-        for r in rects_v:
+        tower_v = _tower_drops(rects_v, W_v, H_v)
+        if tower_v:
+            print(f"[ground] tower hallucination dropped: "
+                  f"{len(tower_v)} same-size edge-to-edge rect(s) in a "
+                  f"vertical chain ({v[4]})")
+        for i, r in enumerate(rects_v):
+            if i in tower_v:
+                continue
             if _huge_rect(r, W_v, H_v):
                 continue
             lo_r = _frame_rect(cam_v, _shift_rect(r, off_v), 0.30)

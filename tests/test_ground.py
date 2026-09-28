@@ -1649,6 +1649,45 @@ def test_huge_rect_guard():
     assert not _huge_rect((100, 400, 1180, 600), W, H), "a thin band is not"
     print("PASS huge-rect guard (hedge boxes rejected, row bands kept)")
 
+
+def test_tower_hallucination_dropped():
+    """The VLM tiling hallucination (user report): a vertical column of
+    IDENTICAL boxes with touching edges from the top of the godview to
+    the bottom. Real rows never stack edge-to-edge (aisles), a back-to-
+    back double is only 2, and genuine over-split cabinets chain
+    HORIZONTALLY along the row -- only the vertical tower drops.
+    A rect INTERSECTING a tower member is a different detection and
+    must survive (user: those may be valid results)."""
+    from agentic_gts.agent.ground import _tower_drops
+    W, H = 1280, 1024
+    # the hallucination: 4 identical rects stacked edge-to-edge
+    tower = [(500, 20 + k * 240, 700, 20 + k * 240 + 240) for k in range(4)]
+    # a jittered variant: a few px drift in position/size still chains
+    tower2 = [(500, 20, 702, 260), (501, 262, 700, 501),
+              (499, 503, 701, 740)]
+    # real: two identical touching cabinets side by side (over-split row)
+    row = [(100, 100, 200, 500), (200, 100, 300, 500)]
+    # real: identical rows in one column WITH an aisle between them
+    aisle = [(600, 100, 900, 300), (600, 380, 900, 580)]
+    # real: a back-to-back double (2 touching, same column)
+    double = [(50, 700, 150, 900), (50, 900, 150, 1100)]
+    # another detection INTERSECTING the tower column (same column,
+    # same size, but overlapping a tower member by ~110px) -- kept
+    overlap = (500, 150, 700, 390)
+    rects = tower + tower2 + row + aisle + double + [overlap]
+    drops = _tower_drops(rects, W, H)
+    assert drops == {0, 1, 2, 3, 4, 5, 6}, \
+        f"both towers must drop entirely, got {sorted(drops)}"
+    assert not any(i in drops for i in range(7, len(rects))), \
+        "real rows / over-split / intersecting boxes must be kept"
+    # full duplicates must NOT chain either (that is the dedup's job,
+    # not the tower guard's): three identical rects at the SAME spot
+    dup = [(500, 20, 700, 260)] * 3
+    assert _tower_drops(dup, W, H) == set(), \
+        "full duplicates are duplication, not a stacked tower"
+    print("PASS tower hallucination dropped (vertical identical chains), "
+          "intersecting / over-split / aisle-separated boxes kept")
+
 def test_floor_map_mesh_rejects_overhead_only_tiles():
     """A mesh tile with only overhead structure (no floor points) must
     NOT report the structure's z as the floor (user report: floor map
