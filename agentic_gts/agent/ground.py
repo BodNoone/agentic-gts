@@ -733,38 +733,7 @@ def _projected_scatter(points: np.ndarray, cam, W: int, H: int) -> np.ndarray:
     return np.clip(arr.astype(np.float32) / 255.0, 0.0, 1.0)
 
 
-# ---------- official-style audit plot (cookbook plot_bounding_boxes) ----------
-
-# the cookbook's per-box color cycle (plot_bounding_boxes), minus
-# near-black colors that vanish on a dark data-center render
-_AUDIT_COLORS = [
-    (220, 20, 60), (34, 139, 34), (0, 0, 255), (255, 215, 0),
-    (255, 140, 0), (255, 105, 180), (138, 43, 226), (165, 42, 42),
-    (128, 128, 128), (0, 206, 209), (0, 255, 255), (255, 0, 255),
-    (0, 255, 0), (25, 25, 112), (0, 128, 128), (240, 128, 128),
-]
-
-
-def _draw_raw_regions(img: np.ndarray, raw_rects: list) -> np.ndarray:
-    """Draw the VLM's RAW pixel rects the way the official cookbook's
-    plot_bounding_boxes does: one DISTINCT color per region, 3-px
-    rectangle outline, and the label text at the box's top-left.
-    raw_rects: [(x0, y0, x1, y1, label)] in THIS image's pixel space."""
-    from PIL import Image, ImageDraw, ImageFont
-    u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., :3].copy()
-    pil = Image.fromarray(u8)
-    dr = ImageDraw.Draw(pil)
-    try:
-        font = ImageFont.truetype("arial.ttf", 16)
-    except OSError:
-        font = ImageFont.load_default()
-    for i, (x0, y0, x1, y1, label) in enumerate(raw_rects):
-        color = _AUDIT_COLORS[i % len(_AUDIT_COLORS)]
-        dr.rectangle(((int(x0), int(y0)), (int(x1), int(y1))),
-                     outline=color, width=3)
-        dr.text((int(x0) + 4, max(int(y0) - 18, 0)), label,
-                fill=color, font=font)
-    return np.asarray(pil, dtype=np.float32) / 255.0
+# ---------- result audit plot ----------
 
 
 def _draw_result_boxes(img: np.ndarray, cam, boxes, off=(0, 0)) -> np.ndarray:
@@ -796,29 +765,23 @@ def _draw_result_boxes(img: np.ndarray, cam, boxes, off=(0, 0)) -> np.ndarray:
     return np.asarray(pil, dtype=np.float32) / 255.0
 
 
-def _save_grounded_png(base_img, cam, boxes, raw_rects, out_dir,
+def _save_grounded_png(base_img, cam, boxes, out_dir,
                        fname: str = "grounded.png", off=(0, 0)) -> None:
-    """The grounding audit image, drawn the way the official 2d_grounding
-    cookbook plots its answers.
-
-    Two layers over the clean view base the VLM answered on:
-      - COLORED 3-px rectangles with labels = the VLM's RAW regions
-        for this view (structured-coordinate hallucination chains
-        already filtered out upstream; one distinct color per region,
-        official plot_bounding_boxes style) -- already in THIS image's
-        pixels
-      - RED 2-px wireframes = the geometry-fitted final row boxes,
-        projected through the camera and shifted by the crop offset
-    This separates WHAT the VLM said from what the point-support fit
-    made of it -- when the result is wrong, the audit shows whether
-    the VLM mis-boxed or the fit mangled it. One image per view
-    (grounded.png / grounded_L.png / grounded_R.png / grounded_t<i>.png).
+    """The FINAL-result audit image: the view base + the grounded
+    boxes only, color-coded by provenance (see _draw_result_boxes).
+    Deliberately result-only (user direction): rects dropped by any
+    guard -- the hallucination filter, the huge-rect hedge guard, the
+    point-support fit -- must not clutter it. The 'what did the VLM
+    actually say' story lives elsewhere: groundview_*.png is the clean
+    base the VLM answered on, hallucination_*.png shows the filter's
+    kept/dropped verdict per rect, and vlm_records.jsonl holds the raw
+    replies. One image per view (grounded.png / grounded_L.png /
+    grounded_R.png / grounded_t<i>.png).
     """
     import os
     try:
         from agentic_gts.output.gs_render import png_bytes
-        img = _draw_result_boxes(_draw_raw_regions(base_img, raw_rects),
-                                 cam, boxes, off=off)
+        img = _draw_result_boxes(base_img, cam, boxes, off=off)
         path = os.path.join(out_dir, fname)
         with open(path, "wb") as f:
             f.write(png_bytes(img))
@@ -2231,17 +2194,17 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # same camera. Tiled views draw ALL boxes (cross-tile ones project
     # outside the frame), so each tile's audit stays self-contained.
     if out_dir:
-        for idx, (img_v, cam_v, _, _, fname_v, rects_v,
+        for idx, (img_v, cam_v, _, _, fname_v, _rects_v,
                   off_v) in enumerate(views):
             # non-tiled: views[0] (the NADIR view) owns grounded.png --
-            # the before/after audit must compare the colored rects and
-            # the red boxes on the view whose rays ARE the footprints;
-            # the tilt views get their own grounded_L / grounded_R
-            # audits (the last-view-writes overwrite used to put the
-            # R view's perspective into the audit instead).
+            # the result audit must show the boxes on the view whose
+            # rays ARE the footprints; the tilt views get their own
+            # grounded_L / grounded_R audits (the last-view-writes
+            # overwrite used to put the R view's perspective into the
+            # audit instead).
             fname_out = ("grounded.png" if (tiles is None and idx == 0)
                          else fname_v.replace("groundview", "grounded"))
             _save_grounded_png(
-                img_v, cam_v, boxes, rects_v, out_dir, fname=fname_out,
+                img_v, cam_v, boxes, out_dir, fname=fname_out,
                 off=off_v)
     return True
