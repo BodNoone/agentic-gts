@@ -769,25 +769,21 @@ def test_ground_stage_cluster_recall():
     assert 5.0 < scene.boxes[-1].size[0] < 6.5, \
         "recovered row keeps its length"
     print("PASS ground stage cluster recall (missed row recovered)")
-def test_ground_stage_adjacent_clump_recall():
-    """The recall net's coverage must judge what was ACTUALLY
-    DETECTED (user report: the net never fired, obvious rectangular
-    clumps left unboxed). A generous VLM rect drawn over a row AND an
-    adjacent AC-sized clump fits ONLY the row (the peak-peeling span
-    keeps the dominant run) -- the old rect-overlap rules called the
-    clump 'covered' by the same rect (forward containment on area),
-    but its points sit in NO fitted box: point coverage must
-    re-propose it."""
+def test_ground_stage_row_plus_clump_rides_whole():
+    """A generous VLM rect over a row AND an adjacent low AC clump fits
+    as ONE union box at stageG (user direction: along-row splitting is
+    stageC's job on SAM + local-view evidence -- the earlier
+    histogram-gap long split here falsely cut complete low devices,
+    whose sparse 0.30-1.00m band read an interior dim run as a gap).
+    The clump's points ride INSIDE the fitted footprint, so the recall
+    net correctly stays silent: the clump is detected, just not yet
+    split; stageC separates it (its local grounding boxes visually
+    distinct units individually)."""
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
     rng = np.random.default_rng(17)
     row = _row_points(0.0, 6.0, y=0.0, rng=rng)
-    # LOW AC-sized clump 1.5m off the row's end (z up to 0.65m): the
-    # rect's own fit NEVER sees it -- the XY fit's middle z-slice
-    # starts at 0.35 x height ~0.74m, entirely above the clump -- so
-    # the fitted box covers the row only, while the clump's area sits
-    # inside the generous rect (the old area-overlap rules called
-    # that 'covered' and the clump stayed missed)
+    # LOW AC-sized clump 1.5m off the row's end (z up to 0.65m)
     ac = rng.uniform([7.5, -0.5, 0.05], [8.5, 0.5, 0.65], (600, 3))
     ceil = np.column_stack([rng.uniform(-2.0, 9.5, 3000),
                             rng.uniform(-2.0, 2.0, 3000),
@@ -797,8 +793,7 @@ def test_ground_stage_adjacent_clump_recall():
     _bootstrap_meta(scene, (-1.5, -0.9, 9.5, 0.9))
     scene.boxes = []
     _, cam, W, H, off = ground._render_topdown(scene, 0.0)
-    # ONE generous rect: the row plus the whole clump (the fit snaps
-    # to the row's denser run; the clump's points stay unfitted)
+    # ONE generous rect: the row plus the whole clump
     uv = cam.project_cv(np.column_stack(
         [[-0.6, 8.6, 8.6, -0.6], [-0.8, -0.8, 0.8, 0.8],
          np.full(4, 1.0)]))
@@ -818,15 +813,27 @@ def test_ground_stage_adjacent_clump_recall():
     with tempfile.TemporaryDirectory() as td:
         ok = ground.ground_stage(scene, judge, out_dir=td)
         assert ok, "grounding must succeed"
-    assert len(scene.boxes) == 2, \
-        f"row + re-proposed clump; got {len(scene.boxes)} boxes: " \
-        + str([(round(b.center[0], 2), round(b.center[1], 2))
+    assert len(scene.boxes) == 1, \
+        f"the union rides as ONE box (stageC splits it later), got " \
+        f"{len(scene.boxes)}: " \
+        + str([(round(b.center[0], 2), round(b.size[0], 2))
                for b in scene.boxes])
-    acb = min(scene.boxes, key=lambda b: abs(b.center[0] - 8.0))
-    assert abs(acb.center[0] - 8.0) < 0.3 and acb.size[1] > 0.5, \
-        f"the clump must get its own box, got centre {acb.center[:2]} " \
-        f"size {acb.size[:2]}"
-    print("PASS adjacent clump recall (point coverage, not rect area)")
+    b = scene.boxes[0]
+    assert b.size[0] > 8.0, \
+        f"the union box must span row + clump, got length {b.size[0]:.2f}"
+    # the clump is DETECTED (inside the fitted footprint by the recall
+    # net's own >= 65% point-coverage rule -- the union fit carries a
+    # slight yaw from the clump, its far corner may stick out) -- the
+    # recall net staying silent on it is the correct verdict, not a miss
+    clump_pts = scene.points[(scene.points[:, 0] > 7.5)
+                             & (scene.points[:, 0] < 8.5)]
+    inside = b.contains(clump_pts)
+    assert inside.mean() >= 0.65, \
+        f"the clump must be 'covered' by the point-coverage rule " \
+        f"(>= 65% inside), only {inside.mean():.0%} are"
+    print(f"PASS row + clump rides whole (union {b.size[0]:.2f}m, "
+          f"clump {inside.mean():.0%} inside >= the 65% coverage bar; "
+          f"splitting is stageC's job)")
 def test_floor_map_mesh_mode():
     """mesh_mode: a mesh sampling has no under-floor haze, so a tile's
     floor is its plain MINIMUM z -- even when the slab is sparsely

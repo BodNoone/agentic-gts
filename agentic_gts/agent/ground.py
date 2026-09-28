@@ -1217,6 +1217,14 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
     strip, a sliver) are dropped by _fit_region_box itself; if NO side
     survives the original whole box is kept (recall first).
 
+    ONLY the cross-axis deep split runs here. Along-row splitting
+    (joined rows, a row + a separate clump) is stageC's job on SAM +
+    local-view evidence (user direction): the earlier histogram-gap
+    long split at this stage had no device-type or visual evidence and
+    falsely cut complete LOW devices -- their 0.30-1.00m band is
+    sparse, an interior dim run read as a gap, and the pieces sat
+    apart so the adjacency merge could not heal them.
+
     max_depth: the CLUSTER net lowers it to 1.35 -- a device standing
     against a wall merges with it into one blob of depth 0.2 (wall) +
     gap + 1.1 (device) ~= 1.6m, under the 1.8 default yet NOT a single
@@ -1245,37 +1253,8 @@ def _fit_region_boxes(points: np.ndarray, rect, min_pts: int = 60,
     # old line said x) -- mis-aiming the split's gap search.
     axis = 1 if abs(math.cos(float(bb.yaw))) > abs(math.sin(float(bb.yaw))) else 0
     if bb.size[1] <= max_depth:
-        # LOW-BAND contract (seed_top set): a rect over a row AND a
-        # separate LOW clump (an AC bank under the old middle slice's
-        # 0.35 x height line) now fits as ONE long box -- the 0.30-1.00
-        # band carries the clump too. Joined cabinets TOUCH along the
-        # row, so an interior >= 0.3m empty run with strong spans on
-        # both sides is two structures: split there (stageC would also
-        # split along-row, but the grounding output should map to
-        # structures, and the recall net's coverage test reads the
-        # fitted footprints).
-        if seed_top is None:
-            return [bb]
-        rax = 1 - axis                # the ROW (long) axis
-        x0, y0, x1, y1 = rect
-        dev = _dev_of(rect)
-        s = _cross_gap_split(dev[:, rax], min_side=0.30)
-        if s is None:
-            return [bb]
-        print(f"[ground] long fit (span {bb.size[0]:.2f}m) -> split at "
-              f"{'y' if rax else 'x'}={s:.2f} (row + separate clump)")
-        subs = ((x0, y0, x1, s), (x0, s, x1, y1)) if rax == 1 \
-            else ((x0, y0, s, y1), (s, y0, x1, y1))
-        out = []
-        for sub in subs:
-            out.extend(_fit_region_boxes(points, sub, min_pts, floor_z,
-                                         max_depth=max_depth,
-                                         min_side=min_side,
-                                         mesh_mode=mesh_mode,
-                                         seed_top=seed_top,
-                                         floor_at=floor_at,
-                                         rect_id=rect_id))
-        return out or [bb]
+        # depth is single-structure: one box, stageC splits along-row
+        return [bb]
     x0, y0, x1, y1 = rect
     dev = _dev_of(rect)
     s = _cross_gap_split(dev[:, axis], min_side=min_side)
