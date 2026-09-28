@@ -1819,18 +1819,11 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     views = []                       # (img, cam, W, H, fname, rects)
     view_specs = [("groundview.png", None)] if tiles is None else \
         [(f"groundview_t{i}.png", fr) for i, fr in enumerate(tiles)]
-    # recall tilts run ONLY for a single view: a tiled layout already
-    # renders edge devices obliquely (perspective nadir + tile overlap),
-    # so the per-tile tilts are redundant -- see the note in the loop.
-    want_tilts = tiles is None
     if tiles is not None:
         print(f"[ground] layout exceeds a single nadir view "
               f"(>{_MAX_SINGLE_SPAN:.0f}m span) -> {len(tiles)} tiled "
-              f"views ({len(tiles)} VLM call(s), recall tilts "
-              f"{'on' if want_tilts else 'skipped'})")
-    if not want_tilts:
-        print("[ground] recall tilts skipped: tiling already renders "
-              "edge devices obliquely (perspective nadir + overlap)")
+              f"view(s), each with L/R recall tilts "
+              f"({3 * len(tiles)} VLM call(s))")
     for fname, fr in view_specs:
         try:
             img, cam, W, H, off = _render_topdown(scene, yaw, frame=fr)
@@ -1859,10 +1852,15 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
         # boxes, and each tilted rect back-projects through its own
         # camera (unproject_ground), so no geometry is shared with the
         # nadir frame by mistake.
-        # SKIPPED for tiled layouts (user insight): tiling already gives
-        # the oblique edge views these exist to add.
-        if not want_tilts:
-            continue
+        # Runs for TILES too (user report: missed detections at tile
+        # edges): a tile camera's height is set by the BINDING (long)
+        # axis, so devices near the short-axis edges sit ~15 deg off
+        # vertical -- roof plates again, and the tile overlap only
+        # guarantees a structure appears WHOLE in some tile, not
+        # FEATUREFUL. PASS2's recall-only guards (dual-height slice
+        # tightening, covered-rect skip, fill-only dedup tier) keep
+        # the perspective-inflated tilt rects from ever touching the
+        # nadir authority.
         stem = fname[:-4] if fname.endswith(".png") else fname
         for tag, d in (("L", -1), ("R", +1)):
             try:

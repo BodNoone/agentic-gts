@@ -1417,10 +1417,13 @@ def test_ground_stage_merges_over_split_regions():
     assert abs(rows[2].center[1] - 3.0) < 0.2
     print(f"PASS ground-stage over-split rects stay separate "
           f"(SOURCE-RECT GATE, pieces {rows[0].size[0]:.2f}m each)")
-def test_ground_stage_tiled_skips_tilts():
-    """End-to-end: a TILED layout renders one nadir call per tile and NO
-    tilt views (user insight: the perspective nadir + tile overlap
-    already give oblique edge views)."""
+def test_ground_stage_tiled_runs_tilts():
+    """End-to-end: a TILED layout renders L/R recall tilts PER TILE.
+    User report: missed detections at tile edges -- the tile camera's
+    height is set by the BINDING (long) axis, so devices near the
+    short-axis edges render as featureless roof plates, and the tile
+    overlap only guarantees a structure appears WHOLE in some tile,
+    not FEATUREFUL."""
     import json as _json
     import os as _os
     import tempfile
@@ -1440,13 +1443,25 @@ def test_ground_stage_tiled_skips_tilts():
         judge._qwen_image_call = lambda png, prompt, *a, **k: (
             calls.append(1) or reply)
         assert ground.ground_stage(scene, judge, out_dir=td)
-        assert not any(f.endswith(("_L.png", "_R.png"))
-                       for f in _os.listdir(td)), \
-            "tiled layout must skip the recall tilts"
-        assert len(calls) >= 2, f"40m layout must tile, got {len(calls)}"
+        files = _os.listdir(td)
+        tilts = [f for f in files
+                 if f.startswith("groundview_")
+                 and f.endswith(("_L.png", "_R.png"))]
+        nadirs = [f for f in files
+                  if f.startswith("groundview_t") and f.endswith(".png")
+                  and not f.endswith(("_L.png", "_R.png"))]
+        n_tiles = len(nadirs)
+        assert n_tiles >= 2, f"40m layout must tile, got {n_tiles}"
+        assert len(tilts) == 2 * n_tiles, \
+            f"every tile needs its L/R recall tilts: {len(tilts)} vs " \
+            f"{2 * n_tiles}"
+        assert len(calls) == 3 * n_tiles, \
+            f"nadir + 2 tilts per tile expected {3 * n_tiles} calls, " \
+            f"got {len(calls)}"
         assert _os.path.exists(_os.path.join(td, "groundview_t0.png")), \
             "the nadir tile render is still produced"
-    print(f"PASS tiled skips tilts ({len(calls)} nadir calls, no tilt views)")
+    print(f"PASS tiled runs recall tilts ({n_tiles} tiles, "
+          f"{len(tilts)} tilt views, {len(calls)} VLM calls)")
 def test_oversized_blob_guard():
     """A box far too 'fat' on its SHORTER axis is a blob, not a device
     row: dropped before the local refine. Long thin rows and back-to-back
