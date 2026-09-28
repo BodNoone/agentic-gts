@@ -69,7 +69,7 @@ def _sample_box_surface(box: OrientedBox, pts_per_m2: float, rng: np.random.Gene
     """
     L, W, H = box.size
     faces = []
-    # each face: (u_len, v_len, generator of local coords)
+    # each face: (name, u_len, v_len)
     specs = [
         ("front", L, H), ("back", L, H),
         ("left", W, H), ("right", W, H),

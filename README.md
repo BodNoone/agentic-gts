@@ -141,7 +141,7 @@ python -m agentic_gts.cli view --point-cloud room.ply --boxes runs/room1/boxes.j
 
 ```
 agentic_gts/
-├── core/models.py        OrientedBox / Scene / Issue 数据模型
+├── core/models.py        OrientedBox / Scene 数据模型
 ├── synth/generator.py    合成机房生成器（含四类噪声注入）
 ├── segment/orientation.py 阶段0：yaw 估计 + 布局 bootstrap（footprint / z_top）
 ├── tools/geometry.py     几何工具集（支撑度）
@@ -153,7 +153,7 @@ agentic_gts/
 ├── output/render.py      SVG/PNG 布局图
 ├── output/visualize.py   点云+框联合可视化（2D叠加 / 3D交互 / PLY导出）
 ├── pipeline.py           全流程编排
-└── cli.py                命令行入口（run / synth / diagnose / view / report）
+└── cli.py                命令行入口（run / synth / diagnose / view）
 tests/                    单元 + 端到端测试
 docs/                     设计方案文档
 ```

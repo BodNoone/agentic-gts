@@ -57,7 +57,6 @@ def _edge_error(pred: OrientedBox, gt: OrientedBox) -> list[float]:
     edge of the predicted box and measure perpendicular offset. Simplified via
     the local frame of the GT box: compare the +-x and +-y face positions.
     """
-    # express pred corners in gt local frame
     corners = pred.corners_2d()
     gtc = np.asarray(gt.center[:2])
     r = gt.rotation[:2, :2]

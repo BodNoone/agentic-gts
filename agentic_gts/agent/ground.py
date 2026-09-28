@@ -373,8 +373,8 @@ def _thin_structure_mask(points: np.ndarray, voxel: float = _THIN_VOXEL,
     def _h(k):
         return (k + 1) @ stride         # +1: shifts may reach -1
 
-    ph = _h(key)                        # per-point voxel hash
-    uh = np.unique(ph)                  # occupied voxels
+    ph = _h(key)
+    uh = np.unique(ph)
     # decode the unique voxels back to coords for the 26 shifts
     kz = uh % int(dims[2])
     r = uh // int(dims[2])
@@ -424,9 +424,9 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
     perspective dilation).
 
     Framing and ceiling cut both come from the stage0 bootstrap
-    byproducts (scene.meta z_top + device_footprint): there is no
-    hint-box input anymore. `frame` (rotated-frame AABB) overrides the
-    framing for TILED views over a big layout (ground resolution).
+    byproducts (scene.meta z_top + device_footprint). `frame`
+    (rotated-frame AABB) overrides the framing for TILED views over a
+    big layout (ground resolution).
 
     tilt_deg + tilt_dir (user direction 1, recall views): tilt the
     nadir camera SLIGHTLY toward +/- row-frame y (across the rows, the
@@ -451,9 +451,7 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
     # a complete structure). A RELATIVE cut (70% of the device top)
     # also buys a large margin against top over-estimation: overhead
     # trays or a dense ceiling mesh dragging the reference top upward
-    # still land above the cut. The FIT pool is cut independently
-    # (top + 0.10 in ground_stage), so fitted box heights keep the true
-    # rack top no matter how deep this renders.
+    # still land above the cut.
     top = float(scene.meta["z_top"]) if scene.meta.get("z_top") else None
     cut = _render_cut(top, mesh_mode=bool(scene.meta.get("geometry_is_mesh")))
     # stepped-floor support: the heightmap restores a per-SECTION zero
@@ -466,20 +464,13 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
     fl = _floor_map(points,
                     mesh_mode=bool(scene.meta.get("geometry_is_mesh")))
     h = points[:, 2] - fl(points[:, 0], points[:, 1])
-    # FLOOR cut for the RENDER: high on purpose (user directive --
-    # devices are tall and the nadir view only needs WHERE they are,
-    # not their full bodies). 3DGS floor gaussians are diffuse, their
-    # means float tens of cm above the slab, and the old 0.30m cut let
-    # them smear the whole view as a bright wash that buried the rows
-    # (user report: the floor rendering into the groundview). 1.00m
-    # (raised from 0.80): floor haze can float up to ~1m in badly
-    # reconstructed regions, and the per-tile P2 floor estimate dips
-    # BELOW the true slab where under-floor smear exceeds the
-    # percentile -- the height-relative cut then leaks the taller
-    # floor haze REGIONALLY (user report: part of the floor back in
-    # the groundview). The FIT pool is cut independently in
-    # ground_stage (0.30m, keeps the whole device body), so fitting
-    # is unaffected.
+    # FLOOR cut for the RENDER at 1.00m height-relative (user
+    # directive: the nadir view needs WHERE devices are, not full
+    # bodies): 3DGS floor haze floats up to ~1m in badly reconstructed
+    # regions and the per-tile P2 floor can dip below the true slab,
+    # so a lower cut leaks floor regionally (user report). The FIT
+    # pool is cut independently in ground_stage (0.30m, whole device
+    # body), so fitting is unaffected.
     if np.isfinite(cut):
         band = points[(h > 1.00) & (h < cut)]
     else:
@@ -817,7 +808,7 @@ def _save_grounded_png(base_img, cam, boxes, raw_rects, out_dir,
     This separates WHAT the VLM said from what the point-support fit
     made of it -- when the result is wrong, the audit shows whether
     the VLM mis-boxed or the fit mangled it. One image per view
-    (grounded.png / grounded_az90.png / grounded_az270.png).
+    (grounded.png / grounded_L.png / grounded_R.png / grounded_t<i>.png).
     """
     import os
     try:
@@ -1357,16 +1348,14 @@ def _cluster_candidates(points: np.ndarray, cell: float = 0.30,
                         min_cell_pts: int = 6, min_cluster_pts: int = 60,
                         margin: float = 0.15) -> list:
     """Geometry-first recall net: connected DENSITY clusters over the
-    fit pool (ROW frame -- same coordinates the rects fit in).
+    render-cut pool (ROW frame -- same coordinates the rects fit in).
 
     User insight: after the ground cut and the top cut the pool holds
     nothing but walls, devices and junk -- on the groundview they all
     read as PIXEL CLUMPS. Free-form image detection (the VLM) misses
     structures on a clean nadir view; connected components over the
     density grid cannot -- a device is a dense blob of cells however
-    axis-aligned and featureless the view. The VLM's job shrinks from
-    DETECTION (find everything) to CLASSIFICATION (judge pre-marked
-    candidates), which it does far more reliably.
+    axis-aligned and featureless the view.
 
     Occupancy: a 30cm cell counts when >= min_cell_pts points fall in
     it (haze cells stay under); components are 8-connected (diagonal
@@ -1557,16 +1546,16 @@ def _merge_adjacent_boxes(boxes: list, pts_fit: np.ndarray, yaw: float,
     support (never boundary-united: noise would inflate the edges);
     the local refine then does the true splitting.
 
-    probe_pool: the pool the DENSITY EVIDENCE is measured on. With a
-    mesh the default pts_fit (0.30 .. z_top + 0.10) carries the CABLE
-    TRAYS -- dense, gapless, physically bridging adjacent device tops
-    -- and a tray strip in the junction passes the density ratio like
-    a real seam, merging devices that have NO overlap on the rendered
-    groundview (user report: the render cut hides the trays, the
-    merge probe does not see them). The caller passes the render-cut
-    pool (trays removed, device bodies kept) so only the devices'
-    own band can testify. The final union refit still uses pts_fit
-    (rack tops belong in the box height)."""
+    probe_pool: the pool the DENSITY EVIDENCE is measured on. The
+    fit pool can carry the CABLE TRAYS (dense, gapless strips
+    physically bridging adjacent device tops -- always in its
+    uncapped fallback form), and a tray strip in the junction passes
+    the density ratio like a real seam, merging devices that have NO
+    overlap on the rendered groundview (user report: the render cut
+    hides the trays, the merge probe does not see them). The caller
+    passes the render-cut pool (trays removed, device bodies kept)
+    so only the devices' own band can testify. The final union refit
+    still uses pts_fit (rack tops belong in the box height)."""
     pp = pts_fit if probe_pool is None else probe_pool
     n = len(boxes)
     if n < 2:
@@ -1990,22 +1979,21 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
             rect_r = _frame_rect(cam_v, _shift_rect(r, off_v), 1.0)
             row_rects.append(rect_r)
             _fit_ground_rect(rect_r)
-    # PASS 2 -- the tilt views are RECALL-ONLY (user report: red
-    # result boxes merging devices the colored rects showed apart).
-    # A tilted camera's back-projection is perspective-INFLATED: the
-    # image rect is the device's visible hull, whose rays cut any
-    # single z-plane in a footprint WIDER than the device -- a tilt
-    # rect SPANNING an already-grounded device plus a missed one
-    # passes the old point-mass coverage gate (~50% covered) and
-    # fits a box across BOTH. Guards, in order:
+    # PASS 2 -- tilt views are RECALL-ONLY (user report: red boxes
+    # merging devices the colored rects showed apart): a tilted
+    # camera's back-projection is perspective-INFLATED (the image rect
+    # is the visible hull, whose rays cut any single z-plane in a
+    # footprint WIDER than the device), so a tilt rect spanning an
+    # already-grounded device plus a missed one would fit a box across
+    # BOTH. Guards:
     #   * the back-projection is TIGHTENED by intersecting the slices
-    #     at two device-band heights (the oblique-view lesson: the
-    #     bottom slice inflates away from the camera, the top slice
-    #     toward it, the intersection trims both);
-    #   * a tilt rect touching already-grounded AREA at all (>= 25%
-    #     of its area inside the nadir fits / raw rects union) is
-    #     skipped WHOLE -- the cluster recall net downstream recovers
-    #     any genuinely missed device without spanning risk.
+    #     at two device-band heights (the bottom slice inflates away
+    #     from the camera, the top toward it, the intersection trims
+    #     both);
+    #   * a tilt rect touching already-grounded AREA at all (>= 25% of
+    #     its area inside the nadir fits / raw rects union) is skipped
+    #     WHOLE -- the cluster recall net downstream recovers any
+    #     genuinely missed device without spanning risk.
     def _rect_covered_frac(rect, others) -> float:
         """Fraction of rect's area inside the UNION of the AABBs."""
         x0, y0, x1, y1 = rect
@@ -2053,25 +2041,17 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     n_rects_total = sum(len(v[5]) for v in views)
     print(f"[ground] {n_rects_total} VLM regions "
           f"({len(views)} view(s)) -> {len(boxes)} fitted boxes")
-    # --- cluster recall net (user insight, RECALL-FIRST) ---
-    # After the ground and top cuts the fit pool holds nothing but
-    # walls, devices and junk -- every structure reads as a DENSITY
-    # CLUMP in row-frame space, and free-form image detection MISSES
-    # some on a clean nadir view (user report: obvious rectangular
-    # clumps left unboxed -> missed devices). The net: connected
-    # components over the density grid PROPOSE, and (user directive)
-    # every uncovered cluster becomes a box UNCONDITIONALLY -- a
-    # wrong proposal is CHEAP, a missed device is LOST: stageC's
-    # per-box local views type-confirm each box and non-devices die
-    # there (type_suspect -> LOW -> final filter). The earlier VLM
-    # classification gate re-imported the very instability the net
-    # exists to absorb (user report: unstable grounding, clusters
-    # rejected or the call failing -> nothing added). Clusters already
-    # covered by a VLM rect are still skipped: the net must only ADD
-    # recall, never question the rects.
-    # cluster recall net: the recall safety net over the render-cut
-    # pool (trays removed -- the fit pool's trays bridge every aisle
-    # and would seam the whole room into one cluster).
+    # --- cluster recall net (RECALL-FIRST) ---
+    # After the cuts the pool holds walls, devices and junk -- every
+    # structure is a DENSITY CLUMP, and free-form VLM detection misses
+    # some on a clean nadir view (user report: obvious clumps left
+    # unboxed). Connected components over the density grid PROPOSE;
+    # every uncovered cluster becomes a box UNCONDITIONALLY (user
+    # directive: a wrong proposal is CHEAP -- stageC's local views cull
+    # non-devices; a missed device is LOST). Clusters covered by a VLM
+    # rect are skipped: the net only ADDS recall, never questions the
+    # rects. Runs on the render-cut pool (trays removed -- their
+    # gapless strips would seam the whole room into one cluster).
     try:
         cands = _cluster_candidates(pts_clu)
     except Exception as e:
@@ -2137,19 +2117,16 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
             print(f"[ground] cluster recall net failed "
                   f"({type(e).__name__}: {e}) -> skipped")
     # DEDUPLICATE, TWO TIERS (user report: colored rects fine, red
-    # boxes merged). The old single tier sorted everything by n_pts
-    # and let the biggest fit win -- a perspective-inflated tilt box
-    # spanning two devices carries the most points, enters FIRST and
-    # eats both correct nadir boxes as 'contained duplicates'. Now:
+    # boxes merged). A perspective-inflated tilt box spanning two
+    # devices carries the most points and would enter FIRST in a
+    # single-tier sort, eating both correct nadir boxes. Now:
     #   * tier 1, NADIR (and cluster-net) boxes only: drop a box that
     #     overlaps a better-supported kept fit (IoU >= 0.5) or is
     #     >= 85% contained in one (nested rects: a small box inside a
     #     big row box has IoU = area ratio but containment ~1.0);
     #   * tier 2, TILT boxes: they may only fill EMPTY space -- any
     #     overlap with a kept box (IoU >= 0.2 or containment >= 0.3)
-    #     drops the tilt box, however many points it carries. A tilt
-    #     box can never replace, out-support or span across a nadir
-    #     grounding.
+    #     drops the tilt box, however many points it carries.
     nadir_boxes = [b for b in boxes if b.meta.get("view") != "tilt"]
     tilt_boxes = [b for b in boxes if b.meta.get("view") == "tilt"]
     dedup = []
@@ -2173,11 +2150,9 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # each fits its own box and the seam never heals (stageC only
     # splits, never merges). Touching / point-bridged boxes merge into
     # a point-support-refitted union; the true splitting is the local
-    # refine's job. The density EVIDENCE is measured on the render-cut
-    # pool -- with a mesh the fit pool carries the cable trays, whose
-    # gapless strips bridge adjacent device tops and pass the density
-    # ratio like a real seam, merging devices that look fully separate
-    # on the groundview (user report).
+    # refine's job. Density evidence is measured on the render-cut
+    # pool (trays would pass the ratio like a real seam -- see
+    # _merge_adjacent_boxes).
     boxes = _merge_adjacent_boxes(boxes, pts_fit, yaw, floor_at=fl_local,
                                   probe_pool=pts_clu, seed_top=fit_top)
     # drop "fat blob" boxes (user report: a huge box covering aisles and

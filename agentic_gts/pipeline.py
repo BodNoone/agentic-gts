@@ -12,7 +12,7 @@ import numpy as np
 from agentic_gts.core.models import OrientedBox, Scene
 from agentic_gts.agent.judge import VLMJudge
 from agentic_gts.agent.loop import LayoutAgent
-from agentic_gts.eval.metrics import EvalResult, evaluate
+from agentic_gts.eval.metrics import evaluate
 from agentic_gts.output.render import boxes_to_png, boxes_to_svg
 
 
@@ -101,10 +101,8 @@ def align_to_ground(points: np.ndarray, return_transform: bool = False):
     Falls back to the 2nd z-percentile as floor when no bottom plane fits.
 
     return_transform: also return {"R", "shift"} where an aligned point is
-    `p @ R.T + shift`. The 3DGS evidence renders and the PLY export read
-    the RAW gaussian file, so they must apply the SAME transform or they
-    land in a different frame than the aligned geometry (a big-shift
-    scene exposed this: exported boxes floated above the cloud).
+    `p @ R.T + shift` (the renders/exports must apply the SAME transform
+    to the RAW gaussian file -- see apply_align_transform).
     """
     _IDENT = {"R": np.eye(3), "shift": np.zeros(3)}
 
@@ -228,8 +226,8 @@ def _map_outputs_to_input_frame(scene: Scene) -> None:
     +0.51m shift was long mistaken for the floor step itself, the boxes
     "floating" whenever boxes.json was laid over the original cloud
     (user report). After this, every output artifact (boxes.json,
-    boxes_objects.json, cloud_with_boxes.ply, overlay, the HTML report,
-    the `view` subcommand) shares the input's coordinates: the render /
+    boxes_objects.json, cloud_with_boxes.ply, overlay, the `view`
+    subcommand) shares the input's coordinates: the render /
     export paths read scene.meta['align_tf'] and, with it dropped, use
     the raw gaussian file unchanged. Box ORIENTATION is kept: the align
     rotation's tilt is <= 10 deg (typically ~0.1), whose effect on a
@@ -285,8 +283,8 @@ def _render_stage(scene: Scene, tag: str, out_dir: str,
                   gt_boxes: list[OrientedBox] | None = None) -> None:
     """Save a top-down overlay PNG of the current scene state (per-stage QA).
 
-    Rendered after every pipeline stage so regressions localize at a glance:
-    stage0_align_yaw -> stageG_ground -> stageC_agent.
+    Rendered after every pipeline stage so regressions localize at a glance
+    (stage0_align_yaw / stageG_ground / stageC_agent / stageD_complete).
     """
     try:
         from agentic_gts.output.visualize import overlay_topdown
@@ -303,16 +301,14 @@ def run_pipeline(scene: Scene,
                  vlm_backend: str = "mock",
                  vlm_api_base: str | None = None,
                  vlm_model: str | None = None,
-                 vlm_thinking_model: str | None = None,
-                 vlm_thinking_base: str | None = None,
                  opts: dict | None = None,
                  out_dir: str = "runs/latest",
                  edge_threshold_m: float = 0.05) -> PipelineResult:
     """Run the unified no-hint flow, render outputs, and (optionally) evaluate.
 
     stage0 (yaw + layout bootstrap) -> stageG (global nadir VLM 2D
-    grounding) -> stageC (per-box local refine). There is no hint-box
-    input anymore: boxes come ONLY from the VLM grounding.
+    grounding) -> stageC (per-box local refine); boxes come ONLY from
+    the VLM grounding.
     """
     opts = opts or {}
     os.makedirs(out_dir, exist_ok=True)
@@ -369,7 +365,6 @@ def run_pipeline(scene: Scene,
             # correction means a genuinely multi-directional layout --
             # warned about, not looped on.
             from agentic_gts.segment.orientation import estimate_residual_yaw
-            yaw_suspect = False
             res = estimate_residual_yaw(scene.points, yaw)
             if abs(res) > math.radians(5.0):
                 fixed = math.remainder(yaw + res, math.pi / 2)
@@ -427,40 +422,30 @@ def run_pipeline(scene: Scene,
     # thin-fragment problem never arises. Failure leaves the scene
     # empty (no fallback boxes exist without hint input).
     judge = VLMJudge(backend=vlm_backend, api_base=vlm_api_base,
-                     model=vlm_model,
-                     thinking_model=vlm_thinking_model,
-                     thinking_api_base=vlm_thinking_base)
-    # record every adjudication (prompt + answer + choice + confidence)
-    # to a JSONL so the user can audit why the agent decided each issue
+                     model=vlm_model)
+    # record every adjudication to vlm_records.jsonl (audit trail,
+    # see VLMJudge.set_record)
     try:
         judge.set_record(os.path.join(out_dir, "vlm_records.jsonl"))
     except Exception as e:
         print(f"[warn] record path set failed ({type(e).__name__}: {e}")
     from agentic_gts.agent.ground import ground_stage
     # --- knife-edged yaw: arbitrate the top candidates by GROUNDING
-    # YIELD (user logs: same mesh, one run 5 regions at the true yaw,
-    # the next 2 regions at a wrong one; the candidate scores were
-    # near-tied, the truth sat at #2-3 by score and never won the
-    # argmax, and the blind residual correction landed on the truth
-    # once and 8 deg off the other time). The estimator alone cannot
-    # break the tie -- but the grounding CAN: render + ground at each
-    # top candidate direction, and let the EVIDENCE pick --
-    #   1. the fitted boxes' OWN directions (per-seed PCA, the
-    #      seed_axis_delta measurement) must AGREE with the render
-    #      yaw: at the true yaw the rows come out axis-aligned and the
-    #      votes cluster AT it; at every wrong yaw the boxes still
-    #      physically point wherever the rows are, so the votes carry
-    #      the ERROR angle -- agreement is unique to the truth;
-    #   2. most boxes wins among agreeing trials (a straight view
-    #      detects more structures than a skewed one: 5 vs 2 in the
-    #      user's logs).
-    # Fires when the residual chain failed twice OR the top-2 folded
-    # candidates are NEAR-TIED (ratio >= 0.85): the self-check measures
-    # consistency, not correctness -- a wrong yaw backed by a REAL
-    # structure at that direction (a wall, a sub-layout) re-aligns
-    # that structure and PASSES (user run 3: yaw -26.7 over a genuine
-    # -26.5 structure, residual 0.7, 2 boxes instead of the true
-    # yaw's 5). Unpinned yaw only -- stable scenes pay nothing.
+    # YIELD. On knife-edged scenes the estimator's candidate scores are
+    # near-tied and the truth can sit at #2-3 by score (user logs: 5
+    # regions at the true yaw vs 2 at a wrong one, run to run) -- the
+    # estimator alone cannot break the tie, but grounding EVIDENCE can:
+    # ground at each top candidate direction and prefer the trial whose
+    # seed-axis votes AGREE with the render yaw (agreement is unique to
+    # the truth: at every wrong yaw the boxes still physically point
+    # wherever the rows are, so the votes carry the ERROR angle; a
+    # straight view also detects more structures than a skewed one).
+    # The self-check measures CONSISTENCY, not correctness -- a wrong
+    # yaw backed by a REAL structure at that direction (wall,
+    # sub-layout) re-aligns it and PASSES (user run 3: -26.7 over a
+    # genuine -26.5 structure, residual 0.7, 2 boxes vs the true yaw's
+    # 5). Fires when the residual chain failed twice OR the top-2
+    # candidates are near-tied (ratio >= 0.85). Unpinned yaw only.
     from agentic_gts.segment.orientation import yaw_arbitration_needed
     arbitrated = False
     if ("yaw" not in opts and info.get("candidates")
@@ -532,23 +517,13 @@ def run_pipeline(scene: Scene,
         _render_stage(scene, "stageG_ground", out_dir, gt_boxes)
 
         # --- grounding feedback: yaw from the seeds' OWN directions ---
-        # The pre-render residual self-check only sees what stage0's
-        # estimator sees (the WHOLE device band -- hijack soil). The
-        # fitted seeds are the purer evidence: each grounded box's
-        # direction is MEASURED by PCA on the device-band points
-        # inside it (the boxes themselves are axis-aligned in the row
-        # frame, so their yaw carries no information), and the votes'
-        # weighted median is the layout's true direction -- local
-        # per-structure, no histogram to hijack, one stray wall-ish
-        # fit cannot drag it. The earlier pool version re-ran the
-        # GLOBAL estimator on the union of the boxes' points, a pool
-        # carved along the ASSUMED yaw: slanted rows re-confirmed the
-        # assumed yaw and residual haze kept stage0's hijack surface
-        # (user report: wrong yaw after the feedback). If the median
-        # disagrees with the render yaw, the groundview was tilted
-        # and the VLM's AABBs over skewed rows are unreliable ->
-        # correct the yaw and re-ground ONCE. Never fires when the
-        # render was already straight.
+        # The fitted seeds are purer evidence than the whole-band
+        # estimator (each box's direction is MEASURED by per-seed PCA;
+        # see seed_axis_delta -- no histogram to hijack). If the votes'
+        # weighted median disagrees with the render yaw by > 3 deg, the
+        # groundview was tilted and the VLM's AABBs over skewed rows
+        # are unreliable -> correct the yaw and re-ground ONCE. Never
+        # fires when the render was already straight.
         if "yaw" not in opts and len(scene.boxes) >= 2:
             from agentic_gts.segment.orientation import seed_axis_delta
             # top cut = the FIT pool's own (z_top + 0.10): the vote
@@ -581,9 +556,8 @@ def run_pipeline(scene: Scene,
     # --- stage C: agent loop (per-box local refine) ---
     agent = LayoutAgent(judge=judge, opts=opts, out_dir=out_dir)
     report = agent.run(scene)
-    n_res = len(report.resolved)
-    n_unres = len(report.unresolved)
-    print(f"[stageC] agent loop -> {n_res} issues resolved, {n_unres} flagged for human review")
+    print(f"[stageC] agent loop -> {len(report.unresolved)} "
+          f"issue(s) flagged for human review")
     _diag_support(scene)
     _eval("stageC")
     _render_stage(scene, "stageC_agent", out_dir, gt_boxes)
@@ -615,9 +589,7 @@ def run_pipeline(scene: Scene,
               f"(geometry-only completions, no VLM confirmation)")
 
     # --- final frame: back to the INPUT coordinates (user report) ---
-    # The pipeline works in the aligned frame; the user's cloud, GT and
-    # downstream tooling live in the RAW input frame. Map everything
-    # back so the outputs overlay the ORIGINAL cloud directly.
+    # (see _map_outputs_to_input_frame)
     _map_outputs_to_input_frame(scene)
 
     # --- outputs ---
@@ -654,15 +626,6 @@ def run_pipeline(scene: Scene,
         print(f"[warn] visualization failed: {type(e).__name__}: {e}")
     with open(os.path.join(out_dir, "agent_report.json"), "w", encoding="utf-8") as f:
         json.dump(report.to_dict(), f, ensure_ascii=False, indent=2)
-    # per-box local-view + VLM-verdict browsable report (self-contained HTML):
-    # fresh local render for every final box, verdicts from vlm_records.jsonl
-    try:
-        from agentic_gts.output.report import build_report
-        html_path = build_report(out_dir, points=scene.points,
-                                 gs_ply=scene.meta.get("gs_ply"))
-        print(f"[out] VLM verdict report -> {html_path}")
-    except Exception as e:  # report must never break the pipeline
-        print(f"[warn] VLM report failed: {type(e).__name__}: {e}")
     if evals:
         with open(os.path.join(out_dir, "eval.json"), "w", encoding="utf-8") as f:
             json.dump(evals, f, ensure_ascii=False, indent=2)

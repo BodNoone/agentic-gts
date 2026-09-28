@@ -82,11 +82,6 @@ class OrientedBox:
         rot = np.array([[c, -s], [s, c]])
         return local @ rot.T + np.asarray(self.center[:2])
 
-    def footprint_edges(self) -> list[tuple[np.ndarray, np.ndarray]]:
-        """Four (start, end) 2D edges of the footprint."""
-        cs = self.corners_2d()
-        return [(cs[i], cs[(i + 1) % 4]) for i in range(4)]
-
     def iou_2d(self, other: "OrientedBox", grid: float = 0.02) -> float:
         """Approximate 2D IoU by rasterization (robust for small yaw diffs)."""
         all_pts = np.vstack([self.corners_2d(), other.corners_2d()])
@@ -146,35 +141,6 @@ class OrientedBox:
         d["center"] = tuple(d["center"])
         d["size"] = tuple(d["size"])
         return cls(**d)
-
-
-class IssueType(str, Enum):
-    OVERSIZED = "oversized"          # box larger than point support
-    UNDERSIZED = "undersized"
-    MISSING = "missing"              # gap in row with point density but no box
-    FALSE_POSITIVE = "false_positive"
-    MERGED_ROW = "merged_row"        # multiple racks in one box
-    MERGED_NEIGHBORS = "merged_neighbors"  # two boxes may be faces of ONE rack
-    OVERLAP = "overlap"              # two boxes overlapping
-    MISALIGNED = "misaligned"        # not aligned with row direction
-    LOW_SUPPORT = "low_support"
-    WIDTH_MISFIT = "width_misfit"    # spans a non-integer number of rack units
-                                      # (e.g. 1.5 devices: one whole + a half)
-
-
-@dataclass
-class Issue:
-    issue_type: IssueType
-    box_ids: list[str]
-    region: tuple[float, float, float, float]   # xmin, ymin, xmax, ymax
-    detail: str = ""
-    severity: float = 0.5
-    issue_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
-
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        d["issue_type"] = self.issue_type.value
-        return d
 
 
 @dataclass
@@ -297,10 +263,3 @@ def save_boxes_as_objects(boxes: list, path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"objects": [_box_to_object_entry(b) for b in boxes]},
                   f, ensure_ascii=False, indent=2)
-
-
-# Standard rack dimensions (meters). Optional priors -- the pipeline
-# must work even when a machine room does not match these.
-STANDARD_RACK_WIDTHS = [0.6, 0.8]
-STANDARD_RACK_DEPTHS = [1.0, 1.1, 1.2]
-STANDARD_RACK_HEIGHT_RANGE = (1.8, 2.3)

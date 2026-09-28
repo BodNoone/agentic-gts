@@ -1,5 +1,4 @@
 """Tests for the VLM 2D grounding stage (no server / GPU needed).
-
 Covers:
   - unproject_ground: pixel -> world roundtrip through the god-view cam
   - _fit_region_box: a region rect becomes a FULL-DEPTH box (the
@@ -7,18 +6,12 @@ Covers:
   - ground_stage end-to-end with a patched VLM answer (scatter path)
 """
 from __future__ import annotations
-
 import math
 import os
 import sys
-
 import numpy as np
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from agentic_gts.core.models import Scene
-
-
 def _row_points(x0, x1, y=0.0, depth=1.1, height=2.1, rng=None, n=6000):
     """A closed-cabinet row: two face bands + TOP face + hollow
     interior (surface points only, like a real 3DGS / mesh sampling of
@@ -35,14 +28,10 @@ def _row_points(x0, x1, y=0.0, depth=1.1, height=2.1, rng=None, n=6000):
                                 rng.uniform(y - half, y + half, n // 2),
                                 np.full(n // 2, height - 0.05)]))
     return np.vstack(pts)
-
-
 def _bootstrap_meta(scene, footprint, z_top=2.1):
     """Fill scene.meta the way stage0's estimate_yaw_detailed does."""
     scene.meta["z_top"] = z_top
     scene.meta["device_footprint"] = footprint
-
-
 def _vlm_px(uv, W, H, off=(0, 0)):
     """Full-frame pixel coords -> the (possibly CROPPED) view's pixel
     rect, clamped like a real VLM reply (projections through the cam
@@ -50,8 +39,6 @@ def _vlm_px(uv, W, H, off=(0, 0)):
     x = np.clip(np.asarray(uv)[:, 0] - off[0], 0, W)
     y = np.clip(np.asarray(uv)[:, 1] - off[1], 0, H)
     return (float(x.min()), float(y.min()), float(x.max()), float(y.max()))
-
-
 def test_render_topdown_tilt_camera_geometry():
     """Recall tilt views (user direction 1): the L/R cameras deviate
     from vertical by ~tilt_deg along the ROW-frame cross axis (eye on
@@ -60,7 +47,6 @@ def test_render_topdown_tilt_camera_geometry():
     camera still closes (unproject_ground handles non-nadir rays)."""
     from agentic_gts.agent import ground
     from agentic_gts.output.gs_render import unproject_ground
-
     rng = np.random.default_rng(11)
     pts = np.vstack([_row_points(0.0, 6.0, y=0.0, rng=rng),
                      _row_points(0.0, 6.0, y=3.0, rng=rng)])
@@ -102,8 +88,6 @@ def test_render_topdown_tilt_camera_geometry():
             f"{np.abs(back[:, :2] - world[:, :2]).max():.4f} m"
     print("PASS tilt camera geometry (L/R eyes, 20 deg sight lines, "
           "roundtrip closed)")
-
-
 def test_ground_stage_tilt_views_add_recall():
     """End-to-end recall (user direction 1): the nadir view outlines
     only row 1; the tilted R view ALSO sees row 2 and a lone AC block
@@ -113,7 +97,6 @@ def test_ground_stage_tilt_views_add_recall():
     pixel->world->snap->fit path."""
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
-
     rng = np.random.default_rng(17)
     row1 = _row_points(0.0, 6.0, y=0.0, rng=rng)
     row2 = _row_points(0.0, 6.0, y=3.0, rng=rng)
@@ -122,7 +105,6 @@ def test_ground_stage_tilt_views_add_recall():
     scene.meta["yaw"] = 0.0
     _bootstrap_meta(scene, (-0.5, -0.8, 9.5, 3.8))
     scene.boxes = []
-
     _, cam0, _, _, off0 = ground._render_topdown(scene, 0.0)
     _, camL, _, _, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
                                               tilt_dir=-1)
@@ -150,7 +132,6 @@ def test_ground_stage_tilt_views_add_recall():
                                      # cluster net recovers row2 instead
                                      ((-0.2, 6.2), (-0.6, 3.6))]),
     }
-
     def _fake_ground(png, W_, H_, png_path=None):
         name = os.path.basename(png_path or "groundview.png")
         cam, specs = view_rects[name]
@@ -164,7 +145,6 @@ def test_ground_stage_tilt_views_add_recall():
                           float(np.clip(uv[:, 0].max() - o[0], 0, W_)),
                           float(np.clip(uv[:, 1].max() - o[1], 0, H_))))
         return rects
-
     judge = VLMJudge(backend="qwen")
     judge.ground_regions = _fake_ground
     import tempfile
@@ -193,8 +173,6 @@ def test_ground_stage_tilt_views_add_recall():
             f"spanning tilt rect leaked through"
     print("PASS tilt views add recall (nadir missed 2, tilted R "
           "recovered both, spanning rect skipped)")
-
-
 def test_render_topdown_mesh_framing_layout():
     """Groundview framing uses the DEVICE LAYOUT (bootstrap) for a MESH
     too -- not the whole-cloud bbox. Long-tail mesh noise (background
@@ -204,7 +182,6 @@ def test_render_topdown_mesh_framing_layout():
     12x8 room make the room centre and the layout centre 3m+ apart, so
     the branch taken is unambiguous."""
     from agentic_gts.agent import ground
-
     rng = np.random.default_rng(23)
     wall = []
     for _x0, _x1, _y0, _y1 in ((-6, 6, -4, -3.8), (-6, 6, 3.8, 4),
@@ -217,7 +194,6 @@ def test_render_topdown_mesh_framing_layout():
     pts = np.vstack(wall + [dev])
     room_c = (float(pts[:, 0].min() + pts[:, 0].max()) / 2.0,
               float(pts[:, 1].min() + pts[:, 1].max()) / 2.0)
-
     scene = Scene(points=pts)
     scene.meta["yaw"] = 0.0
     _bootstrap_meta(scene, (2.8, 0.6, 5.8, 3.2))     # layout centre (4.3, 1.9)
@@ -232,8 +208,6 @@ def test_render_topdown_mesh_framing_layout():
         "mesh framing must NOT use the whole-cloud room centre"
     print(f"PASS mesh framing uses the layout (layout (4.3,1.9) vs room "
           f"({room_c[0]:.1f},{room_c[1]:.1f}))")
-
-
 def test_unproject_ground_roundtrip():
     from agentic_gts.output.gs_render import (make_godview_cam,
                                               unproject_ground)
@@ -249,8 +223,6 @@ def test_unproject_ground_roundtrip():
     assert np.allclose(back[:, :2], world[:, :2], atol=0.01), \
         f"roundtrip error {np.abs(back[:, :2] - world[:, :2]).max():.4f} m"
     print("PASS unproject_ground roundtrip (nadir cam, 1cm)")
-
-
 def test_fit_region_box_full_depth():
     from agentic_gts.agent.ground import _fit_region_box
     rng = np.random.default_rng(7)
@@ -274,8 +246,6 @@ def test_fit_region_box_full_depth():
     assert _fit_region_box(floor, (-1.2, -1.2, 1.2, 1.2)) is None
     print(f"PASS region fit full depth "
           f"(L={bb.size[0]:.2f} D={bb.size[1]:.2f} H={bb.size[2]:.2f})")
-
-
 def test_fit_region_box_haze_immune():
     """The middle-slice strong-bin fit does not flinch at 3DGS aisle
     haze inside a loose rect: the sheets are tall narrow bins, haze is
@@ -298,8 +268,6 @@ def test_fit_region_box_haze_immune():
         f"depth {bb.size[1]:.2f} (haze inflated the faces?)"
     print(f"PASS region fit haze-immune "
           f"(L={bb.size[0]:.2f} D={bb.size[1]:.2f})")
-
-
 def test_fit_region_box_starved_back_face():
     """A rack row whose BACK face is much sparser than the front (the
     wall-facing side of a 3DGS reconstruction) must keep its FULL
@@ -312,7 +280,6 @@ def test_fit_region_box_starved_back_face():
     >= 15% of the front) and falls back to the percentile extent when
     the peel still collapses (< 50% of P0.5-P99.5)."""
     from agentic_gts.agent.ground import _fit_region_box, _region_axis_span
-
     # direct estimator checks on the depth axis
     for n_back in (1200, 600):        # 20% and 10% of the front face
         v = np.concatenate([np.full(6000, 2.45), np.full(n_back, 3.55)])
@@ -330,7 +297,6 @@ def test_fit_region_box_starved_back_face():
     span = _region_axis_span(v)
     assert span is not None and 3.4 < span[1] < 3.7, \
         f"haze extended the span to {span}"
-
     # MESH mode (user directive: NO denoising at all): a wide main
     # body plus a detached thin section at 5% of the peak bin -- the
     # anti-haze peel trims it in GS mode; mesh mode must keep the
@@ -343,7 +309,6 @@ def test_fit_region_box_starved_back_face():
     span_strict = _region_axis_span(v)
     assert span_strict is not None and span_strict[1] < 3.2, \
         f"strict mode must still trim the 5% section: {span_strict}"
-
     # end-to-end: a row with a starved back face keeps a full-depth box
     for n_back in (1200, 300):
         front = np.column_stack([rng.uniform(0.0, 6.0, 6000),
@@ -359,8 +324,6 @@ def test_fit_region_box_starved_back_face():
         assert 0.85 < bb.size[1] < 1.35, \
             f"depth {bb.size[1]:.2f} (want ~1.1, back face dropped?)"
     print("PASS region fit starved-back-face (full depth kept)")
-
-
 def test_robust_span_bin_boundary():
     """_robust_span must not drop the topmost values: a mass sitting
     EXACTLY on a bin boundary (3.55) once fell beyond arange's last
@@ -374,8 +337,6 @@ def test_robust_span_bin_boundary():
     assert span[1] - span[0] > 1.0, \
         f"span {span} collapsed (top-of-range mass dropped)"
     print(f"PASS robust span bin boundary ({span[0]:.2f}..{span[1]:.2f})")
-
-
 def test_ground_stage_with_patched_vlm():
     """End-to-end grounding on the scatter path: the VLM answer is
     fabricated by projecting the TRUE row rects through the same cam the
@@ -383,7 +344,6 @@ def test_ground_stage_with_patched_vlm():
     is exercised without a server."""
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
-
     rng = np.random.default_rng(3)
     # two parallel rows, the classic thin-fragment setup
     pts = np.vstack([_row_points(0.0, 6.0, y=0.0, rng=rng),
@@ -424,9 +384,7 @@ def test_ground_stage_with_patched_vlm():
     reply = ("Row 1: one long joined row at the bottom.\n"
              "Row 2: one long joined row above it.\n"
              + _json.dumps(regions))
-
     judge = VLMJudge(backend="qwen")
-
     def _fake_call(png, prompt, *a, **k):
         return reply
     judge._qwen_image_call = _fake_call    # canned VLM answer
@@ -471,8 +429,6 @@ def test_ground_stage_with_patched_vlm():
     print(f"PASS ground stage end-to-end "
           f"(row1 {rows[0].size[0]:.2f}x{rows[0].size[1]:.2f}, "
           f"row2 {b2.size[0]:.2f}x{b2.size[1]:.2f})")
-
-
 def test_fit_region_box_row_along_y():
     """A row running along the ROTATED-Y axis: the fit must ride the
     long side on the yaw axis (yaw = pi/2, size = (length, depth)). A
@@ -501,8 +457,6 @@ def test_fit_region_box_row_along_y():
         "y extent must be the row length"
     print(f"PASS region fit rides the long side on yaw "
           f"(y-row: yaw=pi/2, L={bb.size[0]:.2f}, D={bb.size[1]:.2f})")
-
-
 def test_floor_map_stepped():
     """Stepped room (small level change): _floor_map must recover each
     section's own floor so height-relative band cuts work again over
@@ -534,8 +488,6 @@ def test_floor_map_stepped():
     assert 1.9 < hh_top.max() < 2.3, \
         f"raised rack height {hh_top.max():.2f} (want ~2.1)"
     print(f"PASS floor map stepped (lower {f_lo:.3f}, raised {f_hi:.3f})")
-
-
 def test_fit_region_box_stepped_floor():
     """A rack standing on a raised slab (floor_z = 0.4): the fitted box
     must BOTTOM on the slab and carry the TRUE rack height -- without
@@ -557,8 +509,6 @@ def test_fit_region_box_stepped_floor():
         f"slab-to-top)"
     print(f"PASS region fit over raised floor "
           f"(bottom {bottom:.2f}, height {bb.size[2]:.2f})")
-
-
 def test_fit_region_boxes_two_rows_in_one_rect():
     """One VLM rect drawn around TWO opposing rows (front + back, an
     aisle between): the union-depth fit must SPLIT across the thickness
@@ -583,8 +533,6 @@ def test_fit_region_boxes_two_rows_in_one_rect():
         f"piece centres {ys} (must sit on the two rows, ~ +/-0.9)"
     print(f"PASS deep rect split (2 rows, centres y={ys[0]:.2f}/{ys[1]:.2f}, "
           f"depth {bbs[0].size[1]:.2f}/{bbs[1].size[1]:.2f})")
-
-
 def test_fit_region_boxes_solid_deep_structure_kept():
     """A genuinely deep SOLID block with no aisle gap: no split is
     possible (no weak run), and the fit must stay whole rather than
@@ -597,8 +545,6 @@ def test_fit_region_boxes_solid_deep_structure_kept():
         f"a solid deep block has no gap to split at, got {len(bbs)}"
     assert 2.0 < bbs[0].size[1] < 2.45, "depth must stay the whole extent"
     print(f"PASS solid deep block kept whole (depth {bbs[0].size[1]:.2f})")
-
-
 def test_render_cut_mesh_mode():
     """mesh_mode trims the nadir render at HALF height: mesh cable
     trays are real gapless geometry that drags z_top up with them, so
@@ -614,8 +560,6 @@ def test_render_cut_mesh_mode():
     # low structures keep the 1.0m floor in both modes
     assert _render_cut(0.9, mesh_mode=True) == 0.8
     print(f"PASS render cut mesh mode (gs {gs}, mesh {mesh})")
-
-
 def test_cluster_pool_tray_stitch():
     """MESH recall-net blind spot (user report: with --mesh-cloud the
     grounding still misses many devices DESPITE the cluster recall
@@ -650,8 +594,6 @@ def test_cluster_pool_tray_stitch():
         f"render-cut pool must give 2 row clusters (got {len(cands)})"
     print(f"PASS cluster tray stitch (fit-pool {len(merged)} cluster, "
           f"render-cut pool {len(cands)} clusters)")
-
-
 def test_render_keep_mask_opacity_dual_band():
     """Opacity-aware dual-band floor cut: a SOLID gaussian (opacity
     >= 0.5) is real geometry and keeps the band from 0.30m -- a 0.7m
@@ -678,8 +620,6 @@ def test_render_keep_mask_opacity_dual_band():
         assert bool(got) is want, \
             f"h={h:.2f} op={o:.2f}: keep={bool(got)}, want {want}"
     print("PASS render keep mask (opacity dual band)")
-
-
 def test_cluster_candidates_basic():
     """The cluster recall net: after the ground / top cuts the fit
     pool holds nothing but walls, devices and junk (user insight) --
@@ -718,8 +658,6 @@ def test_cluster_candidates_basic():
     assert len(cands_h) == 3, "haze cells must not become clusters"
     print("PASS cluster candidates (3 blobs, coverage filter, "
           "haze-immune)")
-
-
 def test_wall_adjacent_devices():
     """Devices standing AGAINST a wall (user question): the wall
     merges into the device's density cluster, so the net must not
@@ -733,7 +671,6 @@ def test_wall_adjacent_devices():
     from agentic_gts.agent.ground import (_cross_gap_split,
                                           _fit_region_boxes,
                                           _rect_covered)
-
     # (a) reverse containment: VLM rect = the device only, cluster =
     # wall + gap + device (much bigger area -> forward containment
     # fails, reverse must hold)
@@ -741,7 +678,6 @@ def test_wall_adjacent_devices():
     vlm_rect = (0.0, 0.0, 6.0, 1.1)
     assert _rect_covered(cluster, vlm_rect), \
         "wall+device blob must read as covered by the device-only rect"
-
     # (b) missed device against a wall: row y in [-0.55, 0.55], wall
     # sheet at y = 1.05 (0.2m thick) -> gap 0.5m, blob depth 1.8m.
     # The strict min_side (0.40) rejects the wall/device gap (the wall
@@ -773,8 +709,6 @@ def test_wall_adjacent_devices():
         "hollow-row faces must stay glued under the default min_side"
     print(f"PASS wall-adjacent devices (covered reverse-containment, "
           f"fit depth {b.size[1]:.2f}m wall-free)")
-
-
 def test_ground_stage_cluster_recall():
     """The VLM MISSED a whole row on the nadir view (user report: a
     clean view cannot always be split into the wanted categories and
@@ -787,7 +721,6 @@ def test_ground_stage_cluster_recall():
     out-supports real boxes and would eat them in the dedup."""
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
-
     rng = np.random.default_rng(3)
     pts = np.vstack([_row_points(0.0, 6.0, y=0.0, rng=rng),
                      _row_points(-1.0, 5.0, y=3.0, rng=rng)])
@@ -816,9 +749,7 @@ def test_ground_stage_cluster_recall():
                       int(round(px[2] / W * 1000)),
                       int(round(px[3] / H * 1000))],
           "label": "row"}]))
-
     judge = VLMJudge(backend="qwen")
-
     def _fake_call(png, prompt, *a, **k):
         return reply                         # grounding: row 1 only
     judge._qwen_image_call = _fake_call
@@ -838,8 +769,6 @@ def test_ground_stage_cluster_recall():
     assert 5.0 < scene.boxes[-1].size[0] < 6.5, \
         "recovered row keeps its length"
     print("PASS ground stage cluster recall (missed row recovered)")
-
-
 def test_ground_stage_adjacent_clump_recall():
     """The recall net's coverage must judge what was ACTUALLY
     DETECTED (user report: the net never fired, obvious rectangular
@@ -851,7 +780,6 @@ def test_ground_stage_adjacent_clump_recall():
     re-propose it."""
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
-
     rng = np.random.default_rng(17)
     row = _row_points(0.0, 6.0, y=0.0, rng=rng)
     # LOW AC-sized clump 1.5m off the row's end (z up to 0.65m): the
@@ -882,9 +810,7 @@ def test_ground_stage_adjacent_clump_recall():
                       int(round(px[2] / W * 1000)),
                       int(round(px[3] / H * 1000))],
           "label": "row"}]))
-
     judge = VLMJudge(backend="qwen")
-
     def _fake_call(png, prompt, *a, **k):
         return reply
     judge._qwen_image_call = _fake_call
@@ -901,8 +827,6 @@ def test_ground_stage_adjacent_clump_recall():
         f"the clump must get its own box, got centre {acb.center[:2]} " \
         f"size {acb.size[:2]}"
     print("PASS adjacent clump recall (point coverage, not rect area)")
-
-
 def test_floor_map_mesh_mode():
     """mesh_mode: a mesh sampling has no under-floor haze, so a tile's
     floor is its plain MINIMUM z -- even when the slab is sparsely
@@ -921,8 +845,6 @@ def test_floor_map_mesh_mode():
     assert -0.05 < f_lo <= 0.02, f"lower floor {f_lo:.3f} (want the min)"
     assert 0.38 < f_hi <= 0.42, f"raised floor {f_hi:.3f} (want the min)"
     print(f"PASS floor map mesh mode (lower {f_lo:.3f}, raised {f_hi:.3f})")
-
-
 def test_tile_frames():
     """Tiling decision: a layout that fits ONE nadir view stays
     single-view (no extra VLM calls); a big layout tiles with exact
@@ -946,8 +868,6 @@ def test_tile_frames():
     for t in tiles:
         assert t[2] - t[0] <= _MAX_SINGLE_SPAN + 1e-9
     print(f"PASS tile frames (60m -> {len(tiles)} tiles, seams ok)")
-
-
 def test_ground_stage_tiled_views():
     """End-to-end TILED grounding: a 40m layout exceeds one nadir view,
     so the stage renders per-tile cameras and calls the VLM once per
@@ -959,7 +879,6 @@ def test_ground_stage_tiled_views():
     import tempfile
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
-
     rng = np.random.default_rng(31)
     pts = _row_points(0.0, 40.0, y=0.0, rng=rng, n=20000)
     scene = Scene(points=pts)
@@ -974,7 +893,6 @@ def test_ground_stage_tiled_views():
     with tempfile.TemporaryDirectory() as td:
         calls = []
         orig = judge._qwen_image_call
-
         def _count(png, prompt, *a, **k):
             calls.append(1)
             return orig(png, prompt, *a, **k)
@@ -993,8 +911,6 @@ def test_ground_stage_tiled_views():
             "the two tile pieces together still cover the 40m row"
         print(f"PASS tiled grounding ({len(calls)} VLM calls -> " \
               f"{len(scene.boxes)} tile pieces, SOURCE-RECT GATE)")
-
-
 def test_ground_stage_row_along_y():
     """End-to-end grounding of a joined row running along the y-axis:
     the emitted box must carry yaw = pi/2, or the downstream local
@@ -1003,7 +919,6 @@ def test_ground_stage_row_along_y():
     import tempfile
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
-
     rng = np.random.default_rng(3)
     row = _row_points(0.0, 6.0, rng=rng)
     row = row[:, [1, 0, 2]]       # the row now runs along y
@@ -1035,8 +950,6 @@ def test_ground_stage_row_along_y():
     assert abs(b.center[1] - 3.0) < 0.2, "centre must sit on the row"
     print(f"PASS ground stage y-row "
           f"(yaw=pi/2, L={b.size[0]:.2f}, D={b.size[1]:.2f})")
-
-
 def test_yaw_bootstrap_byproducts():
     """The hint-free bootstrap: estimate_yaw_detailed's surviving cells
     (device layout; walls dropped as boundary cells, ceiling outside
@@ -1076,8 +989,6 @@ def test_yaw_bootstrap_byproducts():
         f"footprint y must hug the rows: {fp}"
     print(f"PASS yaw bootstrap byproducts "
           f"(z_top={z_top:.2f}, footprint={tuple(round(v, 2) for v in fp)})")
-
-
 def test_ground_stage_bootstrap_driven():
     """Grounding end-to-end driven purely by the stage0 bootstrap
     byproducts (meta z_top + device_footprint): no box input of any
@@ -1087,7 +998,6 @@ def test_ground_stage_bootstrap_driven():
     import tempfile
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
-
     rng = np.random.default_rng(3)
     pts = np.vstack([_row_points(0.0, 6.0, y=0.0, rng=rng),
                      _row_points(-1.0, 5.0, y=3.0, rng=rng)])
@@ -1128,8 +1038,6 @@ def test_ground_stage_bootstrap_driven():
     print(f"PASS bootstrap-driven ground stage "
           f"(row1 {rows[0].size[0]:.2f}x{rows[0].size[1]:.2f}, "
           f"row2 {rows[1].size[0]:.2f}x{rows[1].size[1]:.2f})")
-
-
 def test_nadir_framing_tight_for_rotated_layout():
     """Regression: rotated layouts must not DOUBLE-inflate the nadir
     framing. The old path AABB'd the kept cells in WORLD frame (a 45-deg
@@ -1179,8 +1087,6 @@ def test_nadir_framing_tight_for_rotated_layout():
     assert fill_w > 0.55, f"cells fill only {fill_w:.0%} of the width"
     assert fill_h > 0.70, f"cells fill only {fill_h:.0%} of the height"
     print(f"PASS rotated-layout framing tight (fill {fill_w:.0%} x {fill_h:.0%})")
-
-
 def test_render_cut_relative_not_conservative():
     """The nadir render cut is RELATIVE (user decision: the view only
     needs each device's basic features, not a complete structure, and
@@ -1200,8 +1106,6 @@ def test_render_cut_relative_not_conservative():
     # no reference at all -> no cut
     assert math.isinf(_render_cut(None)) and math.isinf(_render_cut(0.0))
     print("PASS relative render cut (70% of top, low structures kept)")
-
-
 def test_parse_ground_regions_official_format():
     """The official Qwen3-VL grounding reply format (per the 2d_grounding
     cookbook) parses correctly: bare JSON array of {"bbox_2d": [x1,y1,
@@ -1237,11 +1141,8 @@ def test_parse_ground_regions_official_format():
     # noise / no JSON -> nothing
     assert _parse_ground_regions("just prose, no json", W, H) == []
     print("PASS parse official bbox_2d (0-1000 relative, fences, legacy)")
-
-
 def test_parse_ground_regions_salvage():
     """Truncated + malformed reply still yields every COMPLETE bbox.
-
     Real Qwen reply shape on row-heavy rooms (user report): objects
     wrapped in parentheses instead of a JSON array, 'bbox 2d' /
     'bbox _2d' key typos, and the tail cut off mid-item by the token
@@ -1267,12 +1168,9 @@ def test_parse_ground_regions_salvage():
         '("bbox 2d": [1100, 20, 1200, 900])', 1280, 1024)
     assert big and abs(big[0][2] - 1200.0) < 1e-6
     print("PASS parse salvage (truncated + malformed reply recovered)")
-
-
 def test_ground_mock_returns_false():
     """Mock backend / no VLM -> grounding fails soft: the scene stays
     EMPTY (there are no fallback boxes without hint input).
-
     The failure must also be VISIBLE: grounded.png is written with a
     red GROUNDING FAILED banner (previously it only appeared on
     success, so a failed run left nothing but raw renders)."""
@@ -1294,8 +1192,6 @@ def test_ground_mock_returns_false():
     assert scene.boxes == [], \
         "grounding failure must leave the scene empty (no fallback)"
     print("PASS grounding fails soft (mock, scene stays empty)")
-
-
 def test_merge_adjacent_boxes():
     """Tightly-adjacent over-split pieces of ONE row merge into their
     point-support-refitted union; separate rows with an EMPTY lateral
@@ -1364,8 +1260,6 @@ def test_merge_adjacent_boxes():
     assert len(out5) == 1, "dense device bridge must merge"
     print(f"PASS adjacency merge ({m.size[0]:.2f}m union; empty-gap, "
           f"corner-kiss and haze-gap kept separate; dense bridge merged)")
-
-
 def test_merge_adjacent_tray_bridge():
     """MESH tray bridge (user report: close devices with NO overlap on
     the groundview still merged): the fit pool (0.30 .. z_top+0.10)
@@ -1402,8 +1296,6 @@ def test_merge_adjacent_tray_bridge():
         f"tray-bridged close devices must stay separate on the " \
         f"render-cut pool; got {len(out)}"
     print("PASS tray bridge (probe on render-cut pool stays separate)")
-
-
 def test_containment_2d_nested():
     """containment_2d sees what iou_2d cannot: a small box nested in a
     big one has IoU = area ratio (< 0.5) but containment ~1.0."""
@@ -1426,8 +1318,6 @@ def test_containment_2d_nested():
                      yaw=0.0)
     assert far.containment_2d(big) == 0.0 and big.containment_2d(far) == 0.0
     print("PASS containment_2d (nested cross-yaw seen, disjoint zero)")
-
-
 def test_ground_stage_nested_region_dropped():
     """End-to-end: the VLM outlines the WHOLE row and ALSO a sub-section
     of it cross-ways (rect taller than wide in the row frame -> fitted
@@ -1437,7 +1327,6 @@ def test_ground_stage_nested_region_dropped():
     import tempfile
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
-
     rng = np.random.default_rng(3)
     pts = np.vstack([_row_points(0.0, 6.0, y=0.0, rng=rng),
                      _row_points(-1.0, 5.0, y=3.0, rng=rng)])
@@ -1477,8 +1366,6 @@ def test_ground_stage_nested_region_dropped():
     assert abs(rows[0].center[1]) < 0.2
     assert abs(rows[1].center[1] - 3.0) < 0.2, "row 2 untouched"
     print("PASS nested region dropped by the containment guard")
-
-
 def test_ground_stage_merges_over_split_regions():
     """End-to-end: the VLM over-split ONE row into two TIGHT rects
     (regular layout mis-read); the two fitted pieces must merge back
@@ -1487,7 +1374,6 @@ def test_ground_stage_merges_over_split_regions():
     import tempfile
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
-
     rng = np.random.default_rng(3)
     pts = np.vstack([_row_points(0.0, 6.0, y=0.0, rng=rng),
                      _row_points(-1.0, 5.0, y=3.0, rng=rng)])
@@ -1531,8 +1417,6 @@ def test_ground_stage_merges_over_split_regions():
     assert abs(rows[2].center[1] - 3.0) < 0.2
     print(f"PASS ground-stage over-split rects stay separate "
           f"(SOURCE-RECT GATE, pieces {rows[0].size[0]:.2f}m each)")
-
-
 def test_ground_stage_tiled_skips_tilts():
     """End-to-end: a TILED layout renders one nadir call per tile and NO
     tilt views (user insight: the perspective nadir + tile overlap
@@ -1542,7 +1426,6 @@ def test_ground_stage_tiled_skips_tilts():
     import tempfile
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
-
     rng = np.random.default_rng(41)
     pts = _row_points(0.0, 40.0, y=0.0, rng=rng, n=20000)
     scene = Scene(points=pts)
@@ -1564,8 +1447,6 @@ def test_ground_stage_tiled_skips_tilts():
         assert _os.path.exists(_os.path.join(td, "groundview_t0.png")), \
             "the nadir tile render is still produced"
     print(f"PASS tiled skips tilts ({len(calls)} nadir calls, no tilt views)")
-
-
 def test_oversized_blob_guard():
     """A box far too 'fat' on its SHORTER axis is a blob, not a device
     row: dropped before the local refine. Long thin rows and back-to-back
@@ -1579,8 +1460,6 @@ def test_oversized_blob_guard():
     dbl = OrientedBox(center=(0.0, 0.0, 1.0), size=(10.0, 2.2, 2.0), yaw=0.0)
     assert not _oversized_blob(dbl), "back-to-back double row must survive"
     print("PASS oversized blob guard (fat dropped, long row kept)")
-
-
 def test_ground_stage_drops_oversized_blob():
     """End-to-end: a VLM rect around a big supported field fits a fat
     blob -> dropped in stageG (before stageC), leaving no oversized box."""
@@ -1588,7 +1467,6 @@ def test_ground_stage_drops_oversized_blob():
     import tempfile
     from agentic_gts.agent import ground
     from agentic_gts.agent.judge import VLMJudge
-
     rng = np.random.default_rng(51)
     n = 40000
     field = np.column_stack([rng.uniform(-3.0, 3.0, n),
@@ -1608,8 +1486,6 @@ def test_ground_stage_drops_oversized_blob():
         "oversized blob must be dropped, got " \
         f"{[(round(b.size[0], 1), round(b.size[1], 1)) for b in scene.boxes]}"
     print("PASS ground stage drops oversized blob")
-
-
 def test_fit_region_box_uses_own_points_floor():
     """floor_at (per-point): the box bottom comes from the rect's OWN
     points, not the rect CENTRE. A rect whose centre sits on a raised
@@ -1634,8 +1510,6 @@ def test_fit_region_box_uses_own_points_floor():
         f"bottom must sit on the DEVICE's floor (~0), got {bottom:.2f}"
     assert abs(bb.size[2] - 2.1) < 0.05, f"height {bb.size[2]:.2f}"
     print("PASS fit region box uses its OWN points' floor (not the centre)")
-
-
 def test_fit_region_box_seed_top_is_local_height():
     """On a raised slab (floor_at = 0.4 everywhere) the box bottom sits
     on the slab and the top is slab + seed_top -- seed_top is a HEIGHT
@@ -1662,8 +1536,6 @@ def test_fit_region_box_seed_top_is_local_height():
     assert abs(top - 2.5) < 0.05, \
         f"top = slab + seed_top = 2.5, got {top:.2f}"
     print("PASS fit region box seed_top is a local height (slab + height)")
-
-
 def test_floor_at_local_rotates_back():
     """floor_at_local must map ROTATED (row-frame) coords back to WORLD
     before the floor lookup. Regression for the bug that lifted
@@ -1671,10 +1543,8 @@ def test_floor_at_local_rotates_back():
     coords, hitting the wrong step (flat rooms hid it, every lookup ~0)."""
     from agentic_gts.agent.ground import _floor_at_local
     yaw = math.radians(30.0)
-
     def fl(wx, wy):
         return np.where(np.asarray(wx, dtype=float) > 0.0, 0.6, 0.0)
-
     f = _floor_at_local(fl, yaw)
     assert abs(float(f(1.0, 0.0)) - 0.6) < 1e-9, "local +x -> world +x"
     assert abs(float(f(-1.0, 0.0)) - 0.0) < 1e-9, "local -x -> world -x"
@@ -1683,8 +1553,6 @@ def test_floor_at_local_rotates_back():
     assert abs(float(f(-0.5, -1.0)) - 0.6) < 1e-9, \
         "local -> world rotation must be applied before the lookup"
     print("PASS floor_at_local rotates local -> world before lookup")
-
-
 def test_fit_region_box_rotated_stepped_floor():
     """Regression for the wrong-frame floor lookup: with a nonzero yaw
     and a stepped floor, a device on the LOW side must not be lifted
@@ -1694,10 +1562,8 @@ def test_fit_region_box_rotated_stepped_floor():
     import math
     from agentic_gts.agent.ground import _fit_region_box, _floor_at_local
     yaw = math.radians(30.0)
-
     def fl_world(wx, wy):
         return np.where(np.asarray(wx, dtype=float) > 0.0, 0.6, 0.0)
-
     rng = np.random.default_rng(9)
     n = 3000
     half = 0.55
@@ -1721,8 +1587,6 @@ def test_fit_region_box_rotated_stepped_floor():
     assert abs(bottom) < 0.05, \
         f"bottom must be the LOW floor (0), got {bottom:.2f} (wrong-step bug)"
     print("PASS rotated stepped floor (local->world floor lookup in the fit)")
-
-
 def test_floor_map_mesh_step_fine():
     """A stepped MESH: a FINE floor tile must return the RAISED floor on
     the raised section (not the low floor of a straddling coarse tile),
@@ -1752,8 +1616,6 @@ def test_floor_map_mesh_step_fine():
     assert abs(float(np.median(h_lo))) < 0.05, \
         f"low floor must read h~0, got {np.median(h_lo):.2f}"
     print("PASS mesh floor map step (raised floor reads h~0, fine tiles)")
-
-
 def test_grounding_frame_hugs_layout_not_cloud():
     """Long-tail mesh noise (background far outside the room) must NOT
     inflate the grounding frame: framing uses the bootstrap device
@@ -1775,8 +1637,6 @@ def test_grounding_frame_hugs_layout_not_cloud():
     assert abs(lo[0] - (-3.0 - _FRAME_MARGIN)) < 1e-6
     assert abs(hi[0] - (3.0 + _FRAME_MARGIN)) < 1e-6
     print("PASS grounding frame hugs the layout (far background ignored)")
-
-
 def test_huge_rect_guard():
     """A VLM rect covering > half the view is a hedge box (whole room /
     large floor / background), not a device row -- rejected before the
@@ -1788,7 +1648,6 @@ def test_huge_rect_guard():
     assert not _huge_rect((0, 150, 1280, 850), W, H), "a row band is not"
     assert not _huge_rect((100, 400, 1180, 600), W, H), "a thin band is not"
     print("PASS huge-rect guard (hedge boxes rejected, row bands kept)")
-
 
 def test_floor_map_mesh_rejects_overhead_only_tiles():
     """A mesh tile with only overhead structure (no floor points) must
@@ -1807,8 +1666,6 @@ def test_floor_map_mesh_rejects_overhead_only_tiles():
     vf = float(fl(-3.0, 0.0))        # over the real floor
     assert abs(vf) < 0.1, f"real floor must read ~0, got {vf:.2f}"
     print("PASS mesh floor map rejects overhead-only tiles")
-
-
 def test_render_topdown_crops_to_tile_footprint():
     """Long-thin layouts: the nadir camera is driven by the LONG axis,
     so the room fills only a thin band and the rest of the frame is
@@ -1847,8 +1704,6 @@ def test_render_topdown_crops_to_tile_footprint():
         "rect + offset must back-project to the world point"
     print(f"PASS nadir crop to the tile footprint "
           f"({W}x{H}, off={off}, roundtrip closed)")
-
-
 def test_thin_structure_mask():
     """Trails die, sheets keep their FULL extent: the groundview
     thin-structure remover separates 1-D streaks from 2-D surface
@@ -1876,8 +1731,6 @@ def test_thin_structure_mask():
     # tiny input: no cleaning (never nuke a sparse view)
     assert _thin_structure_mask(np.zeros((10, 3))).all()
     print("PASS thin-structure mask (trail removed, sheet intact)")
-
-
 def test_fit_region_box_angled_ob():
     """Fan-shaped rooms: a structure angled 20 deg to the frame fits as
     an OBB seed in its own principal frame (footprint ~0.6x1.1 at yaw
@@ -1889,14 +1742,11 @@ def test_fit_region_box_angled_ob():
     rng = np.random.default_rng(71)
     yaw_d = math.radians(20.0)
     c, s = math.cos(yaw_d), math.sin(yaw_d)
-
     def dev(u, v, z):
         return np.column_stack([c * u - s * v, s * u + c * v, z])
-
     def face(u0, u1, v0, v1, z0, z1):
         return dev(rng.uniform(u0, u1, 8000), rng.uniform(v0, v1, 8000),
                    rng.uniform(z0, z1, 8000))
-
     pts = np.vstack([
         face(-0.30, 0.30, -0.55, -0.50, 0.0, 2.0),   # back sheet
         face(-0.30, 0.30, 0.50, 0.55, 0.0, 2.0),     # front sheet
@@ -1913,8 +1763,6 @@ def test_fit_region_box_angled_ob():
     assert abs(bb.size[0] - 1.1) < 0.12, f"long {bb.size[0]:.2f} (want ~1.1)"
     assert abs(bb.size[1] - 0.6) < 0.12, f"short {bb.size[1]:.2f} (want ~0.6)"
     print("PASS fit region box angled OBB (20 deg device -> true footprint)")
-
-
 def test_fit_region_box_aligned_flip_untouched():
     """An ALIGNED single cabinet keeps the existing flip convention
     (depth on the cross axis -> yaw = pi/2, size[0] = depth): the PCA
@@ -1924,12 +1772,10 @@ def test_fit_region_box_aligned_flip_untouched():
     import math
     from agentic_gts.agent.ground import _fit_region_box
     rng = np.random.default_rng(72)
-
     def face(x0, x1, y0, y1, z0, z1):
         return np.column_stack([rng.uniform(x0, x1, 8000),
                                 rng.uniform(y0, y1, 8000),
                                 rng.uniform(z0, z1, 8000)])
-
     pts = np.vstack([
         face(-0.30, 0.30, -0.55, -0.50, 0.0, 2.0),
         face(-0.30, 0.30, 0.50, 0.55, 0.0, 2.0),
@@ -1942,8 +1788,6 @@ def test_fit_region_box_aligned_flip_untouched():
         f"aligned cabinet keeps the pi/2 flip, got {bb.yaw:.3f}"
     assert abs(bb.size[0] - 1.1) < 0.06 and abs(bb.size[1] - 0.6) < 0.06
     print("PASS fit region box aligned flip untouched")
-
-
 def test_fit_region_boxes_two_angled_rows():
     """A rect over TWO rows both angled 20 deg: the single-structure
     guard rejects rotating the UNION (the aisle shows up as a
@@ -1955,14 +1799,11 @@ def test_fit_region_boxes_two_angled_rows():
     rng = np.random.default_rng(73)
     yaw_d = math.radians(20.0)
     c, s = math.cos(yaw_d), math.sin(yaw_d)
-
     def dev(u, v, z):
         return np.column_stack([c * u - s * v, s * u + c * v, z])
-
     def face(u0, u1, v0, v1, z0, z1):
         return dev(rng.uniform(u0, u1, 8000), rng.uniform(v0, v1, 8000),
                    rng.uniform(z0, z1, 8000))
-
     rows = []
     # aisle 2.0 m: a long row at 20 deg carries 4*sin(20)=1.37 m of
     # y-spread from its own length, so the aisle must exceed that for
@@ -1985,8 +1826,6 @@ def test_fit_region_boxes_two_angled_rows():
         assert abs(b.size[0] - 4.0) < 0.25, f"length {b.size[0]:.2f}"
         assert abs(b.size[1] - 1.1) < 0.15, f"depth {b.size[1]:.2f}"
     print("PASS fit region boxes two angled rows (split + per-row OBB)")
-
-
 def test_merge_adjacent_obb_guard():
     """The merge's OBB proximity guard (user report: fan edges): two
     devices angled DIFFERENTLY to the frame have inflated frame-AABBs
@@ -1998,7 +1837,6 @@ def test_merge_adjacent_obb_guard():
     from agentic_gts.agent.ground import _merge_adjacent_boxes, _obb_sat_gap
     from agentic_gts.core.models import OrientedBox
     rng = np.random.default_rng(81)
-
     # --- unit: the SAT gap discriminates by real orientation ---
     # touching aligned: gap ~ 0
     t1 = OrientedBox(center=(0.0, 0.0, 1.0), size=(1.1, 0.6, 2.0),
@@ -2033,7 +1871,6 @@ def test_merge_adjacent_obb_guard():
     assert rb[0] - ra[2] <= 0.50, "precondition: frame-AABB x-gap within tol"
     assert min(ra[3], rb[3]) - max(ra[1], rb[1]) >= 0.20, "precondition: shared y band"
     assert g > 0.50, f"real footprint gap {g:.2f} must exceed bridge_tol"
-
     # --- end-to-end: the different-angle pair is NOT merged ---
     def device_pts(box, n=600):
         # uniform interior points of the box footprint (density source)
@@ -2043,13 +1880,11 @@ def test_merge_adjacent_obb_guard():
         z = rng.uniform(0.4, 1.9, n)
         return np.column_stack([box.center[0] + c * u - s * v,
                                box.center[1] + s * u + c * v, z])
-
     pts = np.vstack([device_pts(a), device_pts(b)])
     out = _merge_adjacent_boxes([a, b], pts, 0.0, probe_pool=pts)
     assert len(out) == 2, \
         f"different-angle devices (AABB artifact overlap) must NOT " \
         f"merge, got {len(out)}"
-
     # --- control: touching ALIGNED boxes with a dense junction merge ---
     jx = rng.uniform(0.5, 0.6, 200)
     jy = rng.uniform(-0.25, 0.25, 200)
@@ -2059,7 +1894,6 @@ def test_merge_adjacent_obb_guard():
     assert len(out2) == 1, \
         f"touching aligned boxes with a dense junction must merge, " \
         f"got {len(out2)}"
-
     # --- control: touching PARALLEL-angled boxes merge too ---
     # points at the touching seam: midway between the centers, along
     # the boxes' long-side direction (the shared edge)
@@ -2075,50 +1909,3 @@ def test_merge_adjacent_obb_guard():
         f"parallel angled touching boxes must merge, got {len(out3)}"
     print("PASS merge adjacent OBB guard (artifact rejected, "
           "aligned/parallel touching still merged)")
-
-
-if __name__ == "__main__":
-    test_unproject_ground_roundtrip()
-    test_fit_region_box_full_depth()
-    test_fit_region_box_haze_immune()
-    test_fit_region_box_starved_back_face()
-    test_floor_map_stepped()
-    test_fit_region_box_stepped_floor()
-    test_render_cut_mesh_mode()
-    test_floor_map_mesh_mode()
-    test_fit_region_boxes_two_rows_in_one_rect()
-    test_fit_region_boxes_solid_deep_structure_kept()
-    test_tile_frames()
-    test_ground_stage_tiled_views()
-    test_ground_stage_tiled_skips_tilts()
-    test_oversized_blob_guard()
-    test_ground_stage_drops_oversized_blob()
-    test_fit_region_box_uses_own_points_floor()
-    test_fit_region_box_seed_top_is_local_height()
-    test_floor_at_local_rotates_back()
-    test_fit_region_box_rotated_stepped_floor()
-    test_fit_region_box_angled_ob()
-    test_fit_region_box_aligned_flip_untouched()
-    test_fit_region_boxes_two_angled_rows()
-    test_merge_adjacent_obb_guard()
-    test_floor_map_mesh_step_fine()
-    test_floor_map_mesh_rejects_overhead_only_tiles()
-    test_grounding_frame_hugs_layout_not_cloud()
-    test_huge_rect_guard()
-    test_render_topdown_crops_to_tile_footprint()
-    test_thin_structure_mask()
-    test_robust_span_bin_boundary()
-    test_fit_region_box_row_along_y()
-    test_ground_stage_with_patched_vlm()
-    test_ground_stage_row_along_y()
-    test_yaw_bootstrap_byproducts()
-    test_ground_stage_bootstrap_driven()
-    test_render_cut_relative_not_conservative()
-    test_parse_ground_regions_official_format()
-    test_parse_ground_regions_salvage()
-    test_ground_mock_returns_false()
-    test_merge_adjacent_boxes()
-    test_containment_2d_nested()
-    test_ground_stage_nested_region_dropped()
-    test_ground_stage_merges_over_split_regions()
-    print("ALL GROUND TESTS PASSED")

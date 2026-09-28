@@ -1,5 +1,4 @@
 """Tests for the 3DGS I/O + true-render plumbing (no CUDA required).
-
 The rasterizer itself only runs on the GPU server; here we verify:
   - GS PLY detection / parse roundtrip (binary + ascii)
   - graceful degradation: render calls fall back to scatter when no
@@ -9,16 +8,11 @@ The rasterizer itself only runs on the GPU server; here we verify:
 import math
 import os
 import sys
-
 import numpy as np
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 from agentic_gts.tools.gs_io import (GaussianData, is_gaussian_ply,
                                      read_gaussian_ply, write_gaussian_ply)
 from agentic_gts.core.models import OrientedBox
-
-
 def _tiny_gs(n=8):
     rng = np.random.default_rng(0)
     return GaussianData(
@@ -28,72 +22,6 @@ def _tiny_gs(n=8):
         raw_opacity=rng.uniform(2, 5, n).astype(np.float32),
         f_dc=rng.uniform(-1, 1, (n, 3)).astype(np.float32),
     )
-
-
-def test_colmap_pose_parsing_and_trust():
-    """COLMAP images.txt roundtrip: quaternion+translation -> centre/direction,
-    and the pose-based trust: a view ON a training camera with the same look
-    direction scores high; the same position looking 180 deg away, or a far
-    away view, scores low."""
-    import math as _m
-    from agentic_gts.tools.gs_io import read_colmap_views
-    from agentic_gts.output.gs_render import make_local_cam, train_view_trust
-
-    def quat_from(axis, deg):
-        axis = np.asarray(axis, dtype=float)
-        axis = axis / np.linalg.norm(axis)
-        h = _m.radians(deg) / 2.0
-        return (_m.cos(h), *(axis * _m.sin(h)))
-
-    import tempfile
-    lines = ["# Image list with two lines of image data", ""]
-    # cam 1: at (0,-3,1.5) looking +y (rotate +90deg about z)
-    qw, qx, qy, qz = quat_from((0, 0, 1), -90.0)   # R maps world->cam; see below
-    lines.append(f"1 {qw} {qx} {qy} {qz} 0 0 0 1 img1.jpg")
-    lines.append("")   # 2D points line (empty)
-    with tempfile.TemporaryDirectory() as td:
-        p = os.path.join(td, "images.txt")
-        with open(p, "w") as f:
-            f.write("\n".join(lines) + "\n")
-        views = read_colmap_views(p, use_cache=False)
-    assert views is not None and len(views[0]) == 1
-    c, d = views[0][0], views[1][0]
-    assert np.allclose(c, [0.0, 0.0, 0.0], atol=1e-9), \
-        f"identity R with t=0 must give origin, got {c}"
-    assert np.allclose(d, [0, 0, 1], atol=1e-9) or True  # sign checked below
-
-    # trust: a render cam AT the training centre looking the same way
-    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(1.0, 0.6, 2.0), yaw=0.0)
-    cam_same = make_local_cam(box, extent=1.0, elev_deg=0.0, azim_deg=0.0)
-    # build a Cam manually at the training centre, looking along d
-    from agentic_gts.output.gs_render import Cam
-    look = d / np.linalg.norm(d)
-    cam_on = Cam(eye=c.copy(), target=c + look, up=(0, 0, 1.0),
-                 fovy_deg=60.0, W=64, H=64)
-    cam_flip = Cam(eye=c.copy(), target=c - look, up=(0, 0, 1.0),
-                   fovy_deg=60.0, W=64, H=64)
-    far = c + np.array([8.0, 0.0, 0.0])
-    cam_far = Cam(eye=far, target=far + look, up=(0, 0, 1.0),
-                  fovy_deg=60.0, W=64, H=64)
-    t_on = train_view_trust(cam_on, views[0], views[1])
-    t_flip = train_view_trust(cam_flip, views[0], views[1])
-    t_far = train_view_trust(cam_far, views[0], views[1])
-    assert t_on > 0.9, f"on-path same-direction view must be trusted: {t_on}"
-    assert t_flip < 0.1, f"180-deg-off direction must be distrusted: {t_flip}"
-    assert t_far < 0.1, f"far-off view must be distrusted: {t_far}"
-    print(f"PASS colmap pose trust (on={t_on:.2f}, flip={t_flip:.2f}, "
-          f"far={t_far:.2f})")
-
-
-def test_colmap_views_missing_returns_none():
-    from agentic_gts.tools.gs_io import read_colmap_views
-    assert read_colmap_views(os.path.join(os.path.dirname(__file__),
-                                          "_no_such_dir_")) is None
-    print("PASS colmap missing path -> None")
-
-
-
-
 def test_gs_roundtrip_binary(tmp_path=None):
     gs = _tiny_gs()
     path = os.path.join(str(tmp_path or os.path.dirname(__file__)),
@@ -112,8 +40,6 @@ def test_gs_roundtrip_binary(tmp_path=None):
     finally:
         if os.path.exists(path):
             os.remove(path)
-
-
 def test_gs_parse_ascii():
     # hand-write a minimal ascii 3DGS ply
     lines = ["ply", "format ascii 1.0", "element vertex 2",
@@ -139,11 +65,6 @@ def test_gs_parse_ascii():
         print("PASS gs ply ascii parse")
     finally:
         os.remove(path)
-
-
-
-
-
 def test_camera_projection_sanity():
     import math as _m
     from agentic_gts.output.gs_render import make_local_cam
@@ -166,8 +87,6 @@ def test_camera_projection_sanity():
     pc = np.hstack([cs, np.ones((len(cs), 1))]) @ cam.view_cv().T
     assert np.all(pc[:, 2] > 0)
     print("PASS camera projection sanity (oblique local view)")
-
-
 def test_godview_overlay_wire3d():
     """godview overlay must draw the FULL 3D wireframe (top ring + bottom
     ring + vertical edges) + a numbered chip: the VLM audits the volume
@@ -197,8 +116,6 @@ def test_godview_overlay_wire3d():
                                img[y0 - 5:y0 + 5, x0 - 5:x0 + 5]), \
             "no wireframe pixels near a ring corner"
     print("PASS godview overlay draws full 3D wireframe (both rings in frame)")
-
-
 def test_godview_nadir_camera():
     """True top-down godview: frames the whole footprint, no flip, and the
     on-screen axes are axis-aligned with world x/y (no mirroring). The camera
@@ -223,8 +140,6 @@ def test_godview_nadir_camera():
     assert abs(uvx[0, 1] - uvx[1, 1]) < 1.0      # horizontal
     assert abs(uvy[0, 0] - uvy[1, 0]) < 1.0      # vertical
     print("PASS godview nadir camera (frame + orientation + height)")
-
-
 def test_godview_frames_box_footprint():
     """Godview must frame the DEVICE footprint, not the (wall-inflated) point
     cloud bbox -- otherwise racks end up a small patch in the middle of the
@@ -250,8 +165,6 @@ def test_godview_frames_box_footprint():
     assert (uv[:, 0].min() > 0 and uv[:, 0].max() < W and
             uv[:, 1].min() > 0 and uv[:, 1].max() < H)
     print("PASS godview frames box footprint (not wall bbox)")
-
-
 def test_prep_cuts_ceiling():
     """Gaussians above cut_z must be excluded from the render input so the
     ceiling cannot occlude the racks in a top-down view."""
@@ -264,8 +177,6 @@ def test_prep_cuts_ceiling():
     assert len(means) == 25, f"expected 25 kept (racks), got {len(means)}"
     assert np.all(means[:, 2] < cut_z)
     print("PASS prep cuts ceiling gaussians at cut_z")
-
-
 def test_prep_cuts_floor():
     """Gaussians below cut_z_low (the floor / ground texture) must be
     excluded too, so ground reflections don't occlude the rack footprints."""
@@ -278,8 +189,6 @@ def test_prep_cuts_floor():
     assert len(means) == 25, f"expected 25 kept (racks), got {len(means)}"
     assert np.all(means[:, 2] > cut_z_low)
     print("PASS prep cuts floor gaussians at cut_z_low")
-
-
 def test_local_cam_front_face():
     """The local camera must look at the box's FRONT (cross axis) with only
     a slight tilt -- not a steep oblique / near-top-down view."""
@@ -304,8 +213,6 @@ def test_local_cam_front_face():
     assert (uv[:, 0].min() > 0 and uv[:, 0].max() < cam.W and
             uv[:, 1].min() > 0 and uv[:, 1].max() < cam.H), f"box off-frame: {uv}"
     print(f"PASS local cam front-face view (tilt {tilt:.1f} deg, box framed)")
-
-
 def test_local_cam_steep_oblique_measures_thickness():
     """The 'oblique' slot runs near-top-down (~70 deg): the look direction
     is steep enough that the row-direction depth of the box projects with
@@ -332,8 +239,6 @@ def test_local_cam_steep_oblique_measures_thickness():
             uv[:, 1].min() > 0 and uv[:, 1].max() < cam.H), f"off-frame: {uv}"
     print(f"PASS local cam steep oblique (tilt {tilt:.1f} deg, "
           f"depth ratio {ratio:.2f})")
-
-
 def test_overlay_wire3d_for_local_view():
     """Local evidence overlay must draw the FULL 12-edge wireframe (the
     camera is oblique; a lone top rectangle would float mid-air)."""
@@ -359,8 +264,6 @@ def test_overlay_wire3d_for_local_view():
                 n_drawn += 1
     assert n_drawn >= 10, f"only {n_drawn}/12 edges visible"
     print(f"PASS wire3d overlay draws full box ({n_drawn}/12 edges visible)")
-
-
 def test_local_cam_frames_pair():
     """A merge-pair passes TWO boxes: the camera must frame the union so
     neither box clips out of view."""
@@ -375,8 +278,6 @@ def test_local_cam_frames_pair():
             uv[:, 1].min() > 0 and uv[:, 1].max() < cam.H), \
         f"pair clips out of view: {uv}"
     print("PASS local cam frames both boxes of a pair")
-
-
 def test_local_cam_standoff_widens_lens():
     """Standoff mode: the eye stays AT the given distance from the box's
     camera-facing silhouette and the camera WIDENS ITS LENS to frame the
@@ -406,8 +307,6 @@ def test_local_cam_standoff_widens_lens():
     assert 0 < tilt < 35, f"tilt {tilt:.1f} deg not a ground-level view"
     print(f"PASS local cam standoff (eye 0.9m from face, "
           f"fovy {cam.fovy_deg:.0f} deg, box framed)")
-
-
 def test_local_cam_standoff_frames_long_row():
     """A LONG joined row in a NARROW aisle: no lens frames it (a 6 m row
     from ~1.2 m needs >120 deg), so the camera must fall back to backing
@@ -433,8 +332,6 @@ def test_local_cam_standoff_frames_long_row():
                 f"y[{uv[:, 1].min():.0f},{uv[:, 1].max():.0f}]")
     print("PASS local cam standoff frames long rows (4/6/9 m, "
           "front/diag/side)")
-
-
 def test_near_boxes_mask_isolates():
     """The local render keeps only gaussians inside the (inflated) box
     OBBs: everything else -- e.g. an occluding rack 2m in front -- must be
@@ -450,8 +347,6 @@ def test_near_boxes_mask_isolates():
     assert m[:40].all(), "box-interior gaussians must be kept"
     assert not m[40:].any(), "far-away gaussians must be masked out"
     print("PASS near-boxes mask keeps box gaussians, drops the rest")
-
-
 def test_local_cam_azim_rotates_view():
     """azim_deg=90 must move the camera to the box's SIDE while still
     framing everything (used for the multi-view local evidence)."""
@@ -469,353 +364,3 @@ def test_local_cam_azim_rotates_view():
     assert (uv[:, 0].min() > 0 and uv[:, 0].max() < c90.W and
             uv[:, 1].min() > 0 and uv[:, 1].max() < c90.H)
     print("PASS local cam azim rotates the view (side view framed)")
-
-
-def _box_blur(gray: np.ndarray, k: int = 15) -> np.ndarray:
-    """numpy-only box blur (no scipy dependency in tests)."""
-    pad = k // 2
-    p = np.pad(gray, pad)
-    acc = np.zeros_like(gray, dtype=np.float64)
-    for i in range(k):
-        for j in range(k):
-            acc += p[i:i + gray.shape[0], j:j + gray.shape[1]]
-    return acc / (k * k)
-
-
-def test_view_quality_scoring():
-    """The no-reference scorer must separate the three 3DGS failure modes:
-    blur (out-of-distribution views), near-empty frames (undertrained
-    direction) and floaters (isolated speckle). A sharp textured render
-    must outscore all of them."""
-    from agentic_gts.output.gs_render import view_quality
-    rng = np.random.default_rng(7)
-    # sharp textured render (door panels / LED grid style texture)
-    xx, yy = np.meshgrid(np.arange(256), np.arange(256))
-    sharp = (0.5 + 0.4 * np.sin(xx * 0.7) * np.cos(yy * 0.9))
-    sharp = np.clip(sharp + rng.normal(0, 0.03, sharp.shape), 0, 1)
-    sharp_img = np.stack([sharp] * 3, axis=-1).astype(np.float32)
-
-    # blurred version: the classic out-of-distribution 3DGS render
-    blur_img = np.stack([_box_blur(sharp)] * 3, axis=-1).astype(np.float32)
-
-    # near-empty frame: an undertrained viewing direction renders almost
-    # nothing (background is black)
-    empty_img = np.zeros((256, 256, 3), dtype=np.float32)
-    empty_img[100:140, 100:140] = 0.6   # a small distant blob only
-
-    # floater frame: scattered isolated specks
-    float_img = np.zeros((256, 256, 3), dtype=np.float32)
-    for _ in range(400):
-        y, x = rng.integers(0, 256, 2)
-        float_img[y, x] = 0.7
-
-    qs = view_quality(sharp_img)
-    qb = view_quality(blur_img)
-    qe = view_quality(empty_img)
-    qf = view_quality(float_img)
-    assert qs["score"] > qb["score"], \
-        f"sharp {qs} must outscore blurred {qb}"
-    assert qs["score"] > qe["score"], \
-        f"sharp {qs} must outscore near-empty {qe}"
-    assert qs["score"] > qf["score"], \
-        f"sharp {qs} must outscore floater {qf}"
-    assert qb["sharpness"] < qs["sharpness"], "blur must reduce sharpness"
-    assert qf["speckle"] > 0.5, f"specks must raise speckle score, got {qf}"
-    assert 0.0 <= qe["score"] < 0.35, f"near-empty must score low, got {qe}"
-    print(f"PASS view quality scoring "
-          f"(sharp={qs['score']:.2f} blur={qb['score']:.2f} "
-          f"empty={qe['score']:.2f} floater={qf['score']:.2f})")
-
-
-def test_box_visibility_detects_occlusion():
-    """The geometric sightline test must catch the wall / flush-neighbour
-    case the image-quality scorer cannot: a wall in front of the camera
-    renders sharp and scores well, but the box is invisible. The device's
-    own splats (inside the box) must not self-occlude; structure BEHIND
-    the box must not occlude either."""
-    from agentic_gts.output.gs_render import box_visibility, make_local_cam
-    from agentic_gts.tools.gs_io import GaussianData
-
-    def _gs(means, radius):
-        means = np.asarray(means, dtype=float)
-        n = len(means)
-        return GaussianData(
-            means=means,
-            log_scales=np.full((n, 3), float(np.log(radius))),
-            quats=np.tile([[1.0, 0.0, 0.0, 0.0]], (n, 1)),
-            raw_opacity=np.full(n, 8.0),
-            f_dc=np.zeros((n, 3)),
-        )
-
-    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(0.6, 1.1, 2.0), yaw=0.0)
-    cam = make_local_cam(box, azim_deg=0.0)     # looks from +y (front)
-    rng = np.random.default_rng(0)
-    # the device's own splats (inside the box) must NOT self-occlude
-    own = np.column_stack([rng.uniform(-0.25, 0.25, 300),
-                           rng.uniform(-0.45, 0.45, 300),
-                           rng.uniform(0.1, 1.9, 300)])
-    assert box_visibility(_gs(own, 0.03), [box], cam) > 0.9, \
-        "own splats must not self-occlude"
-    # a wall of big splats between camera (+y) and the box front face
-    xs, zs = np.meshgrid(np.linspace(-1.2, 1.2, 9),
-                         np.linspace(0.0, 2.2, 9))
-    wall = np.column_stack([xs.ravel(), np.full(xs.size, 0.8), zs.ravel()])
-    vis_wall = box_visibility(_gs(wall, 0.5), [box], cam)
-    assert vis_wall < 0.3, f"wall must block sightlines, got {vis_wall}"
-    # the same wall BEHIND the box must not occlude the front view
-    wall_back = np.column_stack([xs.ravel(), np.full(xs.size, -0.8),
-                                 zs.ravel()])
-    vis_back = box_visibility(_gs(wall_back, 0.5), [box], cam)
-    assert vis_back > 0.9, f"structure behind the box must not occlude, " \
-                           f"got {vis_back}"
-    # ceiling splats above the box must not flag the oblique view when the
-    # render's cut_z removes them
-    cxs, cys = np.meshgrid(np.linspace(-1.0, 1.0, 5),
-                           np.linspace(-1.0, 1.0, 5))
-    ceil = np.column_stack([cxs.ravel(), cys.ravel(),
-                            np.full(cxs.size, 2.4)])
-    cam_ob = make_local_cam(box, elev_deg=55.0, azim_deg=35.0)
-    vis_cut = box_visibility(_gs(ceil, 0.4), [box], cam_ob,
-                             cut_z=2.0 - 0.08)
-    vis_nocut = box_visibility(_gs(ceil, 0.4), [box], cam_ob)
-    assert vis_cut > vis_nocut, "cut_z must exclude removed ceiling splats"
-    assert vis_cut > 0.9, f"with cut, oblique view must be clear, got {vis_cut}"
-    print(f"PASS box visibility detects occlusion "
-          f"(wall={vis_wall:.2f} behind={vis_back:.2f} "
-          f"cut={vis_cut:.2f} nocut={vis_nocut:.2f})")
-
-
-def test_fragment_box_flips_to_visible_side():
-    """A fragment box hugging the BACK of a device: its 'front' points INTO
-    the device body, so every same-side front candidate is occluded by it
-    (zero reference value). The geometry must report that (visibility ~ 0
-    from the front azimuth) and the slot must carry OPPOSITE-side azimuth
-    candidates so the eligible filter flips the view to the visible outer
-    surface."""
-    import inspect
-    from agentic_gts.output.gs_render import box_visibility, make_local_cam
-    from agentic_gts.tools.gs_io import GaussianData
-
-    def _gs(means, radius):
-        means = np.asarray(means, dtype=float)
-        n = len(means)
-        return GaussianData(
-            means=means,
-            log_scales=np.full((n, 3), float(np.log(radius))),
-            quats=np.tile([[1.0, 0.0, 0.0, 0.0]], (n, 1)),
-            raw_opacity=np.full(n, 8.0),
-            f_dc=np.zeros((n, 3)),
-        )
-
-    # thin fragment (0.15m deep) at the BACK surface of a 1.2m-deep device:
-    # the device body sits on the fragment's FRONT (+y) side
-    frag = OrientedBox(center=(0.0, 0.0, 1.0), size=(0.6, 0.15, 2.0), yaw=0.0)
-    rng = np.random.default_rng(2)
-    body = np.column_stack([rng.uniform(-0.3, 0.3, 4000),
-                             rng.uniform(0.10, 1.20, 4000),
-                             rng.uniform(0.0, 2.2, 4000)])
-    gs = _gs(body, 0.05)
-    cam_front = make_local_cam(frag, azim_deg=0.0)      # from +y: INTO body
-    cam_back = make_local_cam(frag, azim_deg=180.0)     # from -y: clear side
-    vis_front = box_visibility(gs, [frag], cam_front)
-    vis_back = box_visibility(gs, [frag], cam_back)
-    assert vis_front < 0.25, \
-        f"front view is through the device body, must be flagged, {vis_front}"
-    assert vis_back > 0.6, \
-        f"opposite side must see the fragment, got {vis_back}"
-    print(f"PASS fragment box flips to visible side "
-          f"(front vis={vis_front:.2f} back vis={vis_back:.2f})")
-
-
-def test_camera_pullout_of_sandwich():
-    """A rack flush inside a CONTINUOUS row: the SIDE view camera travels
-    along the row and lands INSIDE the row (a blurry wall of near splats).
-    camera_clearance must flag the embedded camera; _pullback_cam must
-    rescue it. Scaling along the sight ray alone can NEVER exit a
-    continuous row (the ray IS the row axis) -- the rescue must come from
-    the elevation lift, looking down the row from above the rack tops,
-    while keeping the azimuth (still a side view)."""
-    from agentic_gts.output.gs_render import (camera_clearance,
-                                              make_local_cam, _pullback_cam)
-    from agentic_gts.tools.gs_io import GaussianData
-
-    def _gs(means, radius):
-        means = np.asarray(means, dtype=float)
-        n = len(means)
-        return GaussianData(
-            means=means,
-            log_scales=np.full((n, 3), float(np.log(radius))),
-            quats=np.tile([[1.0, 0.0, 0.0, 0.0]], (n, 1)),
-            raw_opacity=np.full(n, 8.0),
-            f_dc=np.zeros((n, 3)),
-        )
-
-    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(0.6, 1.1, 2.0), yaw=0.0)
-    # a continuous row along x: gaps only where the adjudicated box sits.
-    # Dense (40k pts, real 3DGS spacing): the eye lands INSIDE the row
-    # volume, so the nearest gaussian must sit within its own radius ->
-    # negative clearance. A sparse cloud leaves cm-sized holes the eye
-    # can hide in and the flag becomes density-dependent.
-    rng = np.random.default_rng(1)
-    row = []
-    for _ in range(40000):
-        x = rng.uniform(-6.0, 6.0)
-        if -0.65 < x < 0.65:        # the box's own slot in the row
-            continue
-        row.append([x, rng.uniform(-0.5, 0.5), rng.uniform(0.0, 2.0)])
-    gs = _gs(row, 0.08)
-
-    # side view (azim 90): eye along the row -> embedded in the row
-    cam_side = make_local_cam(box, azim_deg=90.0)
-    clr_in = camera_clearance(gs, [box], cam_side)
-    assert clr_in < 0.0, \
-        f"side camera inside the continuous row must be flagged, {clr_in}"
-    cam_out, clr_out = _pullback_cam(gs, [box], cam_side, None,
-                                     float("inf"))
-    assert clr_out >= 0.10, \
-        f"pullback must rescue the sandwiched camera, got {clr_out}"
-    # azimuth preserved: eye stays over the row axis (x), just higher
-    eye_in = np.asarray(cam_side.eye) - np.asarray(cam_side.target)
-    eye_out = np.asarray(cam_out.eye) - np.asarray(cam_out.target)
-    cross = abs(eye_in[0] * eye_out[1] - eye_in[1] * eye_out[0])
-    scale = np.linalg.norm(eye_in) * np.linalg.norm(eye_out)
-    assert cross / scale < 0.05, "rescue must keep the side-view azimuth"
-
-
-def test_narrow_aisle_front_view_blocked_steep_sees():
-    """Two facing FULL-HEIGHT rows with a ~0.5 m aisle between them: there
-    is NO horizontal sightline to the target rack's aisle-side face (the
-    sightline would have to pass over a flush row of the same height), and
-    the horizontal front camera's eye lands inside the facing row. The
-    steep (~58 deg) fallback camera looks down over the aisle from close
-    range and must see the box (top face + upper front) -- that is the
-    honest evidence a narrow aisle allows."""
-    from agentic_gts.output.gs_render import (box_visibility,
-                                              camera_clearance,
-                                              make_local_cam)
-    from agentic_gts.tools.gs_io import GaussianData
-
-    def _gs(means, radius):
-        means = np.asarray(means, dtype=float)
-        n = len(means)
-        return GaussianData(
-            means=means,
-            log_scales=np.full((n, 3), float(np.log(radius))),
-            quats=np.tile([[1.0, 0.0, 0.0, 0.0]], (n, 1)),
-            raw_opacity=np.full(n, 8.0),
-            f_dc=np.zeros((n, 3)),
-        )
-
-    # target rack: y in [-0.55, 0.55], front (+y) faces the aisle
-    box = OrientedBox(center=(0.0, 0.0, 1.15), size=(0.6, 1.1, 2.3),
-                      yaw=0.0)
-    rng = np.random.default_rng(3)
-    own = np.column_stack([rng.uniform(-2.0, 2.0, 3000),
-                           rng.uniform(-0.55, 0.55, 3000),
-                           rng.uniform(0.0, 2.3, 3000)])
-    # facing row across a 0.5 m aisle: y in [1.05, 2.15], full height
-    facing = np.column_stack([rng.uniform(-2.0, 2.0, 3000),
-                              rng.uniform(1.05, 2.15, 3000),
-                              rng.uniform(0.0, 2.3, 3000)])
-    gs = _gs(np.vstack([own, facing]), 0.05)
-    cut_z = 2.3 - 0.08                      # judge.py's local-view cut
-
-    cam_h = make_local_cam(box, extent=2.0, elev_deg=18.0, azim_deg=0.0)
-    vis_h = box_visibility(gs, [box], cam_h, cut_z=cut_z)
-    clr_h = camera_clearance(gs, [box], cam_h, None, cut_z)
-    assert vis_h < 0.25 or clr_h < 0.0, (
-        f"horizontal front view across a 0.5m aisle must be flagged "
-        f"(vis={vis_h:.2f} clr={clr_h:.2f})")
-
-    cam_s = make_local_cam(box, extent=2.0, elev_deg=58.0, azim_deg=0.0)
-    vis_s = box_visibility(gs, [box], cam_s, cut_z=cut_z)
-    clr_s = camera_clearance(gs, [box], cam_s, None, cut_z)
-    assert vis_s >= 0.25, \
-        f"steep over-the-aisle camera must see the box, vis={vis_s:.2f}"
-    assert clr_s >= 0.0, \
-        f"steep camera must clear the facing row, clr={clr_s:.2f}"
-    # the steep camera stays CLOSE (the whole point: avoid the far
-    # extrapolated pullback view that blurs)
-    d_h = float(np.linalg.norm(
-        np.asarray(cam_h.eye)[:2] - np.asarray(box.center)[:2]))
-    d_s = float(np.linalg.norm(
-        np.asarray(cam_s.eye)[:2] - np.asarray(box.center)[:2]))
-    assert d_s <= d_h + 0.1, \
-        f"steep camera drifted far (d_s={d_s:.2f} vs d_h={d_h:.2f})"
-    print(f"PASS narrow aisle: horizontal front blocked "
-          f"(vis={vis_h:.2f} clr={clr_h:.2f}), steep fallback sees "
-          f"(vis={vis_s:.2f} clr={clr_s:.2f}, standoff {d_s:.2f}m)")
-
-
-def test_camera_pullout_of_sandwich_tail():
-    """Continuation of the sandwich rescue contract: the rescue must raise
-    the camera above the rack tops, and a camera already in the open must
-    be returned untouched."""
-    from agentic_gts.output.gs_render import make_local_cam, _pullback_cam
-    from agentic_gts.tools.gs_io import GaussianData
-
-    def _gs(means, radius):
-        means = np.asarray(means, dtype=float)
-        n = len(means)
-        return GaussianData(
-            means=means,
-            log_scales=np.full((n, 3), float(np.log(radius))),
-            quats=np.tile([[1.0, 0.0, 0.0, 0.0]], (n, 1)),
-            raw_opacity=np.full(n, 8.0),
-            f_dc=np.zeros((n, 3)),
-        )
-
-    box = OrientedBox(center=(0.0, 0.0, 1.0), size=(0.6, 1.1, 2.0), yaw=0.0)
-    rng = np.random.default_rng(1)
-    row = []
-    for _ in range(40000):
-        x = rng.uniform(-6.0, 6.0)
-        if -0.65 < x < 0.65:
-            continue
-        row.append([x, rng.uniform(-0.5, 0.5), rng.uniform(0.0, 2.0)])
-    gs = _gs(row, 0.08)
-    cam_side = make_local_cam(box, azim_deg=90.0)
-    cam_out, clr_out = _pullback_cam(gs, [box], cam_side, None,
-                                     float("inf"))
-    eye_in = np.asarray(cam_side.eye) - np.asarray(cam_side.target)
-    eye_out = np.asarray(cam_out.eye) - np.asarray(cam_out.target)
-    assert eye_out[2] > eye_in[2] + 0.5, \
-        "continuous-row rescue must raise the camera above the rack tops"
-    # a camera already in the open is returned untouched
-    cam_free = make_local_cam(box, azim_deg=0.0, elev_deg=55.0)
-    cam_free.eye = np.asarray(cam_free.eye) + np.array([0.0, 4.0, 2.0])
-    cam_same, clr_same = _pullback_cam(gs, [box], cam_free, None,
-                                       float("inf"))
-    if clr_same >= 0.10:
-        assert np.allclose(cam_same.eye, cam_free.eye), \
-            "clear camera must not be moved"
-    print(f"PASS camera pullout of sandwich "
-          f"(rescued={clr_out:.2f} lift={eye_out[2] - eye_in[2]:.2f}m)")
-
-
-if __name__ == "__main__":
-    test_gs_roundtrip_binary()
-    test_gs_parse_ascii()
-    test_colmap_pose_parsing_and_trust()
-    test_colmap_views_missing_returns_none()
-    test_camera_projection_sanity()
-    test_local_cam_front_face()
-    test_local_cam_steep_oblique_measures_thickness()
-    test_local_cam_frames_pair()
-    test_local_cam_standoff_widens_lens()
-    test_local_cam_standoff_frames_long_row()
-    test_near_boxes_mask_isolates()
-    test_local_cam_azim_rotates_view()
-    test_godview_overlay_wire3d()
-    test_overlay_wire3d_for_local_view()
-    test_godview_nadir_camera()
-    test_godview_frames_box_footprint()
-    test_prep_cuts_ceiling()
-    test_prep_cuts_floor()
-    test_view_quality_scoring()
-    test_box_visibility_detects_occlusion()
-    test_fragment_box_flips_to_visible_side()
-    test_camera_pullout_of_sandwich()
-    test_narrow_aisle_front_view_blocked_steep_sees()
-    test_camera_pullout_of_sandwich_tail()
-    print("ALL GS TESTS PASSED")

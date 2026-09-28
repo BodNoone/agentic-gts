@@ -153,7 +153,6 @@ def complete_row_gaps(scene: Scene, width_unit: float = 0.6,
         centers = np.asarray([scene.boxes[i].center[:2] for i in idxs])
         cross_vals = centers @ cross
         order = np.argsort(cross_vals)
-        # 1D clustering on the cross coordinate
         rows: list[list[int]] = []
         cur = [order[0]]
         for j in order[1:]:
@@ -217,30 +216,20 @@ def snap_row_seams(boxes: list[OrientedBox], yaw: float,
     """Snap the facing edges of adjacent cabinets in a row together.
 
     A joined row split into single cabinets gets each piece's along-row
-    extent from its OWN measured span, so the seam between two
-    neighbours can come out a few centimetres apart (mask bleed cut at
-    slightly different places per view, the cross-view union, the
-    per-piece side thickness correction). The result reads as a row of
-    DISCONNECTED boxes. This walks the pieces sorted along the row axis
-    and, wherever two facing edges sit within `seam_tol` (a small gap
-    OR overlap), sets both to their average along coordinate -- the
-    "average the vertices" rule. The shared edge's CROSS vertices are
-    merged only where the two facing corner pairs are EACH within
-    `vertex_tol` ("merge vertices only when close"); otherwise only the
-    along seam is normalised and each side keeps its own cross extent.
+    extent from its OWN measured span, so facing edges can sit a few
+    centimetres apart (or overlap) and the row reads as DISCONNECTED
+    boxes. Wherever two facing edges sit within `seam_tol`, both are
+    set to their average along coordinate; the shared edge's CROSS
+    vertices merge only where both facing corner pairs are within
+    `vertex_tol` (otherwise each side keeps its own cross extent).
 
-    HEIGHT STEP (user directive): devices whose TOPS sit more than
-    `height_tol` apart are NOT on one plane -- the split separated them
-    on purpose (different-height cabinets), so they are NEVER seamed,
-    however small the gap. Heights never enter the merge itself beyond
-    this gate -- the top vertices may sit far apart in z, the footprint
-    edge is normalised regardless.
-
-    Boxes are assumed to share the row frame (`yaw`); the split pieces
-    of one seed always do (they copy the seed's yaw and carry the along
-    extent in size[0]). Facing edges must also overlap laterally by at
-    least half the thinner body -- two different sub-rows are never
-    snapped. Mutates in place; returns the number of seams snapped.
+    Guards: NEVER seam across a HEIGHT STEP > `height_tol` (the split
+    separated different-height cabinets on purpose -- user directive;
+    heights never enter the merge beyond this gate), and facing edges
+    must overlap laterally by >= half the thinner body (two different
+    sub-rows are never snapped). Boxes are assumed to share the row
+    frame (`yaw`). Mutates in place; returns the number of seams
+    snapped.
     """
     if len(boxes) < 2:
         return 0
@@ -268,10 +257,7 @@ def snap_row_seams(boxes: list[OrientedBox], yaw: float,
         a_lo, a_hi, a_x, a_d = _span(a)
         b_lo, b_hi, b_x, b_d = _span(b)
         gap = b_lo - a_hi
-        # devices on DIFFERENT height planes (> height_tol between their
-        # tops) are distinct devices the split separated on purpose --
-        # NEVER seam across a height step, however small the gap (user
-        # directive)
+        # height-step gate: the split separated them on purpose
         a_top = float(a.center[2]) + float(a.size[2]) / 2.0
         b_top = float(b.center[2]) + float(b.size[2]) / 2.0
         if abs(a_top - b_top) > height_tol:
@@ -285,11 +271,8 @@ def snap_row_seams(boxes: list[OrientedBox], yaw: float,
         if min(a_chi, b_chi) - max(a_clo, b_clo) < 0.5 * min(a_d, b_d):
             continue
         seam = 0.5 * (a_hi + b_lo)
-        # merge the shared edge's CROSS vertices only where the two
-        # facing corner pairs are EACH within vertex_tol ("merge
-        # vertices only when close"); otherwise only the along seam is
-        # normalised and each side keeps its own cross extent. Heights
-        # never enter -- the top vertices may sit far apart in z.
+        # merge the shared edge's cross vertices only when both facing
+        # corner pairs are close (see docstring)
         if (abs(a_clo - b_clo) <= vertex_tol
                 and abs(a_chi - b_chi) <= vertex_tol):
             new_clo = 0.5 * (a_clo + b_clo)

@@ -101,8 +101,7 @@ def parse_box_groups(text: str) -> list[BoxGroup]:
     if not text:
         return []
     # scan every object/array opener with the standard JSON decoder;
-    # thinking is already stripped upstream, prose fragments mostly
-    # fail to decode
+    # prose fragments mostly fail to decode
     dec = json.JSONDecoder()
     frags = []
     for m in re.finditer(r"[\[{]", text):
@@ -1230,14 +1229,9 @@ def _robust_span(v: np.ndarray, cell: float = 0.05,
     if len(v) < floor:
         return None
     lo, hi = float(v.min()), float(v.max())
-    # explicit bin COUNT, not arange(stop): arange's ceil((stop-start)/
-    # step) also drifts in fp ((3.6-2.45)/0.05 -> 22.999... -> 23
-    # edges), and an edge landing a hair BELOW hi makes np.histogram
-    # silently DROP every v == hi -- a face sheet sitting exactly on a
-    # bin boundary vanishes (_robust_span's span collapses to the far
-    # face, _anchored_top's top under-measures). Two extra bins of
-    # margin: the last edge is always >= hi + cell; trailing bins are
-    # empty-or-real, empty ones never count as strong/dense.
+    # bin edges built by explicit COUNT (fp-safe; see the note in
+    # _anchored_top -- an arange edge a hair below hi makes histogram
+    # drop every v == hi)
     nb = int(np.floor((hi - lo) / cell)) + 2
     edges = lo + cell * np.arange(nb + 1)
     if len(edges) < 3:
@@ -1426,10 +1420,10 @@ def _apply_depth_from_side(instances: list, pts: np.ndarray,
     The side camera looks ALONG the row axis, so the (depth, height)
     profile of every cabinet projects into the same image region; the
     pool contains ALL pieces' points (lifted WITHOUT the z-buffer) and
-    is sliced per piece by along-row span. Two things differ from the
-    old oblique-view rule:
+    is sliced per piece by along-row span. Two properties make the
+    side view the thickness authority:
 
-    * the view is a true PROFILE (90 deg off the front), where an open
+    * it is a true PROFILE (90 deg off the front), where an open
       door sticks out horizontally beyond the cabinet body -- the front
       view cannot separate it (user report), the side view can;
     * the depth estimator is the strong-bin span (_robust_span), which
@@ -1470,7 +1464,7 @@ def _apply_depth_from_side(instances: list, pts: np.ndarray,
             continue
         mid = 0.5 * (c_lo + c_hi)
         # the measured cabinet centre must still live inside the seed's
-        # cross span (padded) -- the Stage-A box bounds the device
+        # cross span (padded) -- the stageG seed box bounds the device
         if abs(mid - seed_cross_c) > seed_half_d + 0.30:
             rec["reason"] = "depth centre too far from seed"
             continue
@@ -1495,34 +1489,24 @@ def _pick_piece_top(z_mask: float | None, z_col: float | None,
     Mask points are the only semantically CLEAN z source (user
     directive after column readings kept scattering high/low): SAM
     isolated this device -- neighbour rows, haze and overhead trays
-    are outside the mask, and cloud sparsity inside the body does not
-    shorten pixels. Its one historical failure is TRUNCATION (a view
-    cut at the frame, a VLM box covering only part of the cabinet,
-    the side pass's vertically-short slice -- "very low boxes").
-    Column guards exactly that: a mask z grossly below the row's tall
-    cabinet (>45% under the seed top) while a SANE column sits well
+    are outside the mask. Its one failure mode is TRUNCATION (a view
+    cut at the frame, a partial VLM box, the side pass's vertically-
+    short slice): a mask z grossly below the row's cabinet (>45%
+    under the seed top) while a SANE column (0.45*seed_top ..
+    seed_top+1.20, anchored so trays/ceiling cannot pass) sits well
     above it is far more likely a cut mask than a real half-height
-    cabinet standing under a clean column -- the column wins the
-    piece. Everything else: mask wins, including short cabinets the
-    VLM split out of a mixed row and pieces TALLER than an
-    under-measured seed (a broken density walk can never drag a
-    column up past its gap). The guard's sane-column ceiling is
-    seed_top + 1.20 (was +0.60): the seed itself under-measuring was
-    untouchable before -- the column band was cut at seed + 0.60, so
-    z_col could never even SEE the true top, let alone pass the cap
-    (user report: boxes far below the real height with no rescue).
-    The column is ANCHORED (trays/ceiling rejected by the first real
-    void), so the extra headroom does not let clutter back in.
+    cabinet -- the column wins. Everything else the mask wins,
+    including short cabinets and pieces taller than the seed. The
+    guard ceiling is seed_top + 1.20 (was +0.60 -- a band cut at
+    seed+0.60 could never even SEE the true top; user report: boxes
+    far below the real height with no rescue).
 
-    strict_mask (MESH geometry, user directive: box heights must
-    strictly follow the SAM mask back-projected MESH points): the
-    column guard is DISABLED. In a mesh the trays are physically
-    connected to the rack tops -- the anchored walk has NO void to
-    stop at and z_col reads the TRAY top, so the very guard meant to
-    rescue truncated masks instead OVERRIDES the correct mask value
-    with the tray height (mesh runs: heights still wrong). The mask
-    over exact mesh points is both semantically and geometrically
-    clean -- it wins unconditionally when valid.
+    strict_mask (MESH geometry, user directive: heights strictly
+    follow the SAM mask): the column guard is DISABLED -- mesh trays
+    are physically connected to the rack tops, the anchored walk has
+    no void to stop at and reads the TRAY top, so the guard would
+    override a correct mask with the tray height. A valid mask wins
+    unconditionally.
 
     Returns (z_top, source) -- source in {"mask", "col-guard", "col"}
     for the audit trail, or (None, None).
@@ -2092,8 +2076,8 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     # Each face grounds independently; the SAME cabinet's spans union
     # across views (_merge_cross_view), a cabinet legible from only
     # one face still splits the row. CLEAN image to the VLM: the
-    # wireframe overlay (prompt_image) is the Stage-A box, which is
-    # often oversized/misplaced -- the VLM anchors on the frame
+    # wireframe overlay (prompt_image) is the seed (stageG) box, which
+    # is often oversized/misplaced -- the VLM anchors on the frame
     # instead of the device. Same principle as global grounding: no
     # box prompts in the input image.
     spans = []
@@ -2110,12 +2094,10 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                   "pts": None, "ms": 0.5, "label": "unknown"}]
 
     # ---- pass 2 (side): thickness correction per piece ----
-    # The side camera looks ALONG the row: every cabinet's (depth,
-    # height) profile projects into the same image region, so the mask
-    # points (lifted WITHOUT the z-buffer) form one pool containing all
-    # pieces, sliced per piece by along span. The VLM prompt already
-    # excludes open doors -- face-on in this profile -- and the strong-
-    # bin estimator drops whatever door tail still leaks through.
+    # The side pool spans all pieces at once (profile view, no
+    # z-buffer -- see _apply_depth_from_side); the VLM prompt already
+    # excludes open doors and the strong-bin estimator drops any tail
+    # that still leaks through.
     depth_ok = False
     if side is not None:
         verdict = judge.adjudicate_sam_boxes(

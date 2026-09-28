@@ -1,18 +1,13 @@
-"""End-to-end and unit tests. Run: python -m pytest tests/ -q  (or python tests/test_pipeline.py)"""
+"""End-to-end and unit tests. Run: python -m pytest tests/ -q"""
 from __future__ import annotations
-
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import numpy as np
-
 from agentic_gts.core.models import OrientedBox, Scene
 from agentic_gts.synth.generator import SynthConfig, generate
 from agentic_gts.pipeline import run_pipeline
 from agentic_gts.eval.metrics import evaluate
-
-
 def test_oriented_box_basic():
     b = OrientedBox(center=(1, 2, 1), size=(0.6, 1.1, 2.0), yaw=0.0)
     pts = np.array([[1.0, 2.0, 1.0], [5.0, 5.0, 5.0]])
@@ -20,13 +15,9 @@ def test_oriented_box_basic():
     assert inside[0] and not inside[1]
     corners = b.corners_2d()
     assert corners.shape == (4, 2)
-
-
 def test_iou_identity():
     b = OrientedBox(center=(0, 0, 1), size=(0.6, 1.1, 2.0), yaw=0.0)
     assert b.iou_2d(b) > 0.9
-
-
 def test_synth_generation():
     scene, gt, corrupt = generate(SynthConfig(seed=1))
     assert len(scene.points) > 10000
@@ -35,8 +26,6 @@ def test_synth_generation():
     # some corruption must exist
     kinds = {b.meta.get("corruption") for b in corrupt}
     assert len(kinds) > 1
-
-
 def test_pipeline_mock_smoke():
     """No-hint flow smoke test: run_pipeline on synth data with the mock
     VLM must complete without raising. Boxes come ONLY from VLM
@@ -46,8 +35,6 @@ def test_pipeline_mock_smoke():
     run_pipeline(scene, gt_boxes=gt,
                  vlm_backend="mock", out_dir="runs/test_tmp")
     print(f"PASS pipeline mock smoke ({len(scene.boxes)} boxes out)")
-
-
 def test_eval_edge_error():
     gt = [OrientedBox(center=(0, 0, 1), size=(0.6, 1.1, 2.0), yaw=0.0)]
     ok = [OrientedBox(center=(0.01, 0, 1), size=(0.6, 1.1, 2.0), yaw=0.0)]
@@ -56,8 +43,6 @@ def test_eval_edge_error():
     r_bad = evaluate(bad, gt, edge_threshold_m=0.05, match_iou=0.1)
     assert r_ok.edge_accuracy == 1.0
     assert r_bad.edge_accuracy < r_ok.edge_accuracy
-
-
 def test_yaw_estimation_rotated_scene():
     import math
     from agentic_gts.segment.orientation import estimate_yaw
@@ -70,18 +55,3 @@ def test_yaw_estimation_rotated_scene():
         err = abs(math.degrees(true - est))
         err = min(err, 90 - err)
         assert err < 3.0, f"yaw error {err:.1f}deg for input {deg}deg"
-
-
-if __name__ == "__main__":
-    fns = [v for k, v in list(globals().items()) if k.startswith("test_")]
-    passed = 0
-    for fn in fns:
-        try:
-            fn()
-            print(f"PASS  {fn.__name__}")
-            passed += 1
-        except AssertionError as e:
-            print(f"FAIL  {fn.__name__}: {e}")
-        except Exception as e:
-            print(f"ERROR {fn.__name__}: {type(e).__name__}: {e}")
-    print(f"\n{passed}/{len(fns)} tests passed")

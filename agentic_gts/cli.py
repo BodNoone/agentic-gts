@@ -29,19 +29,13 @@ def cmd_synth(args):
 
 def cmd_run(args):
     # geometry source: the mesh-discretized cloud when given, else the
-    # --point-cloud input itself (GS centers for a gaussian ply). The
-    # mesh is coordinate-aligned with the 3DGS by contract, and 3DGS
-    # renders well but measures poorly (haze, floaters, sparse zones)
-    # while a mesh sampling is geometrically exact -- so every stage
-    # that MEASURES (yaw/bootstrap, region fits, column heights,
-    # thickness fallbacks) runs on the mesh, and every stage that
-    # RENDERS (groundview, local evidence views) still splats the GS.
+    # --point-cloud input itself -- 3DGS renders well but measures
+    # poorly, a mesh sampling is geometrically exact (see --mesh-cloud)
     mesh = getattr(args, "mesh_cloud", None)
     pts = load_point_cloud(mesh) if mesh else load_point_cloud(args.point_cloud)
     if mesh:
         print(f"[cli] mesh cloud given ({len(pts)} pts): geometry stages "
               f"run on the mesh, rendering stays 3DGS")
-        scene_is_mesh = True
     if args.gt:
         # ground-truth boxes share the cloud's coordinate frame; transforming
         # the cloud alone would desynchronize them. Caller must pre-align.
@@ -53,10 +47,8 @@ def cmd_run(args):
         pts, align_tf = align_to_ground(pts, return_transform=True)
     scene = Scene(points=pts)
     if align_tf is not None:
-        # 3DGS evidence renders / PLY export read the RAW gaussian file, so
-        # they must apply the SAME transform or they land in a different
-        # frame than the aligned geometry (a big-shift scene exposed this:
-        # the exported boxes floated above the raw cloud).
+        # renders/exports read the RAW gaussian file -- they must apply
+        # the SAME transform (see apply_align_transform)
         scene.meta["align_tf"] = align_tf
     # geometry-source flag: a mesh sampling has no haze / floaters /
     # under-floor diffusion -- every "robust" estimator downstream can
@@ -74,17 +66,6 @@ def cmd_run(args):
                   "rendered via Gaussian splatting")
     except Exception as e:
         print(f"[cli] GS detection failed ({type(e).__name__}: {e})")
-    # COLMAP training poses (optional): pose-based render trust
-    if getattr(args, "gs_cams", None):
-        from agentic_gts.tools.gs_io import read_colmap_views
-        tv = read_colmap_views(args.gs_cams)
-        if tv is None:
-            print(f"[cli] --gs-cams: no images.txt found under "
-                  f"{args.gs_cams} -> pose trust disabled")
-        else:
-            scene.meta["gs_cams"] = args.gs_cams
-            print(f"[cli] COLMAP poses loaded: {len(tv[0])} training "
-                  f"cameras -> render trust enabled")
     gt_boxes = None
     if args.gt:
         gs = Scene(points=scene.points)
@@ -104,8 +85,6 @@ def cmd_run(args):
                        vlm_backend=args.vlm,
                        vlm_api_base=args.vlm_base,
                        vlm_model=args.vlm_model,
-                       vlm_thinking_model=args.vlm_thinking_model,
-                       vlm_thinking_base=args.vlm_thinking_base,
                        opts=opts,
                        out_dir=args.out,
                        edge_threshold_m=args.edge_thr)
@@ -154,33 +133,6 @@ def cmd_view(args):
     view_3d(scene, gt_boxes=gt_boxes)
 
 
-def cmd_report(args):
-    """Build the per-box local-view + VLM-verdict HTML report for a run.
-
-    Works retroactively on any run directory (needs boxes.json; verdicts
-    come from vlm_records.jsonl when present). With --point-cloud every
-    final box gets a fresh local three-view render; without it only the
-    on-disk evidence images are shown.
-    """
-    import os
-    from agentic_gts.pipeline import load_point_cloud
-    from agentic_gts.output.report import build_report
-
-    points = None
-    gs_ply = None
-    if args.point_cloud:
-        points = load_point_cloud(args.point_cloud)
-        try:
-            from agentic_gts.tools.gs_io import is_gaussian_ply
-            if is_gaussian_ply(args.point_cloud):
-                gs_ply = args.point_cloud
-        except Exception:
-            pass
-    out = build_report(args.run_dir, out_path=args.out,
-                       points=points, gs_ply=gs_ply)
-    print(f"[report] {out} (open in a browser)")
-
-
 def main():
     p = argparse.ArgumentParser(prog="agentic-gts")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -199,12 +151,6 @@ def main():
                         "fallbacks) runs on the mesh while rendering stays "
                         "3DGS; omitted, the point cloud itself is the "
                         "geometry source")
-    r.add_argument("--gs-cams", default=None, metavar="PATH",
-                   help="COLMAP training poses for render-trust scoring: "
-                        "the sparse dir (e.g. sparse/0 containing "
-                        "cameras.txt + images.txt) or images.txt itself. "
-                        "Candidate view scores then blend the distance to "
-                        "the trained ray distribution")
     r.add_argument("--gt", default=None, help="optional ground-truth boxes json")
     r.add_argument("--out", default="runs/latest")
     r.add_argument("--vlm", default="mock", choices=["mock", "qwen", "local"])
@@ -215,14 +161,6 @@ def main():
                    help="served model name (qwen) or local checkpoint dir (local), "
                         "e.g. Qwen/Qwen3-VL-8B-Instruct or /models/qwen3-vl "
                         "(also env VLM_MODEL)")
-    r.add_argument("--vlm-thinking-model", default=None,
-                   help="optional thinking checkpoint for hard-case escalation, "
-                        "e.g. Qwen/Qwen3-VL-8B-Thinking (also env "
-                        "VLM_THINKING_MODEL). Low-quality evidence renders are "
-                        "re-asked on it; godview audits run on it directly")
-    r.add_argument("--vlm-thinking-base", default=None,
-                   help="API base for the thinking model if served separately "
-                        "(defaults to --vlm-base, also env VLM_THINKING_API_BASE)")
     r.add_argument("--sam-checkpoint", default=None,
                    help="SAM2/SAM checkpoint for local VLM-point + SAM mask "
                         "refinement (also env SAM_CHECKPOINT)")
@@ -244,16 +182,6 @@ def main():
     v.add_argument("--boxes", default=None)
     v.add_argument("--gt", default=None)
     v.set_defaults(fn=cmd_view)
-
-    rp = sub.add_parser("report", help="per-box local view + VLM verdict HTML")
-    rp.add_argument("--run-dir", required=True,
-                    help="pipeline output dir (needs boxes.json)")
-    rp.add_argument("--point-cloud", default=None,
-                    help="optional: re-render a fresh local view for every "
-                         "final box")
-    rp.add_argument("--out", default=None,
-                    help="output html path (default <run-dir>/vlm_report.html)")
-    rp.set_defaults(fn=cmd_report)
 
     args = p.parse_args()
     args.fn(args)

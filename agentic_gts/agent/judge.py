@@ -201,18 +201,11 @@ def _salvage_bboxes(text: str, W: int, H: int) -> list[tuple]:
     return rects
 
 
-def _png_to_b64(png_bytes: bytes) -> str:
-    return base64.b64encode(png_bytes).decode("ascii")
-
-
 class VLMJudge:
     def __init__(self, backend: str = "mock",
                  model: str | None = None,
                  api_base: str | None = None, api_key: str | None = None,
-                 timeout: int = 60,
-                 thinking_model: str | None = None,
-                 thinking_api_base: str | None = None,
-                 thinking_timeout: int = 300):
+                 timeout: int = 60):
         self.backend = backend
         self.model = (model or os.environ.get("VLM_MODEL") or
                       "Qwen/Qwen3-VL-8B-Instruct")
@@ -220,67 +213,16 @@ class VLMJudge:
                          "http://127.0.0.1:8000/v1")
         self.api_key = api_key or os.environ.get("VLM_API_KEY", "EMPTY")
         self.timeout = timeout
-        # ---- escalation tier (optional thinking checkpoint) ----
-        # When set, verdicts whose evidence render scored below the
-        # quality floor are re-asked on the thinking model (and the
-        # god-view audit runs on it directly): multi-step visual
-        # reasoning is exactly where thinking checkpoints gain, and the
-        # 1.5-5x latency is paid only on the (few) hard cases.
-        self.thinking_model = (thinking_model or
-                               os.environ.get("VLM_THINKING_MODEL"))
-        self.thinking_api_base = (thinking_api_base or
-                                  os.environ.get("VLM_THINKING_API_BASE") or
-                                  self.api_base)
-        self.thinking_timeout = thinking_timeout
         self._local_model = None   # lazy: (processor, model), loaded once
-        self._thinking_local_model = None  # lazy second slot, thinking only
         self.record_path = None    # if set, append JSONL records of adjudications
         self.evidence_dir = None   # if set, persist adjudication images here
-
-    def _api_target(self, thinking: bool):
-        """(api_base, api_key, model, timeout) for the tier in question."""
-        if thinking:
-            return (self.thinking_api_base, self.api_key,
-                    self.thinking_model, self.thinking_timeout)
-        return (self.api_base, self.api_key, self.model, self.timeout)
-
-    # built via concatenation so the literal tags survive any tooling that
-    # strips angle-bracket markup from source edits
-    _THINK_O = "<" + "think>"
-    _THINK_C = "</" + "think>"
-
-    @classmethod
-    def _strip_think(cls, text: str) -> str:
-        """Remove inline chain-of-thought blocks from a thinking model's
-        reply. Served without a reasoning parser, Qwen3-VL Thinking emits
-        an explicit think block (or the newer channel syntax) before the
-        final answer. vLLM with a reasoning parser puts the chain in a
-        separate field and the content arrives clean -- stripping is a
-        no-op then. A truncated chain (max_tokens hit inside the block)
-        leaves no closing tag: everything from the opener on is dropped.
-        """
-        if not text:
-            return text
-        import re
-        text = re.sub(re.escape(cls._THINK_O) + r".*?" + re.escape(cls._THINK_C),
-                      "", text, flags=re.DOTALL)
-        text = re.sub(r"<\|channel\|>analysis<\|message\|>.*?(<\|end\|>|$)",
-                      "", text, flags=re.DOTALL)
-        text = re.sub(r"<\|channel\|>\s*final\s*<\|message\|>", "", text)
-        # unclosed think block: max_tokens truncated inside the chain --
-        # nothing after the opener is trustworthy
-        i = text.find(cls._THINK_O)
-        if i >= 0:
-            text = text[:i]
-        return text.strip()
 
     def set_record(self, record_path: str) -> None:
         """Enable structured recording of every adjudication to a JSONL file.
         Also enables persisting every evidence image the VLM actually saw
         (saved next to the record file) so decisions can be audited."""
         self.record_path = record_path
-        import os as _os
-        d = _os.path.dirname(record_path)
+        d = os.path.dirname(record_path)
         self.evidence_dir = d if d else "."
 
     def _save_evidence_png(self, img_arr: np.ndarray, name: str) -> str | None:
@@ -288,12 +230,11 @@ class VLMJudge:
         if not self.evidence_dir:
             return None
         try:
-            import os as _os
             import matplotlib
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
-            _os.makedirs(self.evidence_dir, exist_ok=True)
-            path = _os.path.join(self.evidence_dir, name)
+            os.makedirs(self.evidence_dir, exist_ok=True)
+            path = os.path.join(self.evidence_dir, name)
             plt.imsave(path, img_arr)
             return path
         except Exception as e:
@@ -303,21 +244,17 @@ class VLMJudge:
     def _record(self, kind: str, prompt: str, answer: str,
                 choice: str, confidence: float, detail: str,
                 png_path: str | None = None,
-                quality: dict | None = None,
-                escalated: bool = False) -> None:
+                quality: dict | None = None) -> None:
         """Append one adjudication record (image path + prompt + answer)."""
         if not self.record_path:
             return
-        import os as _os
         rec = {"kind": kind, "prompt": prompt, "answer": answer,
                "choice": choice, "confidence": confidence,
                "detail": detail, "image": png_path}
-        if escalated:
-            rec["escalated"] = True
         if quality:
             rec["quality"] = quality
         try:
-            _os.makedirs(_os.path.dirname(self.record_path), exist_ok=True)
+            os.makedirs(os.path.dirname(self.record_path), exist_ok=True)
             with open(self.record_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception as e:
@@ -356,33 +293,21 @@ class VLMJudge:
         device structure (a joined row = one region).
 
         Returns pixel rects [(x0, y0, x1, y1)] or [] on mock / failure.
-        Runs on the thinking tier when configured: one call per view,
-        and these regions BECOME the pipeline's boxes (high stakes)."""
+        One call per view, and these regions BECOME the pipeline's
+        boxes (high stakes)."""
         prompt = self._GROUND_PROMPT
         if self.backend == "mock":
             return []
-        use_thinking = bool(self.thinking_model)
         try:
-            for thinking in ((True, False) if use_thinking else (False,)):
-                try:
-                    # generous budget: row-heavy rooms return 30+
-                    # regions; the old 900/2048 caps TRUNCATED the
-                    # reply mid-item and the whole grounding silently
-                    # failed (user report)
-                    if self.backend == "local":
-                        text = self._local_image_call(
-                            png, prompt, max_new_tokens=6000,
-                            thinking=thinking)
-                    else:
-                        text = self._qwen_image_call(
-                            png, prompt, max_tokens=6000,
-                            thinking=thinking)
-                    break
-                except Exception as e:
-                    if not thinking:
-                        raise
-                    print(f"[vlm][ground][thinking] failed "
-                          f"({type(e).__name__}: {e}) -> fast model")
+            # generous budget: row-heavy rooms return 30+ regions; the
+            # old 900/2048 caps TRUNCATED the reply mid-item and the
+            # whole grounding silently failed (user report)
+            if self.backend == "local":
+                text = self._local_image_call(
+                    png, prompt, max_new_tokens=6000)
+            else:
+                text = self._qwen_image_call(
+                    png, prompt, max_tokens=6000)
         except Exception as e:
             print(f"[vlm][ground] failed ({type(e).__name__}: {e}) "
                   f"-> no grounding")
@@ -396,8 +321,7 @@ class VLMJudge:
             # grounding output does not parse (user needs the raw text)
             if png_path:
                 try:
-                    import os as _os
-                    rp = _os.path.splitext(png_path)[0] + "_reply.txt"
+                    rp = os.path.splitext(png_path)[0] + "_reply.txt"
                     with open(rp, "w", encoding="utf-8") as rf:
                         rf.write(text or "")
                     print(f"[vlm][ground] full raw reply -> {rp}")
@@ -408,14 +332,10 @@ class VLMJudge:
                     f"{len(rects)} regions", 0.5, "", png_path=png_path)
         return rects
 
-    # Prompt style follows the OFFICIAL 2d_grounding cookbook verbatim
-    # (same lesson as _GROUND_PROMPT above): categories + the JSON
-    # template ONLY. Explaining the coordinate system or dictating a
-    # custom reply structure (the earlier candidate_groups draft) is
-    # off-distribution instruction the model must second-guess. The
-    # official {"bbox_2d": ..., "label": ...} array is the trained
-    # output; parse_box_groups accepts it natively (top-level array,
-    # label -> hypothesis).
+    # Same cookbook lesson as _GROUND_PROMPT above: categories + the
+    # JSON template ONLY; the official {"bbox_2d": ..., "label": ...}
+    # array is the trained output, parse_box_groups accepts it
+    # natively (top-level array, label -> hypothesis).
     # The splitting rules replace the removed split_stage: a joined row
     # whose cabinets differ in height or color must be grounded as
     # SEPARATE instances (the row split now comes from this grounding,
@@ -473,12 +393,9 @@ class VLMJudge:
             png_path = self._save_evidence_png(
                 image, f"sam_boxes_{box.box_id}_{view_name}.png")
         try:
-            # generous budget: a LONG joined row grounds dozens of
-            # cabinets, each its own bbox_2d item (plus the door
-            # instances). The old 800-token cap truncated the reply
-            # mid-item on such rows (user report) -- parse_box_groups
-            # salvage-recovers the COMPLETE boxes, but the tail
-            # cabinets were still lost. Mirrors ground_regions' budget.
+            # generous budget (mirrors ground_regions): a long joined
+            # row grounds dozens of bbox_2d items -- small caps truncate
+            # the reply mid-item (user report) and the tail is lost
             if self.backend == "local":
                 text = self._local_image_call(png, prompt,
                                               max_new_tokens=6000)
@@ -489,8 +406,8 @@ class VLMJudge:
                          f"call failed: {e}", png_path=png_path)
             return Verdict(action="keep", params={"groups": []},
                            confidence=0.0, detail=f"call failed: {e}")
-        parsed = parse_box_groups(self._strip_think(text))
-        quality = reply_view_quality(self._strip_think(text))
+        parsed = parse_box_groups(text)
+        quality = reply_view_quality(text)
         groups = [{"bbox": g.bbox_norm,
                    "hypothesis": g.hypothesis,
                    "confidence": g.confidence} for g in parsed]
@@ -551,7 +468,7 @@ class VLMJudge:
                          0.0, f"call failed: {e}", png_path=png_path)
             return Verdict(action="keep", params=None, confidence=0.0,
                            detail=f"call failed: {e}")
-        p = self._parse_rack_confirm(self._strip_think(text))
+        p = self._parse_rack_confirm(text)
         self._record("rack_confirm", self._RACK_CONFIRM_PROMPT, text,
                      str(p), p["confidence"] if p else 0.0,
                      "no deletion on a 'no' -- LOW + human review",
@@ -598,9 +515,8 @@ class VLMJudge:
         geometric rules for where the side camera stands keep
         misjudging which end is clear -- let the VLM look at the
         actual renders). One tiny call: panels labeled A.. in one
-        image, reply one letter. params["pick"] is the panel index or
+        image, reply one letter.         params["pick"] is the panel index or
         None (unparseable -> the caller's rule order stands)."""
-        import re
         if self.backend == "mock" or n_panels < 1:
             return Verdict(action="keep", params={"pick": None},
                            confidence=0.0,
@@ -621,7 +537,7 @@ class VLMJudge:
                          0.0, f"call failed: {e}", png_path=png_path)
             return Verdict(action="keep", params={"pick": None},
                            confidence=0.0, detail=f"call failed: {e}")
-        body = self._strip_think(text)
+        body = (text or "").strip()
         pick = None
         last = chr(ord("A") + n_panels - 1)
         m = re.match(r"\s*([A-%s])\b" % last, body.strip())
@@ -651,15 +567,11 @@ class VLMJudge:
 
     # ---- shared image-call helpers (grounding / split / sam / rack-confirm) ----
     def _local_image_call(self, png_bytes: bytes, prompt: str,
-                          max_new_tokens: int = 64,
-                          thinking: bool = False) -> str:
+                          max_new_tokens: int = 64) -> str:
         """In-process transformers call with a PNG image + text prompt."""
         from PIL import Image
-        self._ensure_local_model(thinking=thinking)
-        if thinking:
-            processor, model = self._thinking_local_model
-        else:
-            processor, model = self._local_model
+        self._ensure_local_model()
+        processor, model = self._local_model
         image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
         messages = [{
             "role": "user",
@@ -677,20 +589,17 @@ class VLMJudge:
             out = model.generate(**inputs, max_new_tokens=max_new_tokens,
                                   do_sample=False)
         trimmed = [o[len(i):] for i, o in zip(inputs.input_ids, out)]
-        return self._strip_think(
-            processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip())
+        return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
 
     def _qwen_image_call(self, png_bytes: bytes, prompt: str,
-                         max_tokens: int = 64,
-                         thinking: bool = False) -> str:
+                         max_tokens: int = 64) -> str:
         """OpenAI-compatible chat call with a base64 PNG image."""
         b64 = base64.b64encode(png_bytes).decode("ascii")
-        api_base, api_key, model, timeout = self._api_target(thinking)
         r = requests.post(
-            api_base + "/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
+            self.api_base + "/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
             json={
-                "model": model,
+                "model": self.model,
                 "messages": [{
                     "role": "user",
                     "content": [
@@ -709,24 +618,17 @@ class VLMJudge:
                 # others with identical input)
                 "seed": 0,
             },
-            timeout=timeout,
+            timeout=self.timeout,
         )
         r.raise_for_status()
-        return self._strip_think(
-            r.json()["choices"][0]["message"]["content"].strip())
+        return r.json()["choices"][0]["message"]["content"].strip()
 
     # ---- local in-process transformers model ----
-    def _ensure_local_model(self, thinking: bool = False):
-        """Load the model once; subsequent adjudications reuse it.
-        thinking=True loads the ESCALATION checkpoint into a separate
-        slot (lazily -- only if an escalation ever fires)."""
-        if not thinking and self._local_model is not None:
+    def _ensure_local_model(self):
+        """Load the model once; subsequent adjudications reuse it."""
+        if self._local_model is not None:
             return
-        if thinking and self._thinking_local_model is not None:
-            return
-        if thinking and not self.thinking_model:
-            raise RuntimeError("no thinking model configured")
-        model_path = self.thinking_model if thinking else self.model
+        model_path = self.model
         import torch
         import transformers
         from transformers import AutoProcessor
@@ -776,7 +678,4 @@ class VLMJudge:
             kwargs["attn_implementation"] = attn
         model = ModelCls.from_pretrained(model_path, **kwargs)
         model.eval()
-        if thinking:
-            self._thinking_local_model = (processor, model)
-        else:
-            self._local_model = (processor, model)
+        self._local_model = (processor, model)

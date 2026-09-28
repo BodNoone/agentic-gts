@@ -1,5 +1,4 @@
 """Tests for the row-completion recall fallback (complete_row_gaps).
-
 Covers:
   - interior gap fill: a cabinet the VLM never grounded, standing
     between two fitted boxes, is recovered by the point-support probe
@@ -10,19 +9,13 @@ Covers:
     filled (fills only one probe axis; a cabinet fills both)
 """
 from __future__ import annotations
-
 import os
 import sys
-
 import numpy as np
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from agentic_gts.core.models import (BoxSource, Confidence, OrientedBox,
                                       Scene)
 from agentic_gts.tools.geometry import complete_row_gaps, snap_row_seams
-
-
 def _cabinet(cx, cy=0.0, rng=None, w=0.6, d=1.1, h=2.1, n=1500):
     """Surface points of one closed cabinet at (cx, cy)."""
     rng = rng or np.random.default_rng(0)
@@ -38,19 +31,13 @@ def _cabinet(cx, cy=0.0, rng=None, w=0.6, d=1.1, h=2.1, n=1500):
                                     rng.uniform(cy - half_d, cy + half_d, n),
                                     rng.uniform(0.0, h, n)]))
     return np.vstack(pts)
-
-
 def _scene(boxes, points, yaw=0.0):
     scene = Scene(points=points)
     scene.meta["yaw"] = yaw
     scene.boxes = list(boxes)
     return scene
-
-
 def _box(cx, cy=0.0, w=0.6, d=1.1, h=2.1):
     return OrientedBox(center=(cx, cy, h / 2.0), size=(w, d, h), yaw=0.0)
-
-
 def test_interior_gap_filled():
     """Cabinets at x=0 and x=1.2, a THIRD one (points present) at x=0.6
     that grounding missed -> the probe recovers it."""
@@ -67,8 +54,6 @@ def test_interior_gap_filled():
     assert b.confidence == Confidence.LOW
     assert len(scene.boxes) == 3
     print("PASS interior gap fill (missed middle cabinet recovered)")
-
-
 def test_row_end_walk():
     """One fitted cabinet at x=0, point support continues to x=0.6 ->
     the end walk adds it (and stops: nothing beyond)."""
@@ -79,8 +64,6 @@ def test_row_end_walk():
     assert len(added) == 1, f"expected +1 at the row end, got {len(added)}"
     assert abs(added[0].center[0] - 0.6) < 0.15
     print("PASS row end walk (support beyond the last box extends the row)")
-
-
 def test_empty_gap_not_filled():
     """Cabinets at x=0 and x=2.4 with NOTHING in between (a real
     aisle cut through the row) -> no fill."""
@@ -90,8 +73,6 @@ def test_empty_gap_not_filled():
     added = complete_row_gaps(scene)
     assert added == [], f"empty gap must stay empty, got {len(added)} fill(s)"
     print("PASS empty gap not filled (no support -> no box)")
-
-
 def test_wall_past_row_end_not_filled():
     """A thin partition (0.2m) running along the row, past its end: it
     has height and plenty of points, but only fills the probe's CROSS
@@ -107,8 +88,6 @@ def test_wall_past_row_end_not_filled():
     assert added == [], \
         f"a thin wall slice must not become a cabinet, got {len(added)}"
     print("PASS wall past row end not filled (footprint span guard)")
-
-
 def test_rotated_frame():
     """Same interior-gap scenario, whole layout rotated 30 deg in world
     frame (yaw in meta): the fill lands in the rotated position."""
@@ -116,11 +95,9 @@ def test_rotated_frame():
     yaw = math.radians(30.0)
     rng = np.random.default_rng(5)
     c, s = math.cos(yaw), math.sin(yaw)
-
     def rot(p):
         return np.column_stack([c * p[:, 0] - s * p[:, 1],
                                 s * p[:, 0] + c * p[:, 1], p[:, 2]])
-
     pts = rot(np.vstack([_cabinet(0.0, rng=rng), _cabinet(0.6, rng=rng),
                          _cabinet(1.2, rng=rng)]))
     # boxes: long axis along the rotated x = yaw
@@ -133,8 +110,6 @@ def test_rotated_frame():
     ex, ey = c * 0.6, s * 0.6
     assert math.hypot(added[0].center[0] - ex, added[0].center[1] - ey) < 0.15
     print("PASS rotated frame (fill follows the row axis)")
-
-
 def test_snap_row_seams_closes_small_gap():
     """Two split pieces whose seam landed 6cm apart -> snapped to the
     average, so the neighbours share ONE edge."""
@@ -147,8 +122,6 @@ def test_snap_row_seams_closes_small_gap():
     assert abs(a_hi - b_lo) < 1e-9, f"seam not shared ({a_hi:.3f} vs {b_lo:.3f})"
     assert abs(a_hi - 0.33) < 1e-9, f"seam must be the average, got {a_hi:.3f}"
     print("PASS snap row seams (small gap averaged to a shared edge)")
-
-
 def test_snap_row_seams_overlap_averaged():
     """A slight overlap (mask bleed) is normalised to the midpoint too."""
     a = OrientedBox(center=(0.0, 0.0, 1.05), size=(0.6, 1.1, 2.1), yaw=0.0)
@@ -160,8 +133,6 @@ def test_snap_row_seams_overlap_averaged():
     assert abs(a_hi - b_lo) < 1e-9
     assert abs(a_hi - 0.275) < 1e-9, f"seam must be the midpoint, got {a_hi:.3f}"
     print("PASS snap row seams (overlap averaged)")
-
-
 def test_snap_row_seams_leaves_real_aisle():
     """A 0.5m aisle between two cabinets is NOT a seam: untouched."""
     a = OrientedBox(center=(0.0, 0.0, 1.05), size=(0.6, 1.1, 2.1), yaw=0.0)
@@ -170,8 +141,6 @@ def test_snap_row_seams_leaves_real_aisle():
     assert n == 0, f"a real aisle must not be snapped, got {n}"
     assert abs(a.center[0]) < 1e-9 and abs(b.center[0] - 1.1) < 1e-9
     print("PASS snap row seams (real aisle left alone)")
-
-
 def test_snap_row_seams_unifies_cross_vertices():
     """Pieces whose facing CORNER PAIRS are each close get their shared
     edge's cross vertices averaged -> one collinear edge."""
@@ -183,8 +152,6 @@ def test_snap_row_seams_unifies_cross_vertices():
     assert abs(a.center[1] - 0.03) < 1e-9 and abs(b.center[1] - 0.03) < 1e-9
     assert abs(a.size[1] - 1.08) < 1e-9 and abs(b.size[1] - 1.08) < 1e-9
     print("PASS snap row seams (cross vertices averaged, collinear edge)")
-
-
 def test_snap_row_seams_keeps_far_cross():
     """When one facing corner pair is far apart, the cross extent is
     NOT merged -- only the along seam is normalised, and the different
@@ -199,8 +166,6 @@ def test_snap_row_seams_keeps_far_cross():
     b_lo = b.center[0] - b.size[0] / 2.0
     assert abs(a_hi - b_lo) < 1e-9, "the along seam is still shared"
     print("PASS snap row seams (far cross kept, along edge still normalised)")
-
-
 def test_snap_row_seams_height_step_skips():
     """Devices on different height planes (>5cm between their TOPS) are
     NEVER seamed, however small the gap (user directive: the split
@@ -219,17 +184,3 @@ def test_snap_row_seams_height_step_skips():
     assert n2 == 0, "no seam across a height step, even a touching one"
     assert abs(c.center[0]) < 1e-9 and abs(d.center[0] - 0.64) < 1e-9
     print("PASS snap row seams height step (never seamed across a step)")
-
-
-if __name__ == "__main__":
-    test_interior_gap_filled()
-    test_row_end_walk()
-    test_empty_gap_not_filled()
-    test_wall_past_row_end_not_filled()
-    test_rotated_frame()
-    test_snap_row_seams_closes_small_gap()
-    test_snap_row_seams_overlap_averaged()
-    test_snap_row_seams_leaves_real_aisle()
-    test_snap_row_seams_unifies_cross_vertices()
-    test_snap_row_seams_keeps_far_cross()
-    test_snap_row_seams_height_step_skips()

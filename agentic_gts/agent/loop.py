@@ -8,11 +8,8 @@ New-flow contract (user-directed architecture):
   row, where an open door sticks out beyond the body) corrects each
   piece's thickness; plus the rack type-confirm guard.
 
-There is NO issue/repair loop anymore: the old rule-detected
-(MERGED_ROW / FALSE_POSITIVE / OVERLAP / WIDTH_MISFIT) repair rounds,
-god-view suspicious nomination and depth completion were the
-pre-grounding pipeline's patch passes; grounding + per-box SAM evidence
-made them redundant.
+There is NO issue/repair loop anymore: grounding + per-box SAM
+evidence replaced the pre-grounding pipeline's patch passes.
 """
 from __future__ import annotations
 
@@ -42,13 +39,11 @@ def _is_equipment_label(label) -> bool:
 
 @dataclass
 class AgentReport:
-    resolved: list[dict] = field(default_factory=list)
     unresolved: list[dict] = field(default_factory=list)
     actions_taken: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
-            "resolved": self.resolved,
             "unresolved": self.unresolved,
             "actions_taken": self.actions_taken,
         }
@@ -69,8 +64,7 @@ class LayoutAgent:
         # projected 3DGS centers fit the metric OBB. Runs for BOTH
         # externally supplied and VLM-grounded boxes; grounding finds
         # where, local masks refine edges -- and the local grounding
-        # itself splits joined rows whose cabinets differ (the former
-        # split_stage's job, now decided on the same SAM evidence).
+        # itself splits joined rows whose cabinets differ.
         self._local_mask_refine(scene, report)
         # 2. confidence tagging from point support. The type-confirm LOW
         # marks from step 1 are the last word: a well-supported structure

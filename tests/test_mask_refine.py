@@ -1,23 +1,17 @@
 """Local Qwen point prompts -> SAM mask -> 3D OBB tests (no SAM install)."""
 from __future__ import annotations
-
 import json
 import math
 import os
 import sys
 import tempfile
-
 import numpy as np
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from agentic_gts.agent.mask_refine import (
     BoxGroup, SamPredictorAdapter, parse_box_groups,
     refine_box, _anchored_top, _pick_piece_top,
 )
 from agentic_gts.core.models import OrientedBox, Scene
-
-
 def _column(bins: list[tuple[float, float, int]], seed: int = 0):
     """Build a synthetic z-column: [(z0, z1, per-bin count)] -> points
     uniformly spread inside each band (rng-jittered so bins stay
@@ -29,8 +23,6 @@ def _column(bins: list[tuple[float, float, int]], seed: int = 0):
             continue
         out.append(rng.uniform(z0, z1, n))
     return np.concatenate(out) if out else np.zeros(0)
-
-
 def _quality_image(H: int = 768, W: int = 768) -> np.ndarray:
     """A render that passes the gradient-energy gate: bright speckle
     on a dark canvas (coverage well over 2%, edge energy orders above
@@ -41,8 +33,6 @@ def _quality_image(H: int = 768, W: int = 768) -> np.ndarray:
                                           replace=False)
     flat[idx] = 0.85
     return img
-
-
 def _fake_gs(means: np.ndarray):
     """A minimal GaussianData over the given means (solid, tiny)."""
     from agentic_gts.tools.gs_io import GaussianData
@@ -54,8 +44,6 @@ def _fake_gs(means: np.ndarray):
         raw_opacity=np.full(n, 2.0, dtype=np.float32),
         f_dc=np.zeros((n, 3), dtype=np.float32),
     )
-
-
 def test_anchored_top_haze_tail_does_not_extend_body():
     """3DGS haze diffuses through the whole column: bins ABOVE the
     cabinet stay non-empty at a fraction of the body density. The old
@@ -71,8 +59,6 @@ def test_anchored_top_haze_tail_does_not_extend_body():
     top = _anchored_top(pts)
     assert top is not None
     assert top <= 2.15, f"haze tail extended the top to {top:.2f} m"
-
-
 def test_anchored_top_clean_column_and_thin_gap():
     """Clean body: top lands on the upper body edge (a weakened top
     bin at 50% of the body still passes body_frac=0.35), and a thin
@@ -84,7 +70,6 @@ def test_anchored_top_clean_column_and_thin_gap():
     top = _anchored_top(pts)
     assert top is not None and abs(top - 2.00) < 0.03, \
         f"clean body top {top:.2f}, expected ~2.00"
-
     # thin 5cm gap at 1.00-1.05 (1 empty bin; max_gap=2 breaks at 2)
     # -> run continues to 2.0
     pts2 = _column([(0.05 + 0.05 * i, 0.10 + 0.05 * i, 300)
@@ -94,8 +79,6 @@ def test_anchored_top_clean_column_and_thin_gap():
     top2 = _anchored_top(pts2)
     assert top2 is not None and top2 >= 1.95, \
         f"5cm mid-body gap terminated the walk at {top2:.2f}"
-
-
 def test_pick_piece_top_mask_primary_column_guards_truncation():
     """Height-source arbitration: SAM-mask z leads, the raw column
     only rescues the historical mask-TRUNCATION failure (mask z
@@ -135,7 +118,6 @@ def test_pick_piece_top_mask_primary_column_guards_truncation():
     assert _pick_piece_top(4.80, 2.00, seed_top) == (2.00, "col")
     # 8) nothing usable -> seed height stands
     assert _pick_piece_top(4.80, 5.00, seed_top) == (None, None)
-
     # MESH strict-mask mode (user directive: heights strictly follow the
     # SAM mask back-projected MESH points): in a mesh the trays are
     # PHYSICALLY connected to the rack tops, the anchored column walk
@@ -154,8 +136,6 @@ def test_pick_piece_top_mask_primary_column_guards_truncation():
                            strict_mask=True) == (2.00, "col")
     print("PASS piece-top arbitration (mask primary, col truncation guard, "
           "mesh strict-mask)")
-
-
 def test_box_groups_qwen_1000_to_pixels_once():
     reply = (
         'analysis\n{"candidate_groups": ['
@@ -167,8 +147,6 @@ def test_box_groups_qwen_1000_to_pixels_once():
     # 0-1000 grid converted to pixels exactly once
     assert np.allclose(box_pix, [76.7, 102.2, 383.5, 306.6], atol=0.1)
     print("PASS Qwen 0-1000 bbox_2d converted to SAM box pixels once")
-
-
 def test_box_groups_accept_fractional_and_swapped():
     # fractional [0,1] values normalized to the 0-1000 grid
     groups = parse_box_groups('{"bbox_2d": [0.25, 0.5, 0.9, 1.0]}')
@@ -180,8 +158,6 @@ def test_box_groups_accept_fractional_and_swapped():
     assert parse_box_groups('{"bbox_2d": [500, 500, 500, 600]}') == []
     assert parse_box_groups('{"bbox_2d": [100, 100, 2000, 300]}') == []
     print("PASS box groups (fractional, swapped corners, degenerates)")
-
-
 def test_sam_box_prompt_construction():
     """The real-VLM prompt must survive construction (literal JSON
     braces vs .format) AND follow the official 2d_grounding cookbook
@@ -222,8 +198,6 @@ def test_sam_box_prompt_construction():
     assert "quality: good" in prompt and "quality: poor" in prompt, \
         "the prompt must ask for the first-line quality verdict"
     print("PASS SAM box prompt construction (cookbook style, literal braces)")
-
-
 def test_reply_view_quality_parsing():
     """The per-view quality verdict parsed from the grounding reply's
     first line (judged in the SAME call, no extra budget). Missing
@@ -245,8 +219,6 @@ def test_reply_view_quality_parsing():
         "the LAST stated verdict wins"
     assert reply_view_quality("") == "good"
     print("PASS reply view quality parsing")
-
-
 def test_audit_json_survives_numpy_meta():
     """mask_refine.json save regression: audits carry box.to_dict(),
     whose meta transparently forwards numpy values from earlier stages
@@ -255,7 +227,6 @@ def test_audit_json_survives_numpy_meta():
     failed (TypeError)')."""
     import json as _json
     from agentic_gts.agent.mask_refine import json_default
-
     box = OrientedBox(center=(1, 2, 1), size=(0.6, 1.1, 2.0), yaw=0.0,
                       meta={"n_pts": np.int64(1234),
                             "mean_z": np.float32(1.23),
@@ -273,8 +244,6 @@ def test_audit_json_survives_numpy_meta():
     assert back[0]["box"]["meta"]["mean_z"] == float(np.float32(1.23))
     assert back[0]["box"]["meta"]["yaw_samples"] == [0.0, 1.0, 2.0]
     print("PASS audit json save survives numpy meta values")
-
-
 def test_box_groups_official_cookbook_array():
     """Qwen's native 2d_grounding reply: a top-level ARRAY of
     {"bbox_2d": ..., "label": ...} items. The structural scan enters
@@ -296,8 +265,6 @@ def test_box_groups_official_cookbook_array():
     assert len(parse_box_groups(reply2)) == 3, \
         "candidate_groups replies must not truncate either"
     print("PASS box groups (official cookbook array, no truncation)")
-
-
 def test_box_groups_jsonl_one_dict_per_line():
     """JSONL reply: one bare {"bbox_2d": ...} object per line -- the
     shape models emit when they follow the prompt's single-dict
@@ -321,8 +288,6 @@ def test_box_groups_jsonl_one_dict_per_line():
             '{"bbox_2d": [17, 18, 19, 20]}]'
     assert len(parse_box_groups(draft + final)) == 5
     print("PASS box groups (JSONL one-per-line merged in full)")
-
-
 def test_box_groups_long_row_budget():
     """The SAM-box call's token budget must hold a LONG joined row:
     dozens of cabinets, each its own bbox_2d item (plus door
@@ -353,8 +318,6 @@ def test_box_groups_long_row_budget():
     assert "max_tokens=6000" in src or "max_new_tokens=6000" in src, \
         "the SAM-box call must carry the long-row budget (6000)"
     print("PASS long-row reply parses in full (43 items, budget 6000)")
-
-
 def test_merge_spans_dedupes_but_keeps_seams():
     """A duplicate (the VLM double-boxing ONE cabinet -- high 2D IoU of
     the VLM's own pixel boxes) merges; truly adjacent cabinets keep
@@ -376,8 +339,6 @@ def test_merge_spans_dedupes_but_keeps_seams():
     assert abs(out[1]["lo"] - 0.62) < 1e-6 and abs(out[1]["hi"] - 1.20) < 1e-6
     assert len(out[0]["pts"]) == 80      # points merged
     print("PASS span merging (duplicates union, seams survive)")
-
-
 def test_merge_spans_mask_bleed_keeps_instances():
     """SAM masks bleed a few cm across the seam between joined cabinets
     (user report: the VLM grounds DISTINCT instances but the spans
@@ -408,8 +369,6 @@ def test_merge_spans_mask_bleed_keeps_instances():
     assert len(out2) == 2, \
         "distinct VLM boxes never merge, however far the masks bleed"
     print("PASS mask-bleed overlap keeps instances (seam at midpoint)")
-
-
 def test_build_split_pieces_trusts_seed_dims():
     """Pieces are SPLITS OF THE SEED: only the along extent/position come
     from the measured spans; yaw / height / depth / cross centre stay
@@ -440,8 +399,6 @@ def test_build_split_pieces_trusts_seed_dims():
     assert abs(out[0]["fitted"].size[0] - 1.2) < 1e-9
     assert abs(out[1]["fitted"].size[0] - 2.3) < 1e-9
     print("PASS split pieces keep seed dims, spans give along extent")
-
-
 def test_height_and_staggered_thickness_per_piece():
     """Per-piece height + geometry thickness fallback (user report:
     refine never corrected HEIGHTS, and a front-back STAGGERED row
@@ -454,7 +411,6 @@ def test_height_and_staggered_thickness_per_piece():
     from agentic_gts.agent.mask_refine import (_apply_height_and_geom_depth,
                                                 _build_split_pieces)
     rng = np.random.default_rng(7)
-
     def cabinet(x0, x1, c_lo, c_hi, z_hi, n=900):
         # shell-heavy sampling: half the points on each cross wall
         # (what a real cabinet's front/back faces look like to the
@@ -465,7 +421,6 @@ def test_height_and_staggered_thickness_per_piece():
                       c_hi - 0.02 * rng.random(n))
         zs = rng.uniform(0.1, z_hi, n)
         return np.column_stack([xs, cs, zs])
-
     a = cabinet(0.0, 1.2, -0.2, 0.9, 2.1)
     b = cabinet(1.2, 2.4, -0.9, 0.2, 1.2)
     scene = Scene(points=np.vstack([a, b]))
@@ -493,8 +448,6 @@ def test_height_and_staggered_thickness_per_piece():
         assert abs(p.center[1] - mid_exp) < 0.15, \
             f"cross centre {p.center[1]:.2f}, expected ~{mid_exp}"
     print("PASS per-piece height + staggered geometry thickness")
-
-
 def test_cross_view_merge_unions_pairs_drops_coarse():
     """Front + back vote on the SAME cabinets (user report: the front
     aisle is sometimes a narrow corridor -- the back face must
@@ -536,8 +489,6 @@ def test_cross_view_merge_unions_pairs_drops_coarse():
     assert len(out2) == 1 and len(out2[0]["pts"]) == 80
     assert abs(out2[0]["lo"]) < 1e-9 and abs(out2[0]["hi"] - 0.6) < 1e-9
     print("PASS cross-view merge (pairs union, coarse bridges drop)")
-
-
 def test_back_view_rescues_poor_front_end_to_end():
     """The user's narrow-corridor scenario END-TO-END: the front aisle
     is cramped, its render poor, and the VLM grounds ONE whole-row box
@@ -546,12 +497,10 @@ def test_back_view_rescues_poor_front_end_to_end():
     coarse front span is dropped by the cross-view rule, the back's
     fine division stands."""
     import math
-
     from agentic_gts.agent import mask_refine as mr
     from agentic_gts.agent.judge import Verdict, VLMJudge
     from agentic_gts.agent.loop import AgentReport, LayoutAgent
     from agentic_gts.output.gs_render import Cam
-
     rng = np.random.default_rng(7)
     cabA = np.column_stack([rng.uniform(-1.0, -0.05, 800),
                             rng.uniform(-0.5, 0.5, 800),
@@ -585,9 +534,7 @@ def test_back_view_rescues_poor_front_end_to_end():
     _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
              mr.SamPredictorAdapter.predict)
     mr.render_local_views = lambda scene, box, out_dir, judge=None: views
-
     j = VLMJudge(backend="mock")
-
     def fake_ground(image, box, view_name, png_path=None):
         # front: the POOR view -- one whole-row box; back: the open
         # side -- the true two cabinets; side: one profile box
@@ -604,18 +551,14 @@ def test_back_view_rescues_poor_front_end_to_end():
                        "confidence": 0.9}]
         return Verdict(action="segment", params={"groups": groups},
                        confidence=0.9, detail="fake")
-
     j.adjudicate_sam_boxes = fake_ground
-
     def fake_predict(self, image, box_pix):
         m = np.zeros(image.shape[:2], bool)
         x1, y1, x2, y2 = (int(round(float(v))) for v in box_pix)
         m[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)] = True
         return [m], [0.95]
-
     mr.SamPredictorAdapter._load = lambda self: None
     mr.SamPredictorAdapter.predict = fake_predict
-
     agent = LayoutAgent(judge=j, opts={"sam_checkpoint": "fake.pt"},
                         out_dir=None)
     try:
@@ -623,7 +566,6 @@ def test_back_view_rescues_poor_front_end_to_end():
     finally:
         (mr.render_local_views, mr.SamPredictorAdapter._load,
          mr.SamPredictorAdapter.predict) = _real
-
     assert len(scene.boxes) == 2, \
         (f"the back view's fine division must survive the poor front: "
          f"got {len(scene.boxes)}: "
@@ -631,8 +573,6 @@ def test_back_view_rescues_poor_front_end_to_end():
     centers = sorted(b.center[0] for b in scene.boxes)
     assert centers[0] < -0.2 < 0.2 < centers[1], centers
     print("PASS back view rescues a poor front (coarse span dropped)")
-
-
 def test_cluster_box_type_gate_skips_sam():
     """Recall-first cluster proposals (user question: why should a
     pillar / UPS / junk block pay the FULL SAM refinement?): the type
@@ -645,7 +585,6 @@ def test_cluster_box_type_gate_skips_sam():
     from agentic_gts.agent.loop import AgentReport, LayoutAgent
     from agentic_gts.core.models import Confidence
     from agentic_gts.output.gs_render import Cam
-
     rng = np.random.default_rng(3)
     pts = np.column_stack([rng.uniform(-1.0, 1.0, 2000),
                            rng.uniform(-0.5, 0.5, 2000),
@@ -668,36 +607,27 @@ def test_cluster_box_type_gate_skips_sam():
              mr.SamPredictorAdapter.predict)
     mr.render_local_views = lambda scene, box, out_dir, judge=None: views
     mr.SamPredictorAdapter._load = lambda self: None
-
     def fake_predict(self, image, box_pix):
         m = np.zeros(image.shape[:2], bool)
         x1, y1, x2, y2 = (int(round(float(v))) for v in box_pix)
         m[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)] = True
         return [m], [0.95]
-
     mr.SamPredictorAdapter.predict = fake_predict
-
     j = VLMJudge(backend="qwen")
-
     def fake_confirm(png, box, png_path=None):
         is_rack = box.meta.get("cluster") == 2
         return Verdict(action="confirm",
                        params={"is_rack": is_rack, "confidence": 0.9},
                        confidence=0.9, detail="fake")
-
     j.adjudicate_rack_confirm = fake_confirm
-
     grounded = []
-
     def fake_ground(image, box, view_name, png_path=None):
         grounded.append((box.box_id, view_name))
         groups = [{"bbox": (10, 10, 990, 990), "hypothesis": "rack",
                    "confidence": 0.9}]
         return Verdict(action="segment", params={"groups": groups},
                        confidence=0.9, detail="fake")
-
     j.adjudicate_sam_boxes = fake_ground
-
     agent = LayoutAgent(judge=j, opts={"sam_checkpoint": "fake.pt"},
                         out_dir=None)
     try:
@@ -705,7 +635,6 @@ def test_cluster_box_type_gate_skips_sam():
     finally:
         (mr.render_local_views, mr.SamPredictorAdapter._load,
          mr.SamPredictorAdapter.predict) = _real
-
     assert pillar.confidence == Confidence.LOW, \
         "pillar verdict must mark the cluster box LOW"
     assert pillar.meta.get("type_suspect"), \
@@ -716,8 +645,6 @@ def test_cluster_box_type_gate_skips_sam():
         "the SAM grounding must run ONLY for the confirmed rack, " \
         f"got calls for {sorted(set(bid for bid, _ in grounded))}"
     print("PASS cluster type gate (pillar LOW before SAM, rack refines)")
-
-
 def test_vlm_quality_verdict_drops_garbage_view():
     """VLM quality verdict (user direction: judged TOGETHER with the
     grounding in the same call, garbage views DROPPED): a fogged front
@@ -730,7 +657,6 @@ def test_vlm_quality_verdict_drops_garbage_view():
     from agentic_gts.agent.judge import Verdict, VLMJudge
     from agentic_gts.agent.loop import AgentReport, LayoutAgent
     from agentic_gts.output.gs_render import Cam
-
     rng = np.random.default_rng(7)
     cabA = np.column_stack([rng.uniform(-1.0, -0.05, 800),
                             rng.uniform(-0.5, 0.5, 800),
@@ -753,9 +679,7 @@ def test_vlm_quality_verdict_drops_garbage_view():
     _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
              mr.SamPredictorAdapter.predict)
     mr.render_local_views = lambda scene, box, out_dir, judge=None: views
-
     j = VLMJudge(backend="mock")
-
     def fake_ground(image, box, view_name, png_path=None):
         # front: the FOGGED view -- judged poor, but the model still
         # hallucinated a confident whole-row box (the danger the
@@ -775,18 +699,14 @@ def test_vlm_quality_verdict_drops_garbage_view():
         return Verdict(action="segment", params={
             "groups": groups, "view_quality": "good"},
             confidence=0.9, detail="fake", raw="quality: good")
-
     j.adjudicate_sam_boxes = fake_ground
-
     def fake_predict(self, image, box_pix):
         m = np.zeros(image.shape[:2], bool)
         x1, y1, x2, y2 = (int(round(float(v))) for v in box_pix)
         m[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)] = True
         return [m], [0.95]
-
     mr.SamPredictorAdapter._load = lambda self: None
     mr.SamPredictorAdapter.predict = fake_predict
-
     agent = LayoutAgent(judge=j, opts={"sam_checkpoint": "fake.pt"},
                         out_dir=None)
     try:
@@ -794,7 +714,6 @@ def test_vlm_quality_verdict_drops_garbage_view():
     finally:
         (mr.render_local_views, mr.SamPredictorAdapter._load,
          mr.SamPredictorAdapter.predict) = _real
-
     assert len(scene.boxes) == 2, \
         (f"the poor-verdict front must be dropped and the back's "
          f"division stand: got {len(scene.boxes)}: "
@@ -802,8 +721,6 @@ def test_vlm_quality_verdict_drops_garbage_view():
     centers = sorted(b.center[0] for b in scene.boxes)
     assert centers[0] < -0.2 < 0.2 < centers[1], centers
     print("PASS VLM quality verdict drops the garbage view")
-
-
 def test_cross_view_single_face_yields_to_multi():
     """USER RULE: one face grounds ONE instance, the other grounds
     SEVERAL -> the several stand (the row is one whole; the single box
@@ -848,8 +765,6 @@ def test_cross_view_single_face_yields_to_multi():
         "the cable-height z must not leak into any piece's points"
     print("PASS single-instance face yields to the multi face "
           "(extent and points)")
-
-
 def test_height_ignores_truncated_mask_points():
     """The height z-source is the RAW-CLOUD column, not the piece's
     mask points (user report: some boxes came out VERY low). Two ways
@@ -879,8 +794,6 @@ def test_height_ignores_truncated_mask_points():
         f"height {h:.2f} must come from the raw column (~2.1), " \
         "not the truncated mask points (~0.8)"
     print("PASS height ignores truncated mask points (raw column)")
-
-
 def test_sam_unconfigured_is_conservative():
     old = os.environ.pop("SAM_CHECKPOINT", None)
     try:
@@ -890,8 +803,6 @@ def test_sam_unconfigured_is_conservative():
         if old is not None:
             os.environ["SAM_CHECKPOINT"] = old
     print("PASS SAM-unconfigured path keeps boxes unchanged")
-
-
 def test_sam_predict_encodes_image_once_per_object():
     """predict() must call set_image only ONCE per distinct image OBJECT:
     a multi-group view (joined row split into G cabinets) runs G box
@@ -900,13 +811,10 @@ def test_sam_predict_encodes_image_once_per_object():
     must always re-encode (correctness never depends on the cache)."""
     class _FakePred:
         n_set = 0
-
         def set_image(self, u8):
             self.n_set += 1
-
         def predict(self, box, multimask_output):
             return [np.ones((8, 8), bool)], [0.9], None
-
     sam = SamPredictorAdapter(checkpoint=None)
     sam._predictor = _FakePred()
     sam._last_img = None
@@ -919,8 +827,6 @@ def test_sam_predict_encodes_image_once_per_object():
     assert sam._predictor.n_set == 2, \
         f"a new image must re-encode, got {sam._predictor.n_set}"
     print("PASS SAM adapter encodes once per image object")
-
-
 def test_equipment_label_gate():
     """The type-confirm skip gate: grounding labels naming the equipment
     classes pass; anything else (pillar / wall / ups / unknown) fails and
@@ -936,8 +842,6 @@ def test_equipment_label_gate():
     assert not _is_equipment_label("wall segment")
     assert not _is_equipment_label("ups battery")
     print("PASS equipment-label gate for the type-confirm skip")
-
-
 def test_open_side_far_mass_beats_diffuse_wall():
     """The room-boundary override: an EXTREMELY diffuse wall smear
     (faint enough that no 5cm opacity bin reaches mass 1.0, and
@@ -979,8 +883,6 @@ def test_open_side_far_mass_beats_diffuse_wall():
         f"corridor must track the facing row, got {corridor:.2f}"
     print(f"PASS far-mass override beats diffuse wall "
           f"(aisle corridor {corridor:.2f}m)")
-
-
 def test_front_azim_puts_camera_on_open_side():
     """The front-view azimuth must place make_local_cam's EYE on the
     open side -- for BOTH box layouts. The old flip compared open_vec
@@ -1007,8 +909,6 @@ def test_front_azim_puts_camera_on_open_side():
                 f"open={od}, azim={azim}, eye_side={side}")
     print("PASS front azimuth places the camera on the open side "
           "(both layouts, both directions)")
-
-
 def test_free_row_end_and_side_azim():
     """The SIDE view must stand beyond the row's FREE end (user
     report: a cabinet whose side face is flush against a wall veiled
@@ -1066,8 +966,6 @@ def test_free_row_end_and_side_azim():
             f"end_sign={end_sign:+.0f}")
     print("PASS side view stands beyond the free row end "
           "(both layouts, wall at either end)")
-
-
 def test_box_only_mask_excludes_flush_parallel_wall():
     """A wall FLUSH against the row's closed lateral face fogs the
     local views from ANY camera position: its gaussian means sit
@@ -1124,8 +1022,6 @@ def test_box_only_mask_excludes_flush_parallel_wall():
         "pre-conditions: the wall really is within the plain slack"
     print("PASS box-only mask drops the flush parallel wall, keeps "
           "the device's bled face gaussians")
-
-
 def test_open_side_flush_wall_and_floaters():
     """The open-side pick for a WALL-ADJACENT box: a wall flush against
     one face (gap < 0.1 m) must BLOCK that side -- the old single-point
@@ -1160,7 +1056,6 @@ def test_open_side_flush_wall_and_floaters():
     # open side is the aisle (+y), corridor wide (floaters don't block)
     assert vec[1] > 0.99, f"open side must be the aisle +y, got {vec}"
     assert corridor > 2.0, f"floaters must not block, corridor={corridor:.2f}"
-
     # mirror: wall on the +y side, floaters (the aisle) on -y -> the
     # open side flips. (Everything mirrors: an empty side facing away
     # from the interior is correctly vetoed as outside-the-room.)
@@ -1170,8 +1065,6 @@ def test_open_side_flush_wall_and_floaters():
     assert corridor2 > 2.0
     print(f"PASS open side: flush wall blocked, floaters ignored "
           f"(corridor {corridor:.1f} / {corridor2:.1f})")
-
-
 def test_mask_to_points_clips_far_outside_seed():
     """Backprojected points must stay within a small pad of the seed OBB:
     mask-edge bleed onto floor / neighbouring structure picks up their
@@ -1205,8 +1098,6 @@ def test_mask_to_points_clips_far_outside_seed():
     for p in ((0.2, 0.90, 1.0), (1.6, 0.0, 1.0), (0.0, 0.0, -0.30)):
         assert p not in got, f"noise point {p} must be clipped, got {got}"
     print("PASS mask backprojection clips points far outside the seed")
-
-
 def test_door_class_subtracts_from_device_points():
     """The open-door positive class (user finding: the VLM detects
     "open cabinet door" reliably as a detection task but cannot exclude
@@ -1220,21 +1111,17 @@ def test_door_class_subtracts_from_device_points():
         _mask_to_points,
     )
     from agentic_gts.output.gs_render import Cam
-
     assert _is_door("open cabinet door")
     assert _is_door("Open Cabinet DOOR")
     assert not _is_door("rack")
     assert not _is_door(None)
-
     # _door_union: only subtractive-class groups, best-score SAM mask
     # unioned
     IMG = np.zeros((64, 64, 3))       # 64px: VLM boxes clear the
     # degenerate-size guard (a tiny 8px test image would not)
-
     class _FakeSam:
         def __init__(self):
             self.calls = []
-
         def predict(self, image, box_pix):
             self.calls.append(tuple(box_pix))
             # two door/ladder boxes -> two disjoint masks
@@ -1244,7 +1131,6 @@ def test_door_class_subtracts_from_device_points():
             else:                        # right door box
                 m[25:35, 30:50] = True
             return [m], [0.9]
-
     sam = _FakeSam()
     groups = [{"bbox": (100, 100, 400, 500), "hypothesis": "rack"},
               {"bbox": (100, 200, 300, 600), "hypothesis": "open cabinet door"},
@@ -1257,7 +1143,6 @@ def test_door_class_subtracts_from_device_points():
     assert _door_union(IMG,
                        [{"bbox": (100, 100, 400, 500),
                          "hypothesis": "rack"}], sam) is None
-
     # the CABLE LADDER joins the subtractive classes (user report: a
     # vertical ladder included in a front/back device box drags the
     # mask P97.5 height to the ladder top)
@@ -1275,7 +1160,6 @@ def test_door_class_subtracts_from_device_points():
         "only the ladder box hits the subtractive SAM"
     assert ul is not None and ul[30, 40], \
         "the ladder mask must enter the subtractive union"
-
     # _mask_to_points: points projecting into the door mask are dropped
     box = OrientedBox(center=(0.0, 0.0, 1.0), size=(2.0, 1.0, 2.0),
                       yaw=0.0)
@@ -1296,8 +1180,6 @@ def test_door_class_subtracts_from_device_points():
     assert len(out) == 1 and np.allclose(out[0][:2], (0.0, 0.0)), \
         "the door-pixel point must be subtracted, the body point kept"
     print("PASS door class subtracts from device points")
-
-
 def test_sam_debug_render_survives_negative_z():
     """Debug render regression (user report: '[mask-refine] debug
     render failed (ValueError: minvalue must be less than or equal to
@@ -1309,7 +1191,6 @@ def test_sam_debug_render_survives_negative_z():
     import tempfile
     from agentic_gts.agent.mask_refine import _save_sam_debug
     from agentic_gts.output.gs_render import Cam
-
     view = {"image": np.full((64, 64, 3), 0.4, np.float32),
             "cam": None}
     pts3 = np.array([[-1.0, 0.0, -2.4],      # ALL z negative: the
@@ -1324,8 +1205,6 @@ def test_sam_debug_render_survives_negative_z():
         assert os.path.isfile(os.path.join(td, "sam_debug_negz.png")), \
             "the composite must be written despite all-negative z"
     print("PASS SAM debug render survives all-negative z")
-
-
 def test_local_refine_splits_joined_row_end_to_end():
     """END-TO-END for the split adoption path the mock pipeline never
     covers (mock grounding returns empty groups): a seed covering TWO
@@ -1334,17 +1213,14 @@ def test_local_refine_splits_joined_row_end_to_end():
     hold TWO boxes, one per cabinet, each keeping the seed's trusted
     depth/height (user report: boxes_only.ply still showed the joined
     row as ONE box despite the local grounding splitting it).
-
     Parametrized over the row DIRECTION: along x (seed yaw=0) and along
     y (seed yaw=pi/2 -- the user report where the yaw axis landed on
     the THICKNESS and the row split across its depth)."""
     import math
-
     from agentic_gts.agent import mask_refine as mr
     from agentic_gts.agent.judge import Verdict, VLMJudge
     from agentic_gts.agent.loop import AgentReport, LayoutAgent
     from agentic_gts.output.gs_render import Cam
-
     for along_y in (False, True):
         rng = np.random.default_rng(7)
         # two cabinets side by side (a joined row), 1.0m each
@@ -1363,7 +1239,6 @@ def test_local_refine_splits_joined_row_end_to_end():
         seed = OrientedBox(center=(0.0, 0.0, 1.0), size=(2.0, 1.0, 1.9),
                            yaw=math.pi / 2.0 if along_y else 0.0)
         scene.boxes = [seed]
-
         # front: perpendicular to the row (across its long side);
         # side: along the row axis (the thickness profile)
         front_cam = Cam(eye=np.array([4.0, 0.0, 1.2]) if along_y
@@ -1384,11 +1259,9 @@ def test_local_refine_splits_joined_row_end_to_end():
         _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
                  mr.SamPredictorAdapter.predict)
         mr.render_local_views = lambda scene, box, out_dir, judge=None: views
-
         # VLM grounding: TWO device instances on the front view, ONE on
         # the side profile; SAM segments exactly the prompted rectangle
         j = VLMJudge(backend="mock")
-
         def fake_ground(image, box, view_name, png_path=None):
             groups = ([{"bbox": (10, 10, 490, 990), "hypothesis": "rack",
                         "confidence": 0.9},
@@ -1398,18 +1271,14 @@ def test_local_refine_splits_joined_row_end_to_end():
                              "hypothesis": "rack", "confidence": 0.9}])
             return Verdict(action="segment", params={"groups": groups},
                            confidence=0.9, detail="fake")
-
         j.adjudicate_sam_boxes = fake_ground
-
         def fake_predict(self, image, box_pix):
             m = np.zeros(image.shape[:2], bool)
             x1, y1, x2, y2 = (int(round(float(v))) for v in box_pix)
             m[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)] = True
             return [m], [0.95]
-
         mr.SamPredictorAdapter._load = lambda self: None
         mr.SamPredictorAdapter.predict = fake_predict
-
         agent = LayoutAgent(judge=j, opts={"sam_checkpoint": "fake.pt"},
                             out_dir=None)
         try:
@@ -1417,7 +1286,6 @@ def test_local_refine_splits_joined_row_end_to_end():
         finally:              # restore the module-level patches so
             (mr.render_local_views, mr.SamPredictorAdapter._load,
              mr.SamPredictorAdapter.predict) = _real
-
         axis_i = 1 if along_y else 0
         assert len(scene.boxes) == 2, \
             (f"the {'y' if along_y else 'x'}-running joined row must split "
@@ -1443,8 +1311,6 @@ def test_local_refine_splits_joined_row_end_to_end():
                  "across the THICKNESS is the yaw-axis bug")
         print(f"PASS local refine splits a {'y' if along_y else 'x'}-running"
               " joined row end-to-end")
-
-
 def test_apply_depth_from_side_excludes_open_door():
     """The side-view thickness rule: pieces keep along/height (seed-
     trusted); the side pool -- ONE merged cloud over the whole row,
@@ -1464,13 +1330,11 @@ def test_apply_depth_from_side_excludes_open_door():
               "pts": np.zeros((30, 3)), "view": "front",
               "mask_score": 0.8, "score": 0.6, "label": "rack"}
     rng = np.random.default_rng(3)
-
     def slab(along_c, y_lo, y_hi, n):
         return np.column_stack([
             rng.uniform(along_c - 0.22, along_c + 0.22, n),
             rng.uniform(y_lo, y_hi, n),
             rng.uniform(0.1, 1.9, n)])
-
     # body shells: dense, y within [-0.4, 0.4] (true depth 0.8 m)
     pool = np.vstack([slab(-0.3, -0.4, 0.4, 300), slab(0.3, -0.4, 0.4, 300)])
     # open door on cabinet A: a SPREAD-OUT tail beyond the front face
@@ -1500,8 +1364,6 @@ def test_apply_depth_from_side_excludes_open_door():
     assert not recs[0].get("accepted"), recs
     assert abs(inst_c["fitted"].size[1] - 0.15) < 1e-9
     print("PASS side depth application (merged pool, door tail dropped)")
-
-
 def test_parse_rack_confirm():
     from agentic_gts.agent.judge import VLMJudge
     p = VLMJudge._parse_rack_confirm(
@@ -1518,8 +1380,6 @@ def test_parse_rack_confirm():
     assert VLMJudge._parse_rack_confirm("cannot tell") is None
     assert VLMJudge._parse_rack_confirm('{"confidence": 0.9}') is None
     print("PASS rack confirm parse (string bools, clamp, None on no verdict)")
-
-
 def test_type_confirm_marks_low_not_deleted():
     """A VLM 'not a rack' verdict must mark LOW + unresolved and NEVER
     delete the box -- false-positive deletion is the dangerous
@@ -1529,15 +1389,12 @@ def test_type_confirm_marks_low_not_deleted():
     from agentic_gts.agent import mask_refine as mr
     from agentic_gts.agent.judge import Verdict, VLMJudge
     from agentic_gts.core.models import Confidence
-
     scene = Scene(points=np.zeros((50, 3)))
     scene.meta["yaw"] = 0.0
     suspect = OrientedBox(center=(1, 1, 1), size=(0.6, 1.1, 2.0), yaw=0.0)
     good = OrientedBox(center=(4, 1, 1), size=(0.6, 1.1, 2.0), yaw=0.0)
     scene.boxes = [suspect, good]
-
     judge = VLMJudge(backend="qwen")
-
     def _fake_confirm(image, box, png_path=None):
         if box is suspect:
             return Verdict(action="keep",
@@ -1545,7 +1402,6 @@ def test_type_confirm_marks_low_not_deleted():
         return Verdict(action="keep",
                       params={"is_rack": True, "confidence": 0.95})
     judge.adjudicate_rack_confirm = _fake_confirm
-
     fake_view = {"name": "front", "image": np.zeros((4, 4, 3)),
                  "prompt_image": np.zeros((4, 4, 3)), "cam": None,
                  "path": None, "prompt_path": None}
@@ -1557,7 +1413,6 @@ def test_type_confirm_marks_low_not_deleted():
         agent._local_mask_refine(scene, report)
     finally:
         mr.render_local_views = orig_rlv
-
     # suspect: kept in the scene, but LOW + flagged for human review
     ids = [b.box_id for b in scene.boxes]
     assert suspect.box_id in ids, "a 'no' verdict must NOT delete the box"
@@ -1573,15 +1428,12 @@ def test_type_confirm_marks_low_not_deleted():
     mock_ids = len(scene.boxes)
     assert mock_ids == 2
     print("PASS type confirm marks LOW + unresolved, never deletes")
-
-
 def test_sam_debug_composite():
     """The debug composite (user request): prompt box + mask overlay +
     back-projected points, one PNG per SAM candidate. Must produce a
     readable image even with no box prompt / no fitted box."""
     import tempfile
     from agentic_gts.agent.mask_refine import _save_sam_debug
-
     rng = np.random.default_rng(9)
     H = W = 96
     view = {"name": "front", "image": rng.uniform(0, 1, (H, W, 3)),
@@ -1616,8 +1468,6 @@ def test_sam_debug_composite():
         assert os.path.isfile(p2) and os.path.getsize(p2) > 3000, \
             "union / no-fit panel must still be written"
     print("PASS SAM debug composite (3-panel + union/no-fit fallback)")
-
-
 def test_box_only_mask_hides_everything_outside():
     """The local views must render ONLY the device: every gaussian
     outside the box's OBB (plus slack) is hidden -- occluders in the
@@ -1626,7 +1476,6 @@ def test_box_only_mask_hides_everything_outside():
     and it lives OUTSIDE the box."""
     from types import SimpleNamespace
     from agentic_gts.agent.mask_refine import _box_only_mask
-
     box = OrientedBox(center=(3, 0, 1), size=(6, 1.1, 2), yaw=0.0)
     pts = np.array([
         [3.0, 0.0, 1.0],      # inside the box
@@ -1662,15 +1511,12 @@ def test_box_only_mask_hides_everything_outside():
     m2 = _box_only_mask(gs2, box2)
     assert m2[0] and not m2[1], "mask must follow the OBB's rotated axes"
     print("PASS box-only mask (everything outside the OBB hidden)")
-
-
 def test_open_side_picks_aisle():
     """_open_side must find the aisle side: the rack's front faces a
     1.7m corridor, its back a 0.7m gap to the wall -> the open direction
     is +y (front) with the corridor width of the facing structure."""
     from types import SimpleNamespace
     from agentic_gts.agent.mask_refine import _open_side
-
     box = OrientedBox(center=(0, 0, 1), size=(1.2, 0.6, 2.0), yaw=0.0)
     rng = np.random.default_rng(0)
     row = np.column_stack([rng.uniform(-0.6, 0.6, 500),
@@ -1698,8 +1544,6 @@ def test_open_side_picks_aisle():
     vec2, _ = _open_side(gs2, box)
     assert vec2[1] < -0.9, f"mirrored scene must pick -y, got {vec2}"
     print("PASS open side picks the aisle (and flips on mirror)")
-
-
 def test_front_view_axis_swap():
     """'front' must look perpendicular to the LONG edge: a box whose
     length is on the cross axis (size[0] < size[1]) swaps the azimuth
@@ -1720,8 +1564,6 @@ def test_front_view_axis_swap():
     assert abs(d[0]) > abs(d[1]), \
         "camera must look along the yaw (short) axis of the long-cross box"
     print("PASS front view axis swap (perpendicular to the long edge)")
-
-
 def test_side_view_looks_along_row_axis():
     """The SIDE slot (front azimuth + 90 deg) must look ALONG the row
     axis: the (depth, height) PROFILE is what corrects thickness and
@@ -1739,8 +1581,6 @@ def test_side_view_looks_along_row_axis():
     assert abs(look[0]) > 3 * abs(look[1]), (
         f"side view must look along the row, got direction {look}")
     print("PASS side view looks along the row axis (thickness profile)")
-
-
 def test_view_quality_gate_drops_haze_views():
     """VIEW QUALITY GATE (user rule, replaces the reverted corridor
     pre-gate: judge the RENDER, not the geometry). The discriminator
@@ -1753,7 +1593,6 @@ def test_view_quality_gate_drops_haze_views():
     And render_local_views must DROP a fogged view instead of feeding
     it to the VLM."""
     from agentic_gts.agent.mask_refine import _view_quality
-
     def clean(device_frac=0.3, H=128, W=128):
         img = np.full((H, W, 3), 0.01, np.float32)
         k = int(H * W * device_frac)
@@ -1761,7 +1600,6 @@ def test_view_quality_gate_drops_haze_views():
         idx = np.random.default_rng(0).choice(len(flat), k, replace=False)
         flat[idx] = 0.85
         return img
-
     ok, why = _view_quality(clean())
     assert ok, f"clean bimodal render must pass, got {why}"
     ok, _ = _view_quality(clean(device_frac=0.85))
@@ -1782,7 +1620,6 @@ def test_view_quality_gate_drops_haze_views():
     def _ramp(ramp_1d):
         return np.repeat(ramp_1d[:, None], 128, axis=1)[..., None] \
             * np.ones(3, np.float32)
-
     ok, why = _view_quality(
         _ramp(np.linspace(0.2, 0.5, 128, dtype=np.float32)))
     assert not ok, "gradient veil must be rejected"
@@ -1801,7 +1638,6 @@ def test_view_quality_gate_drops_haze_views():
     assert "voters = views[:1]" not in src, \
         "the side view must never inherit the span vote (it looks " \
         "ALONG the row; its masks span the cross axis)"
-
     # render_local_views drops a fogged view (mocked rasterizer
     # returns haze for cameras on the wall side, clean elsewhere)
     from agentic_gts.agent import mask_refine as mr
@@ -1831,12 +1667,10 @@ def test_view_quality_gate_drops_haze_views():
              gio.read_gaussian_ply)
     clean_img = clean(H=768, W=768)
     fog = np.full((768, 768, 3), 0.42, np.float32)
-
     def fake_raster(sub, cam):
         # cameras on the -y (wall) side render from inside the wall:
         # fog
         return fog if float(np.asarray(cam.eye)[1]) < -0.5 else clean_img
-
     gsr.rasterize_gs = fake_raster
     gsr.render_gs_view = lambda *a, **k: clean_img
     gsr.png_bytes = lambda a: b"png"
@@ -1851,8 +1685,6 @@ def test_view_quality_gate_drops_haze_views():
         f"the fogged back view must be dropped, got {names}"
     assert "front" in names, names
     print("PASS view quality gate (veils dropped, clean kept)")
-
-
 def test_side_panel_image_labels():
     """The side-arbitration composite: panels side by side on a dark
     canvas with a big yellow A/B/C stenciled into each panel's
@@ -1872,8 +1704,6 @@ def test_side_panel_image_labels():
         "stencil B missing in panel 1"
     assert not yel[:, 96:104].any(), "gap must stay clean"
     print("PASS side panel composite (A/B/C stencils, dark gaps)")
-
-
 def test_adjudicate_side_pick_parses_letter():
     """The side-pick verdict: reply 'C' -> panel 2; a wordy reply
     'The best panel is B.' -> 1; garbage / out-of-range -> None (the
@@ -1882,7 +1712,6 @@ def test_adjudicate_side_pick_parses_letter():
     j = VLMJudge(backend="qwen")
     box = OrientedBox(center=(0, 0, 1), size=(6, 1, 2), yaw=0.0)
     img = np.zeros((64, 64, 3), np.float32)
-
     def _fake(png, prompt, *a, **k):
         return _fake.reply
     j._qwen_image_call = _fake
@@ -1899,8 +1728,6 @@ def test_adjudicate_side_pick_parses_letter():
     vm = jm.adjudicate_side_pick(img, box, n_panels=3)
     assert vm.params["pick"] is None
     print("PASS side-pick parse (C->2, wordy B->1, junk/mock->None)")
-
-
 def test_side_view_vlm_arbitration_overrides_rule():
     """SIDE view candidate arbitration (user direction: the placement
     rules keep misjudging which end is clear -- let the VLM look at
@@ -1914,7 +1741,6 @@ def test_side_view_vlm_arbitration_overrides_rule():
                                                _open_side, _side_azim)
     from agentic_gts.tools.gs_io import GaussianData
     from agentic_gts.output.gs_render import make_local_cam
-
     rng = np.random.default_rng(5)
     box = OrientedBox(center=(0.0, 0.0, 1.0), size=(4.0, 1.0, 2.0),
                      yaw=0.0)
@@ -1943,7 +1769,6 @@ def test_side_view_vlm_arbitration_overrides_rule():
     eye_rule = np.asarray(make_local_cam(
         [box], W=768, H=768, elev_deg=18.0, azim_deg=azim_rule,
         standoff=standoff).eye)
-
     import agentic_gts.output.gs_render as gsr
     import agentic_gts.tools.gs_io as gio
     _real = (gsr.rasterize_gs, gsr.render_gs_view, gsr.png_bytes,
@@ -1960,16 +1785,13 @@ def test_side_view_vlm_arbitration_overrides_rule():
                                           replace=False)
     flat[idx] = 0.85
     fog = np.full((768, 768, 3), 0.42, np.float32)
-
     def fake_raster(sub, cam):
         e = np.asarray(cam.eye)
         return fog if (e[1] < -0.8 and abs(e[0]) < 2.0) else img
-
     gsr.rasterize_gs = fake_raster
     gsr.render_gs_view = lambda *a, **k: img
     gsr.png_bytes = lambda a: b"png"
     gio.read_gaussian_ply = lambda p: gs
-
     judge = VLMJudge(backend="qwen")
     judge._qwen_image_call = lambda png, prompt, *a, **k: "B"
     try:
@@ -1992,8 +1814,6 @@ def test_side_view_vlm_arbitration_overrides_rule():
          gio.read_gaussian_ply) = _real
     print("PASS side VLM arbitration (B flips the end; no-judge "
           "fallback keeps the rule pick)")
-
-
 def test_sam2_model_cfg_file_path_registers_hydra_dir():
     """A model_cfg that is a real FILE path must be re-rooted: hydra's
     compose(config_name=...) strips the leading '/' of an absolute path
@@ -2006,42 +1826,33 @@ def test_sam2_model_cfg_file_path_registers_hydra_dir():
     import contextlib
     import tempfile
     from agentic_gts.agent.mask_refine import SamPredictorAdapter
-
     calls = {}
-
     @contextlib.contextmanager
     def _init_dir(config_dir, version_base=None):
         calls["dir"] = config_dir
         yield
-
     hydra_mod = types.ModuleType("hydra")
     hydra_mod.initialize_config_dir = _init_dir
     hydra_core = types.ModuleType("hydra.core")
     gh_mod = types.ModuleType("hydra.core.global_hydra")
-
     class _GH:
         @staticmethod
         def instance():
             return _GH()
-
         @staticmethod
         def is_initialized():
             return True
-
         @staticmethod
         def clear():
             calls["cleared"] = True
     gh_mod.GlobalHydra = _GH
-
     sam2_mod = types.ModuleType("sam2")
     sam2_mod.__path__ = []
     build_mod = types.ModuleType("sam2.build_sam")
-
     def _build(cfg, ckpt):
         calls["name"], calls["ckpt"] = cfg, ckpt
         return "model"
     build_mod.build_sam2 = _build
-
     old = {k: sys.modules.get(k) for k in ("sam2", "sam2.build_sam", "hydra",
                                            "hydra.core",
                                            "hydra.core.global_hydra")}
@@ -2075,15 +1886,12 @@ def test_sam2_model_cfg_file_path_registers_hydra_dir():
             else:
                 sys.modules[k] = v
     print("PASS sam2 model_cfg file path re-rooted for hydra")
-
-
 def test_mask_overlay_is_rgb_plus_tint():
     """The debug panel must be an RGB image with a semi-transparent mask
     tint on top. Regression: the blend used uint8 * uint8, which wraps
     modulo 256 (150*165 -> 174) -- the masked region turned into dark
     garbage and only the solid edge line survived ('contour drawing')."""
     from agentic_gts.agent.mask_refine import _overlay_mask
-
     # mid-gray image, 4x4, top half masked
     img = np.full((4, 4, 3), 150, dtype=np.uint8)
     m = np.zeros((4, 4), dtype=bool)
@@ -2102,8 +1910,6 @@ def test_mask_overlay_is_rgb_plus_tint():
     assert out[0, 0, 2] > out[0, 0, 0], "blue channel must dominate"
     # 3D SAM2 mask shape (1, H, W) handled by the caller's squeeze
     print("PASS mask overlay (rgb + tint, no uint8 wraparound)")
-
-
 def test_side_view_z_cap_and_gs_keep():
     """Side-only z cap (user report: a SHORT device beside a tall
     structure -- the seed carries the SCENE-level z_top, so the side
@@ -2113,7 +1919,6 @@ def test_side_view_z_cap_and_gs_keep():
     height, and the side view dict must carry the capped gs_keep for
     the ladder retry."""
     from agentic_gts.agent import mask_refine as mr
-
     rng = np.random.default_rng(9)
     # device body: short (z to ~0.95), dense
     dev = np.column_stack([rng.uniform(-2.0, 2.0, 900),
@@ -2127,26 +1932,22 @@ def test_side_view_z_cap_and_gs_keep():
                             rng.uniform(1.20, 1.90, 40)])
     means = np.vstack([dev, pole])
     pole_i = np.arange(len(dev), len(dev) + 40)
-
     scene = Scene(points=means.astype(np.float64))
     scene.meta["gs_ply"] = "fake.ply"
     box = OrientedBox(center=(0.0, 0.0, 1.05), size=(4.0, 1.0, 2.1),
                      yaw=0.0)
     gs = _fake_gs(means)
-
     import agentic_gts.output.gs_render as gsr
     import agentic_gts.tools.gs_io as gio
     _real = (gsr.rasterize_gs, gsr.render_gs_view, gsr.png_bytes,
              gio.read_gaussian_ply)
     img = _quality_image()
     calls = []
-
     def fake_raster(sub, cam):
         e = np.asarray(cam.eye, dtype=float)
         calls.append((np.asarray(sub.means, dtype=float).copy(),
                       float(e[0]), float(e[1])))
         return img
-
     gsr.rasterize_gs = fake_raster
     gsr.render_gs_view = lambda *a, **k: img
     gsr.png_bytes = lambda a: b"png"
@@ -2156,7 +1957,6 @@ def test_side_view_z_cap_and_gs_keep():
     finally:
         (gsr.rasterize_gs, gsr.render_gs_view, gsr.png_bytes,
          gio.read_gaussian_ply) = _real
-
     side = next(v for v in views if v["name"] == "side")
     assert "gs_keep" in side, "the side view must carry its render pool"
     gk = np.asarray(side["gs_keep"])
@@ -2175,8 +1975,6 @@ def test_side_view_z_cap_and_gs_keep():
         "front/back renders must keep the full seed height"
     print("PASS side view z cap (side pool cut at the device top, "
           "front/back full height, gs_keep stored)")
-
-
 def test_side_ladder_retry_cuts_ladder_and_regrounds():
     """The ladder-domination retry (user report: a short device beside
     a long cable ladder -- the side view grounds ONLY the ladder): the
@@ -2187,7 +1985,6 @@ def test_side_ladder_retry_cuts_ladder_and_regrounds():
     from agentic_gts.agent import mask_refine as mr
     from agentic_gts.agent.judge import Verdict, VLMJudge
     from agentic_gts.output.gs_render import Cam
-
     rng = np.random.default_rng(11)
     dev = np.column_stack([rng.uniform(-2.0, 2.0, 1500),
                            rng.uniform(-0.5, 0.5, 1500),
@@ -2201,7 +1998,6 @@ def test_side_ladder_retry_cuts_ladder_and_regrounds():
     box = OrientedBox(center=(0.0, 0.0, 1.05), size=(4.0, 1.0, 2.1),
                      yaw=0.0)
     gs = _fake_gs(pts)
-
     cam = Cam(eye=np.array([6.0, 0.8, 1.1]),
               target=np.array([0.0, 0.0, 0.95]),
               up=np.array([0.0, 0.0, 1.0]), fovy_deg=75.0, W=768, H=768)
@@ -2210,62 +2006,50 @@ def test_side_ladder_retry_cuts_ladder_and_regrounds():
         assert ((uv[:, 0] >= 1) & (uv[:, 0] < 767)
                 & (uv[:, 1] >= 1) & (uv[:, 1] < 767)).all(), \
             "the whole device+ladder must project inside the frame"
-
     def _rel_bbox(uv):
         return (float(uv[:, 0].min() / 767 * 1000),
                 float(uv[:, 1].min() / 767 * 1000),
                 float(uv[:, 0].max() / 767 * 1000),
                 float(uv[:, 1].max() / 767 * 1000))
-
     def _pix_bbox(uv):
         return np.array([uv[:, 0].min(), uv[:, 1].min(),
                          uv[:, 0].max(), uv[:, 1].max()], dtype=float)
-
     def _dot_mask(uv):
         m = np.zeros((768, 768), bool)
         m[np.rint(uv[:, 1]).astype(int),
           np.rint(uv[:, 0]).astype(int)] = True
         return m
-
     lad_mask, dev_mask = _dot_mask(uv_lad), _dot_mask(uv_dev)
     lad_pix, dev_pix = _pix_bbox(uv_lad), _pix_bbox(uv_dev)
-
     sam = SamPredictorAdapter(checkpoint="fake.pt")
-
     def fake_predict(self, image, box_pix):
         bp = np.asarray(box_pix, dtype=float)
         if abs(bp - lad_pix).sum() < abs(bp - dev_pix).sum():
             return [lad_mask], [0.9]
         return [dev_mask], [0.95]
-
     judge = VLMJudge(backend="mock")
     grounded = []
-
     def fake_ground(image, box, view_name, png_path=None):
         grounded.append(view_name)
         groups = [{"bbox": _rel_bbox(uv_dev),
                    "hypothesis": "server rack", "confidence": 0.9}]
         return Verdict(action="segment", params={"groups": groups},
                        confidence=0.9, detail="fake")
-
     judge.adjudicate_sam_boxes = fake_ground
     keep = mr._box_only_mask(gs, box)
     side = {"name": "side", "image": _quality_image(), "cam": cam,
             "path": None, "prompt_path": None, "gs_keep": keep}
     groups = [{"bbox": _rel_bbox(uv_lad),
                "hypothesis": "cable ladder", "confidence": 0.9}]
-
     import agentic_gts.output.gs_render as gsr
     import agentic_gts.tools.gs_io as gio
     _real = (gsr.rasterize_gs, gsr.png_bytes, gio.read_gaussian_ply,
              SamPredictorAdapter.predict)
     img = _quality_image()
     rendered = []
-
     def fake_raster(sub, cam_):
         rendered.append(np.asarray(sub.means, dtype=float).copy())
         return img
-
     gsr.rasterize_gs = fake_raster
     gsr.png_bytes = lambda a: b"png"
     gio.read_gaussian_ply = lambda p: gs
@@ -2276,7 +2060,6 @@ def test_side_ladder_retry_cuts_ladder_and_regrounds():
     finally:
         (gsr.rasterize_gs, gsr.png_bytes, gio.read_gaussian_ply,
          SamPredictorAdapter.predict) = _real
-
     assert r is not None, "the retry must succeed"
     assert grounded == ["side_retry"], grounded
     # the cut render no longer carries the ladder body (y ~ 0.65)
@@ -2295,8 +2078,6 @@ def test_side_ladder_retry_cuts_ladder_and_regrounds():
         "ladder points must never reach the thickness pool"
     print("PASS side ladder retry (ladder cut, device re-grounded, "
           "pool device-only)")
-
-
 def test_side_ladder_fallback_marks_unavailable():
     """Graceful degradation (user direction: the failure must be
     VISIBLE, not silent): a side view that grounds ONLY the ladder and
@@ -2306,7 +2087,6 @@ def test_side_ladder_fallback_marks_unavailable():
     from agentic_gts.agent import mask_refine as mr
     from agentic_gts.agent.judge import Verdict, VLMJudge
     from agentic_gts.output.gs_render import Cam
-
     rng = np.random.default_rng(13)
     dev = np.column_stack([rng.uniform(-2.0, 2.0, 500),
                            rng.uniform(-0.5, 0.5, 500),
@@ -2326,21 +2106,17 @@ def test_side_ladder_fallback_marks_unavailable():
                float(uv_lad[:, 1].min() / 767 * 1000),
                float(uv_lad[:, 0].max() / 767 * 1000),
                float(uv_lad[:, 1].max() / 767 * 1000))
-
     def fake_predict(self, image, box_pix):
         m = np.zeros(image.shape[:2], bool)
         x1, y1, x2, y2 = (int(round(float(v))) for v in box_pix)
         m[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)] = True
         return [m], [0.9]
-
     judge = VLMJudge(backend="mock")
-
     def fake_ground(image, box, view_name, png_path=None):
         groups = [{"bbox": lad_rel, "hypothesis": "cable ladder",
                    "confidence": 0.9}]
         return Verdict(action="segment", params={"groups": groups},
                        confidence=0.9, detail="fake")
-
     judge.adjudicate_sam_boxes = fake_ground
     sam = SamPredictorAdapter(checkpoint="fake.pt")
     # no gs_keep on the view: the retry has no stored render pool and
@@ -2358,14 +2134,3 @@ def test_side_ladder_fallback_marks_unavailable():
     roles = [v.get("role") for v in audit["views"]]
     assert "depth_profile-unavailable" in roles, roles
     print("PASS side ladder fallback (audit marked unavailable)")
-
-
-if __name__ == "__main__":
-    tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
-    passed = 0
-    for fn in tests:
-        try:
-            fn(); passed += 1
-        except Exception as e:
-            print(f"FAIL {fn.__name__}: {type(e).__name__}: {e}")
-    print(f"\n{passed}/{len(tests)} tests passed")

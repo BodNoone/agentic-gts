@@ -1,24 +1,17 @@
 """Misc regression tests: VLM reply parsing, box IO roundtrip, PLY
 artifacts, split profile cuts, refit trust flags.
-
 (The old god-view nomination / repair-loop tests were removed with the
 pre-grounding pipeline: the flow is now global nadir 2D grounding ->
 per-box local refine -> row split, which has its own tests in
 test_ground.py / test_mask_refine.py.)
 """
 from __future__ import annotations
-
 import os
 import sys
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import numpy as np
-
 from agentic_gts.core.models import Scene
 from agentic_gts.agent.judge import _extract_json
-
-
 def _scene_with_racks(n: int = 12, seed: int = 0) -> Scene:
     """3 rows x 4 racks of synthetic surface points + an aisle FP box."""
     rng = np.random.default_rng(seed)
@@ -38,8 +31,6 @@ def _scene_with_racks(n: int = 12, seed: int = 0) -> Scene:
     pts.append(np.stack([rng.uniform(-1, 4, 500), rng.uniform(-1, 7, 500),
                          np.zeros(500)], axis=1))  # floor
     return Scene(points=np.vstack(pts))
-
-
 def test_extract_json_variants():
     assert _extract_json('{"suspicious": []}') == {"suspicious": []}
     assert _extract_json('Here it is:\n{"suspicious": [{"index": 2, '
@@ -47,8 +38,6 @@ def test_extract_json_variants():
     assert _extract_json("no json at all") is None
     assert _extract_json("broken { not json") is None
     print("PASS json extraction")
-
-
 def test_objects_format_roundtrip():
     """boxes_objects.json must round-trip with the --boxes input schema:
     save -> load -> same center/size/yaw (within float precision)."""
@@ -58,7 +47,6 @@ def test_objects_format_roundtrip():
     import shutil
     from agentic_gts.core.models import (OrientedBox, Scene,
                                          save_boxes_as_objects)
-
     scene = _scene_with_racks()
     # arbitrary yaw (not axis-aligned) + a device_type-derived name
     boxes = [OrientedBox(center=(k * 0.62, 0.3 * k, 1.0),
@@ -83,8 +71,6 @@ def test_objects_format_roundtrip():
         print("PASS objects-format roundtrip (center/size/yaw exact)")
     finally:
         shutil.rmtree(out, ignore_errors=True)
-
-
 def test_ply_artifacts():
     """Output PLYs: boxes_only.ply (no cloud) + cloud_with_boxes.ply
     (height-tinted when no GS, SH-DC colored when GS available)."""
@@ -92,7 +78,6 @@ def test_ply_artifacts():
     import shutil
     from agentic_gts.core.models import OrientedBox
     from agentic_gts.output.visualize import export_boxes_ply, export_ply
-
     scene = _scene_with_racks()
     scene.boxes = [OrientedBox(center=(k * 0.62, 0, 1),
                                size=(0.6, 1.1, 2.0), yaw=0.0)
@@ -120,8 +105,6 @@ def test_ply_artifacts():
         print(f"PASS ply artifacts (boxes_only={n1}, mixed={n2}, gs={n3} pts)")
     finally:
         shutil.rmtree(out, ignore_errors=True)
-
-
 def _ply_point_count(path: str) -> int:
     """Parse 'element vertex N' from the PLY header."""
     with open(path, "rb") as f:
@@ -130,14 +113,10 @@ def _ply_point_count(path: str) -> int:
     m = re.search(r"element vertex (\d+)", head)
     assert m, f"no vertex count in PLY header of {path}"
     return int(m.group(1))
-
-
 def _ply_has_colors(path: str) -> bool:
     with open(path, "rb") as f:
         head = f.read(4096).decode("ascii", errors="ignore")
     return ("red" in head and "green" in head and "blue" in head)
-
-
 def _tiny_gs_ply(out: str) -> str:
     """Minimal binary 3DGS PLY (60 gaussians) for the coloring path."""
     import struct
@@ -163,17 +142,3 @@ def _tiny_gs_ply(out: str) -> str:
         f.write(hdr.encode("ascii"))
         f.write(b"".join(rows))
     return p
-
-
-if __name__ == "__main__":
-    fns = [v for k, v in list(globals().items()) if k.startswith("test_")]
-    passed = 0
-    for fn in fns:
-        try:
-            fn()
-            passed += 1
-        except AssertionError as e:
-            print(f"FAIL  {fn.__name__}: {e}")
-        except Exception as e:
-            print(f"ERROR {fn.__name__}: {type(e).__name__}: {e}")
-    print(f"\n{passed}/{len(fns)} tests passed")

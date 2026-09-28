@@ -1,6 +1,5 @@
 """Adversarial alignment/yaw test: tilted cloud + sparse floor + dense
 rack-top field, mirroring failure modes seen on real 3DGS exports.
-
 The cloud is tilted 5.7/1.5 deg, offset 0.8 m, the floor is decimated to
 15% (poorly reconstructed), and a dense coplanar rack-top plane at z=2.0
 covers the device layout. align_to_ground must level via the rack-top
@@ -10,16 +9,11 @@ the row direction from vertical faces only (30 deg).
 import math
 import os
 import sys
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import numpy as np
-
 from agentic_gts.pipeline import align_to_ground
 from agentic_gts.segment.orientation import estimate_yaw
 from agentic_gts.synth.generator import SynthConfig, generate
-
-
 def test_top_yaw_candidates_user_scene():
     """Fold + rank on the USER'S REAL candidate scores (two mesh runs
     of one scene, from the logs): the truth (-17.5 deg) scored 468/430
@@ -30,10 +24,8 @@ def test_top_yaw_candidates_user_scene():
     and the top-3 must CONTAIN the truth in both runs -- that list is
     what the grounding-yield arbitration tries."""
     from agentic_gts.segment.orientation import top_yaw_candidates
-
     def _near(got, want_deg):
         return any(abs(math.degrees(w) - want_deg) < 2.0 for w, _ in got)
-
     # run 1 pass-1 candidate scores (verbatim from the log)
     run1 = [(72.5, 201), (-17.5, 468), (80.5, 504), (-9.5, 143),
             (63.5, 472), (-26.5, 305), (45.5, 336)]
@@ -44,7 +36,6 @@ def test_top_yaw_candidates_user_scene():
     # 80.5 and -9.5 fold together -> ONE -9.5 entry at the max score
     d95 = [s for w, s in top1 if abs(math.degrees(w) + 9.5) < 2.0]
     assert d95 and d95[0] == 504, "both orientations must merge at max"
-
     # run 2 pass-1 candidate scores (verbatim from the log)
     run2 = [(72.5, 242), (-17.5, 430), (80.5, 412), (-9.5, 168),
             (63.5, 399), (-26.5, 440), (47.5, 261)]
@@ -55,8 +46,6 @@ def test_top_yaw_candidates_user_scene():
     d265 = [s for w, s in top2 if abs(math.degrees(w) + 26.5) < 2.0]
     assert d265 and d265[0] == 440, "63.5 must merge into -26.5 at max"
     print("PASS top yaw candidates (user scene: truth in top-3 both runs)")
-
-
 def test_pick_yaw_trial():
     """Arbitration preference: agreement (the fitted boxes' own
     directions match the render yaw) is unique to the TRUE direction
@@ -66,7 +55,6 @@ def test_pick_yaw_trial():
     more: 5 vs 2 in the user's logs); with no agreement anywhere the
     yield alone decides."""
     from agentic_gts.segment.orientation import pick_yaw_trial
-
     R = math.radians
     # the wrong yaw found 2 boxes that voted 8.5 deg off; the true
     # yaw found 5 boxes that agree -- truth must win
@@ -92,8 +80,6 @@ def test_pick_yaw_trial():
     # empty -> None
     assert pick_yaw_trial([]) is None
     print("PASS pick yaw trial (agreement > yield, yield > delta)")
-
-
 def test_yaw_arbitration_needed():
     """Trigger condition: near-tied top-2 folded candidates must fire
     the arbitration EVEN WHEN the residual self-check passed -- the
@@ -104,7 +90,6 @@ def test_yaw_arbitration_needed():
     -17.5 @410 -> ratio 0.876 -> arbitrate. All three user runs'
     candidate sets must trigger; a clear-cut scene must not."""
     from agentic_gts.segment.orientation import yaw_arbitration_needed
-
     # run 3 (verbatim from the log, residual check PASSED)
     run3 = [(72.5, 197), (-17.5, 410), (80.5, 405), (-9.5, 142),
             (63.5, 468), (-26.5, 304), (45.5, 336)]
@@ -125,8 +110,6 @@ def test_yaw_arbitration_needed():
     assert not yaw_arbitration_needed({"candidates": []},
                                       yaw_suspect=False)
     print("PASS yaw arbitration trigger (near-tied fires without suspect)")
-
-
 def _rot_axis(axis, deg):
     axis = np.asarray(axis, dtype=float)
     axis /= np.linalg.norm(axis)
@@ -135,17 +118,13 @@ def _rot_axis(axis, deg):
                   [-axis[1], axis[0], 0]])
     t = math.radians(deg)
     return np.eye(3) + math.sin(t) * k + (1 - math.cos(t)) * (k @ k)
-
-
 def test_align_and_yaw_on_adversarial_cloud():
     rng = np.random.default_rng(3)
     scene, _, _ = generate(SynthConfig(seed=42, room_yaw_deg=30))
     pts = scene.points
-
     floor_m = pts[:, 2] < 0.05
     keep = ~floor_m | (rng.random(len(pts)) < 0.15)
     pts = pts[keep]
-
     # dense rack-top plane following the (rotated) device layout
     dev_xy = pts[(pts[:, 2] > 0.1) & (pts[:, 2] < 2.0)][:, :2]
     sel = rng.integers(0, len(dev_xy), 120_000)
@@ -155,32 +134,24 @@ def test_align_and_yaw_on_adversarial_cloud():
         np.full(120_000, 2.0),
     ])
     pts = np.vstack([pts, tops])
-
     R = _rot_axis([1, 0, 0], 5.7) @ _rot_axis([0, 1, 0], 1.5)
     adversarial = pts @ R.T + np.array([0.0, 0.0, 0.8])
-
     fixed = align_to_ground(adversarial)
-
     # floor near z=0: the bottom decile hugs the floor (racks reach it)
     zb = fixed[fixed[:, 2] < 0.25]
     assert len(zb) > 100
     assert abs(float(np.median(zb[:, 2]))) < 0.15, "floor not normalized to z~0"
-
     # rack tops ~2 m above the floor (rigidity sanity)
     h, e = np.histogram(fixed[:, 2], bins=np.arange(fixed[:, 2].min(),
                                                     fixed[:, 2].max() + 0.05, 0.05))
     top_bin = float(e[int(np.argmax(h))])
     assert 1.5 < top_bin < 2.5, f"rack-top plane at {top_bin:.2f} m, expected ~2.0"
-
     # row direction: 30 deg layout, from vertical faces only
     yaw = estimate_yaw(fixed)
     err = abs(30.0 - math.degrees(yaw))
     assert err < 3.0, f"yaw error {err:.1f} deg"
-
-
 def test_estimate_residual_yaw():
     """Closed-loop residual: re-estimating on the -yaw-rotated cloud.
-
     1. residual of the estimator's OWN answer must be ~0 (rotated
        rows are axis-aligned -- the self-consistency the hijacked
        first pass cannot fake);
@@ -190,20 +161,16 @@ def test_estimate_residual_yaw():
     from agentic_gts.segment.orientation import estimate_residual_yaw
     scene, _, _ = generate(SynthConfig(seed=7, room_yaw_deg=20))
     pts = scene.points
-
     y = estimate_yaw(pts)
     r_self = estimate_residual_yaw(pts, y)
     assert abs(math.degrees(r_self)) < 2.0, \
         f"self-consistent yaw showed residual {math.degrees(r_self):.1f} deg"
-
     r_wrong = estimate_residual_yaw(pts, 0.0)
     assert 12.0 < math.degrees(r_wrong) < 28.0, \
         f"20-deg layout claimed as 0 must expose ~20 deg residual, " \
         f"got {math.degrees(r_wrong):.1f}"
     print(f"PASS residual yaw (self={math.degrees(r_self):.1f} deg, "
           f"wrong-claim={math.degrees(r_wrong):.1f} deg)")
-
-
 def test_seed_axis_delta():
     """StageG feedback signal: each grounded box's direction is
     MEASURED by PCA on the device-band points inside it (the boxes
@@ -215,7 +182,6 @@ def test_seed_axis_delta():
     the feedback)."""
     from agentic_gts.core.models import OrientedBox
     from agentic_gts.segment.orientation import seed_axis_delta
-
     def _row(yaw_deg, cy, n=3000, seed=5):
         rng = np.random.default_rng(seed)
         a = math.radians(yaw_deg)
@@ -225,14 +191,12 @@ def test_seed_axis_delta():
         w = rng.uniform(-0.5, 0.5, (n, 1))
         xy = np.array([0.0, cy]) + t * u + w * v
         return np.column_stack([xy, rng.uniform(0.1, 2.0, (n, 1))])
-
     def _aabb_box(pts):
         lo, hi = pts[:, :2].min(axis=0) - 0.1, pts[:, :2].max(axis=0) + 0.1
         return OrientedBox(center=(float((lo[0] + hi[0]) / 2),
                                    float((lo[1] + hi[1]) / 2), 1.1),
                            size=(float(hi[0] - lo[0]), float(hi[1] - lo[1]),
                                  2.2), yaw=0.0)
-
     # two rows slanted 8 deg: per-box PCA recovers the slant
     r1, r2 = _row(8.0, 0.0, seed=1), _row(8.2, 4.0, seed=2)
     P = np.vstack([r1, r2])
@@ -240,7 +204,6 @@ def test_seed_axis_delta():
     d = seed_axis_delta(boxes, P, cur_yaw=0.0)
     assert d is not None and abs(math.degrees(d) - 8.0) < 1.0, \
         f"slanted rows must vote their own axis, got {d}"
-
     # perpendicular rows agree (mod-90 fold): 98 deg == 8 deg
     r1, r2 = _row(8.0, 0.0, seed=1), _row(98.0, 4.0, seed=2)
     P = np.vstack([r1, r2])
@@ -248,7 +211,6 @@ def test_seed_axis_delta():
     d = seed_axis_delta(boxes, P, cur_yaw=0.0)
     assert d is not None and abs(math.degrees(d) - 8.0) < 1.0, \
         f"perpendicular rows must fold to one direction, got {d}"
-
     # a heavier stray wall-ish blob cannot drag the weighted median
     r1, r2, wall = _row(8.0, 0.0, seed=1), _row(8.0, 4.0, seed=2), \
         _row(-20.0, 8.0, n=4000, seed=3)
@@ -257,14 +219,12 @@ def test_seed_axis_delta():
     d = seed_axis_delta(boxes, P, cur_yaw=0.0)
     assert d is not None and abs(math.degrees(d) - 8.0) < 1.0, \
         f"weighted median must resist one stray fit, got {math.degrees(d):.1f}"
-
     # straight rows: delta ~ 0 (the feedback never fires)
     r1, r2 = _row(0.3, 0.0, seed=1), _row(-0.2, 4.0, seed=2)
     P = np.vstack([r1, r2])
     boxes = [_aabb_box(r1), _aabb_box(r2)]
     d = seed_axis_delta(boxes, P, cur_yaw=0.0)
     assert d is not None and abs(math.degrees(d)) < 1.0
-
     # dd21246's measurement context: the MIDDLE z-slice with a
     # z_top+0.10 pool cut -- tray remnants floating ABOVE the rows
     # (diagonal sprinkles, off-axis) must not drag the votes; with the
@@ -279,7 +239,6 @@ def test_seed_axis_delta():
     d = seed_axis_delta(boxes, P, cur_yaw=0.0, top_cut=2.0 + 0.10)
     assert d is not None and abs(math.degrees(d) - 8.0) < 1.0, \
         f"top-cut pool + middle slice must ignore tray remnants, got {d}"
-
     # THIN wall boxes cannot vote (user report: with mesh the yaw is
     # right on some runs, wrong on others). A mesh wall slips the
     # sliver guard at ~0.25m, is LONG (passes min_len) and DENSE
@@ -290,7 +249,6 @@ def test_seed_axis_delta():
         a = math.radians(yaw_deg)
         return OrientedBox(
             center=(0.0, cy, 1.1), size=(length, thick, 2.2), yaw=0.0)
-
     r1, r2 = _row(8.0, 0.0, seed=1), _row(8.0, 4.0, seed=2)
     P = np.vstack([r1, r2])
     wall_box = _thin_wall_box(0.0, 8.0)
@@ -306,8 +264,6 @@ def test_seed_axis_delta():
         f"thin wall box must not vote, got {math.degrees(d):.1f} deg"
     print(f"PASS seed axis delta ({math.degrees(d):+.2f} deg on straight, "
           f"~8 deg recovered on slanted, trays ignored)")
-
-
 def _wall_room(theta_deg: float = 17.5, seed: int = 0):
     """A mesh-like rectangular room: dense straight wall lines, device
     rows PARALLEL to the long wall, plus floor/ceiling layers the
@@ -317,7 +273,6 @@ def _wall_room(theta_deg: float = 17.5, seed: int = 0):
     R = np.array([[math.cos(a), -math.sin(a)],
                   [math.sin(a), math.cos(a)]])
     W, H = 16.0, 10.0
-
     def _wall(p0, p1, n):
         u = np.array([p1[0] - p0[0], p1[1] - p0[1]])
         L = float(np.hypot(*u))
@@ -326,7 +281,6 @@ def _wall_room(theta_deg: float = 17.5, seed: int = 0):
         t = rng.uniform(0.0, 1.0, (n, 1))
         w = rng.normal(0.0, 0.05, (n, 1))
         return np.asarray(p0) + t * u + w * v
-
     xys = [_wall((0, 0), (W, 0), 4000), _wall((W, 0), (W, H), 2500),
            _wall((W, H), (0, H), 4000), _wall((0, H), (0, 0), 2500)]
     # device rows parallel to the long (x) walls
@@ -344,8 +298,6 @@ def _wall_room(theta_deg: float = 17.5, seed: int = 0):
     floor = np.column_stack([fxy, rng.uniform(0.0, 0.1, nf)])
     ceil = np.column_stack([fxy, rng.uniform(2.8, 3.5, nf)])
     return np.vstack([pts, floor, ceil])
-
-
 def test_fit_wall_yaw():
     """Mesh fast path: the outer wall lines give the layout direction
     directly -- devices sit parallel to the walls, so the dominant
@@ -353,7 +305,6 @@ def test_fit_wall_yaw():
     into one mod-90 family). Floor/ceiling layers must be ignored
     (z-band slice)."""
     from agentic_gts.segment.orientation import fit_wall_yaw
-
     pts = _wall_room(theta_deg=17.5)
     r = fit_wall_yaw(pts)
     assert r is not None, "rectangular room must yield a wall yaw"
@@ -361,11 +312,9 @@ def test_fit_wall_yaw():
     err = abs(17.5 - math.degrees(yaw))
     assert err < 1.0, f"wall yaw off by {err:.1f} deg"
     assert conf >= 0.9, f"orthogonal room: one family, got share {conf:.2f}"
-
     # negative rotation folds to [-45, 45)
     r = fit_wall_yaw(_wall_room(theta_deg=-26.0, seed=1))
     assert r is not None and abs(math.degrees(r[0]) + 26.0) < 1.0
-
     # slanted device rows inside a straight room: the WALL direction
     # wins by design (mesh premise: devices parallel to walls)
     pts = _wall_room(theta_deg=0.0, seed=2)
@@ -380,7 +329,6 @@ def test_fit_wall_yaw():
     r = fit_wall_yaw(np.vstack([pts, slant]))
     assert r is not None and abs(math.degrees(r[0])) < 1.0, \
         "wall lines must beat slanted interior rows"
-
     # curved outer wall: no dominant straight family -> None (caller
     # falls back to the device-vote estimator)
     rng = np.random.default_rng(4)
@@ -390,8 +338,6 @@ def test_fit_wall_yaw():
                             rng.uniform(0.2, 3.0, 12000)])
     assert fit_wall_yaw(disk) is None, "curved wall must not yield a yaw"
     print("PASS fit wall yaw (mesh fast path)")
-
-
 def test_fit_wall_yaw_bin_boundary_split():
     """Regression (user scene dianchifang): the true walls at -17.5 deg
     sit EXACTLY between rigid 5-deg histogram bins, and per-edge
@@ -401,7 +347,6 @@ def test_fit_wall_yaw_bin_boundary_split():
     clustering must merge the wobbling family and return the wall
     yaw."""
     from agentic_gts.segment.orientation import fit_wall_yaw
-
     rng = np.random.default_rng(11)
     theta = math.radians(-17.5)
     jitters = [math.radians(d) for d in (-1.8, 1.6, -1.2, 2.0)]
@@ -441,13 +386,10 @@ def test_fit_wall_yaw_bin_boundary_split():
     assert conf >= 0.9, f"one wobbly family, got share {conf:.2f}"
     print(f"PASS wall yaw bin-boundary split (yaw="
           f"{math.degrees(yaw):+.1f} deg, share {conf:.0%})")
-
-
 def test_estimate_yaw_detailed_mesh_flag():
     """mesh=True runs the wall fast path FIRST and marks the source;
     mesh=False (3DGS inputs) keeps the pure device-vote path."""
     from agentic_gts.segment.orientation import estimate_yaw_detailed
-
     pts = _wall_room(theta_deg=17.5)
     info = estimate_yaw_detailed(pts, mesh=True)
     assert info.get("yaw_source") == "wall", \
@@ -456,15 +398,11 @@ def test_estimate_yaw_detailed_mesh_flag():
     # byproducts (layout bootstrap) survive the fast path
     assert info.get("device_cells") is not None
     assert info.get("z_top") is not None
-
     info = estimate_yaw_detailed(pts, mesh=False)
     assert "yaw_source" not in info or info["yaw_source"] != "wall"
     print("PASS estimate yaw detailed mesh flag (wall source marked)")
-
-
 def test_align_with_subfloor_noise():
     """Regression: marginal noise spike BELOW the floor must not win.
-
     Real 3DGS exports carry floaters under the floor; a bottom-up
     first-above-threshold scan latches onto them and shifts the whole cloud
     up (floor lands inside the device height band, drowning the device rows).
@@ -473,7 +411,6 @@ def test_align_with_subfloor_noise():
     scene, _, _ = generate(SynthConfig(seed=42))
     pts = scene.points
     lo, hi = pts.min(axis=0), pts.max(axis=0)
-
     # diffuse floater layer + a concentrated spike below the floor
     n = 40_000
     noise = np.column_stack([
@@ -484,21 +421,16 @@ def test_align_with_subfloor_noise():
         rng.uniform(-0.65, -0.60, 5_000)])
     R = _rot_axis([1, 0, 0], 3.0) @ _rot_axis([0, 1, 0], 1.0)
     adversarial = np.vstack([pts, noise, spike]) @ R.T + np.array([0, 0, 0.5])
-
     fixed = align_to_ground(adversarial)
-
     # strongest spike below 0.4 m must be the floor at z~0, not the noise layer
     h, e = np.histogram(fixed[:, 2], bins=np.arange(-3.0, 3.0, 0.05))
     m = e[:-1] < 0.4
     zc = float(e[:-1][m][int(np.argmax(h[m]))])
     assert abs(zc) < 0.15, f"floor mode at z={zc:.2f}, expected ~0"
-
-
 def _mesh_room(rows_yaw_deg: float, part_delta_deg: float | None,
                rng, n_face=9000, n_top=9000, n_part=20000,
                beyond: bool = False):
     """A discretized-MESH-like machine room: perfect planes, no noise.
-
     Rows at `rows_yaw_deg` as HOLLOW SHELLS (two vertical face sheets
     + a top plane -- what a mesh sampling of closed racks actually
     gives); floor / ceiling slabs; four outer walls (rectangular room,
@@ -574,8 +506,6 @@ def _mesh_room(rows_yaw_deg: float, part_delta_deg: float | None,
                 np.full((n_face, 1), wy),
                 rng.uniform(0.05, 3.35, (n_face, 1))]))
     return np.vstack(pts)
-
-
 def test_yaw_clean_mesh_interior_partition():
     """MESH geometry (user report: yaw far off with --mesh-cloud, which
     'should not happen -- mesh noise is small'): a mesh renders an
@@ -604,8 +534,6 @@ def test_yaw_clean_mesh_interior_partition():
     assert err2 < 3.0, f"control (no wall) yaw {math.degrees(yaw2):.1f} deg"
     print(f"PASS clean-mesh yaw (with 47-deg partition: "
           f"{math.degrees(yaw):.1f} deg, control {math.degrees(yaw2):.1f} deg)")
-
-
 def test_yaw_mesh_reconstruction_beyond_room():
     """The other mesh-specific hijack (user report: yaw far off ONLY
     with --mesh-cloud): a reconstruction that extends PAST the machine
@@ -625,8 +553,6 @@ def test_yaw_mesh_reconstruction_beyond_room():
         f"mesh-beyond-room yaw {math.degrees(yaw):.1f} deg (rows at 8) -- " \
         f"the room-frame walls hijacked the estimate"
     print(f"PASS mesh beyond room (yaw {math.degrees(yaw):.1f} deg, rows at 8)")
-
-
 def test_align_transform_roundtrip():
     """align_to_ground(return_transform=True) must return a transform that
     reproduces the aligned cloud: raw @ R.T + shift == aligned. The 3DGS
@@ -648,8 +574,6 @@ def test_align_transform_roundtrip():
         "transform must reproduce the aligned points"
     assert abs(float(np.median(aligned[:, 2]))) < 0.6
     print("PASS align transform roundtrip (raw @ R.T + shift == aligned)")
-
-
 def test_apply_align_transform_shifts_gs_and_spares_cache():
     """apply_align_transform must shift a GaussianData's means WITHOUT
     mutating the input (the read cache must stay raw)."""
@@ -668,8 +592,6 @@ def test_apply_align_transform_shifts_gs_and_spares_cache():
     assert np.allclose(gs.means, before), "input gs must NOT be mutated"
     assert apply_align_transform(gs, None) is gs, "no tf -> unchanged"
     print("PASS apply_align_transform (shifted, input/cache untouched)")
-
-
 def test_unalign_roundtrip_and_output_frame():
     """The final-frame map: raw = (aligned - shift) @ R is the exact
     inverse of the align transform, and _map_outputs_to_input_frame
@@ -693,7 +615,6 @@ def test_unalign_roundtrip_and_output_frame():
     aligned, tf = align_to_ground(raw, return_transform=True)
     assert np.allclose(_unalign(aligned, tf), raw, atol=1e-9), \
         "unalign must be the exact inverse of the align transform"
-
     scene = Scene(points=aligned.copy())
     scene.boxes = [OrientedBox(center=(1.0, 2.0, 1.2),
                                size=(0.6, 1.1, 2.0), yaw=0.3)]
@@ -713,13 +634,3 @@ def test_unalign_roundtrip_and_output_frame():
     _map_outputs_to_input_frame(scene2)
     assert np.allclose(scene2.points, raw)
     print("PASS unalign roundtrip + output frame mapping")
-
-
-if __name__ == "__main__":
-    test_align_and_yaw_on_adversarial_cloud()
-    print("PASS  test_align_and_yaw_on_adversarial_cloud")
-    test_align_with_subfloor_noise()
-    print("PASS  test_align_with_subfloor_noise")
-    test_align_transform_roundtrip()
-    test_apply_align_transform_shifts_gs_and_spares_cache()
-    test_unalign_roundtrip_and_output_frame()

@@ -136,31 +136,19 @@ def seed_axis_delta(boxes, points: np.ndarray, cur_yaw: float,
 
     The stageG feedback signal. The seeds fit in the row frame (their
     box.yaw is 0 / pi/2 BY CONSTRUCTION -- it carries no direction
-    information), so each seed's direction is MEASURED here, in the
-    EXACT context the original local-PCA seed fit used (dd21246, the
-    version that selected the yaw correctly on real scenes): PCA on
-    the MIDDLE z-slice of the structure -- [0.35, 0.75] x height
-    above the box's floor, the band that cuts floor creep AND tray /
-    ceiling remnants alike -- drawn from a pool cut at z_top + 0.10.
-    A whole-device-band PCA (the first reinstatement) let the haze at
-    both ends of the band pull the covariance and the votes came out
-    imperfect (user report). This is deliberately NOT the older pool
-    feedback either, which re-ran the GLOBAL histogram estimator on
-    the union of the boxes' points -- a pool CARVED by box geometry
-    cut along the ASSUMED yaw, so slanted rows re-confirmed the
-    assumed yaw. Per-box middle-slice PCA keeps each vote LOCAL to
-    one structure: no histogram to hijack, one stray wall-ish fit
-    cannot drag the aggregate.
+    information), so each seed's direction is MEASURED here: PCA on
+    the MIDDLE z-slice of the structure ([0.35, 0.75] x height above
+    the box's floor -- the band that cuts floor creep AND tray /
+    ceiling remnants alike), drawn from a pool cut at z_top + 0.10.
+    Per-box middle-slice PCA keeps each vote LOCAL to one structure:
+    no histogram to hijack, one stray wall-ish fit cannot drag the
+    aggregate (a whole-band pool version did -- user report).
 
-    Votes: only boxes long enough for a trustworthy axis (a stubby AC
-    unit's PCA direction is noise), THICK enough to be a device (a
-    WALL box is long and -- in a mesh -- dense, exactly the heaviest
-    possible voter at the WRONG angle: the cluster recall net proposes
-    wall blobs, the VLM sometimes calls them rack rows, and the vote
-    then drags the median and corrupts a CORRECT yaw, run-to-run
-    randomly with the VLM's own nondeterminism -- user report), and
-    with enough point support; folded mod-90 (perpendicular rows
-    agree), weighted by point count, taken as the weighted MEDIAN.
+    Votes: only boxes long enough for a trustworthy axis, THICK enough
+    to be a device (a mesh WALL box is long and dense -- exactly the
+    heaviest possible voter at the WRONG angle; user report), and with
+    enough point support; folded mod-90 (perpendicular rows agree),
+    weighted by point count, taken as the weighted MEDIAN.
     """
     hi = float(top_cut) if top_cut else 2.5
     band = points[(points[:, 2] > 0.30) & (points[:, 2] < hi)]
@@ -584,19 +572,6 @@ def boundary_keep_mask(cells: np.ndarray, dist: float = 0.35) -> np.ndarray:
     return keep
 
 
-def _remove_boundary_cells(cells: np.ndarray, dist: float = 0.35) -> np.ndarray:
-    """Drop cells near the convex-hull boundary of the occupied area.
-
-    In real 3DGS clouds walls are denser than device surfaces and their
-    direction would otherwise dominate the yaw histogram (walls axis-aligned,
-    devices rotated). Removing a boundary strip suppresses wall bands while
-    leaving the row bands intact.
-    """
-    kept = cells[boundary_keep_mask(cells, dist)]
-    print(f"[diag][yaw] boundary (wall) cell removal: {len(cells)} -> {len(kept)}")
-    return kept
-
-
 def _row_band_score(cells: np.ndarray, yaw: float, bin_w: float = 0.15) -> float:
     """How well does this yaw explain device *rows*?
 
@@ -609,16 +584,13 @@ def _row_band_score(cells: np.ndarray, yaw: float, bin_w: float = 0.15) -> float
 
     MESH hijack guard (user report: yaw far off with --mesh-cloud): a
     mesh renders walls as PERFECT dense planes, and when the
-    reconstruction extends past the machine room (captured corridor /
-    neighboring space) the room walls are INTERIOR to the hull -- the
-    boundary strip cannot remove them, and their single-line bands
-    carry full mass: wall mass ~ row-face mass and the score flips on
-    noise. A wall band and a rack FACE band are geometrically
-    identical thin vertical planes -- the discriminator is PAIRING: a
-    rack face always has its front/back sibling one rack-depth away
-    (0.5..2.4m, incl. back-to-back doubles), a wall stands alone.
-    Thin bands score full mass only when PAIRED; solitary thin lines
-    (walls, starved single faces) score 10%.
+    reconstruction extends past the machine room the room walls are
+    INTERIOR to the hull -- the boundary strip cannot remove them, and
+    a wall band and a rack FACE band are geometrically identical thin
+    vertical planes. The discriminator is PAIRING: thin bands score
+    full mass only when a sibling thin band sits within 0.40..2.4m
+    (a rack face always has its front/back sibling one rack-depth
+    away); solitary thin lines (walls) score 10%.
     """
     cross = np.array([-math.sin(yaw), math.cos(yaw)])
     v = cells @ cross
@@ -646,14 +618,10 @@ def _row_band_score(cells: np.ndarray, yaw: float, bin_w: float = 0.15) -> float
             i = j + 1
         else:
             i += 1
-    # thin bands: a rack FACE always has its front/back sibling one
-    # rack-depth away (network racks 0.45m to back-to-back doubles
-    # 2.2m); a wall stands alone or in pairs metres apart. Sibling
-    # support is NON-EXCLUSIVE (greedy exclusive pairing mis-couples
-    # an interior artifact band with one face and starves the other):
-    # any thin band with another thin band within 0.40..2.4m scores
-    # full mass; solitary thin lines (walls, lone starved faces)
-    # score 10%.
+    # thin bands: sibling support is NON-EXCLUSIVE (greedy exclusive
+    # pairing mis-couples an interior artifact band with one face and
+    # starves the other) -- any thin band with another within
+    # 0.40..2.4m scores full mass, solitary ones score 10%.
     tc = [c for c, _ in thins]
     for k, (c, m) in enumerate(thins):
         sib = any(0.40 <= abs(c - c2) <= 2.4
