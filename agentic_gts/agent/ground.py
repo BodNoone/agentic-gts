@@ -22,6 +22,8 @@ import math
 import numpy as np
 
 from agentic_gts.core.models import DeviceType, OrientedBox
+from agentic_gts.agent.hallucination import (filter_hallucination_rects,
+                                              save_debug_png)
 
 
 # ---------- row-frame rotation ----------
@@ -801,9 +803,10 @@ def _save_grounded_png(base_img, cam, boxes, raw_rects, out_dir,
 
     Two layers over the clean view base the VLM answered on:
       - COLORED 3-px rectangles with labels = the VLM's RAW regions
-        for this view (tower hallucinations already filtered out
-        upstream; one distinct color per region, official
-        plot_bounding_boxes style) -- already in THIS image's pixels
+        for this view (structured-coordinate hallucination chains
+        already filtered out upstream; one distinct color per region,
+        official plot_bounding_boxes style) -- already in THIS image's
+        pixels
       - RED 2-px wireframes = the geometry-fitted final row boxes,
         projected through the camera and shifted by the crop offset
     This separates WHAT the VLM said from what the point-support fit
@@ -1713,70 +1716,6 @@ def _huge_rect(r, W: int, H: int, max_frac: float = _MAX_RECT_FRAC) -> bool:
     return (w * h) > max_frac * float(W) * float(H)
 
 
-def _tower_drops(rects, W: int, H: int) -> set[int]:
-    """Indices of the 'tower' tiling hallucination (user report: a
-    column of IDENTICAL boxes running from the top of the godview to
-    the bottom, edges touching): a chain of >= 3 pixel rects with
-    near-identical width AND height, x-edges aligned, stacked
-    edge-to-edge VERTICALLY.
-
-    The godview renders the ROW frame axis-aligned (image x = row
-    axis, image y = the across-row axis), so a vertical tower reads
-    as 'neighbouring rows stacked with NO aisle between them' --
-    physically impossible: real adjacent rows always have an aisle
-    (>= 0.6 m, far above the touch tolerance at any frame scale) and a
-    back-to-back double is 2, never 3+. Genuine over-split cabinets
-    chain HORIZONTALLY along the row (edge-to-edge same-size boxes are
-    the over-split signature) and are never dropped.
-
-    STRICTLY edge-to-edge: a rect that INTERSECTS a tower member by
-    more than the alignment noise is a DIFFERENT detection in the same
-    column (user: may be valid) and never chains into the tower -- the
-    chain links only on touching edges (hairline gap or overlap of a
-    few px). Dropped rects never reach the fits NOR the grounded.png
-    audit (user direction: the audit shows what survived). If a
-    dropped tower did cover real devices, the cluster recall net
-    re-proposes them -- nothing is lost silently."""
-    n = len(rects)
-    if n < 3:
-        return set()
-    tol = max(4.0, 0.008 * min(W, H))      # size / x-alignment match
-    touch = max(8.0, 0.012 * min(W, H))    # edge-to-edge (hairline gap)
-    b = [(float(r[0]), float(r[1]), float(r[2]), float(r[3])) for r in rects]
-    parent = list(range(n))
-
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    for i in range(n):
-        x0i, y0i, x1i, y1i = b[i]
-        for j in range(i + 1, n):
-            x0j, y0j, x1j, y1j = b[j]
-            if abs(x0i - x0j) > tol or abs(x1i - x1j) > tol:
-                continue          # not the same column
-            if abs((y1i - y0i) - (y1j - y0j)) > tol:
-                continue          # heights differ -> not the same tile
-            # vertical separation: only touching edges chain. A gap
-            # above `touch` is an aisle (real rows); an overlap beyond
-            # `tol` is another detection intersecting the column --
-            # keep it, it is not part of the tower
-            g = max(y0j - y1i, y0i - y1j)
-            if g > touch or g < -tol:
-                continue
-            parent[find(i)] = find(j)
-    groups: dict[int, list[int]] = {}
-    for i in range(n):
-        groups.setdefault(find(i), []).append(i)
-    drops = set()
-    for members in groups.values():
-        if len(members) >= 3:
-            drops.update(members)
-    return drops
-
-
 # ---------- grounding stage ----------
 
 
@@ -1820,6 +1759,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     except Exception:
         tiles = None
     views = []                       # (img, cam, W, H, fname, rects)
+    hallu_diag = []                  # per-view hallucination-filter records
     view_specs = [("groundview.png", None)] if tiles is None else \
         [(f"groundview_t{i}.png", fr) for i, fr in enumerate(tiles)]
     if tiles is not None:
@@ -1844,15 +1784,18 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                 print(f"[ground] png save failed ({type(e).__name__})")
                 png_path = None
         rects = judge.ground_regions(png, W, H, png_path=png_path)
-        # tower hallucinations are dropped AT COLLECTION: neither the
-        # fits nor the grounded.png audit ever sees them (user
-        # direction: filtered rects must not clutter the audit view)
-        tower = _tower_drops(rects, W, H)
-        if tower:
-            print(f"[ground] tower hallucination dropped: {len(tower)} "
-                  f"same-size edge-to-edge rect(s) in a vertical "
-                  f"chain ({fname})")
-            rects = [r for i, r in enumerate(rects) if i not in tower]
+        # structured-coordinate hallucination filter: parsed rects in,
+        # verified rects out -- nothing hallucinated reaches the 2D->3D
+        # lifting or the audit (see agent/hallucination.py)
+        rects, hdiag = filter_hallucination_rects(rects, W, H, view=fname)
+        if hdiag["chains"]:
+            hallu_diag.append(hdiag)
+        if hdiag["n_dropped"]:
+            print(f"[ground] hallucination filter: "
+                  f"{hdiag['n_dropped']} rect(s) dropped in {fname}")
+            if out_dir:
+                save_debug_png(img, rects, hdiag, os.path.join(
+                    out_dir, f"hallucination_{fname}"))
         print(f"[ground] view {fname}: {len(rects)} regions")
         views.append((img, cam, W, H, fname, rects, off))
         # ---- recall tilt views (user direction 1) ----
@@ -1896,18 +1839,35 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
                     pngp_t = None
             rects_t = judge.ground_regions(png_t, W_t, H_t,
                                            png_path=pngp_t)
-            tower_t = _tower_drops(rects_t, W_t, H_t)
-            if tower_t:
-                print(f"[ground] tower hallucination dropped: "
-                      f"{len(tower_t)} same-size edge-to-edge rect(s) in "
-                      f"a vertical chain ({stem}_{tag})")
-                rects_t = [r for i, r in enumerate(rects_t)
-                           if i not in tower_t]
+            rects_t, hdiag_t = filter_hallucination_rects(
+                rects_t, W_t, H_t, view=f"{stem}_{tag}")
+            if hdiag_t["chains"]:
+                hallu_diag.append(hdiag_t)
+            if hdiag_t["n_dropped"]:
+                print(f"[ground] hallucination filter: "
+                      f"{hdiag_t['n_dropped']} rect(s) dropped in "
+                      f"{stem}_{tag}")
+                if out_dir:
+                    save_debug_png(img_t, rects_t, hdiag_t, os.path.join(
+                        out_dir, f"hallucination_{stem}_{tag}.png"))
             print(f"[ground] view {stem}_{tag}: {len(rects_t)} regions")
             views.append((img_t, cam_t, W_t, H_t, f"{stem}_{tag}.png",
                           rects_t, off_t))
     if not views:
         return False                 # every render failed (logged above)
+    # hallucination-filter diagnostics: one JSON for the whole run,
+    # every scored chain with score, verdict and per-indicator stats
+    if hallu_diag and out_dir:
+        try:
+            import json as _json
+            with open(os.path.join(out_dir, "hallucination_diag.json"),
+                      "w", encoding="utf-8") as f:
+                f.write(_json.dumps(hallu_diag, ensure_ascii=False,
+                                    indent=2))
+            print(f"[ground] hallucination diagnostics -> "
+                  f"hallucination_diag.json ({len(hallu_diag)} view(s))")
+        except OSError as e:
+            print(f"[halluc][diag] write failed ({type(e).__name__}: {e})")
     if not any(v[5] for v in views):
         print("[ground] VLM returned no usable regions")
         if out_dir:
