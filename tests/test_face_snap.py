@@ -1,0 +1,159 @@
+"""Tests for stageF -- the final mesh-driven face polish
+(tools/geometry.snap_box_faces / snap_faces_to_mesh): front/back faces
+snap onto the densest mesh sheets in the box's own column; an open
+door's low wide cross-plateau never qualifies, a flush wall's strong
+but farther peak never steals the face, and boxes already on their
+sheets are untouched (idempotent)."""
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from agentic_gts.core.models import OrientedBox, Scene
+from agentic_gts.tools.geometry import snap_box_faces, snap_faces_to_mesh
+
+
+def _box(half_d, half_len=1.0, z=1.05):
+    return OrientedBox(center=(0.0, 0.0, z),
+                       size=(2.0 * half_len, 2.0 * half_d, 2.10),
+                       yaw=0.0)
+
+
+def _sheet(rng, cross, n=1500, along=1.0, z_lo=0.35, z_hi=2.00):
+    """A dense planar sheet at a fixed cross coordinate."""
+    return np.column_stack([rng.uniform(-along, along, n),
+                            rng.uniform(cross - 0.01, cross + 0.01, n),
+                            rng.uniform(z_lo, z_hi, n)])
+
+
+def _plateau(rng, c_lo, c_hi, n=400, along=0.6, z_lo=0.35, z_hi=2.00):
+    """A low wide plateau across a cross range (an open door swung 90
+    deg: the panel spreads along the cross axis)."""
+    return np.column_stack([rng.uniform(-along, along, n),
+                            rng.uniform(c_lo, c_hi, n),
+                            rng.uniform(z_lo, z_hi, n)])
+
+
+def _floor(rng, n=800):
+    """Floor points spanning the whole cross range -- excluded by the
+    z band, they would flatten the face peaks into a background."""
+    return np.column_stack([rng.uniform(-1.0, 1.0, n),
+                            rng.uniform(-1.2, 1.2, n),
+                            rng.uniform(0.00, 0.20, n)])
+
+
+def test_face_snap_pulls_in_open_door_inflation():
+    """The primary case (user direction): a box inflated by an open
+    door snaps both faces back onto the device's own sheets; the
+    door's plateau never qualifies."""
+    rng = np.random.default_rng(3)
+    pts = np.vstack([
+        _sheet(rng, 0.55), _sheet(rng, -0.55),
+        _plateau(rng, 0.57, 1.25),      # the open door, front side
+        _floor(rng)])
+    b = _box(0.70)                       # inflated: faces at +/-0.70
+    nb, info = snap_box_faces(b, pts)
+    assert info["moved"], info
+    assert abs(nb.size[1] - 1.11) < 0.06, \
+        f"depth must return to the sheets (~1.11), got {nb.size[1]:.2f}"
+    assert abs(nb.center[1]) < 0.03, "the box stays centred"
+    assert nb.box_id == b.box_id and nb.meta is b.meta, \
+        "identity and meta must survive"
+    print(f"PASS face snap pulls in door inflation "
+          f"(depth {info['depth'][0]:.2f} -> {info['depth'][1]:.2f})")
+
+
+def test_face_snap_noop_on_clean_box():
+    """A box already on its sheets does not move (idempotent)."""
+    rng = np.random.default_rng(4)
+    pts = np.vstack([_sheet(rng, 0.55), _sheet(rng, -0.55), _floor(rng)])
+    b = _box(0.55)
+    nb, info = snap_box_faces(b, pts)
+    assert not info["moved"] and nb is b
+    print("PASS face snap no-op on a clean box")
+
+
+def test_face_snap_extends_under_measured():
+    """An under-measured box (faces inside the device) extends out to
+    its sheets through the tight outward window."""
+    rng = np.random.default_rng(5)
+    pts = np.vstack([_sheet(rng, 0.55), _sheet(rng, -0.55), _floor(rng)])
+    b = _box(0.45)
+    nb, info = snap_box_faces(b, pts)
+    assert info["moved"], info
+    assert abs(nb.size[1] - 1.11) < 0.06, \
+        f"depth must reach the sheets, got {nb.size[1]:.2f}"
+    print(f"PASS face snap extends under-measured "
+          f"(depth {info['depth'][0]:.2f} -> {info['depth'][1]:.2f})")
+
+
+def test_face_snap_ignores_wall_behind():
+    """A flush wall behind the back face is a strong peak INSIDE the
+    outward window but FARTHER than the device's own back sheet:
+    nearest-strong wins, the face stays on the device."""
+    rng = np.random.default_rng(6)
+    wall = _sheet(rng, -0.68, n=2500, along=1.2)   # denser than the sheets
+    pts = np.vstack([_sheet(rng, 0.55), _sheet(rng, -0.55), wall,
+                     _floor(rng)])
+    b = _box(0.55)
+    nb, info = snap_box_faces(b, pts)
+    assert not info["moved"], \
+        f"a strong but farther wall must not steal the back face: {info}"
+    print("PASS face snap ignores the wall behind (nearest-strong)")
+
+
+def test_face_snap_door_only_window_does_not_move():
+    """When the inward window contains ONLY the door plateau (the box
+    is inflated beyond the window), the global strength bar rejects
+    the plateau and the face does not move -- no snap onto noise."""
+    rng = np.random.default_rng(7)
+    pts = np.vstack([
+        _sheet(rng, 0.55), _sheet(rng, -0.55),
+        _plateau(rng, 0.56, 1.30, n=500),
+        _floor(rng)])
+    b = _box(1.00)                      # inflated far beyond the window
+    nb, info = snap_box_faces(b, pts)
+    assert not info["moved"], \
+        f"a door-only window must not snap onto its own plateau: {info}"
+    print("PASS face snap no-move on a door-only window")
+
+
+def test_face_snap_depth_bounds_guard():
+    """Sheets that would snap the box below the minimum device depth
+    are rejected -- the box is returned unchanged."""
+    rng = np.random.default_rng(8)
+    pts = np.vstack([_sheet(rng, 0.12), _sheet(rng, -0.12), _floor(rng)])
+    b = _box(0.35)
+    nb, info = snap_box_faces(b, pts)
+    assert not info["moved"] and "bounds" in info.get("reason", ""), info
+    print("PASS face snap depth bounds guard")
+
+
+def test_snap_faces_to_mesh_scene_level():
+    """Scene wrapper: the inflated box is adjusted with meta recorded,
+    the clean box untouched, and the return count is right."""
+    rng = np.random.default_rng(9)
+    inflated_pts = np.vstack([_sheet(rng, 0.55), _sheet(rng, -0.55),
+                              _plateau(rng, 0.57, 1.25), _floor(rng)])
+    clean_pts = np.vstack([_sheet(rng, 0.55, along=0.5),
+                           _sheet(rng, -0.55, along=0.5)])
+    # two boxes in separate columns (x offset), one inflated one clean
+    inf = _box(0.70)
+    inf.center = (0.0, 5.0, 1.05)
+    cln = _box(0.55, half_len=0.5)
+    cln.center = (5.0, 0.0, 1.05)
+    off_inf = inflated_pts + np.array([0.0, 5.0, 0.0])
+    off_cln = clean_pts + np.array([5.0, 0.0, 0.0])
+    scene = Scene(points=np.vstack([off_inf, off_cln]))
+    scene.boxes = [inf, cln]
+    n = snap_faces_to_mesh(scene)
+    assert n == 1, f"exactly the inflated box adjusts, got {n}"
+    adj = scene.boxes[0]
+    assert abs(adj.size[1] - 1.11) < 0.06
+    assert "face_snap" in adj.meta and adj.meta["face_snap"]["moved"]
+    assert "face_snap" not in scene.boxes[1].meta
+    assert abs(scene.boxes[1].size[1] - 1.10) < 1e-9, \
+        "the clean box must be untouched"
+    print("PASS snap_faces_to_mesh scene level (1 adjusted, 1 clean)")

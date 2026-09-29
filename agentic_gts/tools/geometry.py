@@ -285,3 +285,156 @@ def snap_row_seams(boxes: list[OrientedBox], yaw: float,
             _rebuild(b, seam, b_hi, b_x, b_d)
         snapped += 1
     return snapped
+
+
+# ---------- final face polish (stageF: mesh-driven thickness snap) ----------
+
+# cross-profile histogram resolution
+_FACE_BIN = 0.03
+# a mesh-sampled face sheet is 2-5cm thick: aggregate this much cross
+# extent into one "face strength" sample (single bins split a sheet)
+_FACE_BAND = 0.06
+# per-face search window, ASYMMETRIC: generous INWARD (the open-door
+# error direction is outward inflation -- the true sheet sits inward),
+# tight OUTWARD (a small under-measure allowance; a tight outward
+# window also keeps a flush wall or a neighbour's sheet from pulling
+# the face out)
+_FACE_SNAP_IN = 0.35
+_FACE_SNAP_OUT = 0.15
+# a candidate peak must reach this fraction of the window's strongest
+# peak AND of the box profile's global max. The window bar alone would
+# let a door-only window snap onto its own plateau; the global bar
+# (relative to the box's own strongest sheet) rejects that: an open
+# door's cross profile is a low wide plateau, an order of magnitude
+# under the face sheets
+_FACE_SNAP_TAU = 0.50
+_FACE_SNAP_ABS = 0.25
+# moves below this are noise -> no-op
+_FACE_SNAP_MIN_MOVE = 0.02
+# device depth bounds for the snapped result
+_FACE_SNAP_MIN_D, _FACE_SNAP_MAX_D = 0.30, 2.50
+
+
+def snap_box_faces(box: OrientedBox,
+                   pts: np.ndarray) -> tuple[OrientedBox, dict]:
+    """Snap ONE box's front/back (cross-axis) faces onto the densest
+    mesh sheets in its own column (user direction: a final thickness
+    polish -- the side-view chain has real holes, wall-masked /
+    ladder-dominated / dim renders leave the depth uncorrected, and the
+    mesh fallback measures whatever is in the slice, an open door
+    included, since door subtraction only exists in the local VIEW
+    path).
+
+    The box's cross profile: a face sheet is a tall narrow peak (all
+    its points share one cross coordinate), an open door a low wide
+    plateau (the swung panel spreads along the cross axis), a wall
+    behind a strong but FARTHER peak. Rule: per face, snap to the
+    NEAREST peak within an inward-biased window that clears both the
+    window-relative and the profile-global strength bars -- nearest
+    beats strongest so a flush wall never steals the back face and the
+    door plateau never qualifies. Idempotent: a face already on its
+    sheet has its peak at distance ~0 and does not move. Returns
+    (box, info); the box is unchanged unless info["moved"]."""
+    yaw = float(box.yaw)
+    axis = np.array([math.cos(yaw), math.sin(yaw)])
+    cross = np.array([-math.sin(yaw), math.cos(yaw)])
+    c = np.asarray(box.center, dtype=float)
+    along_c = float(c[:2] @ axis)
+    cross_c = float(c[:2] @ cross)
+    half_len = float(box.size[0]) / 2.0
+    half_d = float(box.size[1]) / 2.0
+    bottom = float(c[2]) - float(box.size[2]) / 2.0
+    top = float(c[2]) + float(box.size[2]) / 2.0
+    pts = np.asarray(pts, dtype=float)
+    if len(pts) < 50:
+        return box, {"moved": False, "reason": "too few points"}
+    # the box's own column: along-slice + a floor-excluding z band
+    # (floor points span the whole cross range and would flatten the
+    # face peaks into a uniform background)
+    m = ((np.abs(pts[:, :2] @ axis - along_c) <= half_len + 0.05)
+         & (pts[:, 2] > bottom + 0.30) & (pts[:, 2] <= top))
+    if int(m.sum()) < 50:
+        return box, {"moved": False, "reason": "too few profile points"}
+    cc = pts[m, :2] @ cross
+    prof_lo = cross_c - half_d - _FACE_SNAP_OUT
+    prof_hi = cross_c + half_d + _FACE_SNAP_OUT
+    # explicit bin COUNT, not arange(stop): arange's ceil drifts in fp
+    # and an edge landing a hair below the sheet drops its points
+    nb = int(np.floor((prof_hi - prof_lo) / _FACE_BIN)) + 2
+    edges = prof_lo + _FACE_BIN * np.arange(nb + 1)
+    hist, _ = np.histogram(cc, bins=edges)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    k = max(1, int(round(_FACE_BAND / _FACE_BIN)))
+    band = np.convolve(hist, np.ones(k, dtype=int), mode="same")
+    gmax = int(band.max())
+    if gmax <= 0:
+        return box, {"moved": False, "reason": "empty profile"}
+
+    def _snap(face_pos: float, win_lo: float, win_hi: float) -> float:
+        in_win = (centers >= win_lo) & (centers <= win_hi)
+        if not in_win.any():
+            return face_pos
+        thr = max(_FACE_SNAP_TAU * float(band[in_win].max()),
+                  _FACE_SNAP_ABS * gmax)
+        is_peak = np.ones(len(band), dtype=bool)
+        is_peak[1:-1] = ((band[1:-1] >= band[:-2])
+                         & (band[1:-1] >= band[2:]))
+        cand = np.where(in_win & is_peak & (band >= thr))[0]
+        if not len(cand):
+            return face_pos
+        d = np.abs(centers[cand] - face_pos)
+        return float(centers[cand[int(np.argmin(d))]])
+
+    front, back = cross_c + half_d, cross_c - half_d
+    f1 = _snap(front, front - _FACE_SNAP_IN, front + _FACE_SNAP_OUT)
+    b1 = _snap(back, back - _FACE_SNAP_OUT, back + _FACE_SNAP_IN)
+    mf = abs(f1 - front) >= _FACE_SNAP_MIN_MOVE
+    mb = abs(b1 - back) >= _FACE_SNAP_MIN_MOVE
+    if not mf:
+        f1 = front
+    if not mb:
+        b1 = back
+    if not (mf or mb):
+        return box, {"moved": False, "reason": "already on the sheets"}
+    depth, old_depth = f1 - b1, 2.0 * half_d
+    if not (_FACE_SNAP_MIN_D <= depth <= _FACE_SNAP_MAX_D):
+        return box, {"moved": False,
+                     "reason": f"snapped depth {depth:.2f} out of bounds"}
+    new_cross_c = 0.5 * (f1 + b1)
+    dxy = cross * (new_cross_c - cross_c)
+    new_box = OrientedBox(
+        center=(float(c[0] + dxy[0]), float(c[1] + dxy[1]), float(c[2])),
+        size=(float(box.size[0]), float(depth), float(box.size[2])),
+        yaw=box.yaw, box_id=box.box_id, device_type=box.device_type,
+        source=box.source, confidence=box.confidence, row_id=box.row_id,
+        meta=box.meta)
+    info = {"moved": True,
+            "depth": [round(old_depth, 3), round(depth, 3)],
+            "front": [round(front, 3), round(f1, 3)],
+            "back": [round(back, 3), round(b1, 3)]}
+    return new_box, info
+
+
+def snap_faces_to_mesh(scene: Scene) -> int:
+    """stageF: snap every box's front/back faces onto the densest mesh
+    sheets in its own column (see snap_box_faces). Identity and meta
+    preserved; the adjustment is recorded in meta['face_snap'].
+    Returns the number of boxes adjusted."""
+    n = 0
+    for i, b in enumerate(scene.boxes):
+        try:
+            nb, info = snap_box_faces(b, scene.points)
+        except Exception as e:
+            print(f"[stageF] {b.box_id[:6]} face snap failed "
+                  f"({type(e).__name__}: {e})")
+            continue
+        if not info.get("moved"):
+            continue
+        scene.boxes[i] = nb
+        nb.meta["face_snap"] = info
+        n += 1
+        print(f"[stageF] {nb.box_id[:6]} face snap: depth "
+              f"{info['depth'][0]:.2f} -> {info['depth'][1]:.2f}m "
+              f"(front {info['front'][0]:.2f} -> {info['front'][1]:.2f}, "
+              f"back {info['back'][0]:.2f} -> {info['back'][1]:.2f})")
+    return n
