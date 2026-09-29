@@ -105,20 +105,25 @@ def test_face_snap_ignores_wall_behind():
     print("PASS face snap ignores the wall behind (nearest-strong)")
 
 
-def test_face_snap_door_only_window_does_not_move():
-    """When the inward window contains ONLY the door plateau (the box
-    is inflated beyond the window), the global strength bar rejects
-    the plateau and the face does not move -- no snap onto noise."""
+def test_face_snap_wide_open_door_trims():
+    """The user's case: a WIDE-open door (0.6m+ stick-out) pushes the
+    face past the old 0.35m inward window -- the true sheet sat
+    outside it and the strength bars went self-referential over the
+    door's plateau, leaving the face stuck on the door. The door-sized
+    window (1.2m) reaches the sheet through the door and trims."""
     rng = np.random.default_rng(7)
     pts = np.vstack([
         _sheet(rng, 0.55), _sheet(rng, -0.55),
         _plateau(rng, 0.56, 1.30, n=500),
         _floor(rng)])
-    b = _box(1.00)                      # inflated far beyond the window
+    b = _box(1.00)                      # the face sits ON the open door
     nb, info = snap_box_faces(b, pts)
-    assert not info["moved"], \
-        f"a door-only window must not snap onto its own plateau: {info}"
-    print("PASS face snap no-move on a door-only window")
+    assert info["moved"], \
+        f"a wide-open door inflation must trim to the sheet: {info}"
+    assert abs(nb.size[1] - 1.11) < 0.06, \
+        f"depth must return to the sheets (~1.11), got {nb.size[1]:.2f}"
+    print(f"PASS face snap wide-open door trims "
+          f"(depth {info['depth'][0]:.2f} -> {info['depth'][1]:.2f})")
 
 
 def test_face_snap_depth_bounds_guard():

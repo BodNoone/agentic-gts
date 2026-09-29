@@ -304,12 +304,21 @@ _FACE_BIN = 0.03
 # a mesh-sampled face sheet is 2-5cm thick: aggregate this much cross
 # extent into one "face strength" sample (single bins split a sheet)
 _FACE_BAND = 0.06
-# per-face search window, ASYMMETRIC: generous INWARD (the open-door
-# error direction is outward inflation -- the true sheet sits inward),
-# tight OUTWARD (a small under-measure allowance; a tight outward
-# window also keeps a flush wall or a neighbour's sheet from pulling
-# the face out)
-_FACE_SNAP_IN = 0.35
+# per-face search windows, ASYMMETRIC. CROSS faces: the inward window
+# is DOOR-SIZED (user report: a wide-open door pushes the face
+# 0.6-1.0m out -- with the old 0.35m window the true sheet sat outside
+# it, and the strength bars went self-referential over the door's
+# plateau, leaving the face stuck on the door); 1.20m covers a 1.0m
+# door plus bleed margin. The nearest-qualifying-peak rule keeps the
+# wide window safe: the own sheet is always the nearest strong peak to
+# a door-inflated face, interior structure spreads into sub-bar
+# plateaus, and other boxes' points never enter the profile. OUTWARD
+# stays tight (a small under-measure allowance; also keeps a flush
+# wall or a neighbour's sheet from pulling the face out). END faces:
+# the inflation source is mask BLEED, not doors -- the window stays
+# bleed-sized
+_FACE_SNAP_IN = 1.20
+_END_SNAP_IN = 0.35
 _FACE_SNAP_OUT = 0.15
 # a candidate peak must reach this fraction of the window's strongest
 # peak AND of the box profile's global max. The window bar alone would
@@ -546,11 +555,11 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
     def _snap_end(face_pos: float, outer_sign: int) -> float:
         # outer_sign=+1: the right face (outward = +along); -1: left
         if outer_sign > 0:
-            win_lo = face_pos - _FACE_SNAP_IN
+            win_lo = face_pos - _END_SNAP_IN
             win_hi = face_pos + _FACE_SNAP_OUT
         else:
             win_lo = face_pos - _FACE_SNAP_OUT
-            win_hi = face_pos + _FACE_SNAP_IN
+            win_hi = face_pos + _END_SNAP_IN
         in_win = (centers >= win_lo) & (centers <= win_hi)
         if not in_win.any():
             return face_pos
