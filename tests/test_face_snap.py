@@ -12,7 +12,8 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from agentic_gts.core.models import OrientedBox, Scene
-from agentic_gts.tools.geometry import snap_box_faces, snap_faces_to_mesh
+from agentic_gts.tools.geometry import (snap_box_ends, snap_box_faces,
+                                        snap_faces_to_mesh)
 
 
 def _box(half_d, half_len=1.0, z=1.05):
@@ -157,3 +158,122 @@ def test_snap_faces_to_mesh_scene_level():
     assert abs(scene.boxes[1].size[1] - 1.10) < 1e-9, \
         "the clean box must be untouched"
     print("PASS snap_faces_to_mesh scene level (1 adjusted, 1 clean)")
+
+
+# ---------- row-END snap tests ----------
+
+def _row(rng, lo, hi, cross=0.55, n_per_m=900):
+    """A row plateau: front+back sheets spanning [lo, hi] along."""
+    n = max(400, int((hi - lo) * n_per_m))
+    front = np.column_stack([rng.uniform(lo, hi, n),
+                             rng.uniform(cross - 0.01, cross + 0.01, n),
+                             rng.uniform(0.35, 2.00, n)])
+    back = np.column_stack([rng.uniform(lo, hi, n),
+                            rng.uniform(-cross - 0.01, -cross + 0.01, n),
+                            rng.uniform(0.35, 2.00, n)])
+    return np.vstack([front, back])
+
+
+def _bleed(rng, lo, hi, n=60, cross=0.55):
+    """Sparse mask-bleed points past a row end (each cross bin gets a
+    couple of points -- far under every strength bar)."""
+    return np.column_stack([rng.uniform(lo, hi, n),
+                            rng.uniform(-cross, cross, n),
+                            rng.uniform(0.35, 2.00, n)])
+
+
+def _end_box(lo, hi, cross=0.55):
+    return OrientedBox(center=(0.5 * (lo + hi), 0.0, 1.05),
+                       size=(hi - lo, 2.0 * cross, 2.10), yaw=0.0)
+
+
+def test_end_snap_trims_mask_bleed():
+    """A standalone row whose right end is inflated by mask bleed
+    snaps back to the plateau edge; the clean left end stays."""
+    rng = np.random.default_rng(11)
+    pts = np.vstack([_row(rng, -3.0, 3.0), _floor(rng),
+                     _bleed(rng, 3.02, 3.28)])
+    b = _end_box(-3.0, 3.30)
+    nb, info = snap_box_ends(b, pts)
+    assert info["moved"], info
+    assert abs(info["right"][1] - 3.0) < 0.06, \
+        f"the right end must trim to the plateau edge (~3.0), " \
+        f"got {info['right'][1]}"
+    assert abs(info["left"][1] - info["left"][0]) < 1e-9, \
+        "the clean left end must not move"
+    print(f"PASS end snap trims bleed (right 3.30 -> "
+          f"{info['right'][1]:.2f})")
+
+
+def test_end_snap_extends_under_measured():
+    """An under-measured end (the true edge visible inside the tight
+    outward window) extends out to the plateau edge."""
+    rng = np.random.default_rng(12)
+    pts = np.vstack([_row(rng, -3.0, 3.0), _floor(rng)])
+    b = _end_box(-3.0, 2.90)
+    nb, info = snap_box_ends(b, pts)
+    assert info["moved"], info
+    assert abs(info["right"][1] - 3.0) < 0.06, \
+        f"the right end must extend to ~3.0, got {info['right'][1]}"
+    print(f"PASS end snap extends under-measured (right 2.90 -> "
+          f"{info['right'][1]:.2f})")
+
+
+def test_end_snap_row_pieces_only_outer_ends():
+    """User direction: a SPLIT row's internal seam is never touched
+    (snap_row_seams owns it); only the row's outermost ends snap --
+    even when the internal face carries bleed."""
+    rng = np.random.default_rng(13)
+    pts = np.vstack([
+        _row(rng, -3.0, 3.0),
+        _floor(rng),
+        _bleed(rng, 0.02, 0.15),        # bleed past A's right (seam) face
+        _bleed(rng, 3.02, 3.28)])       # bleed past B's right (outer) face
+    a = _end_box(-3.0, 0.15)            # A: left free, right = seam
+    b = _end_box(0.0, 3.30)             # B: left = seam, right free
+    scene = Scene(points=pts)
+    scene.boxes = [a, b]
+    n = snap_faces_to_mesh(scene)
+    ea = scene.boxes[0]
+    eb = scene.boxes[1]
+    assert abs(ea.size[0] - 3.15) < 1e-9, \
+        f"A's internal seam face must stay (bleed and all), " \
+        f"got length {ea.size[0]:.3f}"
+    assert abs(ea.center[0] - (-1.425)) < 1e-9, "A must not shift"
+    assert abs((eb.center[0] + eb.size[0] / 2.0) - 3.0) < 0.06, \
+        f"B's OUTER right end must trim to ~3.0, got " \
+        f"{eb.center[0] + eb.size[0] / 2.0:.2f}"
+    assert abs((eb.center[0] - eb.size[0] / 2.0) - 0.0) < 1e-9, \
+        "B's internal seam face must stay at 0.0"
+    assert "end_snap" in eb.meta and "end_snap" not in ea.meta
+    print("PASS end snap: split row -- only the outer ends move")
+
+
+def test_end_snap_no_move_when_edge_not_visible():
+    """Under-measured beyond the outward window: the plateau reaches
+    the window's outer boundary, the true edge is not visible -- the
+    face does not move (no snap to an arbitrary window edge)."""
+    rng = np.random.default_rng(14)
+    pts = np.vstack([_row(rng, -3.0, 3.0), _floor(rng)])
+    b = _end_box(-3.0, 2.70)            # 0.30 short -- past the 0.15 window
+    nb, info = snap_box_ends(b, pts)
+    assert not info["moved"], \
+        f"an edge beyond the window must not move the face: {info}"
+    print("PASS end snap no-move when the edge is not visible")
+
+
+def test_end_snap_union_not_amputated():
+    """A union box spanning row + gap + clump (post long-split removal
+    these ride whole; splitting is stageC's job): the end face sits on
+    the OUTER structure's edge and must not be pulled back to the
+    row's edge -- no amputation."""
+    rng = np.random.default_rng(15)
+    pts = np.vstack([_row(rng, 0.0, 3.0),
+                     _row(rng, 4.0, 5.0, n_per_m=1800),   # the clump
+                     _floor(rng)])
+    b = _end_box(0.0, 5.0)
+    nb, info = snap_box_ends(b, pts)
+    assert not info["moved"], \
+        f"the union's ends are already on the outer edges: {info}"
+    assert abs(nb.size[0] - 5.0) < 1e-9, "the union must stay whole"
+    print("PASS end snap: union box not amputated")

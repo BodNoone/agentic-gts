@@ -309,6 +309,13 @@ _FACE_SNAP_OUT = 0.15
 # under the face sheets
 _FACE_SNAP_TAU = 0.50
 _FACE_SNAP_ABS = 0.25
+# the END rule's bar is LOWER: it separates the plateau from mask
+# bleed (a ~20:1 contrast), while the cross rule separates competing
+# peaks (2:1) -- 50% of a fluctuating window max sits inside the
+# plateau's own counting noise (an edge bin a couple of sigma low
+# vs a bin a couple high) and drops the TRUE edge bin, landing the
+# snap a bin inside
+_FACE_END_TAU = 0.30
 # moves below this are noise -> no-op
 _FACE_SNAP_MIN_MOVE = 0.02
 # device depth bounds for the snapped result
@@ -415,26 +422,218 @@ def snap_box_faces(box: OrientedBox,
     return new_box, info
 
 
+def _row_continues(boxes, box, side: int) -> bool:
+    """True when another box continues the row past `box`'s `side` end
+    (+1 = right along the row axis, -1 = left): similar direction,
+    overlapping cross range, along-adjacent (a seam or a small gap).
+    User direction: joined rows are fine-tuned ONLY at their outmost
+    ends -- internal seams stay where snap_row_seams put them."""
+    yaw = float(box.yaw)
+    axis = np.array([math.cos(yaw), math.sin(yaw)])
+    cross = np.array([-math.sin(yaw), math.cos(yaw)])
+    c = np.asarray(box.center, dtype=float)[:2]
+    along_c = float(c @ axis)
+    half_len = float(box.size[0]) / 2.0
+    half_d = float(box.size[1]) / 2.0
+    for b in boxes:
+        if b.box_id == box.box_id:
+            continue
+        if abs(math.remainder(float(b.yaw) - yaw, math.pi)) \
+                > math.radians(20.0):
+            continue
+        cs = b.corners_2d()
+        ba = cs @ axis
+        bc = cs @ cross
+        # cross ranges must overlap (same row line, not the facing row
+        # across the aisle): at least half the thinner extent
+        if (min(bc.max(), half_d) - max(bc.min(), -half_d)
+                <= 0.5 * min(bc.max() - bc.min(), 2.0 * half_d)):
+            continue
+        gap = ((ba.min() - (along_c + half_len)) if side > 0
+               else ((along_c - half_len) - ba.max()))
+        if -0.20 <= gap <= 0.40:
+            return True
+    return False
+
+
+def snap_box_ends(box: OrientedBox, pts: np.ndarray,
+                   snap_left: bool = True,
+                   snap_right: bool = True) -> tuple[OrientedBox, dict]:
+    """Snap the FREE row ends (along-axis faces) of one box onto the
+    plateau edges of its own column (user direction: joined rows are
+    fine-tuned only at their outmost ends -- the caller gates the
+    faces; internal seams belong to snap_row_seams).
+
+    The along profile of a row is a PLATEAU, not twin peaks: the
+    front/back sheets run its whole length, so there is no peak to
+    snap to -- the end face snaps to the OUTER EDGE of the qualifying
+    run nearest the current face. The run CONTAINING the face when it
+    sits on mass (extend/trim within the connected structure); when
+    the face sits past the mass (bleed, or a gap between structures)
+    the run farthest from the box centre wins -- an over-inflated or
+    gap-straddling face trims/extends to the OUTER structure and never
+    amputates an inner one (a union box spanning row + gap + clump
+    keeps its clump; splitting it is stageC's job). The edge must be
+    VISIBLE: a run reaching the window's outer boundary means the
+    structure continues past the window -- the true end is beyond
+    reach and the face does not move."""
+    if not (snap_left or snap_right):
+        return box, {"moved": False, "reason": "no free ends"}
+    yaw = float(box.yaw)
+    axis = np.array([math.cos(yaw), math.sin(yaw)])
+    cross = np.array([-math.sin(yaw), math.cos(yaw)])
+    c = np.asarray(box.center, dtype=float)
+    along_c = float(c[:2] @ axis)
+    cross_c = float(c[:2] @ cross)
+    half_len = float(box.size[0]) / 2.0
+    half_d = float(box.size[1]) / 2.0
+    bottom = float(c[2]) - float(box.size[2]) / 2.0
+    top = float(c[2]) + float(box.size[2]) / 2.0
+    pts = np.asarray(pts, dtype=float)
+    if len(pts) < 50:
+        return box, {"moved": False, "reason": "too few points"}
+    # the box's own row line: cross-slice + the same floor-excluding
+    # z band as the face snap
+    m = ((np.abs(pts[:, :2] @ cross - cross_c) <= half_d + 0.05)
+         & (pts[:, 2] > bottom + 0.30) & (pts[:, 2] <= top))
+    if int(m.sum()) < 50:
+        return box, {"moved": False, "reason": "too few profile points"}
+    aa = pts[m, :2] @ axis
+    prof_lo = along_c - half_len - _FACE_SNAP_OUT
+    prof_hi = along_c + half_len + _FACE_SNAP_OUT
+    nb = int(np.floor((prof_hi - prof_lo) / _FACE_BIN)) + 2
+    edges = prof_lo + _FACE_BIN * np.arange(nb + 1)
+    hist, _ = np.histogram(aa, bins=edges)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    # RAW counts, not the sliding band: the end rule detects a
+    # PLATEAU EDGE (where density drops), and the band convolve HALVES
+    # the edge bin's strength (it only sees the interior side) -- at
+    # the 50% window bar the true edge bin is borderline and the snap
+    # lands a bin inside. The band exists for the cross faces' thin
+    # sheets; the plateau needs no aggregation.
+    gmax = int(hist.max())
+    if gmax <= 0:
+        return box, {"moved": False, "reason": "empty profile"}
+
+    def _runs(q):
+        idx = np.where(q)[0]
+        if not len(idx):
+            return []
+        runs, start, prev = [], idx[0], idx[0]
+        for j in idx[1:]:
+            if j == prev + 1:
+                prev = j
+            else:
+                runs.append((start, prev))
+                start = prev = j
+        runs.append((start, prev))
+        return runs
+
+    def _snap_end(face_pos: float, outer_sign: int) -> float:
+        # outer_sign=+1: the right face (outward = +along); -1: left
+        if outer_sign > 0:
+            win_lo = face_pos - _FACE_SNAP_IN
+            win_hi = face_pos + _FACE_SNAP_OUT
+        else:
+            win_lo = face_pos - _FACE_SNAP_OUT
+            win_hi = face_pos + _FACE_SNAP_IN
+        in_win = (centers >= win_lo) & (centers <= win_hi)
+        if not in_win.any():
+            return face_pos
+        thr = max(_FACE_END_TAU * float(hist[in_win].max()),
+                  _FACE_SNAP_ABS * gmax)
+        runs = _runs(in_win & (hist >= thr))
+        if not runs:
+            return face_pos
+        fi = int(np.argmin(np.abs(centers - face_pos)))
+        run = next((r for r in runs if r[0] <= fi <= r[1]), None)
+        if run is None:
+            edge_i = 1 if outer_sign > 0 else 0
+            run = max(runs, key=lambda r: abs(centers[r[edge_i]] - along_c))
+        edge = run[1] if outer_sign > 0 else run[0]
+        # the edge must be VISIBLE within the window: a run reaching
+        # the outer boundary means the structure continues past it
+        if outer_sign > 0 and centers[edge] >= win_hi - _FACE_BIN:
+            return face_pos
+        if outer_sign < 0 and centers[edge] <= win_lo + _FACE_BIN:
+            return face_pos
+        # SUB-BIN edge: the outermost actual point in the run's edge
+        # bin. A bin-centre target quantises to +/-3cm, and the
+        # PARTIAL edge bin (the true edge lands mid-bin) can fail the
+        # threshold, which would land the snap a full bin early -- the
+        # point-level edge keeps both cases sub-centimetre
+        sel = (aa >= edges[edge]) & (aa <= edges[edge + 1])
+        if not sel.any():
+            return face_pos
+        return float(aa[sel].max() if outer_sign > 0 else aa[sel].min())
+
+    right, left = along_c + half_len, along_c - half_len
+    r1 = _snap_end(right, +1) if snap_right else right
+    l1 = _snap_end(left, -1) if snap_left else left
+    mr = abs(r1 - right) >= _FACE_SNAP_MIN_MOVE
+    ml = abs(l1 - left) >= _FACE_SNAP_MIN_MOVE
+    if not mr:
+        r1 = right
+    if not ml:
+        l1 = left
+    if not (mr or ml):
+        return box, {"moved": False,
+                     "reason": "already on the plateau edges"}
+    length, old_length = r1 - l1, 2.0 * half_len
+    if length < 0.30:
+        return box, {"moved": False,
+                     "reason": f"snapped length {length:.2f} too short"}
+    new_along_c = 0.5 * (r1 + l1)
+    dxy = axis * (new_along_c - along_c)
+    new_box = OrientedBox(
+        center=(float(c[0] + dxy[0]), float(c[1] + dxy[1]), float(c[2])),
+        size=(float(length), float(box.size[1]), float(box.size[2])),
+        yaw=box.yaw, box_id=box.box_id, device_type=box.device_type,
+        source=box.source, confidence=box.confidence, row_id=box.row_id,
+        meta=box.meta)
+    info = {"moved": True,
+            "length": [round(old_length, 3), round(length, 3)],
+            "left": [round(left, 3), round(l1, 3)],
+            "right": [round(right, 3), round(r1, 3)]}
+    return new_box, info
+
+
 def snap_faces_to_mesh(scene: Scene) -> int:
-    """stageF: snap every box's front/back faces onto the densest mesh
-    sheets in its own column (see snap_box_faces). Identity and meta
-    preserved; the adjustment is recorded in meta['face_snap'].
-    Returns the number of boxes adjusted."""
+    """stageF: per box, snap the FREE row ends (the outmost ends of a
+    joined row -- internal seams are left to snap_row_seams, user
+    direction) and then the front/back faces onto the densest mesh
+    sheets in the box's own column (see snap_box_ends /
+    snap_box_faces; ends first so the cross snap reads the cleaned
+    column). Identity and meta preserved; adjustments recorded in
+    meta['end_snap'] / meta['face_snap']. Returns the number of boxes
+    adjusted."""
     n = 0
-    for i, b in enumerate(scene.boxes):
+    snapshot = list(scene.boxes)
+    for i, b in enumerate(snapshot):
         try:
-            nb, info = snap_box_faces(b, scene.points)
+            nb, einfo = snap_box_ends(
+                b, scene.points,
+                snap_left=not _row_continues(snapshot, b, -1),
+                snap_right=not _row_continues(snapshot, b, +1))
+            if einfo.get("moved"):
+                nb.meta["end_snap"] = einfo
+                print(f"[stageF] {nb.box_id[:6]} end snap: length "
+                      f"{einfo['length'][0]:.2f} -> {einfo['length'][1]:.2f}m "
+                      f"(left {einfo['left'][0]:.2f} -> {einfo['left'][1]:.2f}, "
+                      f"right {einfo['right'][0]:.2f} -> "
+                      f"{einfo['right'][1]:.2f})")
+            nb2, finfo = snap_box_faces(nb, scene.points)
+            if finfo.get("moved"):
+                nb2.meta["face_snap"] = finfo
+                print(f"[stageF] {nb2.box_id[:6]} face snap: depth "
+                      f"{finfo['depth'][0]:.2f} -> {finfo['depth'][1]:.2f}m "
+                      f"(front {finfo['front'][0]:.2f} -> "
+                      f"{finfo['front'][1]:.2f}, back "
+                      f"{finfo['back'][0]:.2f} -> {finfo['back'][1]:.2f})")
+            if einfo.get("moved") or finfo.get("moved"):
+                scene.boxes[i] = nb2
+                n += 1
         except Exception as e:
-            print(f"[stageF] {b.box_id[:6]} face snap failed "
+            print(f"[stageF] {b.box_id[:6]} snap failed "
                   f"({type(e).__name__}: {e})")
-            continue
-        if not info.get("moved"):
-            continue
-        scene.boxes[i] = nb
-        nb.meta["face_snap"] = info
-        n += 1
-        print(f"[stageF] {nb.box_id[:6]} face snap: depth "
-              f"{info['depth'][0]:.2f} -> {info['depth'][1]:.2f}m "
-              f"(front {info['front'][0]:.2f} -> {info['front'][1]:.2f}, "
-              f"back {info['back'][0]:.2f} -> {info['back'][1]:.2f})")
     return n

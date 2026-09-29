@@ -588,7 +588,7 @@ def run_pipeline(scene: Scene,
         print(f"[out] dropped {n_low} LOW-confidence box(es) "
               f"(geometry-only completions, no VLM confirmation)")
 
-    # --- stage F: final face polish (mesh-driven thickness snap) ---
+    # --- stage F: final face polish (mesh-driven thickness + end snap) ---
     # The side-view thickness chain has real holes (wall-masked /
     # ladder-dominated / dim renders leave depth_ok=False, and the mesh
     # fallback measures whatever is in the slice -- an open door
@@ -596,8 +596,11 @@ def run_pipeline(scene: Scene,
     # path). Snap each box's front/back faces onto the densest mesh
     # sheets in its own column: a face sheet is a tall narrow peak in
     # the cross profile, an open door a low wide plateau (filtered), a
-    # wall behind a strong but FARTHER peak (nearest wins). Boxes
-    # already on their sheets are untouched (idempotent).
+    # wall behind a strong but FARTHER peak (nearest wins). The FREE
+    # row ends snap to the along-profile's plateau edges (user
+    # direction: joined rows are fine-tuned only at their outmost
+    # ends -- internal seams stay with snap_row_seams). Boxes already
+    # on their sheets are untouched (idempotent).
     from agentic_gts.tools.geometry import snap_faces_to_mesh
     n_snap = snap_faces_to_mesh(scene)
     if n_snap:
