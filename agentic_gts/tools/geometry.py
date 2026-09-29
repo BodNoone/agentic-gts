@@ -477,15 +477,19 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
     The along profile of a row is a PLATEAU, not twin peaks: the
     front/back sheets run its whole length, so there is no peak to
     snap to -- the end face snaps to the OUTER EDGE of the qualifying
-    run nearest the current face. The run CONTAINING the face when it
-    sits on mass (extend/trim within the connected structure); when
-    the face sits past the mass (bleed, or a gap between structures)
-    the run farthest from the box centre wins -- an over-inflated or
-    gap-straddling face trims/extends to the OUTER structure and never
-    amputates an inner one (a union box spanning row + gap + clump
-    keeps its clump; splitting it is stageC's job). The edge must be
-    VISIBLE: a run reaching the window's outer boundary means the
-    structure continues past the window -- the true end is beyond
+    run nearest the current face, with an INWARD PRIORITY (user
+    report: the face extended onto the cable ladder beside the row's
+    end -- outward seeking finds the ladder; in practice end faces
+    need trimming far more often than extending): (1) a face ON
+    qualifying mass extends/trims within its own connected run (an
+    under-measured end reaches the true edge; a union box's face sits
+    ON the outer structure and does not move -- the amputation
+    protection); (2) a face PAST its mass (bleed, a gap) trims to the
+    nearest qualifying run INWARD -- outward seeking is removed
+    entirely, an outward structure in the window (a ladder, a separate
+    device) is a neighbour, never this row's continuation. The edge
+    must be VISIBLE: a run reaching the window's outer boundary means
+    the structure continues past the window -- the true end is beyond
     reach and the face does not move."""
     if not (snap_left or snap_right):
         return box, {"moved": False, "reason": "no free ends"}
@@ -557,10 +561,29 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
             return face_pos
         fi = int(np.argmin(np.abs(centers - face_pos)))
         run = next((r for r in runs if r[0] <= fi <= r[1]), None)
-        if run is None:
-            edge_i = 1 if outer_sign > 0 else 0
-            run = max(runs, key=lambda r: abs(centers[r[edge_i]] - along_c))
-        edge = run[1] if outer_sign > 0 else run[0]
+        if run is not None:
+            edge = run[1] if outer_sign > 0 else run[0]
+        else:
+            # INWARD PRIORITY (user report: the face extended onto the
+            # cable ladder beside the row's end -- the old farthest-run
+            # tie-break SEEKED outer mass). A face past its own mass
+            # trims to the nearest qualifying run INWARD; an outward
+            # structure in the window is a NEIGHBOUR (ladder, separate
+            # device), never this row's continuation. The realistic
+            # union case needs no seeking: its face sits ON the outer
+            # structure (the on-mass path above, no move).
+            if outer_sign > 0:
+                inward = [r for r in runs if centers[r[1]] < face_pos]
+                if not inward:
+                    return face_pos
+                run = max(inward, key=lambda r: centers[r[1]])
+                edge = run[1]
+            else:
+                inward = [r for r in runs if centers[r[0]] > face_pos]
+                if not inward:
+                    return face_pos
+                run = min(inward, key=lambda r: centers[r[0]])
+                edge = run[0]
         # the edge must be VISIBLE within the window: a run reaching
         # the outer boundary means the structure continues past it
         if outer_sign > 0 and centers[edge] >= win_hi - _FACE_BIN:

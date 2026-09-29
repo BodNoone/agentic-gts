@@ -351,3 +351,39 @@ def test_nested_trim_guard_phantom_small_box():
         f"the correct big box must be untouched, got " \
         f"{b.size[0]:.2f} x {b.size[1]:.2f}"
     print("PASS nested trim guard (phantom small box rejected)")
+
+
+def test_end_snap_inward_priority_over_ladder():
+    """INWARD PRIORITY (user report: the end face EXTENDED onto the
+    cable ladder beside the row's end -- the old farthest-run
+    tie-break sought the outermost mass and found the ladder). A face
+    sitting past the row's own mass must trim INWARD to the plateau
+    edge; the ladder beyond the gap is a neighbour and must never
+    attract the face, however dense it is."""
+    rng = np.random.default_rng(23)
+    # the row: plateau along [-3, 3]
+    pts = np.vstack([_row(rng, -3.0, 3.0), _floor(rng)])
+    # a vertical cable ladder just beyond the row's end (along
+    # [3.12, 3.22]): rails+rungs density -- ABOVE every strength bar
+    # (a real mesh structure, enough to attract the old farthest-run
+    # rule) but realistic, not denser than the row's own sheets
+    ladder = np.column_stack([rng.uniform(3.12, 3.22, 400),
+                              rng.uniform(-0.55, 0.55, 400),
+                              rng.uniform(0.35, 2.00, 400)])
+    pts = np.vstack([pts, ladder])
+    # the end face sits in the GAP past the row's true end (3.0),
+    # before the ladder: the old rule sought the farthest run (the
+    # ladder) and extended onto it
+    b = _end_box(-3.0, 3.10)
+    nb, info = snap_box_ends(b, pts)
+    if info.get("moved"):
+        assert info["right"][1] < 3.06, \
+            f"the face must trim INWARD to the row's edge (~3.0), " \
+            f"not extend onto the ladder: {info}"
+    else:
+        pass  # a no-op is also acceptable (both beat extending)
+    end = nb.center[0] + nb.size[0] / 2.0
+    assert end < 3.06, \
+        f"the box end must stay off the ladder (got {end:.2f})"
+    print(f"PASS end snap inward priority (end {end:.2f}, ladder "
+          "ignored)")
