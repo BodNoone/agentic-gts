@@ -2134,3 +2134,143 @@ def test_side_ladder_fallback_marks_unavailable():
     roles = [v.get("role") for v in audit["views"]]
     assert "depth_profile-unavailable" in roles, roles
     print("PASS side ladder fallback (audit marked unavailable)")
+
+
+def test_neighbour_suppression_ownership():
+    """Ownership-resolved neighbour suppression (user report: a clutter
+    seed whose rect ate the device's edge -- the local view rendered
+    the device, the grounding's 'rack' label skipped the type-confirm
+    and the clutter box survived on the neighbour's evidence).
+    Ownership = nearest EXCLUSIVE mass: the device's face sheet in the
+    OVERLAP band is continuous with the device body, so it drops out
+    of the clutter seed's view but STAYS in the device's own view (a
+    naive symmetric suppression would shave the face sheet off the
+    device's own front render)."""
+    from agentic_gts.agent.mask_refine import _neighbour_suppression
+    rng = np.random.default_rng(7)
+    cart = np.column_stack([rng.uniform(0.0, 1.2, 800),
+                            rng.uniform(0.00, 0.60, 800),
+                            rng.uniform(0.10, 0.90, 800)])
+    sheet = np.column_stack([rng.uniform(0.0, 1.2, 400),
+                             rng.uniform(0.80, 0.83, 400),
+                             rng.uniform(0.10, 2.00, 400)])
+    body = np.column_stack([rng.uniform(0.0, 1.2, 2000),
+                            rng.uniform(0.84, 1.90, 2000),
+                            rng.uniform(0.10, 2.00, 2000)])
+    wall = np.column_stack([rng.uniform(-1.5, 3.0, 200),
+                            np.full(200, -1.5),
+                            rng.uniform(0.0, 3.0, 200)])
+    pts = np.vstack([cart, sheet, body, wall]).astype(np.float64)
+    n_cart, n_sheet, n_body = len(cart), len(sheet), len(body)
+    scene = Scene(points=pts)
+    # the clutter seed: cart-fitted, but its back edge (y=0.9) eats
+    # the device's face sheet (y in [0.80, 0.83])
+    cart_seed = OrientedBox(center=(0.6, 0.45, 1.05),
+                            size=(1.2, 0.90, 2.10), yaw=0.0)
+    dev_box = OrientedBox(center=(0.6, 1.375, 1.05),
+                          size=(1.2, 1.15, 2.10), yaw=0.0)
+    scene.boxes = [cart_seed, dev_box]
+    # the CLUTTER seed's view: sheet + body are the device's -> hidden
+    s1 = _neighbour_suppression(scene, cart_seed, pts)
+    assert s1 is not None
+    assert not s1[:n_cart].any(), "the cart's own points must stay"
+    assert s1[n_cart:n_cart + n_sheet].all(), \
+        "the device face sheet (overlap band) must be suppressed"
+    assert s1[n_cart + n_sheet:n_cart + n_sheet + n_body].all(), \
+        "the device body must be suppressed"
+    assert not s1[n_cart + n_sheet + n_body:].any(), \
+        "unowned points (the wall) must stay"
+    # the DEVICE's own view: its face sheet STAYS (ownership), the
+    # cart is the neighbour's -> hidden
+    s2 = _neighbour_suppression(scene, dev_box, pts)
+    assert s2 is not None
+    assert s2[:n_cart].all(), "the cart must be suppressed here"
+    assert not s2[n_cart:n_cart + n_sheet].any(), \
+        "the device's OWN face sheet must stay in its own view"
+    assert not s2[n_cart + n_sheet:n_cart + n_sheet + n_body].any(), \
+        "the device's own body must stay"
+    assert not s2[n_cart + n_sheet + n_body:].any(), \
+        "unowned points must stay here too"
+    # nothing near -> nothing to do
+    far = Scene(points=pts)
+    far.boxes = [cart_seed,
+                 OrientedBox(center=(30.0, 30.0, 1.0),
+                             size=(1.2, 1.1, 2.1), yaw=0.0)]
+    assert _neighbour_suppression(far, cart_seed, pts) is None
+    print("PASS neighbour suppression (ownership-resolved, "
+          "both views verified)")
+
+
+def test_render_local_views_suppresses_neighbour():
+    """End-to-end through render_local_views (user report: the clutter
+    seed's local views rendered the neighbouring device's edge, the
+    local grounding boxed it and its 'rack' label skipped the
+    type-confirm). With ownership-resolved suppression EVERY render
+    pool of the clutter seed must exclude the device, and the DEVICE's
+    own render must keep its face sheet."""
+    from agentic_gts.agent import mask_refine as mr
+    rng = np.random.default_rng(11)
+    cart = np.column_stack([rng.uniform(0.0, 1.2, 800),
+                            rng.uniform(0.00, 0.60, 800),
+                            rng.uniform(0.10, 0.90, 800)])
+    sheet = np.column_stack([rng.uniform(0.0, 1.2, 400),
+                             rng.uniform(0.80, 0.83, 400),
+                             rng.uniform(0.10, 2.00, 400)])
+    body = np.column_stack([rng.uniform(0.0, 1.2, 2000),
+                            rng.uniform(0.84, 1.90, 2000),
+                            rng.uniform(0.10, 2.00, 2000)])
+    means = np.vstack([cart, sheet, body])
+    scene = Scene(points=means.astype(np.float64))
+    scene.meta["gs_ply"] = "fake.ply"
+    cart_seed = OrientedBox(center=(0.6, 0.45, 1.05),
+                            size=(1.2, 0.90, 2.10), yaw=0.0)
+    dev_box = OrientedBox(center=(0.6, 1.375, 1.05),
+                          size=(1.2, 1.15, 2.10), yaw=0.0)
+    scene.boxes = [cart_seed, dev_box]
+    gs = _fake_gs(means)
+    import agentic_gts.output.gs_render as gsr
+    import agentic_gts.tools.gs_io as gio
+    _real = (gsr.rasterize_gs, gsr.render_gs_view, gsr.png_bytes,
+             gio.read_gaussian_ply)
+    img = _quality_image()
+    pools = []
+
+    def fake_raster(sub, cam):
+        pools.append(np.asarray(sub.means, dtype=float).copy())
+        return img
+
+    gsr.rasterize_gs = fake_raster
+    gsr.render_gs_view = lambda *a, **k: img
+    gsr.png_bytes = lambda a: b"png"
+    gio.read_gaussian_ply = lambda p: gs
+    try:
+        views = mr.render_local_views(scene, cart_seed, None, judge=None)
+        assert any(v["name"] == "front" for v in views), \
+            "the clutter seed must still render its own views"
+        for m in pools:
+            assert m[:, 1].max() < 0.75, \
+                f"the device (sheet y>=0.80) must not render in the " \
+                f"clutter seed's views; pool max y={m[:, 1].max():.2f}"
+            assert len(m) > 100, \
+                "the cart's own points must still render"
+        # the DEVICE's own render keeps its face sheet, drops the cart
+        pools.clear()
+        views = mr.render_local_views(scene, dev_box, None, judge=None)
+        assert any(v["name"] == "front" for v in views)
+        for m in pools:
+            assert m[:, 1].min() > 0.70, \
+                f"the cart (y<=0.60) must be suppressed from the " \
+                f"device's views; pool min y={m[:, 1].min():.2f}"
+            assert m[:, 1].max() > 1.0, \
+                "the device body must render in its own views"
+        # the sheet itself (y in [0.80, 0.83]) must be present: the
+        # ownership rule keeps it for the device, unlike a naive
+        # symmetric suppression
+        assert any(((m[:, 1] > 0.79) & (m[:, 1] < 0.84)).any()
+                   for m in pools), \
+            "the device's own face sheet must stay in its own views"
+    finally:
+        (gsr.rasterize_gs, gsr.render_gs_view, gsr.png_bytes,
+         gio.read_gaussian_ply) = _real
+    print("PASS render_local_views suppresses the neighbour "
+          "(clutter view clean, device view keeps its sheet)")

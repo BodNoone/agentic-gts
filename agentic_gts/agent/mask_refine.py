@@ -319,6 +319,95 @@ def _subset_or_none(gs, keep: np.ndarray):
     return _subset_gs(gs, keep)
 
 
+def _aabb_gap_xy(a: "OrientedBox", b: "OrientedBox") -> float:
+    """Footprint-AABB distance between two boxes (metres; 0 when the
+    AABBs overlap)."""
+    ca, cb = a.corners_2d(), b.corners_2d()
+    dx = max(cb[:, 0].min() - ca[:, 0].max(),
+             ca[:, 0].min() - cb[:, 0].max(), 0.0)
+    dy = max(cb[:, 1].min() - ca[:, 1].max(),
+             ca[:, 1].min() - cb[:, 1].max(), 0.0)
+    return float(math.hypot(dx, dy))
+
+
+_NEIGHBOUR_REACH = 2.0
+
+
+def _neighbour_suppression(scene: Scene, seed: "OrientedBox",
+                           pts: np.ndarray) -> np.ndarray | None:
+    """Mask over `pts`: True = the point is owned by ANOTHER scene box
+    and must be hidden from this seed's local views (user report: a
+    clutter seed next to a device -- the seed rect ate the device's
+    edge, the local view rendered it, the local grounding boxed it,
+    its 'rack' label then SKIPPED the type-confirm and the clutter box
+    survived on the neighbour's evidence).
+
+    Ownership: a point belongs to the box whose EXCLUSIVE mass it is
+    continuous with (nearest exclusive-point distance). In an overlap
+    band the device's face sheet sits at BOTH boxes' boundary, so
+    containment depth cannot decide -- but the sheet is continuous
+    with the device body and far from the clutter: nearest-exclusive
+    assigns it to the device, suppressing it from the clutter seed's
+    view while KEEPING it in the device's own view (a naive symmetric
+    'inside a neighbour -> suppress' would shave the face sheet off
+    the device's own front render). Points in NO box (walls, floor)
+    are never suppressed -- the side-view standoff logic needs the
+    wall context. Returns None when there is nothing to suppress."""
+    pts = np.asarray(pts, dtype=float)
+    if not len(pts) or len(scene.boxes) < 2:
+        return None
+    near = [b for b in scene.boxes
+            if b.box_id != seed.box_id
+            and _aabb_gap_xy(seed, b) <= _NEIGHBOUR_REACH]
+    if not near:
+        return None
+    cand = [seed] + near
+    inside = np.stack([b.contains(pts) for b in cand])   # (K, N)
+    n_in = inside.sum(axis=0)
+    in_seed = inside[0]
+    # in others only -> theirs (the slack-band leak: a neighbour's
+    # body within the render slack but outside the seed OBB)
+    supp = (~in_seed) & (n_in > 0)
+    # in the seed AND a neighbour -> nearest exclusive mass decides
+    contested = in_seed & (n_in > 1)
+    if contested.any():
+        try:
+            from scipy.spatial import cKDTree
+        except ImportError:
+            return supp if supp.any() else None
+        P = np.asarray(scene.points, dtype=float)
+        ca = seed.corners_2d()
+        m = ((P[:, 0] >= ca[:, 0].min() - _NEIGHBOUR_REACH)
+             & (P[:, 0] <= ca[:, 0].max() + _NEIGHBOUR_REACH)
+             & (P[:, 1] >= ca[:, 1].min() - _NEIGHBOUR_REACH)
+             & (P[:, 1] <= ca[:, 1].max() + _NEIGHBOUR_REACH))
+        region = P[m] if len(P) else P
+        if len(region) >= 50:
+            rin = np.stack([b.contains(region) for b in cand])
+            rn = rin.sum(axis=0)
+            rng = np.random.default_rng(0)
+            trees = []
+            for k in range(len(cand)):
+                ex = region[(rn == 1) & rin[k]]
+                if len(ex) > 20000:
+                    ex = ex[rng.choice(len(ex), 20000, replace=False)]
+                trees.append(cKDTree(ex) if len(ex) >= 5 else None)
+            q = pts[contested]
+            best = np.full(len(q), np.inf)
+            owner = np.full(len(q), -1, dtype=int)
+            for k, t in enumerate(trees):
+                if t is None:
+                    continue
+                d, _ = t.query(q)
+                closer = d < best
+                best[closer] = d[closer]
+                owner[closer] = k
+            # owner == -1 (no exclusive mass anywhere) -> keep: never
+            # suppress on missing evidence
+            supp[contested] = owner > 0
+    return supp if supp.any() else None
+
+
 def _open_side(gs, box: OrientedBox, reach: float = 3.0):
     """The box's open side (the aisle) and the clear corridor width.
 
@@ -700,6 +789,21 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # every view (the mask does not depend on the camera).
     keep = _box_only_mask(gs, box, wall_vec=wall_vec,
                           face_half=face_half)
+    # NEIGHBOUR SUPPRESSION (ownership-resolved): points owned by OTHER
+    # scene boxes are hidden from this seed's views -- a clutter seed
+    # whose rect ate a device's edge must not render that edge, or the
+    # local grounding boxes it and its 'rack' label skips the
+    # type-confirm (user report). Ownership by nearest-EXCLUSIVE-mass
+    # keeps the device's own face sheet in the DEVICE's view; see
+    # _neighbour_suppression. NB: the rasterizer-failure fallback
+    # (isolate_boxes=True) keeps its old loose isolation.
+    supp = _neighbour_suppression(scene, box,
+                                  np.asarray(gs.means, dtype=float))
+    if supp is not None:
+        keep = keep & ~supp
+        print(f"[mask-refine] neighbour suppression: "
+              f"{int(supp.sum())} gaussian(s) hidden from "
+              f"{box.box_id[:6]}'s local views")
     sub = _subset_or_none(gs, keep)
     # SIDE-ONLY z cap (user report: a SHORT device beside a tall cable
     # ladder -- the seed carries the SCENE-level z_top, so the side
