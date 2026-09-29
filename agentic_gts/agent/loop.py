@@ -158,6 +158,7 @@ class LayoutAgent:
             # grounding result also decides whether the type-confirm
             # question is worth asking ----
             instances = []
+            audit = {}          # structural flag carrier even without SAM
             if sam.available:
                 try:
                     instances, audit = refine_box(scene, old, self.judge,
@@ -187,10 +188,18 @@ class LayoutAgent:
             # score (>= 0.6) -- asking again would be a redundant third
             # VLM call per box. A cluster box the early gate already
             # confirmed (or rejected) is never re-asked either.
+            # NEVER SKIP on a structural label (wall / pillar, user
+            # report: the final boxes still included pillars and walls
+            # -- the closed category set forced the model to squeeze
+            # them into 'server rack', and that high score is exactly
+            # what must NOT bypass the dedicated question). The label
+            # forces the question; the confirm decides.
             if confirmed_rack:
                 pass                    # early gate already recorded it
             else:
-                skip_confirm = bool(instances) and all(
+                structural = bool(audit.get("structural_label")) \
+                    if isinstance(audit, dict) else False
+                skip_confirm = (not structural) and bool(instances) and all(
                     _is_equipment_label(e["label"]) and e["score"] >= 0.6
                     for e in instances)
                 if skip_confirm:

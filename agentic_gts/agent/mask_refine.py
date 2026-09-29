@@ -1843,6 +1843,19 @@ def _is_subtractive(label) -> bool:
     return _is_door(label) or _is_ladder(label)
 
 
+def _is_structural(label) -> bool:
+    """The wall/pillar positive class (user report: the final boxes
+    still included pillars and walls -- the local grounding's category
+    set was CLOSED, the model had no honest output for a structural
+    slab and squeezed it into 'server rack' with a high score, which
+    then SKIPPED the type-confirm). Like the door class, the label
+    now has an honest outlet -- and its purpose is REJECTION: a
+    structural label never contributes spans or thickness points, and
+    its presence forces the dedicated type-confirm (see loop.py)."""
+    l = str(label or "").lower()
+    return "wall" in l or "pillar" in l or "column" in l
+
+
 def _door_union(image: np.ndarray, groups: list, sam: SamPredictorAdapter
                 ) -> np.ndarray | None:
     """Pixel union of the SAM masks of every SUBTRACTIVE-class box
@@ -1882,6 +1895,9 @@ def _side_thickness_pool(scene: Scene, box: OrientedBox, view: dict,
     for gi, g in enumerate(groups):
         if _is_subtractive(g.get("hypothesis")):
             continue          # subtraction only, never a pool
+        if _is_structural(g.get("hypothesis")):
+            continue          # wall / pillar: rejection-only, its
+                             # points never feed the thickness pool
         group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
                          float(g.get("confidence", 0.5)))
         box_pix = group.pixel_box(W, H)
@@ -2061,6 +2077,12 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
     yaw = float(box.yaw)
     axis = np.array([math.cos(yaw), math.sin(yaw)])
     along0 = float(np.asarray(box.center, dtype=float)[:2] @ axis)
+    # the structural class (wall/pillar) never contributes spans, and
+    # its presence anywhere in this view flags the whole refinement --
+    # loop.py forces the type-confirm for the box (never skipped), the
+    # label's purpose is REJECTION, not measurement
+    if any(_is_structural(g.get("hypothesis")) for g in groups):
+        va["structural_label"] = True
     # the door class first: its SAM masks form the subtractive layer
     # every device back-projection is pixel-cleaned with
     doors = _door_union(voter["image"], groups, sam)
@@ -2069,6 +2091,9 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
         if _is_subtractive(g.get("hypothesis")):
             continue          # door / ladder: subtraction only, never
                              # a span -- box refinement fits devices only
+        if _is_structural(g.get("hypothesis")):
+            continue          # wall / pillar: rejection-only, never a
+                             # span or a thickness point
         group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
                          float(g.get("confidence", 0.5)))
         box_pix = group.pixel_box(W, H)
@@ -2286,8 +2311,12 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     _apply_height_and_geom_depth(instances, box, scene)
 
     if not front_ok and not depth_ok:
-        # nothing was measured: keep the seed untouched
+        # nothing was measured: keep the seed untouched (the structural
+        # flag still propagates -- a wall/pillar-labelled view must
+        # force the type-confirm even when no span survived)
         audit["reason"] = "no front span and no side depth measurement"
+        if any(v.get("structural_label") for v in audit["views"]):
+            audit["structural_label"] = True
         return [], audit
 
     # ---- pass 4: regularise the split seams ----
@@ -2305,6 +2334,12 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     audit["seams_snapped"] = n_seams
 
     instances.sort(key=lambda e: e["score"], reverse=True)
+    # the structural flag (wall/pillar labelled anywhere in any view)
+    # propagates to the top-level audit: loop.py reads it to force the
+    # type-confirm -- the label is REJECTION evidence, the skip path
+    # must never fire for a box the VLM itself called a wall/pillar
+    if any(v.get("structural_label") for v in audit["views"]):
+        audit["structural_label"] = True
     audit.update({"accepted": True,
                   "instances": [
                       {"score": round(e["score"], 4), "view": e["view"],
