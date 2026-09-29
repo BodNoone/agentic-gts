@@ -578,7 +578,7 @@ def _side_azim(box: OrientedBox, azim_front: float,
     return azim_front + 90.0
 
 
-def _box_only_mask(gs, box: OrientedBox, pad: float = 0.25,
+def _box_only_mask(gs, box: OrientedBox, pad: float = 0.30,
                    wall_vec=None, face_half: float | None = None,
                    wall_pad: float = 0.05,
                    z_pad: float = 0.15) -> np.ndarray:
@@ -586,13 +586,6 @@ def _box_only_mask(gs, box: OrientedBox, pad: float = 0.25,
     (plus `pad` metres of HORIZONTAL slack, since the globally grounded
     OBB carries a placement offset of up to ~15cm -- a tight slack cut
     a strip of the device off the local views, user report).
-
-    pad is ALIGNED with _mask_to_points' lift margin (0.25): the two
-    cover the SAME placement error, and a render band beyond the lift
-    clip is a dead zone -- the VLM sees it, SAM masks it, but the
-    back-projection drops it, leaving nothing but distraction for the
-    grounding and the type-confirm (user direction: render exactly
-    what is liftable).
 
     The slack is HORIZONTAL-ONLY: `z_pad` (kept at the old 0.15m)
     governs the vertical axis, so widening `pad` does not reach up and
