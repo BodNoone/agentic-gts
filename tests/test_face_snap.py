@@ -392,3 +392,49 @@ def test_end_snap_inward_priority_over_ladder():
         f"the box end must stay off the ladder (got {end:.2f})"
     print(f"PASS end snap inward priority (end {end:.2f}, ladder "
           "ignored)")
+
+
+def test_end_snap_density_cliff_splits_ladder_from_row():
+    """DENSITY CLIFF on the on-mass path (user report: the face sat ON
+    the cable ladder beside the row's end -- the gap's density was
+    above the 30% bar, row + gap + ladder formed ONE qualifying run,
+    and the old 'take the run's outer edge' logic extended onto the
+    ladder's far end). The cliff scan finds the row's true end where
+    the density drops from plateau level to gap level."""
+    rng = np.random.default_rng(24)
+    # the row: dense plateau along [-3, 3] (~27 pts/bin from two
+    # full-height face sheets in the cross-slice)
+    row = np.vstack([
+        np.column_stack([rng.uniform(-3.0, 3.0, 2700),
+                         rng.uniform(0.54, 0.56, 2700),
+                         rng.uniform(0.35, 2.00, 2700)]),
+        np.column_stack([rng.uniform(-3.0, 3.0, 2700),
+                         rng.uniform(-0.56, -0.54, 2700),
+                         rng.uniform(0.35, 2.00, 2700)])])
+    # sparse bridge: gap density ABOVE the 30% qualifying bar (~9/bin,
+    # so the gap bins qualify and row+gap+ladder merge into ONE run)
+    # but WELL BELOW the row's peak (~27/bin, so the 50% cliff fires)
+    bridge = np.column_stack([rng.uniform(3.0, 3.1, 35),
+                              rng.uniform(-0.55, 0.55, 35),
+                              rng.uniform(0.35, 2.00, 35)])
+    # the ladder: a bit denser than the bridge but still below the
+    # row's cliff threshold (50% x 27 = 13.5/bin)
+    ladder = np.column_stack([rng.uniform(3.1, 3.2, 45),
+                              rng.uniform(-0.55, 0.55, 45),
+                              rng.uniform(0.35, 2.00, 45)])
+    pts = np.vstack([row, bridge, ladder])
+    # the face sits ON the gap/bridge (on-mass path -- the gap bins
+    # qualify above the 30% bar, so the face bin is inside the merged
+    # run)
+    b = _end_box(-3.0, 3.10)
+    nb, info = snap_box_ends(b, pts)
+    assert info["moved"], \
+        f"the density cliff must trim the face to the row's edge: {info}"
+    assert info["right"][1] < 3.06, \
+        f"the face must stop at the row's edge (~3.0), not the " \
+        f"ladder's far end: {info['right']}"
+    end = nb.center[0] + nb.size[0] / 2.0
+    assert end < 3.06, \
+        f"the box end must stay off the ladder (got {end:.2f})"
+    print(f"PASS end snap density cliff (end {end:.2f}, row edge "
+          "~3.0, ladder ignored)")

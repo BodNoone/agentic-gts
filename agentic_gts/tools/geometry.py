@@ -570,7 +570,13 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
             return face_pos
         fi = int(np.argmin(np.abs(centers - face_pos)))
         run = next((r for r in runs if r[0] <= fi <= r[1]), None)
-        if run is not None:
+        if (run is not None and hist[fi] >= 0.5 * gmax):
+            # genuinely ON the main structure (the face bin's density
+            # is at least half the PROFILE's peak -- the row's own
+            # sheet density, not just the containing run's: a face on
+            # a sparse bridge between row and ladder has a low absolute
+            # density even though it's ≥50% of the BRIDGE run's peak,
+            # and must NOT count as on-mass)
             edge = run[1] if outer_sign > 0 else run[0]
         else:
             # INWARD PRIORITY (user report: the face extended onto the
