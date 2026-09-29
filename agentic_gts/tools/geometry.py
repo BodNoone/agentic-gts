@@ -332,9 +332,16 @@ _FACE_SNAP_ABS = 0.25
 # bleed (a ~20:1 contrast), while the cross rule separates competing
 # peaks (2:1) -- 50% of a fluctuating window max sits inside the
 # plateau's own counting noise (an edge bin a couple of sigma low
-# vs a bin a couple high) and drops the TRUE edge bin, landing the
+# vs one a couple high) and drops the TRUE edge bin, landing the
 # snap a bin inside
 _FACE_END_TAU = 0.30
+# END inward search range: 1/3 of the box's along extent (user
+# direction: shrink is the default, outward extension is the LAST
+# resort -- scan inward all the way to 1/3 of the row's length
+# before even considering outward). Capped so a 40m row doesn't
+# scan 13m inward
+_END_SNAP_IN_FRAC = 1.0 / 3.0
+_END_SNAP_IN_MAX = 3.0
 # moves below this are noise -> no-op
 _FACE_SNAP_MIN_MOVE = 0.02
 # device depth bounds for the snapped result
@@ -554,12 +561,17 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
 
     def _snap_end(face_pos: float, outer_sign: int) -> float:
         # outer_sign=+1: the right face (outward = +along); -1: left
+        # INWARD search range: 1/3 of the box's along extent (user
+        # direction: shrink is the default, outward is the last
+        # resort). The outward range stays tight at 0.15m.
+        in_range = min(float(box.size[0]) * _END_SNAP_IN_FRAC,
+                       _END_SNAP_IN_MAX)
         if outer_sign > 0:
-            win_lo = face_pos - _END_SNAP_IN
+            win_lo = face_pos - in_range
             win_hi = face_pos + _FACE_SNAP_OUT
         else:
             win_lo = face_pos - _FACE_SNAP_OUT
-            win_hi = face_pos + _END_SNAP_IN
+            win_hi = face_pos + in_range
         in_win = (centers >= win_lo) & (centers <= win_hi)
         if not in_win.any():
             return face_pos
@@ -579,26 +591,41 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
             # and must NOT count as on-mass)
             edge = run[1] if outer_sign > 0 else run[0]
         else:
-            # INWARD PRIORITY (user report: the face extended onto the
-            # cable ladder beside the row's end -- the old farthest-run
-            # tie-break SEEKED outer mass). A face past its own mass
-            # trims to the nearest qualifying run INWARD; an outward
-            # structure in the window is a NEIGHBOUR (ladder, separate
-            # device), never this row's continuation. The realistic
-            # union case needs no seeking: its face sits ON the outer
-            # structure (the on-mass path above, no move).
+            # INWARD PRIORITY (user direction: shrink is the default,
+            # outward is the LAST resort -- scan inward up to 1/3 of
+            # the box length first; only when NOTHING qualifies inward
+            # look outward with the tight 0.15m window, and even then
+            # only to a run whose density is >= the on-mass bar (a
+            # sparse bridge/ladder run never attracts the face)
             if outer_sign > 0:
                 inward = [r for r in runs if centers[r[1]] < face_pos]
-                if not inward:
-                    return face_pos
-                run = max(inward, key=lambda r: centers[r[1]])
-                edge = run[1]
+                if inward:
+                    run = max(inward, key=lambda r: centers[r[1]])
+                    edge = run[1]
+                else:
+                    # last resort: OUTWARD, but only to a run whose
+                    # peak density is on-par with the row (a bridge or
+                    # ladder at <50% of gmax must never attract)
+                    outward = [r for r in runs if centers[r[0]] > face_pos
+                               and float(hist[r[0]:r[1] + 1].max())
+                               >= 0.5 * gmax]
+                    if not outward:
+                        return face_pos
+                    run = min(outward, key=lambda r: centers[r[0]])
+                    edge = run[0]
             else:
                 inward = [r for r in runs if centers[r[0]] > face_pos]
-                if not inward:
-                    return face_pos
-                run = min(inward, key=lambda r: centers[r[0]])
-                edge = run[0]
+                if inward:
+                    run = min(inward, key=lambda r: centers[r[0]])
+                    edge = run[0]
+                else:
+                    outward = [r for r in runs if centers[r[1]] < face_pos
+                               and float(hist[r[0]:r[1] + 1].max())
+                               >= 0.5 * gmax]
+                    if not outward:
+                        return face_pos
+                    run = max(outward, key=lambda r: centers[r[1]])
+                    edge = run[1]
         # the edge must be VISIBLE within the window: a run reaching
         # the outer boundary means the structure continues past it
         if outer_sign > 0 and centers[edge] >= win_hi - _FACE_BIN:
