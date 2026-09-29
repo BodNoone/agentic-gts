@@ -289,6 +289,16 @@ def snap_row_seams(boxes: list[OrientedBox], yaw: float,
 
 # ---------- final face polish (stageF: mesh-driven thickness snap) ----------
 
+def aabb_gap_xy(a: "OrientedBox", b: "OrientedBox") -> float:
+    """Footprint-AABB distance between two boxes (metres; 0 when the
+    AABBs overlap)."""
+    ca, cb = a.corners_2d(), b.corners_2d()
+    dx = max(cb[:, 0].min() - ca[:, 0].max(),
+             ca[:, 0].min() - cb[:, 0].max(), 0.0)
+    dy = max(cb[:, 1].min() - ca[:, 1].max(),
+             ca[:, 1].min() - cb[:, 1].max(), 0.0)
+    return float(math.hypot(dx, dy))
+
 # cross-profile histogram resolution
 _FACE_BIN = 0.03
 # a mesh-sampled face sheet is 2-5cm thick: aggregate this much cross
@@ -598,21 +608,161 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
     return new_box, info
 
 
+def _own_points(pts: np.ndarray, boxes, self_box,
+                reach: float = 1.0) -> np.ndarray:
+    """Mask over pts: True = the point is NOT inside any OTHER near
+    box. Each box's stageF profile is built from its OWN mass only
+    (user report: a big box over-covering a small device must not
+    measure the device's points -- with them in the profile the face
+    snaps onto the DEVICE instead of the row's own sheet; this also
+    closes the cross-box peak-steal hole noted at the face snap's
+    introduction). Boxes farther than `reach` cannot own points in
+    this box's column and are skipped for cost."""
+    near = [b for b in boxes
+            if b.box_id != self_box.box_id
+            and aabb_gap_xy(self_box, b) <= reach]
+    if not near:
+        return np.ones(len(pts), dtype=bool)
+    inside = np.zeros(len(pts), dtype=bool)
+    for b in near:
+        inside |= b.contains(pts)
+    return ~inside
+
+
+def _nested_trim(box: "OrientedBox", boxes, pts: np.ndarray):
+    """Cut an over-extended face back to a nested smaller box's near
+    boundary (user report: ONE VLM rect covering a row + the small
+    device beside it -- the fit/split left a big box still covering the
+    device while the device's own small box also survived, two
+    detections at the device). GUARD: the cut region's points must be
+    >= 80% the SMALL box's own -- a phantom small box inside a correct
+    big box fails this (the cut would remove the big box's own mass)
+    and is left alone. Returns (box, info); unchanged unless
+    info["moved"]."""
+    pts = np.asarray(pts, dtype=float)
+    if len(pts) < 50 or len(boxes) < 2:
+        return box, None
+    for s in boxes:
+        if s.box_id == box.box_id:
+            continue
+        if float(s.containment_2d(box)) < 0.50:
+            continue
+        a_s = float(np.prod(np.asarray(s.size, dtype=float)[:2]))
+        a_b = float(np.prod(np.asarray(box.size, dtype=float)[:2]))
+        if a_s > 0.5 * a_b:
+            continue            # only the clearly smaller box wins
+        yaw = float(box.yaw)
+        axis = np.array([math.cos(yaw), math.sin(yaw)])
+        cross = np.array([-math.sin(yaw), math.cos(yaw)])
+        c = np.asarray(box.center, dtype=float)
+        sc = np.asarray(s.center, dtype=float)
+        d2 = (sc - c)[:2]
+        dalong, dcross = float(d2 @ axis), float(d2 @ cross)
+        cs = s.corners_2d()
+        sa, scross = cs @ axis, cs @ cross
+        along_c = float(c[:2] @ axis)
+        cross_c = float(c[:2] @ cross)
+        half_len = float(box.size[0]) / 2.0
+        half_d = float(box.size[1]) / 2.0
+        bottom = float(c[2]) - float(box.size[2]) / 2.0
+        top = float(c[2]) + float(box.size[2]) / 2.0
+        along_all = pts[:, :2] @ axis
+        cross_all = pts[:, :2] @ cross
+        band = (pts[:, 2] > bottom + 0.30) & (pts[:, 2] <= top)
+        if abs(dcross) >= abs(dalong):
+            near_edge = (float(scross.min()) if dcross > 0
+                         else float(scross.max()))
+            old_face = cross_c + (half_d if dcross > 0 else -half_d)
+            lo, hi = sorted((near_edge, old_face))
+            cut = (band & (cross_all >= lo) & (cross_all <= hi)
+                   & (np.abs(along_all - along_c) <= half_len + 0.05))
+            side = "front" if dcross > 0 else "back"
+        else:
+            near_edge = (float(sa.min()) if dalong > 0
+                         else float(sa.max()))
+            old_face = along_c + (half_len if dalong > 0 else -half_len)
+            lo, hi = sorted((near_edge, old_face))
+            cut = (band & (along_all >= lo) & (along_all <= hi)
+                   & (np.abs(cross_all - cross_c) <= half_d + 0.05))
+            side = "right" if dalong > 0 else "left"
+        if int(cut.sum()) < 20:
+            continue
+        if float(s.contains(pts[cut]).mean()) < 0.80:
+            continue            # the cut region is not the small box's
+        if side in ("front", "back"):
+            front, back = cross_c + half_d, cross_c - half_d
+            if side == "front":
+                front = near_edge
+            else:
+                back = near_edge
+            new_depth = front - back
+            if not (0.30 <= new_depth <= 2.50):
+                continue
+            dxy = cross * (0.5 * (front + back) - cross_c)
+            new_box = OrientedBox(
+                center=(float(c[0] + dxy[0]), float(c[1] + dxy[1]),
+                        float(c[2])),
+                size=(float(box.size[0]), float(new_depth),
+                      float(box.size[2])),
+                yaw=box.yaw, box_id=box.box_id,
+                device_type=box.device_type, source=box.source,
+                confidence=box.confidence, row_id=box.row_id,
+                meta=box.meta)
+        else:
+            right, left = along_c + half_len, along_c - half_len
+            if side == "right":
+                right = near_edge
+            else:
+                left = near_edge
+            new_len = right - left
+            if new_len < 0.30:
+                continue
+            dxy = axis * (0.5 * (right + left) - along_c)
+            new_box = OrientedBox(
+                center=(float(c[0] + dxy[0]), float(c[1] + dxy[1]),
+                        float(c[2])),
+                size=(float(new_len), float(box.size[1]),
+                      float(box.size[2])),
+                yaw=box.yaw, box_id=box.box_id,
+                device_type=box.device_type, source=box.source,
+                confidence=box.confidence, row_id=box.row_id,
+                meta=box.meta)
+        info = {"moved": True, "side": side,
+                "cut": [round(old_face, 3), round(near_edge, 3)],
+                "small_box": s.box_id}
+        return new_box, info
+    return box, None
+
+
 def snap_faces_to_mesh(scene: Scene) -> int:
-    """stageF: per box, snap the FREE row ends (the outmost ends of a
-    joined row -- internal seams are left to snap_row_seams, user
-    direction) and then the front/back faces onto the densest mesh
-    sheets in the box's own column (see snap_box_ends /
-    snap_box_faces; ends first so the cross snap reads the cleaned
-    column). Identity and meta preserved; adjustments recorded in
-    meta['end_snap'] / meta['face_snap']. Returns the number of boxes
-    adjusted."""
+    """stageF: per box -- (1) NESTED TRIM, cutting an over-extended
+    face back to a nested smaller box's near boundary (guarded: the cut
+    region must be the small box's own mass); (2) the FREE row ends
+    (the outmost ends of a joined row -- internal seams are left to
+    snap_row_seams, user direction) and (3) the front/back faces snap
+    onto the densest mesh sheets of the box's OWN column (other boxes'
+    points never feed the profile). Identity and meta preserved;
+    adjustments recorded in meta['nested_trim'] / meta['end_snap'] /
+    meta['face_snap']. Returns the number of boxes adjusted."""
     n = 0
     snapshot = list(scene.boxes)
+    pts = np.asarray(scene.points, dtype=float)
     for i, b in enumerate(snapshot):
         try:
+            cur = b
+            tb, tinfo = _nested_trim(cur, scene.boxes, pts)
+            if tinfo is not None:
+                cur = tb
+                scene.boxes[i] = cur
+                cur.meta["nested_trim"] = tinfo
+                n += 1
+                print(f"[stageF] {cur.box_id[:6]} nested trim: "
+                      f"{tinfo['side']} face {tinfo['cut'][0]:.2f} -> "
+                      f"{tinfo['cut'][1]:.2f} (cut back to "
+                      f"{tinfo['small_box'][:6]})")
+            own = _own_points(pts, scene.boxes, cur)
             nb, einfo = snap_box_ends(
-                b, scene.points,
+                cur, pts[own],
                 snap_left=not _row_continues(snapshot, b, -1),
                 snap_right=not _row_continues(snapshot, b, +1))
             if einfo.get("moved"):
@@ -622,7 +772,7 @@ def snap_faces_to_mesh(scene: Scene) -> int:
                       f"(left {einfo['left'][0]:.2f} -> {einfo['left'][1]:.2f}, "
                       f"right {einfo['right'][0]:.2f} -> "
                       f"{einfo['right'][1]:.2f})")
-            nb2, finfo = snap_box_faces(nb, scene.points)
+            nb2, finfo = snap_box_faces(nb, pts[own])
             if finfo.get("moved"):
                 nb2.meta["face_snap"] = finfo
                 print(f"[stageF] {nb2.box_id[:6]} face snap: depth "

@@ -277,3 +277,77 @@ def test_end_snap_union_not_amputated():
         f"the union's ends are already on the outer edges: {info}"
     assert abs(nb.size[0] - 5.0) < 1e-9, "the union must stay whole"
     print("PASS end snap: union box not amputated")
+
+
+# ---------- nested trim + own-point profile tests ----------
+
+def test_nested_trim_cuts_over_covering_big_box():
+    """The user's case: ONE VLM rect covering a row + the small device
+    beside it left a BIG box still covering the device while the
+    device's own small box also survived (two detections at the
+    device). The big box's face on the device's side is cut back to
+    the small box's near boundary, then -- with the device's points
+    excluded from its profile -- the cross snap lands on the ROW's own
+    sheet. The small box keeps its territory."""
+    rng = np.random.default_rng(21)
+    # the row: front/back sheets at cross +/-0.55, along [-2, 2]
+    row = np.vstack([_sheet(rng, 0.55, along=2.0),
+                     _sheet(rng, -0.55, along=2.0)])
+    # the small device beside the row's front side: a shell at
+    # cross 0.64 / 1.20 (deterministic peaks for its own snap)
+    dev = np.vstack([
+        np.column_stack([rng.uniform(-0.4, 0.4, 400),
+                         rng.uniform(0.63, 0.65, 400),
+                         rng.uniform(0.35, 1.00, 400)]),
+        np.column_stack([rng.uniform(-0.4, 0.4, 400),
+                         rng.uniform(1.19, 1.21, 400),
+                         rng.uniform(0.35, 1.00, 400)])])
+    pts = np.vstack([row, dev, _floor(rng)])
+    big = OrientedBox(center=(0.0, 0.35, 1.05),
+                      size=(4.0, 1.90, 2.10), yaw=0.0)
+    small = OrientedBox(center=(0.0, 0.92, 0.675),
+                        size=(0.88, 0.68, 0.75), yaw=0.0)
+    scene = Scene(points=pts)
+    scene.boxes = [big, small]
+    snap_faces_to_mesh(scene)
+    b, s = scene.boxes
+    assert "nested_trim" in b.meta, \
+        "the over-covering big box must be trimmed"
+    assert abs(b.size[1] - 1.11) < 0.06, \
+        f"the big box's depth must land on the ROW's sheets (~1.11), " \
+        f"got {b.size[1]:.2f} -- the device's points must be excluded " \
+        f"from its profile"
+    bmax = b.center[1] + b.size[1] / 2.0
+    assert bmax < 0.62, \
+        f"the big box must be off the device (front {bmax:.2f})"
+    # the small box keeps its own territory beside the row
+    smin = s.center[1] - s.size[1] / 2.0
+    assert smin > 0.55, \
+        f"the small box must keep its territory (min cross {smin:.2f})"
+    assert abs(s.center[0]) < 0.1, "the small box stays put laterally"
+    print(f"PASS nested trim (big cut to {bmax:.2f} then snapped to "
+          f"the row, depth {b.size[1]:.2f}; small intact)")
+
+
+def test_nested_trim_guard_phantom_small_box():
+    """A PHANTOM small box drawn inside a CORRECT big box must not
+    trigger the trim: the cut region is the big box's own mass (the
+    row's sheet + interior, mostly outside the phantom) and the >= 80%
+    guard rejects -- the big box is left alone."""
+    rng = np.random.default_rng(22)
+    pts = np.vstack([_sheet(rng, 0.55, along=2.0),
+                     _sheet(rng, -0.55, along=2.0), _floor(rng)])
+    big = OrientedBox(center=(0.0, 0.0, 1.05),
+                      size=(4.0, 1.10, 2.10), yaw=0.0)
+    phantom = OrientedBox(center=(0.0, 0.25, 1.0),
+                          size=(1.0, 0.50, 2.0), yaw=0.0)
+    scene = Scene(points=pts)
+    scene.boxes = [big, phantom]
+    snap_faces_to_mesh(scene)
+    b = scene.boxes[0]
+    assert "nested_trim" not in b.meta, \
+        "a phantom small box inside a correct big box must not trim it"
+    assert abs(b.size[1] - 1.10) < 0.06 and abs(b.size[0] - 4.0) < 0.06, \
+        f"the correct big box must be untouched, got " \
+        f"{b.size[0]:.2f} x {b.size[1]:.2f}"
+    print("PASS nested trim guard (phantom small box rejected)")
