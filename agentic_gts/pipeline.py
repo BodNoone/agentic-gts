@@ -565,6 +565,16 @@ def run_pipeline(scene: Scene,
                     _render_stage(scene, "stageG_ground", out_dir,
                                   gt_boxes)
 
+    # --- pre-C: clean obvious nested global grounding regions ---
+    # This keeps a large Stage G seed from contaminating the local VLM/SAM
+    # views of a clearly smaller grounded device. Split-piece seams remain
+    # inside Stage C, after the local measurements are complete.
+    from agentic_gts.tools.geometry import trim_nested_boxes
+    n_nested = trim_nested_boxes(scene)
+    if n_nested:
+        _diag_support(scene)
+        _render_stage(scene, "preC_nested_trim", out_dir, gt_boxes)
+
     # --- stage C: agent loop (per-box local refine) ---
     agent = LayoutAgent(judge=judge, opts=opts, out_dir=out_dir)
     report = agent.run(scene)

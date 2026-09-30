@@ -13,7 +13,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from agentic_gts.core.models import OrientedBox, Scene
 from agentic_gts.tools.geometry import (snap_box_ends, snap_box_faces,
-                                        snap_faces_to_mesh)
+                                        snap_faces_to_mesh,
+                                        trim_nested_boxes)
 
 
 def _box(half_d, half_len=1.0, z=1.05):
@@ -343,6 +344,7 @@ def test_nested_trim_cuts_over_covering_big_box():
                         size=(0.88, 0.68, 0.75), yaw=0.0)
     scene = Scene(points=pts)
     scene.boxes = [big, small]
+    trim_nested_boxes(scene)
     snap_faces_to_mesh(scene)
     b, s = scene.boxes
     assert "nested_trim" in b.meta, \
@@ -377,6 +379,7 @@ def test_nested_trim_guard_phantom_small_box():
                           size=(1.0, 0.50, 2.0), yaw=0.0)
     scene = Scene(points=pts)
     scene.boxes = [big, phantom]
+    trim_nested_boxes(scene)
     snap_faces_to_mesh(scene)
     b = scene.boxes[0]
     assert "nested_trim" not in b.meta, \

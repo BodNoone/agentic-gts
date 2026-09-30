@@ -902,32 +902,50 @@ def _nested_trim(box: "OrientedBox", boxes, pts: np.ndarray):
     return box, None
 
 
+def trim_nested_boxes(scene: Scene) -> int:
+    """Trim obvious global nested boxes before local VLM/SAM refinement.
+
+    This is a seed-cleaning operation: a large Stage G region that covers a
+    clearly smaller grounded device is cut back before local views and SAM
+    masks are generated. Returns the number of boxes changed.
+    """
+    n = 0
+    snapshot = list(scene.boxes)
+    pts = np.asarray(scene.points, dtype=float)
+    for i, b in enumerate(snapshot):
+        try:
+            trimmed, info = _nested_trim(b, scene.boxes, pts)
+        except Exception as e:
+            print(f"[preC] nested trim failed ({type(e).__name__})")
+            continue
+        if info is None:
+            continue
+        scene.boxes[i] = trimmed
+        trimmed.meta["nested_trim"] = info
+        n += 1
+        print(f"[preC] {trimmed.box_id[:6]} nested trim: "
+              f"{info['side']} face {info['cut'][0]:.2f} -> "
+              f"{info['cut'][1]:.2f} (cut back to "
+              f"{info['small_box'][:6]})")
+    return n
+
+
 def snap_faces_to_mesh(scene: Scene) -> int:
-    """stageF: per box -- (1) NESTED TRIM, cutting an over-extended
-    face back to a nested smaller box's near boundary (guarded: the cut
-    region must be the small box's own mass); (2) the FREE row ends
-    (the outmost ends of a joined row -- internal seams are left to
-    snap_row_seams, user direction) and (3) the front/back faces snap
+    """stageF: per box -- (1) the FREE row ends (the outmost ends of a
+    joined row -- internal seams are left to snap_row_seams, user direction)
+    and (2) the front/back faces snap
     onto the densest mesh sheets of the box's OWN column (other boxes'
-    points never feed the profile). Identity and meta preserved;
-    adjustments recorded in meta['nested_trim'] / meta['end_snap'] /
-    meta['face_snap']. Returns the number of boxes adjusted."""
+    points never feed the profile). Nested trimming is performed before
+    Stage C by trim_nested_boxes(); Stage F only polishes geometry.
+    Identity and meta are preserved; adjustments are recorded in
+    meta['end_snap'] / meta['face_snap']. Returns the number of boxes
+    adjusted."""
     n = 0
     snapshot = list(scene.boxes)
     pts = np.asarray(scene.points, dtype=float)
     for i, b in enumerate(snapshot):
         try:
             cur = b
-            tb, tinfo = _nested_trim(cur, scene.boxes, pts)
-            if tinfo is not None:
-                cur = tb
-                scene.boxes[i] = cur
-                cur.meta["nested_trim"] = tinfo
-                n += 1
-                print(f"[stageF] {cur.box_id[:6]} nested trim: "
-                      f"{tinfo['side']} face {tinfo['cut'][0]:.2f} -> "
-                      f"{tinfo['cut'][1]:.2f} (cut back to "
-                      f"{tinfo['small_box'][:6]})")
             own = _own_points(pts, scene.boxes, cur)
             nb, einfo = snap_box_ends(
                 cur, pts[own],
