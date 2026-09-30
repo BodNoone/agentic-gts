@@ -156,6 +156,21 @@ def test_face_snap_outward_fallback_when_inward_sheet_missing():
     print("PASS face snap outward fallback")
 
 
+def test_face_snap_does_not_move_to_similar_density_peak():
+    """A candidate with no meaningful density gain is not a boundary."""
+    rng = np.random.default_rng(27)
+    pts = np.vstack([
+        _sheet(rng, 0.55, n=900), _sheet(rng, -0.55, n=900),
+        _sheet(rng, 0.68, n=900), _sheet(rng, 0.70, n=850),
+        _sheet(rng, -0.68, n=900), _sheet(rng, -0.70, n=850),
+        _floor(rng)])
+    b = _box(0.55)
+    nb, info = snap_box_faces(b, pts)
+    assert not info["moved"], info
+    assert nb is b
+    print("PASS face snap rejects similar-density peak")
+
+
 def test_face_snap_depth_bounds_guard():
     """Sheets that would snap the box below the minimum device depth
     are rejected -- the box is returned unchanged."""

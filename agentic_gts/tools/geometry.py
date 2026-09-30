@@ -406,6 +406,10 @@ _FACE_SNAP_OUT = 0.15
 # under the face sheets
 _FACE_SNAP_TAU = 0.50
 _FACE_SNAP_ABS = 0.25
+# A snap is a boundary correction, not a nearest-peak operation. The new
+# sheet must beat the density already present at the old face by this margin
+# when there is measurable old-face mass.
+_FACE_SNAP_GAIN = 1.25
 # the END rule's bar is LOWER: it separates the plateau from mask
 # bleed (a ~20:1 contrast), while the cross rule separates competing
 # peaks (2:1) -- 50% of a fluctuating window max sits inside the
@@ -508,7 +512,18 @@ def snap_box_faces(box: OrientedBox,
             cand = _peaks(*outward, side)
         if len(cand):
             d = np.abs(centers[cand] - face_pos)
-            return float(centers[cand[int(np.argmin(d))]])
+            chosen = int(cand[int(np.argmin(d))])
+            # A similar-density peak is not a clearer boundary. Compare
+            # against the old face neighbourhood, excluding the proposed
+            # sheet itself, and keep the original face when there is no
+            # meaningful density gain.
+            old_zone = ((np.abs(centers - face_pos) <= _FACE_BAND)
+                        & (np.abs(centers - centers[chosen]) > _FACE_BAND))
+            old_peak = int(band[old_zone].max()) if old_zone.any() else 0
+            new_peak = int(band[chosen])
+            if old_peak > 0 and new_peak < _FACE_SNAP_GAIN * old_peak:
+                return face_pos
+            return float(centers[chosen])
         return face_pos
 
     front, back = cross_c + half_d, cross_c - half_d
