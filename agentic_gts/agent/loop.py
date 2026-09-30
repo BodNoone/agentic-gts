@@ -14,6 +14,7 @@ evidence replaced the pre-grounding pipeline's patch passes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 
 import numpy as np
 
@@ -41,11 +42,13 @@ def _is_equipment_label(label) -> bool:
 class AgentReport:
     unresolved: list[dict] = field(default_factory=list)
     actions_taken: list[dict] = field(default_factory=list)
+    performance: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
             "unresolved": self.unresolved,
             "actions_taken": self.actions_taken,
+            "performance": self.performance,
         }
 
 
@@ -105,6 +108,7 @@ class LayoutAgent:
         import json as _json
         import os as _os
 
+        refine_t0 = time.perf_counter()
         sam = SamPredictorAdapter(
             checkpoint=self.opts.get("sam_checkpoint"),
             model_cfg=self.opts.get("sam_model_cfg"))
@@ -278,6 +282,8 @@ class LayoutAgent:
                                    indent=2, default=json_default)
             except Exception as e:
                 print(f"[mask-refine] audit save failed ({type(e).__name__})")
+        report.performance["local_mask_refine_seconds"] = round(
+            time.perf_counter() - refine_t0, 4)
 
     @staticmethod
     def _adopt_refit(scene: Scene, old: OrientedBox,

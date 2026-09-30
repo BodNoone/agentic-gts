@@ -942,24 +942,35 @@ def render_local_views(scene: Scene, box: OrientedBox,
         return out
     pick = 0
     if len(survivors) >= 2 and judge is not None:
-        try:
-            panel = _side_panel_image([s[0] for s in survivors])
-            panel_path = None
-            if out_dir:
-                os.makedirs(out_dir, exist_ok=True)
-                panel_path = os.path.join(
-                    out_dir, f"side_pick_{box.box_id}.png")
-                with open(panel_path, "wb") as f:
-                    f.write(png_bytes(panel))
-            v = judge.adjudicate_side_pick(panel, box,
-                                           n_panels=len(survivors),
-                                           png_path=panel_path)
-            p = v.params.get("pick") if v.params else None
-            if p is not None and 0 <= int(p) < len(survivors):
-                pick = int(p)
-        except Exception as e:
-            print(f"[mask-refine] side VLM arbitration failed "
-                  f"({type(e).__name__}: {e}) -> rule order")
+        energies = [_view_edge_energy(s[0]) for s in survivors]
+        order = np.argsort(energies)[::-1]
+        # If one candidate has clearly more structure than the next best,
+        # use the cheap image-quality signal and skip one VLM call. Keep the
+        # VLM arbitration for close calls where visual semantics matter.
+        if (len(energies) >= 2
+                and energies[order[0]] >= 1.35 * max(energies[order[1]], 1e-12)):
+            pick = int(order[0])
+            print(f"[mask-refine] side view: candidate {chr(65 + pick)} "
+                  f"chosen by edge-energy gate (VLM skipped)")
+        else:
+            try:
+                panel = _side_panel_image([s[0] for s in survivors])
+                panel_path = None
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                    panel_path = os.path.join(
+                        out_dir, f"side_pick_{box.box_id}.png")
+                    with open(panel_path, "wb") as f:
+                        f.write(png_bytes(panel))
+                v = judge.adjudicate_side_pick(panel, box,
+                                               n_panels=len(survivors),
+                                               png_path=panel_path)
+                p = v.params.get("pick") if v.params else None
+                if p is not None and 0 <= int(p) < len(survivors):
+                    pick = int(p)
+            except Exception as e:
+                print(f"[mask-refine] side VLM arbitration failed "
+                      f"({type(e).__name__}: {e}) -> rule order")
     raw, prompt_img, cam = survivors[pick]
     print(f"[mask-refine] side view: candidate {chr(65 + pick)} of "
           f"{len(survivors)} survivor(s) chosen"
@@ -1023,6 +1034,13 @@ def _view_quality(img: np.ndarray) -> tuple[bool, str]:
         return False, (f"smooth veil, no structure (edge energy "
                        f"{edge:.2e}, coverage {cov:.1%})")
     return True, ""
+
+
+def _view_edge_energy(img: np.ndarray) -> float:
+    """Cheap scalar used to avoid VLM side-pick on obvious winners."""
+    lum = np.clip(np.asarray(img, dtype=float)[..., :3], 0.0, 1.0).mean(axis=2)
+    return float(np.mean(np.diff(lum, axis=1) ** 2)
+                 + np.mean(np.diff(lum, axis=0) ** 2))
 
 
 def _mask_to_points(scene: Scene, box: OrientedBox, mask: np.ndarray, cam,

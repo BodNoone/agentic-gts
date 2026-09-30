@@ -106,6 +106,7 @@ runs/xxx/
 ├── boxes_stageC_refined.ply 局部 VLM/SAM 精修后的 box-only 快照
 ├── cloud_with_boxes.ply  点云 + box 线框合并 PLY（CloudCompare/MeshLab 直接打开做 3D 检查）
 ├── agent_report.json     agent 决策记录（issue → 动作 → 结果）
+├── perf.json             关键阶段耗时与最终 box 数量
 └── eval.json             分阶段评测（由内部评测工具生成）
 ```
 

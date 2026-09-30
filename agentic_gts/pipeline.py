@@ -325,6 +325,7 @@ def run_pipeline(scene: Scene,
     opts = opts or {}
     os.makedirs(out_dir, exist_ok=True)
     evals: dict = {}
+    perf: dict = {"stages": {}}
     t0 = time.time()
     diag_point_cloud(scene.points)
 
@@ -576,8 +577,10 @@ def run_pipeline(scene: Scene,
         _render_stage(scene, "preC_nested_trim", out_dir, gt_boxes)
 
     # --- stage C: agent loop (per-box local refine) ---
+    stage_t0 = time.perf_counter()
     agent = LayoutAgent(judge=judge, opts=opts, out_dir=out_dir)
     report = agent.run(scene)
+    perf["stages"]["stageC_agent"] = round(time.perf_counter() - stage_t0, 4)
     print(f"[stageC] agent loop -> {len(report.unresolved)} "
           f"issue(s) flagged for human review")
     _diag_support(scene)
@@ -608,8 +611,11 @@ def run_pipeline(scene: Scene,
     # view) is lost for good without this pass. Walks the fitted
     # rows' interiors and ends with point-support probes -- the old
     # rules' find_gaps/add_box_at job, seeded from grounded boxes.
+    stage_t0 = time.perf_counter()
     from agentic_gts.tools.geometry import complete_row_gaps
     added = complete_row_gaps(scene)
+    perf["stages"]["stageD_row_completion"] = round(
+        time.perf_counter() - stage_t0, 4)
     if added:
         print(f"[stageD] row completion: +{len(added)} point-supported "
               f"fill(s), Confidence.LOW (human review)")
@@ -645,8 +651,11 @@ def run_pipeline(scene: Scene,
     # direction: joined rows are fine-tuned only at their outmost
     # ends -- internal seams stay with snap_row_seams). Boxes already
     # on their sheets are untouched (idempotent).
+    stage_t0 = time.perf_counter()
     from agentic_gts.tools.geometry import snap_faces_to_mesh
     n_snap = snap_faces_to_mesh(scene)
+    perf["stages"]["stageF_face_polish"] = round(
+        time.perf_counter() - stage_t0, 4)
     if n_snap:
         _diag_support(scene)
         _eval("stageF_faces")
@@ -702,6 +711,11 @@ def run_pipeline(scene: Scene,
         print(f"[warn] visualization failed: {type(e).__name__}: {e}")
     with open(os.path.join(out_dir, "agent_report.json"), "w", encoding="utf-8") as f:
         json.dump(report.to_dict(), f, ensure_ascii=False, indent=2)
+    perf["total_seconds"] = round(time.time() - t0, 4)
+    perf["box_count_final"] = len(scene.boxes)
+    perf["agent"] = getattr(report, "performance", {})
+    with open(os.path.join(out_dir, "perf.json"), "w", encoding="utf-8") as f:
+        json.dump(perf, f, ensure_ascii=False, indent=2)
     if evals:
         with open(os.path.join(out_dir, "eval.json"), "w", encoding="utf-8") as f:
             json.dump(evals, f, ensure_ascii=False, indent=2)
