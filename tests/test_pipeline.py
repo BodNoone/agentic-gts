@@ -96,6 +96,20 @@ def test_low_sam_split_piece_is_not_dropped(monkeypatch, tmp_path):
     pipeline.run_pipeline(scene, vlm_backend="local", out_dir=str(tmp_path))
     assert split in scene.boxes
     assert completion not in scene.boxes
+
+
+def test_stage_c_snapshot_boxes_map_without_mutating_live_scene():
+    from agentic_gts.pipeline import _boxes_in_input_frame
+
+    box = OrientedBox(center=(1.0, 2.0, 3.0), size=(1.0, 2.0, 3.0))
+    tf = {"R": np.eye(3), "shift": np.array([0.0, 0.0, -1.0])}
+    mapped = _boxes_in_input_frame([box], tf)
+
+    assert mapped[0] is not box
+    assert mapped[0].center == (1.0, 2.0, 4.0)
+    assert box.center == (1.0, 2.0, 3.0)
+
+
 def test_eval_edge_error():
     gt = [OrientedBox(center=(0, 0, 1), size=(0.6, 1.1, 2.0), yaw=0.0)]
     ok = [OrientedBox(center=(0.01, 0, 1), size=(0.6, 1.1, 2.0), yaw=0.0)]

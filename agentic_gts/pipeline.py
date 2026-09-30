@@ -246,6 +246,18 @@ def _map_outputs_to_input_frame(scene: Scene) -> None:
           f"on z)")
 
 
+def _boxes_in_input_frame(boxes: list[OrientedBox], tf) -> list[OrientedBox]:
+    """Return copied boxes mapped from the aligned frame to input frame."""
+    if not tf:
+        return [b for b in boxes]
+    import copy
+    out = copy.deepcopy(boxes)
+    for b in out:
+        c = _unalign(np.asarray(b.center, dtype=np.float64).reshape(1, 3), tf)[0]
+        b.center = (float(c[0]), float(c[1]), float(c[2]))
+    return out
+
+
 def diag_point_cloud(points: np.ndarray) -> None:
     """Print stats to diagnose coordinate-system / scale / density problems."""
     if len(points) == 0:
@@ -561,6 +573,24 @@ def run_pipeline(scene: Scene,
     _diag_support(scene)
     _eval("stageC")
     _render_stage(scene, "stageC_agent", out_dir, gt_boxes)
+
+    # Preserve a box-only snapshot immediately after local VLM/SAM refinement.
+    # Stage C still runs in the aligned frame, so map only the copied boxes
+    # back to the input frame; the live scene must stay aligned for Stage D/F.
+    try:
+        from agentic_gts.output.visualize import export_boxes_ply
+        stage_c_scene = Scene(
+            points=np.empty((0, 3), dtype=np.float64),
+            boxes=_boxes_in_input_frame(
+                scene.boxes, scene.meta.get("align_tf")))
+        export_boxes_ply(
+            stage_c_scene,
+            os.path.join(out_dir, "boxes_stageC_refined.ply"))
+        print(f"[out] Stage C refined boxes -> "
+              f"{os.path.join(out_dir, 'boxes_stageC_refined.ply')}")
+    except Exception as e:
+        print(f"[warn] Stage C boxes-only export failed: "
+              f"{type(e).__name__}: {e}")
 
     # --- stage D: row completion (geometry-only recall fallback) ---
     # VLM grounding is the only box producer; a cabinet it missed
