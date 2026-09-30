@@ -608,6 +608,18 @@ def run_pipeline(scene: Scene,
         _eval("stageF_faces")
         _render_stage(scene, "stageF_faces", out_dir, gt_boxes)
 
+    # --- structural geometry filter: walls and pillars by SHAPE ---
+    # (user direction: the VLM structural class was reverted; walls
+    # and pillars are filtered by GEOMETRY). A box is LOW when it is
+    # BOTH taller than any real device (>2.80m) AND has no cable-tray
+    # mesh points in the band above its top (real device rows always
+    # have overhead cable infrastructure; walls/pillars have nothing).
+    from agentic_gts.tools.geometry import filter_structural_by_geometry
+    n_struct = filter_structural_by_geometry(scene)
+    if n_struct:
+        print(f"[stageF] structural geometry filter: {n_struct} "
+              f"box(es) flagged (tall + no overhead trays)")
+
     # --- final frame: back to the INPUT coordinates (user report) ---
     # (see _map_outputs_to_input_frame)
     _map_outputs_to_input_frame(scene)

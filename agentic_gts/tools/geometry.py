@@ -287,6 +287,84 @@ def snap_row_seams(boxes: list[OrientedBox], yaw: float,
     return snapped
 
 
+# ---------- structural geometry filter (wall/pillar post-processing) ----------
+
+# device height ceiling: no server rack / IT cabinet / CRAC exceeds
+# this; walls and pillars run to the ceiling (user observation: the
+# heights are clearly different). 42U racks are ~2.0m, tall network
+# racks ~2.4m, CRACs ~2.3m -- 2.8 is a generous ceiling
+_STRUCT_MAX_DEVICE_H = 2.80
+# the vertical band above the box top to scan for cable trays: real
+# device rows in a datacenter ALWAYS have cable trays / ladders
+# running above them (typically 0.3-0.5m above rack tops); walls and
+# pillars have nothing but air up to the ceiling (user observation:
+# local views of walls/pillars show no overhead cable infrastructure)
+_STRUCT_TRAY_BAND = (0.20, 0.80)
+# minimum mesh points in the tray band above the box to count as
+# "has overhead infrastructure"
+_STRUCT_TRAY_MIN_PTS = 30
+
+
+def has_overhead_structure(scene: Scene, box: OrientedBox,
+                           band: tuple = _STRUCT_TRAY_BAND,
+                           min_pts: int = _STRUCT_TRAY_MIN_PTS) -> bool:
+    """True when the box has cable-tray/ladder mesh points in the
+    vertical band above its top, within its (slightly padded)
+    footprint -- real device rows always have overhead cable
+    infrastructure; walls and pillars do not."""
+    pts = np.asarray(scene.points, dtype=float)
+    if not len(pts):
+        return False
+    top = float(box.center[2]) + float(box.size[2]) / 2.0
+    m = ((pts[:, 2] > top + band[0]) & (pts[:, 2] < top + band[1]))
+    if int(m.sum()) < min_pts:
+        return False
+    sel = pts[m]
+    # XY overlap with the box footprint (padded 0.3m: trays may sit
+    # slightly offset from the rack row centre line)
+    half = np.asarray(box.size, dtype=float)[:2] / 2.0 + 0.30
+    local = box.world_to_local(sel)
+    inside = np.all(np.abs(local[:, :2]) <= half, axis=1)
+    return int(inside.sum()) >= min_pts
+
+
+def filter_structural_by_geometry(scene: Scene) -> int:
+    """Post-processing wall/pillar filter (user direction: the VLM
+    structural class was reverted; walls and pillars are filtered by
+    GEOMETRY instead). A box is marked LOW when BOTH signals fire:
+
+    1. HEIGHT anomaly: the box is taller than any real device
+       (> 2.80m -- walls and pillars run to the ceiling; server racks
+       are 1.8-2.5m);
+    2. NO overhead cable infrastructure: the vertical band above the
+       box's top, within its footprint, has no cable-tray/ladder mesh
+       points (real device rows ALWAYS have trays above them; walls
+       and pillars have nothing but air).
+
+    Both signals are required: a tall rack WITH trays above it passes
+    (has infrastructure); a short box without trays passes (not
+    tall). Only tall boxes with nothing above them are marked LOW --
+    the conservative direction. Returns the number of boxes flagged."""
+    n = 0
+    for b in scene.boxes:
+        h = float(b.size[2])
+        tall = h > _STRUCT_MAX_DEVICE_H
+        if not tall:
+            continue
+        if has_overhead_structure(scene, b):
+            continue
+        b.confidence = Confidence.LOW
+        b.meta["structural_geom"] = {
+            "height": round(h, 2), "overhead_pts": 0,
+            "reason": "tall box with no overhead cable infrastructure "
+                      "(wall/pillar geometric signature)"}
+        n += 1
+        print(f"[stageF] {b.box_id[:6]} structural geometry filter: "
+              f"height {h:.2f}m > {_STRUCT_MAX_DEVICE_H}m, no overhead "
+              f"tray points -> LOW (wall/pillar)")
+    return n
+
+
 # ---------- final face polish (stageF: mesh-driven thickness snap) ----------
 
 def aabb_gap_xy(a: "OrientedBox", b: "OrientedBox") -> float:
