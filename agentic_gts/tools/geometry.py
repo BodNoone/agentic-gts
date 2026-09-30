@@ -439,12 +439,14 @@ def snap_box_faces(box: OrientedBox,
     The box's cross profile: a face sheet is a tall narrow peak (all
     its points share one cross coordinate), an open door a low wide
     plateau (the swung panel spreads along the cross axis), a wall
-    behind a strong but FARTHER peak. Rule: per face, snap to the
-    NEAREST peak within an inward-biased window that clears both the
-    window-relative and the profile-global strength bars -- nearest
-    beats strongest so a flush wall never steals the back face and the
-    door plateau never qualifies. Idempotent: a face already on its
-    sheet has its peak at distance ~0 and does not move. Returns
+    behind a strong but FARTHER peak. Rule: per face, search the
+    inward window FIRST and accept its nearest qualifying peak; only
+    when no inward peak qualifies is the tight outward window tried.
+    This shrink-first order prevents a nearby weak exterior structure
+    from stealing a face that has a valid device sheet inside. The
+    outward fallback is retained for genuinely under-measured boxes.
+    Idempotent: a face already on its sheet has its peak at distance ~0
+    and does not move. Returns
     (box, info); the box is unchanged unless info["moved"]."""
     yaw = float(box.yaw)
     axis = np.array([math.cos(yaw), math.sin(yaw)])
@@ -481,24 +483,41 @@ def snap_box_faces(box: OrientedBox,
     if gmax <= 0:
         return box, {"moved": False, "reason": "empty profile"}
 
-    def _snap(face_pos: float, win_lo: float, win_hi: float) -> float:
-        in_win = (centers >= win_lo) & (centers <= win_hi)
+    def _peaks(win_lo: float, win_hi: float, side: int) -> np.ndarray:
+        # Keep each face on its own side of the box centre. Without this
+        # guard, an under-measured front face can see the back sheet in its
+        # large inward window and produce an invalid negative depth.
+        in_win = ((centers >= win_lo) & (centers <= win_hi)
+                  & ((centers >= cross_c) if side > 0
+                     else (centers <= cross_c)))
         if not in_win.any():
-            return face_pos
+            return np.empty(0, dtype=np.int64)
         thr = max(_FACE_SNAP_TAU * float(band[in_win].max()),
                   _FACE_SNAP_ABS * gmax)
         is_peak = np.ones(len(band), dtype=bool)
         is_peak[1:-1] = ((band[1:-1] >= band[:-2])
                          & (band[1:-1] >= band[2:]))
-        cand = np.where(in_win & is_peak & (band >= thr))[0]
+        return np.where(in_win & is_peak & (band >= thr))[0]
+
+    def _snap(face_pos: float, inward: tuple[float, float],
+              outward: tuple[float, float], side: int) -> float:
+        # Strict shrink-first: a valid inward sheet wins even if an
+        # exterior peak is closer to the current face.
+        cand = _peaks(*inward, side)
         if not len(cand):
-            return face_pos
-        d = np.abs(centers[cand] - face_pos)
-        return float(centers[cand[int(np.argmin(d))]])
+            cand = _peaks(*outward, side)
+        if len(cand):
+            d = np.abs(centers[cand] - face_pos)
+            return float(centers[cand[int(np.argmin(d))]])
+        return face_pos
 
     front, back = cross_c + half_d, cross_c - half_d
-    f1 = _snap(front, front - _FACE_SNAP_IN, front + _FACE_SNAP_OUT)
-    b1 = _snap(back, back - _FACE_SNAP_OUT, back + _FACE_SNAP_IN)
+    f1 = _snap(front,
+               (front - _FACE_SNAP_IN, front),
+               (front, front + _FACE_SNAP_OUT), +1)
+    b1 = _snap(back,
+               (back, back + _FACE_SNAP_IN),
+               (back - _FACE_SNAP_OUT, back), -1)
     mf = abs(f1 - front) >= _FACE_SNAP_MIN_MOVE
     mb = abs(b1 - back) >= _FACE_SNAP_MIN_MOVE
     if not mf:
@@ -787,6 +806,12 @@ def _nested_trim(box: "OrientedBox", boxes, pts: np.ndarray):
         return box, None
     for s in boxes:
         if s.box_id == box.box_id:
+            continue
+        # Pieces marked by the same local SAM refinement are independent
+        # cabinets from one joined seed, not a large-box/small-box overlap.
+        # Let their seam and own profiles remain independent.
+        split_group = box.meta.get("sam_split_seed")
+        if (split_group and split_group == s.meta.get("sam_split_seed")):
             continue
         if float(s.containment_2d(box)) < 0.50:
             continue

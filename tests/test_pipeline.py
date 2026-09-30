@@ -4,7 +4,8 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
-from agentic_gts.core.models import OrientedBox, Scene
+from agentic_gts.core.models import (BoxSource, Confidence, OrientedBox,
+                                     Scene)
 from agentic_gts.synth.generator import SynthConfig, generate
 from agentic_gts.pipeline import run_pipeline
 from agentic_gts.eval.metrics import evaluate
@@ -38,6 +39,63 @@ def test_pipeline_local_empty_reply_smoke(monkeypatch, tmp_path):
         "the pipeline should retain geometry-bootstrap boxes when VLM is empty"
     assert (tmp_path / "grounded.png").is_file()
     print(f"PASS pipeline local empty-reply smoke ({len(scene.boxes)} boxes out)")
+
+
+def test_low_sam_split_piece_is_not_dropped(monkeypatch, tmp_path):
+    """Only geometry-only row completions are dropped by the final filter."""
+    from agentic_gts import pipeline
+
+    split = OrientedBox(
+        center=(0.0, 0.0, 1.0), size=(0.6, 1.1, 2.0),
+        source=BoxSource.AGENT_FIX, confidence=Confidence.LOW,
+        meta={"sam_refined": True})
+    completion = OrientedBox(
+        center=(1.0, 0.0, 1.0), size=(0.6, 1.1, 2.0),
+        source=BoxSource.ROW_COMPLETION, confidence=Confidence.LOW)
+    scene = Scene(points=np.empty((0, 3)))
+    scene.boxes = [split, completion]
+
+    monkeypatch.setattr(pipeline, "_render_stage", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "_map_outputs_to_input_frame", lambda *a: None)
+    monkeypatch.setattr(pipeline, "diag_point_cloud", lambda *a: None)
+    monkeypatch.setattr(pipeline, "_diag_support", lambda *a: None)
+    monkeypatch.setattr(pipeline, "evaluate", lambda *a, **k: None)
+
+    class _Agent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, scene):
+            return type("Report", (), {
+                "unresolved": [],
+                "to_dict": lambda self: {},
+            })()
+
+    monkeypatch.setattr(pipeline, "LayoutAgent", _Agent)
+    monkeypatch.setattr(
+        "agentic_gts.tools.geometry.complete_row_gaps",
+        lambda scene: [],
+    )
+    monkeypatch.setattr(
+        "agentic_gts.tools.geometry.snap_faces_to_mesh",
+        lambda scene: 0,
+    )
+    monkeypatch.setattr(
+        "agentic_gts.tools.geometry.filter_structural_by_geometry",
+        lambda scene: 0,
+    )
+
+    # Stop after the filter/output boundary; this test targets the ownership
+    # rule and does not need to render final artifacts.
+    monkeypatch.setattr(Scene, "save_boxes", lambda self, path: None)
+    monkeypatch.setattr(pipeline, "boxes_to_svg", lambda *a, **k: "")
+    monkeypatch.setattr(pipeline, "boxes_to_png", lambda *a, **k: b"")
+    monkeypatch.setattr(pipeline.os, "makedirs", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "json", __import__("json"))
+
+    pipeline.run_pipeline(scene, vlm_backend="local", out_dir=str(tmp_path))
+    assert split in scene.boxes
+    assert completion not in scene.boxes
 def test_eval_edge_error():
     gt = [OrientedBox(center=(0, 0, 1), size=(0.6, 1.1, 2.0), yaw=0.0)]
     ok = [OrientedBox(center=(0.01, 0, 1), size=(0.6, 1.1, 2.0), yaw=0.0)]

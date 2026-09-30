@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from agentic_gts.core.models import OrientedBox, Scene
+from agentic_gts.core.models import BoxSource, OrientedBox, Scene
 from agentic_gts.agent.judge import VLMJudge
 from agentic_gts.agent.loop import LayoutAgent
 from agentic_gts.eval.metrics import evaluate
@@ -577,16 +577,20 @@ def run_pipeline(scene: Scene,
         _eval("stageD")
         _render_stage(scene, "stageD_complete", out_dir, gt_boxes)
 
-    # --- final filter: drop LOW-confidence boxes (user directive) ---
-    # The only LOW boxes are the stageD geometry-only row completions
-    # (no VLM confirmation); too unreliable to keep in the result.
+    # --- final filter: drop unconfirmed geometry-only completions ---
+    # SAM-refined split pieces and type-confirm failures can also be LOW,
+    # but those are real VLM/SAM-backed boxes and must remain visible for
+    # review. Only Stage D row completions lack VLM confirmation.
     from agentic_gts.core.models import Confidence
-    n_low = sum(1 for b in scene.boxes if b.confidence == Confidence.LOW)
-    if n_low:
+    dropped = [b for b in scene.boxes
+               if b.confidence == Confidence.LOW
+               and b.source == BoxSource.ROW_COMPLETION]
+    if dropped:
         scene.boxes = [b for b in scene.boxes
-                       if b.confidence != Confidence.LOW]
-        print(f"[out] dropped {n_low} LOW-confidence box(es) "
-              f"(geometry-only completions, no VLM confirmation)")
+                       if not (b.confidence == Confidence.LOW
+                               and b.source == BoxSource.ROW_COMPLETION)]
+        print(f"[out] dropped {len(dropped)} LOW-confidence row completion "
+              f"box(es) (no VLM confirmation)")
 
     # --- stage F: final face polish (mesh-driven thickness + end snap) ---
     # The side-view thickness chain has real holes (wall-masked /

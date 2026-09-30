@@ -126,6 +126,35 @@ def test_face_snap_wide_open_door_trims():
           f"(depth {info['depth'][0]:.2f} -> {info['depth'][1]:.2f})")
 
 
+def test_face_snap_strictly_prefers_inward_sheet_over_near_outer_peak():
+    """A valid inward device sheet wins over a closer exterior peak."""
+    rng = np.random.default_rng(25)
+    pts = np.vstack([
+        _sheet(rng, 0.55, n=1500), _sheet(rng, -0.55, n=1500),
+        _sheet(rng, 0.73, n=500),   # nearer exterior peak for front face
+        _floor(rng)])
+    b = _box(0.70)  # front face at 0.70; inward sheet is at 0.55
+    nb, info = snap_box_faces(b, pts)
+    assert info["moved"], info
+    assert abs(info["front"][1] - 0.55) < 0.06, info
+    assert abs(nb.size[1] - 1.11) < 0.08, nb.size
+    print("PASS face snap strict inward priority")
+
+
+def test_face_snap_outward_fallback_when_inward_sheet_missing():
+    """An under-measured face may still extend to a strong outer sheet."""
+    rng = np.random.default_rng(26)
+    pts = np.vstack([
+        _sheet(rng, 0.60, n=1500), _sheet(rng, -0.55, n=1500),
+        _floor(rng)])
+    b = _box(0.55)
+    nb, info = snap_box_faces(b, pts)
+    assert info["moved"], info
+    assert abs(info["front"][1] - 0.60) < 0.06, info
+    assert nb.size[1] > b.size[1], (b.size, nb.size)
+    print("PASS face snap outward fallback")
+
+
 def test_face_snap_depth_bounds_guard():
     """Sheets that would snap the box below the minimum device depth
     are rejected -- the box is returned unchanged."""
@@ -356,6 +385,23 @@ def test_nested_trim_guard_phantom_small_box():
         f"the correct big box must be untouched, got " \
         f"{b.size[0]:.2f} x {b.size[1]:.2f}"
     print("PASS nested trim guard (phantom small box rejected)")
+
+
+def test_nested_trim_skips_sam_split_pieces():
+    """Independent pieces from one SAM split must not be treated as a
+    nested duplicate pair by the final face polish."""
+    rng = np.random.default_rng(24)
+    pts = np.vstack([_row(rng, -3.0, 3.0), _floor(rng)])
+    left = _end_box(-3.0, 0.2)
+    right = _end_box(0.1, 3.0)
+    left.meta.update({"sam_refined": True, "sam_split_seed": "seed-1"})
+    right.meta.update({"sam_refined": True, "sam_split_seed": "seed-1"})
+    scene = Scene(points=pts)
+    scene.boxes = [left, right]
+    snap_faces_to_mesh(scene)
+    assert "nested_trim" not in left.meta
+    assert "nested_trim" not in right.meta
+    print("PASS nested trim skips independent SAM split pieces")
 
 
 def test_end_snap_inward_priority_over_ladder():

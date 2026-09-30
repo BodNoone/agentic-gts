@@ -1801,7 +1801,9 @@ def _build_split_pieces(spans: list, seed: "OrientedBox") -> list:
             size=(length, float(seed.size[1]), float(seed.size[2])),
             yaw=yaw, box_id=seed.box_id, device_type=seed.device_type,
             source=BoxSource.AGENT_FIX, confidence=seed.confidence,
-            row_id=seed.row_id, meta={**seed.meta, "sam_refined": True})
+            row_id=seed.row_id,
+            meta={**seed.meta, "sam_refined": True,
+                  "sam_split_seed": seed.box_id})
         if s["pts"] is not None:
             score = 0.55 * float(s["ms"]) + 0.45 * min(len(s["pts"]) / 200.0,
                                                        1.0)
