@@ -171,6 +171,27 @@ def test_face_snap_does_not_move_to_similar_density_peak():
     print("PASS face snap rejects similar-density peak")
 
 
+def test_top_trim_removes_sparse_overhead_tail():
+    """A low-density tail above the body is trimmed, never extended."""
+    rng = np.random.default_rng(28)
+    body = np.vstack([_sheet(rng, 0.55, z_hi=2.0),
+                      _sheet(rng, -0.55, z_hi=2.0)])
+    tail = np.column_stack([rng.uniform(-0.8, 0.8, 40),
+                            rng.uniform(-0.2, 0.2, 40),
+                            rng.uniform(2.35, 3.0, 40)])
+    box = _box(0.55, z=1.5)
+    box.size = (box.size[0], box.size[1], 3.0)
+    nb, info = _trim_sparse_top_for_test(box, np.vstack([body, tail]))
+    assert info["moved"], info
+    assert nb.size[2] < box.size[2]
+    assert nb.center[2] < box.center[2]
+
+
+def _trim_sparse_top_for_test(box, pts):
+    from agentic_gts.tools.geometry import _trim_sparse_top
+    return _trim_sparse_top(box, pts)
+
+
 def test_face_snap_depth_bounds_guard():
     """Sheets that would snap the box below the minimum device depth
     are rejected -- the box is returned unchanged."""

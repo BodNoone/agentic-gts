@@ -430,6 +430,79 @@ _FACE_SNAP_MIN_MOVE = 0.02
 _FACE_SNAP_MIN_D, _FACE_SNAP_MAX_D = 0.30, 2.50
 
 
+def _height_boundary_ok(box: OrientedBox, pts: np.ndarray,
+                        axis: np.ndarray, cross: np.ndarray,
+                        along: float, cross_pos: float,
+                        end_profile: bool = False) -> bool:
+    """Reject candidate sheets dominated by overhead ladder geometry."""
+    c = np.asarray(box.center, dtype=float)
+    half = np.asarray(box.size, dtype=float) / 2.0
+    p = np.asarray(pts, dtype=float)
+    along_p = p[:, :2] @ axis
+    cross_p = p[:, :2] @ cross
+    m = ((np.abs(along_p - along) <= (max(_FACE_BAND, 0.06)
+                                     if end_profile else half[0] + 0.05))
+         & (np.abs(cross_p - cross_pos) <= (half[1] + 0.05
+                                            if end_profile
+                                            else max(_FACE_BAND, 0.06)))
+         & (p[:, 2] > c[2] - half[2] + 0.30))
+    z = p[m, 2]
+    if len(z) < 12:
+        return False
+    top = float(c[2] + half[2])
+    body = int(np.count_nonzero(z <= top + 0.05))
+    overhead = int(np.count_nonzero(z > top + 0.10))
+    if body < 12:
+        return False
+    # A candidate whose evidence is mostly above the current device top is
+    # more likely a cable ladder/tray than a device boundary.
+    return overhead <= max(8, int(0.50 * body))
+
+
+def _trim_sparse_top(box: OrientedBox, pts: np.ndarray):
+    """Conservatively trim a low-density over-height tail downward only."""
+    c = np.asarray(box.center, dtype=float)
+    half = np.asarray(box.size, dtype=float) / 2.0
+    local = box.world_to_local(np.asarray(pts, dtype=float))
+    m = (np.all(np.abs(local[:, :2]) <= half[:2] + 0.05, axis=1)
+         & (local[:, 2] > -half[2] + 0.30))
+    z = local[m, 2] + c[2]
+    if len(z) < 80:
+        return box, {"moved": False, "reason": "too few top points"}
+    lo, hi = float(c[2] - half[2] + 0.30), float(c[2] + half[2])
+    edges = np.arange(lo, hi + 0.05, 0.05)
+    if len(edges) < 4:
+        return box, {"moved": False, "reason": "short height range"}
+    hist, _ = np.histogram(z, bins=edges)
+    peak = int(hist.max())
+    if peak <= 0:
+        return box, {"moved": False, "reason": "empty top profile"}
+    # Find the highest density-supported body bin. A very sparse tail above
+    # it is treated as reconstruction haze/overhead structure, never as a
+    # reason to grow the box.
+    supported = np.where(hist >= max(5, 0.15 * peak))[0]
+    if not len(supported):
+        return box, {"moved": False, "reason": "no supported top"}
+    new_top = float(edges[int(supported[-1]) + 1])
+    old_top = float(c[2] + half[2])
+    if old_top - new_top < 0.15:
+        return box, {"moved": False, "reason": "top tail not significant"}
+    new_h = new_top - float(c[2] - half[2])
+    if new_h < 0.30:
+        return box, {"moved": False, "reason": "trimmed height too short"}
+    new_box = OrientedBox(
+        center=(float(c[0]), float(c[1]),
+                float(c[2] - (old_top - new_top) / 2.0)),
+        size=(float(box.size[0]), float(box.size[1]), float(new_h)),
+        yaw=box.yaw, box_id=box.box_id, device_type=box.device_type,
+        source=box.source, confidence=box.confidence, row_id=box.row_id,
+        meta=box.meta)
+    return new_box, {"moved": True,
+                     "height": [round(float(box.size[2]), 3),
+                                round(float(new_h), 3)],
+                     "top": [round(old_top, 3), round(new_top, 3)]}
+
+
 def snap_box_faces(box: OrientedBox,
                    pts: np.ndarray) -> tuple[OrientedBox, dict]:
     """Snap ONE box's front/back (cross-axis) faces onto the densest
@@ -522,6 +595,9 @@ def snap_box_faces(box: OrientedBox,
             old_peak = int(band[old_zone].max()) if old_zone.any() else 0
             new_peak = int(band[chosen])
             if old_peak > 0 and new_peak < _FACE_SNAP_GAIN * old_peak:
+                return face_pos
+            if not _height_boundary_ok(box, pts, axis, cross,
+                                       along_c, float(centers[chosen])):
                 return face_pos
             return float(centers[chosen])
         return face_pos
@@ -744,6 +820,10 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
             return face_pos
         if outer_sign < 0 and centers[edge] <= win_lo + _FACE_BIN:
             return face_pos
+        if not _height_boundary_ok(box, pts, axis, cross,
+                                   float(centers[edge]), cross_c,
+                                   end_profile=True):
+            return face_pos
         # SUB-BIN edge: the outermost actual point in the run's edge
         # bin. A bin-centre target quantises to +/-3cm, and the
         # PARTIAL edge bin (the true edge lands mid-bin) can fail the
@@ -961,6 +1041,15 @@ def snap_faces_to_mesh(scene: Scene) -> int:
     for i, b in enumerate(snapshot):
         try:
             cur = b
+            tb, tinfo = _trim_sparse_top(cur, pts)
+            if tinfo.get("moved"):
+                cur = tb
+                scene.boxes[i] = cur
+                cur.meta["top_trim"] = tinfo
+                n += 1
+                print(f"[stageF] {cur.box_id[:6]} top trim: height "
+                      f"{tinfo['height'][0]:.2f} -> "
+                      f"{tinfo['height'][1]:.2f}m")
             own = _own_points(pts, scene.boxes, cur)
             nb, einfo = snap_box_ends(
                 cur, pts[own],
