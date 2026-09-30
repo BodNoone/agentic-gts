@@ -171,6 +171,30 @@ def test_face_snap_does_not_move_to_similar_density_peak():
     print("PASS face snap rejects similar-density peak")
 
 
+def test_low_device_does_not_snap_to_partial_tall_ladder():
+    """A nearby tall ladder may be only a small part of the slice, but
+    its high local z extent must still reject the face candidate."""
+    rng = np.random.default_rng(29)
+    body = np.vstack([
+        _sheet(rng, 0.45, n=1400, z_lo=0.30, z_hi=0.95),
+        _sheet(rng, -0.45, n=1400, z_lo=0.30, z_hi=0.95),
+    ])
+    ladder = np.column_stack([
+        rng.uniform(-0.20, 0.20, 80),
+        rng.uniform(0.53, 0.55, 80),
+        rng.uniform(1.10, 2.60, 80),
+    ])
+    low = OrientedBox(center=(0.0, 0.0, 0.50),
+                      size=(2.0, 1.10, 1.0), yaw=0.0)
+    nb, info = snap_box_faces(low, np.vstack([body, ladder, _floor(rng)]))
+    # The genuine body sheet may still pull the face inward; the guard must
+    # prevent the nearby ladder from becoming the accepted exterior sheet.
+    assert info["moved"], info
+    assert abs(info["front"][1] - 0.55) < 0.03, info
+    assert abs(nb.center[1] - low.center[1]) < 0.06
+    print("PASS low device rejects partial tall ladder")
+
+
 def test_top_trim_removes_sparse_overhead_tail():
     """A low-density tail above the body is trimmed, never extended."""
     rng = np.random.default_rng(28)

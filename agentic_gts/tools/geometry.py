@@ -451,11 +451,18 @@ def _height_boundary_ok(box: OrientedBox, pts: np.ndarray,
         return False
     top = float(c[2] + half[2])
     body = int(np.count_nonzero(z <= top + 0.05))
-    overhead = int(np.count_nonzero(z > top + 0.10))
+    high = z[z > top + 0.10]
+    overhead = int(len(high))
     if body < 12:
         return False
+    # A long ladder can occupy only a small fraction of a low device's
+    # candidate slice, so a majority-only test is too weak. A coherent
+    # group of high points is enough to reject the candidate, even when the
+    # overall box height would not change.
+    if overhead >= 8 and float(np.percentile(high, 95)) > top + 0.15:
+        return False
     # A candidate whose evidence is mostly above the current device top is
-    # more likely a cable ladder/tray than a device boundary.
+    # also more likely a cable ladder/tray than a device boundary.
     return overhead <= max(8, int(0.50 * body))
 
 
