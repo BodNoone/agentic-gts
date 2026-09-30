@@ -29,45 +29,36 @@ def test_is_structural():
     print("PASS _is_structural label matching")
 
 
-def test_structural_groups_never_become_spans():
-    """A view whose ONLY grounded group is a wall/pillar produces no
-    spans -- the label is rejection evidence, not measurement."""
-    # fake judge returning one wall group + one rack group
-    class _Judge:
-        backend = "qwen"
-        def adjudicate_sam_boxes(self, img, box, name, png_path=None):
-            from agentic_gts.agent.judge import Verdict
-            return Verdict(action="segment", params={
-                "groups": [
-                    {"bbox": [0.1, 0.1, 0.4, 0.9],
-                     "hypothesis": "wall / pillar", "confidence": 0.8},
-                ],
-                "view_quality": "good"}, raw="wall")
-
-    class _FakeSAM:
-        available = True
-        def predict(self, image, box_pix):
-            h, w = image.shape[:2]
-            m = np.zeros((h, w), dtype=bool)
-            x0, y0, x1, y1 = [int(v) for v in box_pix]
-            m[max(y0,0):min(y1,h), max(x0,0):min(x1,w)] = True
-            return [m], [0.9]
-
-    # build a scene with wall-ish points inside a seed box
-    rng = np.random.default_rng(31)
-    pts = np.column_stack([rng.uniform(-0.5, 0.5, 500),
-                           rng.uniform(-0.5, 0.5, 500),
-                           rng.uniform(0.30, 2.0, 500)])
-    scene = Scene(points=pts)
-    box = OrientedBox(center=(0, 0, 1.05), size=(1.0, 1.0, 2.1), yaw=0.0)
-    img = np.full((768, 768, 3), 0.5, dtype=np.float32)
-    view = {"name": "front", "image": img, "path": None, "cam": None}
-    audit = {"views": []}
-    spans = _voter_spans(scene, box, view, _Judge(), _FakeSAM(),
-                         None, audit)
-    assert spans == [], f"a wall-only view must yield no spans, got {spans}"
-    assert audit["views"][0]["structural_label"] is True
-    print("PASS structural groups never become spans (flag set)")
+def test_structural_groups_still_generate_spans():
+    """A view with a wall-labelled group DOES generate spans (user
+    report: a tall+short device pair stopped splitting after the
+    structural class was added -- the short device was mislabelled
+    'wall / pillar' and its span was suppressed, killing the split).
+    The structural label's purpose is to trigger the type-confirm,
+    not to suppress the split: the span must exist so the piece can
+    be created and the confirm can save or kill it."""
+    # verify the CODE PATH: the structural label is NOT in the span
+    # skip list (unlike the subtractive door/ladder labels which ARE
+    # skipped) -- the group enters the SAM/mask/lift pipeline
+    from agentic_gts.agent import mask_refine as mr
+    import inspect
+    src = inspect.getsource(mr._voter_spans)
+    # the structural skip was in the span loop and has been removed
+    assert 'if _is_structural' not in src.split('for gi, g in enumerate')[1].split('spans.append')[0], \
+        "the _is_structural skip must NOT be in the span generation loop"
+    # the subtractive skip IS still there
+    assert 'if _is_subtractive' in src.split('for gi, g in enumerate')[1].split('spans.append')[0], \
+        "the _is_subtractive skip must remain in the span generation loop"
+    # the structural label check IS in the side-thickness pool skip
+    src_pool = inspect.getsource(mr._side_thickness_pool)
+    assert '_is_structural' in src_pool, \
+        "the _is_structural skip must remain in the thickness pool"
+    # the structural flag IS still set
+    assert '_is_structural' in src and 'structural_label' in src, \
+        "the structural flag must still be set in _voter_spans"
+    print("PASS structural groups still generate spans " \
+          "(skip removed from span loop, kept in thickness pool, " \
+          "flag still set)")
 
 
 def test_refine_box_propagates_structural_flag():

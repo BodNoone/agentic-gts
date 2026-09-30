@@ -1848,10 +1848,14 @@ def _is_structural(label) -> bool:
     still included pillars and walls -- the local grounding's category
     set was CLOSED, the model had no honest output for a structural
     slab and squeezed it into 'server rack' with a high score, which
-    then SKIPPED the type-confirm). Like the door class, the label
-    now has an honest outlet -- and its purpose is REJECTION: a
-    structural label never contributes spans or thickness points, and
-    its presence forces the dedicated type-confirm (see loop.py)."""
+    then SKIPPED the type-confirm). The label's purpose is to TRIGGER
+    REJECTION, not to suppress measurement: structural-labelled groups
+    still generate SPANS (a mislabelled short/white device must become
+    a piece so the confirm can save it -- user report: a tall+short
+    pair stopped splitting when the structural skip was in the span
+    path), they are skipped from the SIDE-VIEW THICKNESS pool (a
+    wall's points must not pollute device thickness), and their
+    presence forces the dedicated type-confirm (see loop.py)."""
     l = str(label or "").lower()
     return "wall" in l or "pillar" in l or "column" in l
 
@@ -2077,10 +2081,14 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
     yaw = float(box.yaw)
     axis = np.array([math.cos(yaw), math.sin(yaw)])
     along0 = float(np.asarray(box.center, dtype=float)[:2] @ axis)
-    # the structural class (wall/pillar) never contributes spans, and
-    # its presence anywhere in this view flags the whole refinement --
-    # loop.py forces the type-confirm for the box (never skipped), the
-    # label's purpose is REJECTION, not measurement
+    # the structural class (wall/pillar) still generates SPANS (unlike
+    # the subtractive door/ladder classes whose purpose is pixel
+    # subtraction -- the structural label's purpose is REJECTION, and
+    # rejection happens at the type-confirm, not by suppressing the
+    # split: a short/white device mislabelled "wall / pillar" must
+    # still become a piece so the confirm can save it -- user report:
+    # a tall+short pair stopped splitting after the structural class
+    # was added, the short one was mislabelled and its span vanished)
     if any(_is_structural(g.get("hypothesis")) for g in groups):
         va["structural_label"] = True
     # the door class first: its SAM masks form the subtractive layer
@@ -2091,9 +2099,6 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
         if _is_subtractive(g.get("hypothesis")):
             continue          # door / ladder: subtraction only, never
                              # a span -- box refinement fits devices only
-        if _is_structural(g.get("hypothesis")):
-            continue          # wall / pillar: rejection-only, never a
-                             # span or a thickness point
         group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
                          float(g.get("confidence", 0.5)))
         box_pix = group.pixel_box(W, H)
