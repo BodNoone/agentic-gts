@@ -534,7 +534,8 @@ def test_back_view_rescues_poor_front_end_to_end():
     _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
              mr.SamPredictorAdapter.predict)
     mr.render_local_views = lambda scene, box, out_dir, judge=None: views
-    j = VLMJudge(backend="mock")
+    j = VLMJudge(backend="local")
+    j._local_image_call = lambda *args, **kwargs: ""
     def fake_ground(image, box, view_name, png_path=None):
         # front: the POOR view -- one whole-row box; back: the open
         # side -- the true two cabinets; side: one profile box
@@ -679,7 +680,8 @@ def test_vlm_quality_verdict_drops_garbage_view():
     _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
              mr.SamPredictorAdapter.predict)
     mr.render_local_views = lambda scene, box, out_dir, judge=None: views
-    j = VLMJudge(backend="mock")
+    j = VLMJudge(backend="local")
+    j._local_image_call = lambda *args, **kwargs: ""
     def fake_ground(image, box, view_name, png_path=None):
         # front: the FOGGED view -- judged poor, but the model still
         # hallucinated a confident whole-row box (the danger the
@@ -1206,8 +1208,8 @@ def test_sam_debug_render_survives_negative_z():
             "the composite must be written despite all-negative z"
     print("PASS SAM debug render survives all-negative z")
 def test_local_refine_splits_joined_row_end_to_end():
-    """END-TO-END for the split adoption path the mock pipeline never
-    covers (mock grounding returns empty groups): a seed covering TWO
+    """END-TO-END for the split adoption path the empty-reply smoke path never
+    covers: a seed covering TWO
     joined cabinets, a local grounding that returns two device boxes,
     SAM that segments them -- after _local_mask_refine the scene must
     hold TWO boxes, one per cabinet, each keeping the seed's trusted
@@ -1261,7 +1263,8 @@ def test_local_refine_splits_joined_row_end_to_end():
         mr.render_local_views = lambda scene, box, out_dir, judge=None: views
         # VLM grounding: TWO device instances on the front view, ONE on
         # the side profile; SAM segments exactly the prompted rectangle
-        j = VLMJudge(backend="mock")
+        j = VLMJudge(backend="local")
+        j._local_image_call = lambda *args, **kwargs: ""
         def fake_ground(image, box, view_name, png_path=None):
             groups = ([{"bbox": (10, 10, 490, 990), "hypothesis": "rack",
                         "confidence": 0.9},
@@ -1424,7 +1427,8 @@ def test_type_confirm_marks_low_not_deleted():
     # good box untouched
     assert good.confidence != Confidence.LOW
     assert not good.meta.get("type_suspect")
-    # no VLM answer, no marking: mock judge returns None -> box stays
+    # no VLM answer, no marking: the local empty-reply double returns None
+    # -> box stays
     mock_ids = len(scene.boxes)
     assert mock_ids == 2
     print("PASS type confirm marks LOW + unresolved, never deletes")
@@ -1707,7 +1711,7 @@ def test_side_panel_image_labels():
 def test_adjudicate_side_pick_parses_letter():
     """The side-pick verdict: reply 'C' -> panel 2; a wordy reply
     'The best panel is B.' -> 1; garbage / out-of-range -> None (the
-    caller's rule order stands). Mock backend gives no signal."""
+    caller's rule order stands). An empty local test double gives no signal."""
     from agentic_gts.agent.judge import VLMJudge
     j = VLMJudge(backend="qwen")
     box = OrientedBox(center=(0, 0, 1), size=(6, 1, 2), yaw=0.0)
@@ -1724,10 +1728,11 @@ def test_adjudicate_side_pick_parses_letter():
     _fake.reply = "panel 7 please"
     v = j.adjudicate_side_pick(img, box, n_panels=3)
     assert v.params["pick"] is None, v.params
-    jm = VLMJudge(backend="mock")
+    jm = VLMJudge(backend="local")
+    jm._local_image_call = lambda *args, **kwargs: ""
     vm = jm.adjudicate_side_pick(img, box, n_panels=3)
     assert vm.params["pick"] is None
-    print("PASS side-pick parse (C->2, wordy B->1, junk/mock->None)")
+    print("PASS side-pick parse (C->2, wordy B->1, junk/empty->None)")
 def test_side_view_vlm_arbitration_overrides_rule():
     """SIDE view candidate arbitration (user direction: the placement
     rules keep misjudging which end is clear -- let the VLM look at
@@ -2027,7 +2032,8 @@ def test_side_ladder_retry_cuts_ladder_and_regrounds():
         if abs(bp - lad_pix).sum() < abs(bp - dev_pix).sum():
             return [lad_mask], [0.9]
         return [dev_mask], [0.95]
-    judge = VLMJudge(backend="mock")
+    judge = VLMJudge(backend="local")
+    judge._local_image_call = lambda *args, **kwargs: ""
     grounded = []
     def fake_ground(image, box, view_name, png_path=None):
         grounded.append(view_name)
@@ -2111,7 +2117,8 @@ def test_side_ladder_fallback_marks_unavailable():
         x1, y1, x2, y2 = (int(round(float(v))) for v in box_pix)
         m[max(y1, 0):max(y2, 1), max(x1, 0):max(x2, 1)] = True
         return [m], [0.9]
-    judge = VLMJudge(backend="mock")
+    judge = VLMJudge(backend="local")
+    judge._local_image_call = lambda *args, **kwargs: ""
     def fake_ground(image, box, view_name, png_path=None):
         groups = [{"bbox": lad_rel, "hypothesis": "cable ladder",
                    "confidence": 0.9}]

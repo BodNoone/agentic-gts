@@ -26,15 +26,18 @@ def test_synth_generation():
     # some corruption must exist
     kinds = {b.meta.get("corruption") for b in corrupt}
     assert len(kinds) > 1
-def test_pipeline_mock_smoke():
-    """No-hint flow smoke test: run_pipeline on synth data with the mock
-    VLM must complete without raising. Boxes come ONLY from VLM
-    grounding, and the mock backend grounds nothing -- so an empty
-    result is the expected, contract-conformant outcome here."""
+def test_pipeline_local_empty_reply_smoke(monkeypatch, tmp_path):
+    """No-hint flow smoke test without loading a model or using a network."""
+    from agentic_gts.agent.judge import VLMJudge
+    monkeypatch.setattr(VLMJudge, "_local_image_call",
+                        lambda self, png, prompt, max_new_tokens=64: "")
     scene, gt, corrupt = generate(SynthConfig(seed=42))
     run_pipeline(scene, gt_boxes=gt,
-                 vlm_backend="mock", out_dir="runs/test_tmp")
-    print(f"PASS pipeline mock smoke ({len(scene.boxes)} boxes out)")
+                 vlm_backend="local", out_dir=str(tmp_path))
+    assert len(scene.boxes) > 0, \
+        "the pipeline should retain geometry-bootstrap boxes when VLM is empty"
+    assert (tmp_path / "grounded.png").is_file()
+    print(f"PASS pipeline local empty-reply smoke ({len(scene.boxes)} boxes out)")
 def test_eval_edge_error():
     gt = [OrientedBox(center=(0, 0, 1), size=(0.6, 1.1, 2.0), yaw=0.0)]
     ok = [OrientedBox(center=(0.01, 0, 1), size=(0.6, 1.1, 2.0), yaw=0.0)]

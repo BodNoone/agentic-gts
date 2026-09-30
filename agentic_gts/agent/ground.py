@@ -1676,7 +1676,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     excluded) drive the nadir framing and the ceiling cut; there is
     no box input of any kind.
 
-    False = grounding unavailable (mock backend / VLM failure / no
+    False = grounding unavailable (VLM failure / no
     region survived the point-support guards): the scene stays empty.
     """
     import os

@@ -298,7 +298,7 @@ def _render_stage(scene: Scene, tag: str, out_dir: str,
 
 def run_pipeline(scene: Scene,
                  gt_boxes: list[OrientedBox] | None = None,
-                 vlm_backend: str = "mock",
+                 vlm_backend: str = "local",
                  vlm_api_base: str | None = None,
                  vlm_model: str | None = None,
                  opts: dict | None = None,

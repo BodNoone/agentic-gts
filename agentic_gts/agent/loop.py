@@ -52,7 +52,7 @@ class AgentReport:
 class LayoutAgent:
     def __init__(self, judge: VLMJudge | None = None,
                  opts: dict | None = None, out_dir: str | None = None):
-        self.judge = judge or VLMJudge(backend="mock")
+        self.judge = judge or VLMJudge(backend="local")
         self.opts = opts or {}
         self.out_dir = out_dir
 
@@ -116,10 +116,8 @@ class LayoutAgent:
             if scene.get_box(old.box_id) is None:
                 continue
             # one render per box, shared by both questions
-            views = (render_local_views(scene, old, self.out_dir,
-                                        judge=self.judge)
-                     if (sam.available
-                         or self.judge.backend != "mock") else [])
+            views = render_local_views(scene, old, self.out_dir,
+                                       judge=self.judge)
             # ---- type gate for CLUSTER-proposed boxes (BEFORE SAM) ----
             # The recall-first net proposes every density clump with NO
             # VLM label behind it; a pillar / UPS / junk block would
@@ -131,8 +129,7 @@ class LayoutAgent:
             # the post-SAM skip_confirm logic covers them). A 'no'
             # NEVER deletes -- LOW + human review, as always.
             confirmed_rack: bool | None = None
-            if (old.meta.get("cluster")
-                    and (sam.available or self.judge.backend != "mock")):
+            if old.meta.get("cluster"):
                 try:
                     r = confirm_device_type(self.judge, old, views)
                 except Exception as e:

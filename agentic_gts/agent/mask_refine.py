@@ -941,8 +941,7 @@ def render_local_views(scene: Scene, box: OrientedBox,
               "the quality gate")
         return out
     pick = 0
-    if len(survivors) >= 2 and judge is not None \
-            and getattr(judge, "backend", "mock") != "mock":
+    if len(survivors) >= 2 and judge is not None:
         try:
             panel = _side_panel_image([s[0] for s in survivors])
             panel_path = None
@@ -1360,13 +1359,10 @@ def confirm_device_type(judge, box: OrientedBox, views: list,
     the caller's render_local_views call (shared with refine_box --
     one render, two questions).
 
-    Returns None when there is no signal (no views, or the judge is mock
-    -- never penalise for missing evidence); else {"is_rack": bool,
+    Returns None when there is no signal (no views); else {"is_rack": bool,
     "confidence": float}. The CALLER decides policy; the standing
     contract is mark-LOW + human review, never deletion.
     """
-    if getattr(judge, "backend", "mock") == "mock":
-        return None
     front = next((v for v in views if v["name"] == "front"), None)
     if front is None:
         return None

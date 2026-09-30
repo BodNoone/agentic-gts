@@ -50,44 +50,31 @@ pip install -r requirements.txt
 # 从点云直接跑（box 全部来自 VLM grounding，无需任何初始输入）
 python -m agentic_gts.cli run --point-cloud room.ply --out runs/room1
 
-# 带真值评测
-python -m agentic_gts.cli run --point-cloud room.ply \
-    --gt gt_boxes.json --edge-thr 0.05 --out runs/room1
+# 评测与合成数据仅供内部测试工具使用，见下文
 ```
 
-### 2. 接入 Qwen3-VL 裁判
-
-启动一个 OpenAI 兼容服务（vLLM / SGLang / DashScope 均可）：
-
-```bash
-# 例：vLLM
-vllm serve Qwen/Qwen3-VL-8B-Instruct --port 8000
-```
-
-然后：
+### 2. 使用本地 VLM
 
 ```bash
 python -m agentic_gts.cli run --point-cloud room.ply \
-    --vlm qwen --vlm-base http://127.0.0.1:8000/v1 --out runs/room1
+    --vlm local --vlm-model Qwen/Qwen3-VL-8B-Instruct --out runs/room1
 ```
 
-不配置 VLM 时自动使用规则降级模式（mock），管线仍可运行但 grounding 不产出 box（无输入 box、无 fallback）——这也是可靠性下限基线。
+默认使用本地 VLM（`--vlm local`）。通过 `--vlm-model` 指定本地模型目录；未配置可用模型时不会自动加载替代模型，测试中应显式注入本地调用 double。grounding 失败时场景保持为空，没有输入 box 或 fallback。
 
 ### 3. 局部细化的 SAM2 mask（可选但推荐）
 
 ```bash
 python -m agentic_gts.cli run --point-cloud room.ply \
-    --vlm qwen --vlm-base http://127.0.0.1:8000/v1 \
+    --vlm local --vlm-model /models/qwen3-vl \
     --sam-checkpoint sam2.1_hiera_base_plus.pt --sam-model-cfg sam2.1_hiera_b+.yaml \
     --out runs/room1
 ```
 
-### 4. 生成合成测试数据
+### 4. 内部测试与评测工具
 
-```bash
-python -m agentic_gts.cli synth --seed 42 --out runs/synth
-# 产出 points.npy / gt_boxes.json / corrupted_boxes.json
-```
+合成数据生成器、真值数据和评测指标仍保留在 Python 内部测试工具中，供
+`tests/` 和开发验证使用；它们不再是生产 CLI 子命令或生产后端。
 
 ## 输入输出格式
 
@@ -115,27 +102,17 @@ runs/xxx/
 ├── layout.svg            矢量布局图（按置信度着色）
 ├── layout.png            布局预览图
 ├── overlay.png           点云 + 检测框叠加图（点云按高度着色；框按置信度着色；
-│                         提供 --gt 时真值框以蓝色虚线叠加，可直观对比偏差）
+│                         真值对比由内部评测工具处理）
 ├── cloud_with_boxes.ply  点云 + box 线框合并 PLY（CloudCompare/MeshLab 直接打开做 3D 检查）
 ├── agent_report.json     agent 决策记录（issue → 动作 → 结果）
-└── eval.json             分阶段评测（提供 --gt 时）
+└── eval.json             分阶段评测（由内部评测工具生成）
 ```
 
 **输出坐标系与输入点云一致**：管线内部的地面对齐（调平/归零）在写出前已逆映射回原始坐标，`boxes.json` / `cloud_with_boxes.ply` 可直接叠在原始点云上使用。
 
-### 3D 交互查看
-
-```bash
-# 打开 Open3D 窗口：点云 + 3D 线框框（绿=high / 黄=mid / 红=low，蓝=真值）
-python -m agentic_gts.cli view --point-cloud room.ply --boxes runs/room1/boxes.json
-
-# 或直接用任意点云软件打开合并 PLY
-# CloudCompare runs/room1/cloud_with_boxes.ply
-```
-
 ## 评测指标
 
-按验收标准实现：**贴边准确率** = 预测 box 边与匹配真值 box 边的垂直误差 < 阈值（默认 5cm，`--edge-thr` 可调）的边占比。同时报告 recall / precision / mean / p90 边误差。
+按验收标准实现：**贴边准确率** = 预测 box 边与匹配真值 box 边的垂直误差 < 阈值的边占比。同时报告 recall / precision / mean / p90 边误差。该指标和阈值配置保留给内部评测工具，不属于生产 CLI 参数。
 
 ## 代码结构
 
@@ -145,15 +122,15 @@ agentic_gts/
 ├── synth/generator.py    合成机房生成器（含四类噪声注入）
 ├── segment/orientation.py 阶段0：yaw 估计 + 布局 bootstrap（footprint / z_top）
 ├── tools/geometry.py     几何工具集（支撑度）
-├── agent/judge.py        VLM 裁判（Qwen3-VL 接口 + mock 降级）
+├── agent/judge.py        VLM 裁判（local 后端；Qwen 兼容接口保留为内部后端）
 ├── agent/ground.py       阶段G：全局 nadir VLM 2D grounding
 ├── agent/mask_refine.py  阶段C：三视角局部细化（SAM2 mask / 切分 / 高度修正）
 ├── agent/loop.py         阶段C：agent 修复循环（诊断→动作→验证→回滚）
 ├── eval/metrics.py       贴边准确率评测
 ├── output/render.py      SVG/PNG 布局图
-├── output/visualize.py   点云+框联合可视化（2D叠加 / 3D交互 / PLY导出）
+├── output/visualize.py   点云+框联合可视化（2D叠加 / PLY导出）
 ├── pipeline.py           全流程编排
-└── cli.py                命令行入口（run / synth / diagnose / view）
+└── cli.py                命令行入口（run）
 tests/                    单元 + 端到端测试
 docs/                     设计方案文档
 ```
@@ -162,7 +139,7 @@ docs/                     设计方案文档
 
 ```bash
 python -m pytest tests/ -q
-# 85 passed
+# 合成数据和评测测试仍由 tests/ 覆盖
 ```
 
 ## 与真实 3DGS pipeline 对接

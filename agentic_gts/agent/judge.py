@@ -11,9 +11,6 @@ Two backends:
                only pays per-call inference. Use when you don't want a
                separate server process (costs ~1-2 min model load at startup
                and the GPU memory is held for the whole pipeline run).
-  - "mock"   : deterministic rule-based fallback (no network), so the whole
-               pipeline runs without any model. This is also the reliability
-               floor / baseline.
 """
 from __future__ import annotations
 
@@ -202,10 +199,12 @@ def _salvage_bboxes(text: str, W: int, H: int) -> list[tuple]:
 
 
 class VLMJudge:
-    def __init__(self, backend: str = "mock",
+    def __init__(self, backend: str = "local",
                  model: str | None = None,
                  api_base: str | None = None, api_key: str | None = None,
                  timeout: int = 60):
+        if backend not in {"local", "qwen"}:
+            raise ValueError(f"unsupported VLM backend: {backend!r}")
         self.backend = backend
         self.model = (model or os.environ.get("VLM_MODEL") or
                       "Qwen/Qwen3-VL-8B-Instruct")
@@ -292,12 +291,10 @@ class VLMJudge:
         """2D grounding over the global top-down view: outline EVERY
         device structure (a joined row = one region).
 
-        Returns pixel rects [(x0, y0, x1, y1)] or [] on mock / failure.
+        Returns pixel rects [(x0, y0, x1, y1)] or [] on failure.
         One call per view, and these regions BECOME the pipeline's
         boxes (high stakes)."""
         prompt = self._GROUND_PROMPT
-        if self.backend == "mock":
-            return []
         try:
             # generous budget: row-heavy rooms return 30+ regions; the
             # old 900/2048 caps TRUNCATED the reply mid-item and the
@@ -382,12 +379,8 @@ class VLMJudge:
         # .replace, NOT .format: the prompt's JSON example carries
         # literal braces ({"candidate_groups": ...}) that str.format
         # parses as a replacement field named '"candidate_groups"'
-        # (quotes included) -> KeyError on EVERY real-VLM call (mock
-        # never formats, so the tests could not catch it)
+        # (quotes included) -> KeyError on every VLM call.
         prompt = self._SAM_BOX_PROMPT.replace("{view_name}", view_name)
-        if self.backend == "mock":
-            return Verdict(action="keep", params={"groups": []},
-                           confidence=0.0, detail="mock: no SAM boxes")
         png = self._array_png_bytes(image)
         if png_path is None:
             png_path = self._save_evidence_png(
@@ -449,9 +442,6 @@ class VLMJudge:
         -- it marks LOW confidence and surfaces the box for human
         review (false-positive deletion is the dangerous direction).
         """
-        if self.backend == "mock":
-            return Verdict(action="keep", params=None, confidence=0.0,
-                           detail="mock: no type signal")
         png = self._array_png_bytes(image)
         if png_path is None:
             png_path = self._save_evidence_png(
@@ -517,10 +507,10 @@ class VLMJudge:
         actual renders). One tiny call: panels labeled A.. in one
         image, reply one letter.         params["pick"] is the panel index or
         None (unparseable -> the caller's rule order stands)."""
-        if self.backend == "mock" or n_panels < 1:
+        if n_panels < 1:
             return Verdict(action="keep", params={"pick": None},
                            confidence=0.0,
-                           detail="mock: no side-pick signal")
+                           detail="no side-view candidates")
         png = self._array_png_bytes(image)
         if png_path is None:
             png_path = self._save_evidence_png(

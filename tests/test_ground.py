@@ -1175,8 +1175,8 @@ def test_parse_ground_regions_salvage():
         '("bbox 2d": [1100, 20, 1200, 900])', 1280, 1024)
     assert big and abs(big[0][2] - 1200.0) < 1e-6
     print("PASS parse salvage (truncated + malformed reply recovered)")
-def test_ground_mock_returns_false():
-    """Mock backend / no VLM -> grounding fails soft: the scene stays
+def test_ground_local_empty_reply_returns_false():
+    """An empty local test-double reply makes grounding fail soft: the scene stays
     EMPTY (there are no fallback boxes without hint input).
     The failure must also be VISIBLE: grounded.png is written with a
     red GROUNDING FAILED banner (previously it only appeared on
@@ -1190,7 +1190,8 @@ def test_ground_mock_returns_false():
     scene.meta["yaw"] = 0.0
     _bootstrap_meta(scene, (-0.5, -0.8, 6.5, 0.8))
     scene.boxes = []
-    judge = VLMJudge(backend="mock")
+    judge = VLMJudge(backend="local")
+    judge._local_image_call = lambda *args, **kwargs: ""
     with tempfile.TemporaryDirectory() as td:
         assert ground.ground_stage(scene, judge, out_dir=td) is False
         gpng = os.path.join(td, "grounded.png")
@@ -1198,7 +1199,7 @@ def test_ground_mock_returns_false():
             "failure audit grounded.png (banner) must be written"
     assert scene.boxes == [], \
         "grounding failure must leave the scene empty (no fallback)"
-    print("PASS grounding fails soft (mock, scene stays empty)")
+    print("PASS grounding fails soft (local empty reply, scene stays empty)")
 def test_merge_adjacent_boxes():
     """Tightly-adjacent over-split pieces of ONE row merge into their
     point-support-refitted union; separate rows with an EMPTY lateral

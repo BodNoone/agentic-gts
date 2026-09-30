@@ -8,23 +8,8 @@ from __future__ import annotations
 
 import argparse
 
-import numpy as np
-
 from agentic_gts.core.models import Scene
 from agentic_gts.pipeline import load_point_cloud, run_pipeline
-from agentic_gts.synth.generator import SynthConfig, generate
-
-
-def cmd_synth(args):
-    cfg = SynthConfig(seed=args.seed)
-    scene, gt, corrupt = generate(cfg)
-    import os
-    os.makedirs(args.out, exist_ok=True)
-    np.save(f"{args.out}/points.npy", scene.points)
-    scene.save_boxes(f"{args.out}/corrupted_boxes.json")
-    s2 = Scene(points=scene.points, boxes=gt)
-    s2.save_boxes(f"{args.out}/gt_boxes.json")
-    print(f"[synth] n_points={len(scene.points)} gt={len(gt)} corrupted={len(corrupt)}")
 
 
 def cmd_run(args):
@@ -36,15 +21,9 @@ def cmd_run(args):
     if mesh:
         print(f"[cli] mesh cloud given ({len(pts)} pts): geometry stages "
               f"run on the mesh, rendering stays 3DGS")
-    if args.gt:
-        # ground-truth boxes share the cloud's coordinate frame; transforming
-        # the cloud alone would desynchronize them. Caller must pre-align.
-        print("[diag][ground] gt boxes given -> skipping auto ground alignment")
-        align_tf = None
-    else:
-        from agentic_gts.pipeline import align_to_ground, denoise_cloud
-        pts = denoise_cloud(pts)
-        pts, align_tf = align_to_ground(pts, return_transform=True)
+    from agentic_gts.pipeline import align_to_ground, denoise_cloud
+    pts = denoise_cloud(pts)
+    pts, align_tf = align_to_ground(pts, return_transform=True)
     scene = Scene(points=pts)
     if align_tf is not None:
         # renders/exports read the RAW gaussian file -- they must apply
@@ -66,11 +45,6 @@ def cmd_run(args):
                   "rendered via Gaussian splatting")
     except Exception as e:
         print(f"[cli] GS detection failed ({type(e).__name__}: {e})")
-    gt_boxes = None
-    if args.gt:
-        gs = Scene(points=scene.points)
-        gs.load_boxes(args.gt)
-        gt_boxes = gs.boxes
     opts = {}
     if args.yaw is not None:
         import math as _math
@@ -81,66 +55,17 @@ def cmd_run(args):
         if getattr(args, "sam_model_cfg", None):
             opts["sam_model_cfg"] = args.sam_model_cfg
         print(f"[cli] local SAM mask refinement enabled: {args.sam_checkpoint}")
-    res = run_pipeline(scene, gt_boxes=gt_boxes,
+    res = run_pipeline(scene,
                        vlm_backend=args.vlm,
-                       vlm_api_base=args.vlm_base,
                        vlm_model=args.vlm_model,
                        opts=opts,
-                       out_dir=args.out,
-                       edge_threshold_m=args.edge_thr)
+                       out_dir=args.out)
     return res
-
-
-def cmd_diagnose(args):
-    """Preprocess a cloud, estimate yaw, render a yaw-diagnosis PNG.
-
-    Use this when the pipeline output looks wrong (e.g. axis-aligned boxes
-    on a rotated room): the PNG shows the device-band points with all
-    candidate yaw arrows and the chosen one, so a hijacked estimate is
-    visible at a glance.
-    """
-    import os
-    from agentic_gts.pipeline import align_to_ground, denoise_cloud
-    from agentic_gts.segment.orientation import estimate_yaw_detailed
-    from agentic_gts.output.visualize import render_yaw_diagnosis
-
-    pts = load_point_cloud(args.point_cloud)
-    if len(pts) == 0:
-        print("[diagnose] empty point cloud, nothing to do")
-        return
-    os.makedirs(args.out, exist_ok=True)
-    pts = denoise_cloud(pts)
-    pts = align_to_ground(pts)
-    info = estimate_yaw_detailed(pts)
-    png = os.path.join(args.out, "yaw_check.png")
-    render_yaw_diagnosis(info["device_pts"], info["candidates"], info["yaw"], png)
-    print(f"[diagnose] chosen yaw = {__import__('math').degrees(info['yaw']):.1f} deg")
-    print(f"[diagnose] visualization -> {png}")
-    print("[diagnose] check: does the RED arrow follow your device rows?")
-
-
-def cmd_view(args):
-    """Open the 3D interactive viewer: point cloud + wireframe boxes."""
-    from agentic_gts.output.visualize import view_3d
-    scene = Scene(points=load_point_cloud(args.point_cloud))
-    if args.boxes:
-        scene.load_boxes(args.boxes)
-    gt_boxes = None
-    if args.gt:
-        gs = Scene(points=scene.points)
-        gs.load_boxes(args.gt)
-        gt_boxes = gs.boxes
-    view_3d(scene, gt_boxes=gt_boxes)
 
 
 def main():
     p = argparse.ArgumentParser(prog="agentic-gts")
     sub = p.add_subparsers(dest="cmd", required=True)
-
-    s = sub.add_parser("synth", help="generate synthetic machine room data")
-    s.add_argument("--seed", type=int, default=42)
-    s.add_argument("--out", default="runs/synth")
-    s.set_defaults(fn=cmd_synth)
 
     r = sub.add_parser("run", help="run pipeline on point cloud")
     r.add_argument("--point-cloud", required=True)
@@ -151,12 +76,8 @@ def main():
                         "fallbacks) runs on the mesh while rendering stays "
                         "3DGS; omitted, the point cloud itself is the "
                         "geometry source")
-    r.add_argument("--gt", default=None, help="optional ground-truth boxes json")
     r.add_argument("--out", default="runs/latest")
-    r.add_argument("--vlm", default="mock", choices=["mock", "qwen", "local"])
-    r.add_argument("--vlm-base", default=None,
-                   help="OpenAI-compatible API base, e.g. http://127.0.0.1:8000/v1 "
-                        "(also env VLM_API_BASE)")
+    r.add_argument("--vlm", default="local", choices=["local"])
     r.add_argument("--vlm-model", default=None,
                    help="served model name (qwen) or local checkpoint dir (local), "
                         "e.g. Qwen/Qwen3-VL-8B-Instruct or /models/qwen3-vl "
@@ -167,21 +88,9 @@ def main():
     r.add_argument("--sam-model-cfg", default=None,
                    help="SAM2 model config (also env SAM_MODEL_CFG); omitted "
                         "for legacy segment-anything")
-    r.add_argument("--edge-thr", type=float, default=0.05)
     r.add_argument("--yaw", type=float, default=None,
                    help="pin device row yaw in degrees (skips estimation)")
     r.set_defaults(fn=cmd_run)
-
-    g = sub.add_parser("diagnose", help="preprocess + yaw check visualization")
-    g.add_argument("--point-cloud", required=True)
-    g.add_argument("--out", default="runs/diag")
-    g.set_defaults(fn=cmd_diagnose)
-
-    v = sub.add_parser("view", help="open 3D viewer: cloud + boxes")
-    v.add_argument("--point-cloud", required=True)
-    v.add_argument("--boxes", default=None)
-    v.add_argument("--gt", default=None)
-    v.set_defaults(fn=cmd_view)
 
     args = p.parse_args()
     args.fn(args)
