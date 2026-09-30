@@ -356,7 +356,7 @@ class VLMJudge:
         "frame). Minor rendering imperfections are NOT poor.\n"
         "Locate every instance that belongs to the following categories: "
         '"server rack / IT cabinet, air-conditioning unit, '
-        'open cabinet door, cable ladder, wall / pillar".\n'
+        'open cabinet door, cable ladder".\n'
         "Instance rules: cabinets joined side by side in one row are "
         "DIFFERENT instances when they differ in height or in color -- "
         "give each its own box at its own boundary; truly identical "
@@ -368,10 +368,6 @@ class VLMJudge:
         "beside or behind the device) is its OWN instance labelled "
         "\"cable ladder\" -- the box covers ONLY the ladder itself, "
         "never any part of a rack or cabinet.\n"
-        "A wall segment, pillar or column (a plain structural slab or "
-        "column, typically white or grey, with no doors, vents, panels "
-        "or cables) is its OWN instance labelled \"wall / pillar\" -- "
-        "the box covers ONLY the structure itself.\n"
         "Each box must cover the whole visible instance it belongs to.\n"
         "Report bbox coordinates in JSON format like this: "
         '{"bbox_2d": [x1, y1, x2, y2], "label": "rack"}'
@@ -436,9 +432,7 @@ class VLMJudge:
         "/ IT cabinet (or a joined row of them) OR an air-conditioning "
         "unit (CRAC / precision cooling)? A pillar, wall segment, cable "
         "tray, UPS unit, pipe, floor patch or any other clutter is NOT "
-        "equipment even when the box fits it well. A plain white or "
-        "grey slab -- a pillar, wall or column with no doors, vents, "
-        "panels or cables -- is NOT equipment. Judge the object, "
+        "equipment even when the box fits it well. Judge the object, "
         "not the box fit.\n"
         "Output ONLY JSON on the last line:\n"
         '{"is_rack": true|false, "confidence": 0.0-1.0}'

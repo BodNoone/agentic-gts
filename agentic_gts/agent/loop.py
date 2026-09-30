@@ -158,7 +158,6 @@ class LayoutAgent:
             # grounding result also decides whether the type-confirm
             # question is worth asking ----
             instances = []
-            audit = {}          # structural flag carrier even without SAM
             if sam.available:
                 try:
                     instances, audit = refine_box(scene, old, self.judge,
@@ -188,32 +187,12 @@ class LayoutAgent:
             # score (>= 0.6) -- asking again would be a redundant third
             # VLM call per box. A cluster box the early gate already
             # confirmed (or rejected) is never re-asked either.
-            # NEVER SKIP on a structural label (wall / pillar, user
-            # report: the final boxes still included pillars and walls
-            # -- the closed category set forced the model to squeeze
-            # them into 'server rack', and that high score is exactly
-            # what must NOT bypass the dedicated question). The label
-            # forces the question; the confirm decides.
-            # EXCEPTION: when the refinement SPLIT the seed into
-            # multiple pieces, the structural label does NOT force the
-            # confirm -- the split itself is evidence that the VLM saw
-            # multiple distinct structures (a single wall/pillar never
-            # grounds as multiple instances). Forcing a single yes/no
-            # on the whole seed view would kill the PRIMARY piece when
-            # the confirm focuses on the structural-labelled short
-            # device beside the tall one (user report: a tall+short
-            # pair split into 2, the confirm answered 'not a rack' on
-            # the mixed view, the primary went LOW, only 1 survived).
             if confirmed_rack:
                 pass                    # early gate already recorded it
             else:
-                structural = bool(audit.get("structural_label")) \
-                    if isinstance(audit, dict) else False
-                split = len(instances) > 1
-                skip_confirm = ((not structural or split)
-                                and bool(instances) and all(
+                skip_confirm = bool(instances) and all(
                     _is_equipment_label(e["label"]) and e["score"] >= 0.6
-                    for e in instances))
+                    for e in instances)
                 if skip_confirm:
                     conf_audits.append({
                         "box_id": old.box_id, "is_rack": True,
