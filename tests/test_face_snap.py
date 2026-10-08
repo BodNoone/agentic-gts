@@ -127,6 +127,22 @@ def test_face_snap_wide_open_door_trims():
           f"(depth {info['depth'][0]:.2f} -> {info['depth'][1]:.2f})")
 
 
+def test_face_snap_inward_accepts_moderate_density_gain_over_open_door():
+    """A real inward cabinet sheet needs only a moderate gain over the
+    open-door tail; outward candidates keep their stricter threshold."""
+    rng = np.random.default_rng(30)
+    pts = np.vstack([
+        _sheet(rng, 0.55, n=1200), _sheet(rng, -0.55, n=1200),
+        _plateau(rng, 0.57, 0.72, n=700),
+        _floor(rng)])
+    b = _box(0.70)
+    nb, info = snap_box_faces(b, pts)
+    assert info["moved"], info
+    assert abs(info["front"][1] - 0.55) < 0.06, info
+    assert abs(nb.size[1] - 1.11) < 0.08, nb.size
+    print("PASS face snap accepts moderate inward gain over open door")
+
+
 def test_face_snap_strictly_prefers_inward_sheet_over_near_outer_peak():
     """A valid inward device sheet wins over a closer exterior peak."""
     rng = np.random.default_rng(25)
