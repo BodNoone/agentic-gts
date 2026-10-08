@@ -143,6 +143,22 @@ def test_face_snap_inward_accepts_moderate_density_gain_over_open_door():
     print("PASS face snap accepts moderate inward gain over open door")
 
 
+def test_face_snap_inward_accepts_slightly_weaker_sheet_than_door_edge():
+    """Door/edge spill can make the old-face bin denser than the real
+    cabinet sheet; inward search should still recover the cabinet face."""
+    rng = np.random.default_rng(31)
+    pts = np.vstack([
+        _sheet(rng, 0.55, n=900), _sheet(rng, -0.55, n=1500),
+        _plateau(rng, 0.57, 0.72, n=1800),
+        _floor(rng)])
+    b = _box(0.70)
+    nb, info = snap_box_faces(b, pts)
+    assert info["moved"], info
+    assert abs(info["front"][1] - 0.55) < 0.10, info
+    assert nb.size[1] < b.size[1], (b.size, nb.size)
+    print("PASS face snap recovers weaker inward sheet behind open door")
+
+
 def test_face_snap_strictly_prefers_inward_sheet_over_near_outer_peak():
     """A valid inward device sheet wins over a closer exterior peak."""
     rng = np.random.default_rng(25)
@@ -206,7 +222,7 @@ def test_low_device_does_not_snap_to_partial_tall_ladder():
     # The genuine body sheet may still pull the face inward; the guard must
     # prevent the nearby ladder from becoming the accepted exterior sheet.
     assert info["moved"], info
-    assert abs(info["front"][1] - 0.55) < 0.03, info
+    assert abs(info["front"][1] - 0.45) < 0.03, info
     assert abs(nb.center[1] - low.center[1]) < 0.06
     print("PASS low device rejects partial tall ladder")
 
