@@ -406,11 +406,6 @@ _FACE_SNAP_OUT = 0.15
 # under the face sheets
 _FACE_SNAP_TAU = 0.50
 _FACE_SNAP_ABS = 0.25
-# A snap is a boundary correction, not a nearest-peak operation. The new
-# sheet must beat the density already present at the old face by this margin
-# when there is measurable old-face mass.
-_FACE_SNAP_GAIN_INWARD = 0.90
-_FACE_SNAP_GAIN_OUTWARD = 1.25
 # the END rule's bar is LOWER: it separates the plateau from mask
 # bleed (a ~20:1 contrast), while the cross rule separates competing
 # peaks (2:1) -- 50% of a fluctuating window max sits inside the
@@ -594,40 +589,7 @@ def snap_box_faces(box: OrientedBox,
             cand = _peaks(*outward, side)
         if len(cand):
             d = np.abs(centers[cand] - face_pos)
-            if is_inward:
-                # Prefer narrow sheet peaks over the broad, dense edge of
-                # an open-door plateau. Candidate width is measured at half
-                # height in the band-smoothed profile.
-                widths = []
-                for idx in cand:
-                    level = 0.5 * float(band[idx])
-                    lo = hi = int(idx)
-                    while lo > 0 and band[lo - 1] >= level:
-                        lo -= 1
-                    while hi + 1 < len(band) and band[hi + 1] >= level:
-                        hi += 1
-                    widths.append(hi - lo + 1)
-                narrow = np.flatnonzero(np.asarray(widths) <= 3)
-                if len(narrow):
-                    cand = cand[narrow]
-                    d = np.abs(centers[cand] - face_pos)
-                raw_peak = hist[cand]
-                best = np.flatnonzero(raw_peak == raw_peak.max())
-                chosen = int(cand[best[int(np.argmin(d[best]))]])
-            else:
-                chosen = int(cand[int(np.argmin(d))])
-            # A similar-density peak is not a clearer boundary. Compare
-            # against the old face neighbourhood, excluding the proposed
-            # sheet itself, and keep the original face when there is no
-            # meaningful density gain.
-            old_zone = ((np.abs(centers - face_pos) <= _FACE_BAND)
-                        & (np.abs(centers - centers[chosen]) > _FACE_BAND))
-            old_peak = int(band[old_zone].max()) if old_zone.any() else 0
-            new_peak = int(band[chosen])
-            gain = (_FACE_SNAP_GAIN_INWARD if is_inward
-                    else _FACE_SNAP_GAIN_OUTWARD)
-            if old_peak > 0 and new_peak < gain * old_peak:
-                return face_pos
+            chosen = int(cand[int(np.argmin(d))])
             if not _height_boundary_ok(box, pts, axis, cross,
                                        along_c, float(centers[chosen])):
                 return face_pos

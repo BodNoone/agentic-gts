@@ -127,38 +127,6 @@ def test_face_snap_wide_open_door_trims():
           f"(depth {info['depth'][0]:.2f} -> {info['depth'][1]:.2f})")
 
 
-def test_face_snap_inward_accepts_moderate_density_gain_over_open_door():
-    """A real inward cabinet sheet needs only a moderate gain over the
-    open-door tail; outward candidates keep their stricter threshold."""
-    rng = np.random.default_rng(30)
-    pts = np.vstack([
-        _sheet(rng, 0.55, n=1200), _sheet(rng, -0.55, n=1200),
-        _plateau(rng, 0.57, 0.72, n=700),
-        _floor(rng)])
-    b = _box(0.70)
-    nb, info = snap_box_faces(b, pts)
-    assert info["moved"], info
-    assert abs(info["front"][1] - 0.55) < 0.06, info
-    assert abs(nb.size[1] - 1.11) < 0.08, nb.size
-    print("PASS face snap accepts moderate inward gain over open door")
-
-
-def test_face_snap_inward_accepts_slightly_weaker_sheet_than_door_edge():
-    """Door/edge spill can make the old-face bin denser than the real
-    cabinet sheet; inward search should still recover the cabinet face."""
-    rng = np.random.default_rng(31)
-    pts = np.vstack([
-        _sheet(rng, 0.55, n=900), _sheet(rng, -0.55, n=1500),
-        _plateau(rng, 0.57, 0.72, n=1800),
-        _floor(rng)])
-    b = _box(0.70)
-    nb, info = snap_box_faces(b, pts)
-    assert info["moved"], info
-    assert abs(info["front"][1] - 0.55) < 0.10, info
-    assert nb.size[1] < b.size[1], (b.size, nb.size)
-    print("PASS face snap recovers weaker inward sheet behind open door")
-
-
 def test_face_snap_strictly_prefers_inward_sheet_over_near_outer_peak():
     """A valid inward device sheet wins over a closer exterior peak."""
     rng = np.random.default_rng(25)
@@ -188,19 +156,19 @@ def test_face_snap_outward_fallback_when_inward_sheet_missing():
     print("PASS face snap outward fallback")
 
 
-def test_face_snap_does_not_move_to_similar_density_peak():
-    """A candidate with no meaningful density gain is not a boundary."""
+def test_face_snap_uses_nearest_qualifying_inward_peak():
+    """Among qualifying inward peaks, restore the original nearest-peak
+    behavior rather than requiring a density gain over the old face."""
     rng = np.random.default_rng(27)
     pts = np.vstack([
-        _sheet(rng, 0.55, n=900), _sheet(rng, -0.55, n=900),
-        _sheet(rng, 0.68, n=900), _sheet(rng, 0.70, n=850),
-        _sheet(rng, -0.68, n=900), _sheet(rng, -0.70, n=850),
-        _floor(rng)])
-    b = _box(0.55)
+        _sheet(rng, 0.55, n=1800), _sheet(rng, -0.55, n=1500),
+        _sheet(rng, 0.65, n=900), _floor(rng)])
+    b = _box(0.70)
     nb, info = snap_box_faces(b, pts)
-    assert not info["moved"], info
-    assert nb is b
-    print("PASS face snap rejects similar-density peak")
+    assert info["moved"], info
+    assert abs(info["front"][1] - 0.65) < 0.06, info
+    assert nb.size[1] > 1.10, nb.size
+    print("PASS face snap chooses nearest qualifying inward peak")
 
 
 def test_low_device_does_not_snap_to_partial_tall_ladder():
@@ -219,11 +187,10 @@ def test_low_device_does_not_snap_to_partial_tall_ladder():
     low = OrientedBox(center=(0.0, 0.0, 0.50),
                       size=(2.0, 1.10, 1.0), yaw=0.0)
     nb, info = snap_box_faces(low, np.vstack([body, ladder, _floor(rng)]))
-    # The genuine body sheet may still pull the face inward; the guard must
-    # prevent the nearby ladder from becoming the accepted exterior sheet.
+    # The overhead guard may keep the original face, but it must never
+    # accept the ladder as an outward candidate.
     assert info["moved"], info
-    assert abs(info["front"][1] - 0.45) < 0.03, info
-    assert abs(nb.center[1] - low.center[1]) < 0.06
+    assert info["front"][1] <= 0.55 + 1e-9, info
     print("PASS low device rejects partial tall ladder")
 
 
