@@ -429,7 +429,8 @@ _FACE_SNAP_MIN_D, _FACE_SNAP_MAX_D = 0.30, 2.50
 def _height_boundary_ok(box: OrientedBox, pts: np.ndarray,
                         axis: np.ndarray, cross: np.ndarray,
                         along: float, cross_pos: float,
-                        end_profile: bool = False) -> bool:
+                        end_profile: bool = False,
+                        inward: bool = False) -> bool:
     """Reject candidate sheets dominated by overhead ladder geometry."""
     c = np.asarray(box.center, dtype=float)
     half = np.asarray(box.size, dtype=float) / 2.0
@@ -437,7 +438,9 @@ def _height_boundary_ok(box: OrientedBox, pts: np.ndarray,
     along_p = p[:, :2] @ axis
     cross_p = p[:, :2] @ cross
     m = ((np.abs(along_p - along) <= (max(_FACE_BAND, 0.06)
-                                     if end_profile else half[0] + 0.05))
+                                     if end_profile
+                                     else max(0.30, min(0.80,
+                                                        0.25 * box.size[0]))))
          & (np.abs(cross_p - cross_pos) <= (half[1] + 0.05
                                             if end_profile
                                             else max(_FACE_BAND, 0.06)))
@@ -455,11 +458,12 @@ def _height_boundary_ok(box: OrientedBox, pts: np.ndarray,
     # candidate slice, so a majority-only test is too weak. A coherent
     # group of high points is enough to reject the candidate, even when the
     # overall box height would not change.
-    if overhead >= 8 and float(np.percentile(high, 95)) > top + 0.15:
+    if not inward and overhead >= 8 \
+            and float(np.percentile(high, 95)) > top + 0.15:
         return False
     # A candidate whose evidence is mostly above the current device top is
     # also more likely a cable ladder/tray than a device boundary.
-    return overhead <= max(8, int(0.50 * body))
+    return inward or overhead <= max(8, int(0.50 * body))
 
 
 def _trim_sparse_top(box: OrientedBox, pts: np.ndarray):
@@ -590,8 +594,9 @@ def snap_box_faces(box: OrientedBox,
         if len(cand):
             d = np.abs(centers[cand] - face_pos)
             chosen = int(cand[int(np.argmin(d))])
-            if not _height_boundary_ok(box, pts, axis, cross,
-                                       along_c, float(centers[chosen])):
+            if not _height_boundary_ok(
+                    box, pts, axis, cross, along_c,
+                    float(centers[chosen]), inward=is_inward):
                 return face_pos
             return float(centers[chosen])
         return face_pos
