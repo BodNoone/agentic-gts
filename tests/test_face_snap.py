@@ -171,6 +171,24 @@ def test_face_snap_uses_strongest_qualifying_inward_peak():
     print("PASS face snap chooses strongest qualifying inward peak")
 
 
+def test_face_snap_recovers_when_initial_face_has_no_points():
+    """A grossly oversized seed face with no local mass must still find
+    the strongest device sheet inside its thickness-scaled search range."""
+    rng = np.random.default_rng(33)
+    pts = np.vstack([
+        _sheet(rng, 0.45, n=1200), _sheet(rng, -0.45, n=1200),
+        _floor(rng)])
+    # Initial faces are +/-0.90, with no points there; actual sheets are
+    # at +/-0.45 and fall within 2/3 of the initial 1.8m depth.
+    box = _box(0.90)
+    nb, info = snap_box_faces(box, pts)
+    assert info["moved"], info
+    assert abs(info["front"][1] - 0.45) < 0.06, info
+    assert abs(info["back"][1] + 0.45) < 0.06, info
+    assert abs(nb.size[1] - 0.90) < 0.10, nb.size
+    print("PASS face snap recovers empty oversized initial faces")
+
+
 def test_low_device_does_not_snap_to_partial_tall_ladder():
     """A nearby tall ladder may be only a small part of the slice, but
     its high local z extent must still reject the face candidate."""

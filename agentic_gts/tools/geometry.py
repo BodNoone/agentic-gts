@@ -559,7 +559,8 @@ def snap_box_faces(box: OrientedBox,
     if gmax <= 0:
         return box, {"moved": False, "reason": "empty profile"}
 
-    def _peaks(win_lo: float, win_hi: float, side: int) -> np.ndarray:
+    def _peaks(win_lo: float, win_hi: float, side: int,
+               empty_face: bool = False) -> np.ndarray:
         # Keep each face on its own side of the box centre. Without this
         # guard, an under-measured front face can see the back sheet in its
         # large inward window and produce an invalid negative depth.
@@ -568,8 +569,15 @@ def snap_box_faces(box: OrientedBox,
                      else (centers <= cross_c)))
         if not in_win.any():
             return np.empty(0, dtype=np.int64)
-        thr = max(_FACE_SNAP_TAU * float(band[in_win].max()),
-                  _FACE_SNAP_ABS * gmax)
+        if empty_face:
+            # A grossly oversized seed can have almost no points on its
+            # current face. In that case, recover the strongest interior
+            # device sheet without requiring the absent face to provide a
+            # meaningful local-density reference.
+            thr = max(0.15 * float(band[in_win].max()), 0.10 * gmax)
+        else:
+            thr = max(_FACE_SNAP_TAU * float(band[in_win].max()),
+                      _FACE_SNAP_ABS * gmax)
         is_peak = np.ones(len(band), dtype=bool)
         is_peak[1:-1] = ((band[1:-1] >= band[:-2])
                          & (band[1:-1] >= band[2:]))
@@ -579,7 +587,11 @@ def snap_box_faces(box: OrientedBox,
               outward: tuple[float, float], side: int) -> float:
         # Strict shrink-first: a valid inward sheet wins even if an
         # exterior peak is closer to the current face.
-        cand = _peaks(*inward, side)
+        face_zone = np.abs(centers - face_pos) <= _FACE_BAND
+        current_face_density = (float(band[face_zone].max())
+                                if face_zone.any() else 0.0)
+        empty_face = current_face_density <= 0.10 * gmax
+        cand = _peaks(*inward, side, empty_face=empty_face)
         is_inward = bool(len(cand))
         if not is_inward:
             cand = _peaks(*outward, side)
