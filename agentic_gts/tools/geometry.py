@@ -599,6 +599,8 @@ def snap_box_faces(box: OrientedBox,
     if gmax <= 0:
         return box, {"moved": False, "reason": "empty profile"}
 
+    debug = []
+
     def _peaks(win_lo: float, win_hi: float, side: int,
                empty_face: bool = False) -> np.ndarray:
         # Keep each face on its own side of the box centre. Without this
@@ -633,8 +635,24 @@ def snap_box_faces(box: OrientedBox,
         empty_face = current_face_density <= 0.10 * gmax
         cand = _peaks(*inward, side, empty_face=empty_face)
         is_inward = bool(len(cand))
+        searched = "inward"
         if not is_inward:
             cand = _peaks(*outward, side)
+            searched = "outward"
+        rec = {
+            "face": "front" if side > 0 else "back",
+            "old": round(float(face_pos), 3),
+            "inward_range": [round(float(inward[0]), 3),
+                             round(float(inward[1]), 3)],
+            "outward_range": [round(float(outward[0]), 3),
+                              round(float(outward[1]), 3)],
+            "profile_points": int(m.sum()),
+            "gmax": int(gmax),
+            "face_density": round(current_face_density, 1),
+            "empty_face": bool(empty_face),
+            "searched": searched,
+            "candidate_count": int(len(cand)),
+        }
         if len(cand):
             d = np.abs(centers[cand] - face_pos)
             if is_inward:
@@ -643,14 +661,24 @@ def snap_box_faces(box: OrientedBox,
                 chosen = int(cand[strongest[int(np.argmin(d[strongest]))]])
             else:
                 chosen = int(cand[int(np.argmin(d))])
+            rec["candidate_peak"] = int(band[chosen])
+            rec["candidate"] = round(float(centers[chosen]), 3)
             # Inward candidates are already inside the current box and
             # identify its device surface. Overhead geometry must not veto
             # this recovery path; the height guard is for outward growth.
             if not is_inward and not _height_boundary_ok(
                     box, pts, axis, cross, along_c,
                     float(centers[chosen])):
+                rec["accepted"] = False
+                rec["reason"] = "outward_height_guard"
+                debug.append(rec)
                 return face_pos
+            rec["accepted"] = True
+            debug.append(rec)
             return float(centers[chosen])
+        rec["accepted"] = False
+        rec["reason"] = "no_qualifying_peak"
+        debug.append(rec)
         return face_pos
 
     front, back = cross_c + half_d, cross_c - half_d
@@ -668,11 +696,13 @@ def snap_box_faces(box: OrientedBox,
     if not mb:
         b1 = back
     if not (mf or mb):
-        return box, {"moved": False, "reason": "already on the sheets"}
+        return box, {"moved": False, "reason": "already on the sheets",
+                     "debug": debug}
     depth, old_depth = f1 - b1, 2.0 * half_d
     if not (_FACE_SNAP_MIN_D <= depth <= _FACE_SNAP_MAX_D):
         return box, {"moved": False,
-                     "reason": f"snapped depth {depth:.2f} out of bounds"}
+                     "reason": f"snapped depth {depth:.2f} out of bounds",
+                     "debug": debug}
     new_cross_c = 0.5 * (f1 + b1)
     dxy = cross * (new_cross_c - cross_c)
     new_box = OrientedBox(
@@ -684,7 +714,8 @@ def snap_box_faces(box: OrientedBox,
     info = {"moved": True,
             "depth": [round(old_depth, 3), round(depth, 3)],
             "front": [round(front, 3), round(f1, 3)],
-            "back": [round(back, 3), round(b1, 3)]}
+            "back": [round(back, 3), round(b1, 3)],
+            "debug": debug}
     return new_box, info
 
 
@@ -1115,6 +1146,8 @@ def snap_faces_to_mesh(scene: Scene) -> int:
                       f"right {einfo['right'][0]:.2f} -> "
                       f"{einfo['right'][1]:.2f})")
             nb2, finfo = snap_box_faces(nb, pts[own])
+            if finfo.get("debug"):
+                nb2.meta["face_snap_debug"] = finfo["debug"]
             if finfo.get("moved"):
                 nb2.meta["face_snap"] = finfo
                 print(f"[stageF] {nb2.box_id[:6]} face snap: depth "
