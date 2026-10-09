@@ -9,8 +9,9 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agentic_gts.agent.mask_refine import (
     BoxGroup, SamPredictorAdapter, parse_box_groups,
-    refine_box, _anchored_top, _pick_piece_top,
+    refine_box, _anchored_top, _pick_piece_top, _face_views_ladder_only,
 )
+from agentic_gts.agent.judge import VLMJudge, Verdict
 from agentic_gts.core.models import OrientedBox, Scene
 def _column(bins: list[tuple[float, float, int]], seed: int = 0):
     """Build a synthetic z-column: [(z0, z1, per-bin count)] -> points
@@ -2141,6 +2142,59 @@ def test_side_ladder_fallback_marks_unavailable():
     roles = [v.get("role") for v in audit["views"]]
     assert "depth_profile-unavailable" in roles, roles
     print("PASS side ladder fallback (audit marked unavailable)")
+
+
+def test_face_views_ladder_only_rejects_seed_before_side_rescue():
+    """A side-view device false positive cannot rescue a seed that both
+    face views identified exclusively as cable ladder."""
+    from agentic_gts.agent.mask_refine import (
+        _face_views_ladder_only, refine_box)
+
+    audits = [
+        {"view": "front", "groups": [
+            {"hypothesis": "cable ladder"}]},
+        {"view": "back", "groups": [
+            {"hypothesis": "vertical cable tray"}]},
+    ]
+    assert _face_views_ladder_only(audits)
+    assert not _face_views_ladder_only([
+        *audits,
+        {"view": "back", "groups": [{"hypothesis": "server rack"}]},
+    ])
+
+    # Verify the early exit occurs before side grounding is called.
+    from agentic_gts.agent import mask_refine as mr
+    box = OrientedBox(center=(0, 0, 1), size=(2, 1, 2))
+    scene = Scene(points=np.zeros((0, 3)))
+    views = [
+        {"name": "front", "image": _quality_image(), "path": None},
+        {"name": "side", "image": _quality_image(), "path": None},
+    ]
+    old_voters = mr._voter_spans
+    old_render = mr.render_local_views
+    old_side_call = getattr(VLMJudge, "adjudicate_sam_boxes", None)
+    def fake_voter(scene, box, view, judge, sam, out_dir, audit):
+        audit["views"].append({
+            "view": view["name"], "groups": [
+                {"hypothesis": "cable ladder"}]})
+        return []
+    mr._voter_spans = fake_voter
+    mr.render_local_views = lambda *a, **k: views
+    judge = VLMJudge(backend="local")
+    judge.adjudicate_sam_boxes = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("side grounding must not rescue a ladder-only seed"))
+    try:
+        pieces, audit = refine_box(scene, box, judge,
+                                   SamPredictorAdapter(checkpoint="fake.pt"),
+                                   views=views)
+    finally:
+        mr._voter_spans = old_voters
+        mr.render_local_views = old_render
+        if old_side_call is not None:
+            VLMJudge.adjudicate_sam_boxes = old_side_call
+    assert pieces == []
+    assert audit["rejected_ladder_seed"]
+    print("PASS face-only ladder seed rejected before side rescue")
 
 
 def test_neighbour_suppression_ownership():

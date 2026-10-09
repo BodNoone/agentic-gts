@@ -1859,6 +1859,16 @@ def _is_subtractive(label) -> bool:
     return _is_door(label) or _is_ladder(label)
 
 
+def _face_views_ladder_only(view_audits: list[dict]) -> bool:
+    """True when front/back views see ladders but no device instances."""
+    groups = [g for v in view_audits
+              if v.get("view") in ("front", "back")
+              for g in v.get("groups", [])]
+    return (any(_is_ladder(g.get("hypothesis")) for g in groups)
+            and not any(not _is_subtractive(g.get("hypothesis"))
+                        for g in groups))
+
+
 def _door_union(image: np.ndarray, groups: list, sam: SamPredictorAdapter
                 ) -> np.ndarray | None:
     """Pixel union of the SAM masks of every SUBTRACTIVE-class box
@@ -2204,6 +2214,13 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     for voter in voters:
         spans.extend(_voter_spans(scene, box, voter, judge, sam,
                                   out_dir, audit))
+    if _face_views_ladder_only(audit["views"]):
+        audit["reason"] = "front/back views detected only cable ladder"
+        audit["rejected_ladder_seed"] = True
+        print(f"[mask-refine] {box.box_id[:6]} rejected: front/back "
+              "views identified only cable ladder; side evidence cannot "
+              "promote it to a device")
+        return [], audit
     spans = _merge_cross_view(spans, axis, along0)
     front_ok = bool(spans)
     if not front_ok:
