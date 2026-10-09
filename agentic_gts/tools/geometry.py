@@ -367,6 +367,7 @@ def filter_structural_by_geometry(scene: Scene) -> int:
 
 _LOW_FURNITURE_MAX_H = 1.20
 _LOW_FURNITURE_MIN_FOOTPRINT = 0.45
+_LOW_FURNITURE_SOLID_SUPPORT = 0.25
 
 
 def filter_low_furniture_by_geometry(scene: Scene) -> int:
@@ -387,6 +388,11 @@ def filter_low_furniture_by_geometry(scene: Scene) -> int:
                 or min(w, d) < _LOW_FURNITURE_MIN_FOOTPRINT):
             continue
         if has_overhead_structure(scene, b):
+            continue
+        # Low battery cabinets and similar equipment can lack overhead
+        # trays. Dense 3D surface support distinguishes their cabinet-like
+        # body from sparse-legged furniture such as tables and chairs.
+        if support_fraction(scene, b) >= _LOW_FURNITURE_SOLID_SUPPORT:
             continue
         b.confidence = Confidence.LOW
         b.meta["low_furniture_geom"] = {

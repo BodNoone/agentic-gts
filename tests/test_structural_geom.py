@@ -102,7 +102,11 @@ def test_low_furniture_filter_drops_low_raw_box_but_keeps_refined_piece():
     raw = _box(0.0, 0.0, 0.9, w=1.2, d=0.7)
     refined = _box(5.0, 0.0, 0.9, w=1.2, d=0.7)
     refined.source = BoxSource.AGENT_FIX
-    scene = Scene(points=np.zeros((10, 3)))
+    # Sparse low furniture points: a few tabletop / leg samples only.
+    sparse = np.column_stack([rng.uniform(-0.6, 0.6, 50),
+                              rng.uniform(-0.35, 0.35, 50),
+                              rng.uniform(0.05, 0.9, 50)])
+    scene = Scene(points=sparse)
     scene.boxes = [raw, refined]
     n = filter_low_furniture_by_geometry(scene)
     assert n == 1
@@ -110,3 +114,24 @@ def test_low_furniture_filter_drops_low_raw_box_but_keeps_refined_piece():
     assert "low_furniture_geom" in raw.meta
     assert refined.confidence != Confidence.LOW
     print("PASS low furniture filter protects refined pieces")
+
+
+def test_low_furniture_filter_keeps_solid_battery_cabinet_without_trays():
+    rng = np.random.default_rng(46)
+    battery = _box(0.0, 0.0, 0.9, w=0.8, d=0.65)
+    # Dense samples on the cabinet's four vertical body faces.
+    faces = []
+    for x in (-0.4, 0.4):
+        faces.append(np.column_stack([
+            np.full(700, x), rng.uniform(-0.325, 0.325, 700),
+            rng.uniform(0.0, 0.9, 700)]))
+    for y in (-0.325, 0.325):
+        faces.append(np.column_stack([
+            rng.uniform(-0.4, 0.4, 700), np.full(700, y),
+            rng.uniform(0.0, 0.9, 700)]))
+    scene = Scene(points=np.vstack(faces))
+    scene.boxes = [battery]
+    n = filter_low_furniture_by_geometry(scene)
+    assert n == 0
+    assert "low_furniture_geom" not in battery.meta
+    print("PASS low furniture filter keeps solid battery cabinet")
