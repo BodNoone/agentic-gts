@@ -194,6 +194,28 @@ def test_low_device_does_not_snap_to_partial_tall_ladder():
     print("PASS low device rejects partial tall ladder")
 
 
+def test_inward_face_snap_ignores_overhead_height_guard():
+    """Overhead ladder points must not veto recovery to an inward device
+    sheet; the height guard is reserved for outward candidate growth."""
+    rng = np.random.default_rng(32)
+    body = np.vstack([
+        _sheet(rng, 0.45, n=1500, z_lo=0.30, z_hi=0.95),
+        _sheet(rng, -0.45, n=1500, z_lo=0.30, z_hi=0.95),
+    ])
+    ladder = np.column_stack([
+        rng.uniform(-0.4, 0.4, 300),
+        rng.uniform(0.43, 0.47, 300),
+        rng.uniform(1.10, 2.60, 300),
+    ])
+    low = OrientedBox(center=(0.0, 0.0, 0.50),
+                      size=(2.0, 1.30, 1.0), yaw=0.0)
+    nb, info = snap_box_faces(low, np.vstack([body, ladder, _floor(rng)]))
+    assert info["moved"], info
+    assert abs(info["front"][1] - 0.45) < 0.04, info
+    assert nb.size[1] < low.size[1]
+    print("PASS inward face snap ignores overhead height guard")
+
+
 def test_top_trim_removes_sparse_overhead_tail():
     """A low-density tail above the body is trimmed, never extended."""
     rng = np.random.default_rng(28)

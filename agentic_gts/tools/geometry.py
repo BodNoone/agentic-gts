@@ -423,8 +423,7 @@ _FACE_SNAP_MIN_D, _FACE_SNAP_MAX_D = 0.30, 2.50
 def _height_boundary_ok(box: OrientedBox, pts: np.ndarray,
                         axis: np.ndarray, cross: np.ndarray,
                         along: float, cross_pos: float,
-                        end_profile: bool = False,
-                        inward: bool = False) -> bool:
+                        end_profile: bool = False) -> bool:
     """Reject candidate sheets dominated by overhead ladder geometry."""
     c = np.asarray(box.center, dtype=float)
     half = np.asarray(box.size, dtype=float) / 2.0
@@ -452,12 +451,11 @@ def _height_boundary_ok(box: OrientedBox, pts: np.ndarray,
     # candidate slice, so a majority-only test is too weak. A coherent
     # group of high points is enough to reject the candidate, even when the
     # overall box height would not change.
-    if not inward and overhead >= 8 \
-            and float(np.percentile(high, 95)) > top + 0.15:
+    if overhead >= 8 and float(np.percentile(high, 95)) > top + 0.15:
         return False
     # A candidate whose evidence is mostly above the current device top is
     # also more likely a cable ladder/tray than a device boundary.
-    return inward or overhead <= max(8, int(0.50 * body))
+    return overhead <= max(8, int(0.50 * body))
 
 
 def _trim_sparse_top(box: OrientedBox, pts: np.ndarray):
@@ -593,9 +591,12 @@ def snap_box_faces(box: OrientedBox,
                 chosen = int(cand[strongest[int(np.argmin(d[strongest]))]])
             else:
                 chosen = int(cand[int(np.argmin(d))])
-            if not _height_boundary_ok(
+            # Inward candidates are already inside the current box and
+            # identify its device surface. Overhead geometry must not veto
+            # this recovery path; the height guard is for outward growth.
+            if not is_inward and not _height_boundary_ok(
                     box, pts, axis, cross, along_c,
-                    float(centers[chosen]), inward=is_inward):
+                    float(centers[chosen])):
                 return face_pos
             return float(centers[chosen])
         return face_pos
