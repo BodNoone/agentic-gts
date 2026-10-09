@@ -366,6 +366,7 @@ def filter_structural_by_geometry(scene: Scene) -> int:
 
 
 _LOW_FURNITURE_MAX_H = 1.20
+_LOW_FURNITURE_MIN_FOOTPRINT = 0.45
 
 
 def filter_low_furniture_by_geometry(scene: Scene) -> int:
@@ -382,7 +383,8 @@ def filter_low_furniture_by_geometry(scene: Scene) -> int:
             continue
         h = float(b.size[2])
         w, d = float(b.size[0]), float(b.size[1])
-        if h > _LOW_FURNITURE_MAX_H or min(w, d) < 0.25:
+        if (h > _LOW_FURNITURE_MAX_H
+                or min(w, d) < _LOW_FURNITURE_MIN_FOOTPRINT):
             continue
         if has_overhead_structure(scene, b):
             continue
