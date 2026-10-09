@@ -365,6 +365,38 @@ def filter_structural_by_geometry(scene: Scene) -> int:
     return n
 
 
+_LOW_FURNITURE_MAX_H = 1.20
+
+
+def filter_low_furniture_by_geometry(scene: Scene) -> int:
+    """Mark likely tables/benches/chairs for removal.
+
+    This conservative filter only targets low, unrefined boxes without
+    overhead device infrastructure. SAM/VLM-adopted pieces are retained for
+    review because they have stronger semantic evidence than a raw global
+    grounding box.
+    """
+    n = 0
+    for b in scene.boxes:
+        if b.source == BoxSource.AGENT_FIX:
+            continue
+        h = float(b.size[2])
+        w, d = float(b.size[0]), float(b.size[1])
+        if h > _LOW_FURNITURE_MAX_H or min(w, d) < 0.25:
+            continue
+        if has_overhead_structure(scene, b):
+            continue
+        b.confidence = Confidence.LOW
+        b.meta["low_furniture_geom"] = {
+            "height": round(h, 2),
+            "footprint": [round(w, 2), round(d, 2)],
+            "reason": "low box without overhead device infrastructure "
+                      "(table/bench/chair signature)",
+        }
+        n += 1
+    return n
+
+
 # ---------- final face polish (stageF: mesh-driven thickness snap) ----------
 
 def aabb_gap_xy(a: "OrientedBox", b: "OrientedBox") -> float:

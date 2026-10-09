@@ -9,9 +9,10 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from agentic_gts.core.models import (Confidence, OrientedBox, Scene)
-from agentic_gts.tools.geometry import (filter_structural_by_geometry,
-                                         has_overhead_structure)
+from agentic_gts.core.models import (BoxSource, Confidence, OrientedBox, Scene)
+from agentic_gts.tools.geometry import (
+    filter_low_furniture_by_geometry, filter_structural_by_geometry,
+    has_overhead_structure)
 
 
 def _box(cx, cy, h, w=1.1, d=0.6):
@@ -94,3 +95,18 @@ def test_has_overhead_structure():
     assert not has_overhead_structure(far_scene, box), \
         "points above but outside the footprint -> no overhead"
     print("PASS has_overhead_structure (band + footprint check)")
+
+
+def test_low_furniture_filter_drops_low_raw_box_but_keeps_refined_piece():
+    rng = np.random.default_rng(45)
+    raw = _box(0.0, 0.0, 0.9, w=1.2, d=0.7)
+    refined = _box(5.0, 0.0, 0.9, w=1.2, d=0.7)
+    refined.source = BoxSource.AGENT_FIX
+    scene = Scene(points=np.zeros((10, 3)))
+    scene.boxes = [raw, refined]
+    n = filter_low_furniture_by_geometry(scene)
+    assert n == 1
+    assert raw.confidence == Confidence.LOW
+    assert "low_furniture_geom" in raw.meta
+    assert refined.confidence != Confidence.LOW
+    print("PASS low furniture filter protects refined pieces")

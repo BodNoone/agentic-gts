@@ -673,6 +673,14 @@ def run_pipeline(scene: Scene,
         print(f"[stageF] structural geometry filter: {n_struct} "
               f"box(es) flagged (tall + no overhead trays)")
 
+    from agentic_gts.tools.geometry import filter_low_furniture_by_geometry
+    n_furniture = filter_low_furniture_by_geometry(scene)
+    if n_furniture:
+        scene.boxes = [b for b in scene.boxes
+                       if not b.meta.get("low_furniture_geom")]
+        print(f"[out] dropped {n_furniture} low-furniture box(es) "
+              f"(low height + no overhead device infrastructure)")
+
     # --- final frame: back to the INPUT coordinates (user report) ---
     # (see _map_outputs_to_input_frame)
     _map_outputs_to_input_frame(scene)
