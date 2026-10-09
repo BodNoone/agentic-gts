@@ -382,20 +382,14 @@ _FACE_BIN = 0.03
 # a mesh-sampled face sheet is 2-5cm thick: aggregate this much cross
 # extent into one "face strength" sample (single bins split a sheet)
 _FACE_BAND = 0.06
-# per-face search windows, ASYMMETRIC. CROSS faces: the inward window
-# is DOOR-SIZED (user report: a wide-open door pushes the face
-# 0.6-1.0m out -- with the old 0.35m window the true sheet sat outside
-# it, and the strength bars went self-referential over the door's
-# plateau, leaving the face stuck on the door); 1.20m covers a 1.0m
-# door plus bleed margin. The nearest-qualifying-peak rule keeps the
-# wide window safe: the own sheet is always the nearest strong peak to
-# a door-inflated face, interior structure spreads into sub-bar
-# plateaus, and other boxes' points never enter the profile. OUTWARD
-# stays tight (a small under-measure allowance; also keeps a flush
-# wall or a neighbour's sheet from pulling the face out). END faces:
+# per-face search windows, ASYMMETRIC. Inward search scales with current
+# depth (2/3 of size[1]); the strongest qualifying sheet wins, with
+# distance as a tie-break. OUTWARD stays tight (a small under-measure
+# allowance; also keeps a flush wall or neighbour's sheet from pulling
+# the face out). END faces:
 # the inflation source is mask BLEED, not doors -- the window stays
 # bleed-sized
-_FACE_SNAP_IN = 1.20
+_FACE_SNAP_IN_FRAC = 2.0 / 3.0
 _END_SNAP_IN = 0.35
 _FACE_SNAP_OUT = 0.15
 # a candidate peak must reach this fraction of the window's strongest
@@ -593,7 +587,12 @@ def snap_box_faces(box: OrientedBox,
             cand = _peaks(*outward, side)
         if len(cand):
             d = np.abs(centers[cand] - face_pos)
-            chosen = int(cand[int(np.argmin(d))])
+            if is_inward:
+                peak = band[cand]
+                strongest = np.flatnonzero(peak == peak.max())
+                chosen = int(cand[strongest[int(np.argmin(d[strongest]))]])
+            else:
+                chosen = int(cand[int(np.argmin(d))])
             if not _height_boundary_ok(
                     box, pts, axis, cross, along_c,
                     float(centers[chosen]), inward=is_inward):
@@ -602,11 +601,12 @@ def snap_box_faces(box: OrientedBox,
         return face_pos
 
     front, back = cross_c + half_d, cross_c - half_d
+    inward_range = float(box.size[1]) * _FACE_SNAP_IN_FRAC
     f1 = _snap(front,
-               (front - _FACE_SNAP_IN, front),
+               (front - inward_range, front),
                (front, front + _FACE_SNAP_OUT), +1)
     b1 = _snap(back,
-               (back, back + _FACE_SNAP_IN),
+               (back, back + inward_range),
                (back - _FACE_SNAP_OUT, back), -1)
     mf = abs(f1 - front) >= _FACE_SNAP_MIN_MOVE
     mb = abs(b1 - back) >= _FACE_SNAP_MIN_MOVE

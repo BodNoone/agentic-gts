@@ -156,9 +156,9 @@ def test_face_snap_outward_fallback_when_inward_sheet_missing():
     print("PASS face snap outward fallback")
 
 
-def test_face_snap_uses_nearest_qualifying_inward_peak():
-    """Among qualifying inward peaks, restore the original nearest-peak
-    behavior rather than requiring a density gain over the old face."""
+def test_face_snap_uses_strongest_qualifying_inward_peak():
+    """Inward search uses the strongest qualifying device sheet, with
+    proximity only resolving equal-strength candidates."""
     rng = np.random.default_rng(27)
     pts = np.vstack([
         _sheet(rng, 0.55, n=1800), _sheet(rng, -0.55, n=1500),
@@ -166,9 +166,9 @@ def test_face_snap_uses_nearest_qualifying_inward_peak():
     b = _box(0.70)
     nb, info = snap_box_faces(b, pts)
     assert info["moved"], info
-    assert abs(info["front"][1] - 0.65) < 0.06, info
-    assert nb.size[1] > 1.10, nb.size
-    print("PASS face snap chooses nearest qualifying inward peak")
+    assert abs(info["front"][1] - 0.55) < 0.06, info
+    assert abs(nb.size[1] - 1.10) < 0.08, nb.size
+    print("PASS face snap chooses strongest qualifying inward peak")
 
 
 def test_low_device_does_not_snap_to_partial_tall_ladder():
