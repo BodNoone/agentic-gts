@@ -448,11 +448,7 @@ _FACE_EMPTY_FACE_FRAC = 0.12
 # vs one a couple high) and drops the TRUE edge bin, landing the
 # snap a bin inside
 _FACE_END_TAU = 0.30
-# END inward search range: 1/3 of the box's along extent (user
-# direction: shrink is the default, outward extension is the LAST
-# resort -- scan inward all the way to 1/3 of the row's length
-# before even considering outward). Capped so a 40m row doesn't
-# scan 13m inward
+# END inward search range: 1/3 of the box's along extent, capped at 3m.
 _END_SNAP_IN_FRAC = 1.0 / 3.0
 _END_SNAP_IN_MAX = 3.0
 # moves below this are noise -> no-op
@@ -847,9 +843,6 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
 
     def _snap_end(face_pos: float, outer_sign: int) -> float:
         # outer_sign=+1: the right face (outward = +along); -1: left
-        # INWARD search range: 1/3 of the box's along extent (user
-        # direction: shrink is the default, outward is the last
-        # resort). The outward range stays tight at 0.15m.
         in_range = min(float(box.size[0]) * _END_SNAP_IN_FRAC,
                        _END_SNAP_IN_MAX)
         if outer_sign > 0:
@@ -861,6 +854,7 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
         in_win = (centers >= win_lo) & (centers <= win_hi)
         if not in_win.any():
             return face_pos
+
         thr = max(_FACE_END_TAU * float(hist[in_win].max()),
                   _FACE_SNAP_ABS * gmax)
         runs = _runs(in_win & (hist >= thr))
@@ -918,9 +912,11 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
             return face_pos
         if outer_sign < 0 and centers[edge] <= win_lo + _FACE_BIN:
             return face_pos
-        if not _height_boundary_ok(box, pts, axis, cross,
-                                   float(centers[edge]), cross_c,
-                                   end_profile=True):
+        inward_snap = (centers[edge] - face_pos) * outer_sign < 0.0
+        if (not inward_snap
+                and not _height_boundary_ok(box, pts, axis, cross,
+                                            float(centers[edge]), cross_c,
+                                            end_profile=True)):
             return face_pos
         # SUB-BIN edge: the outermost actual point in the run's edge
         # bin. A bin-centre target quantises to +/-3cm, and the
