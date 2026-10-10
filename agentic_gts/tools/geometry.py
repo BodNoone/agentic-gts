@@ -440,6 +440,8 @@ _FACE_SNAP_OUT = 0.15
 # under the face sheets
 _FACE_SNAP_TAU = 0.50
 _FACE_SNAP_ABS = 0.25
+_INWARD_SNAP_WINDOW_FRAC = 0.55
+_INWARD_SNAP_GLOBAL_FRAC = 0.25
 _FACE_EMPTY_FACE_FRAC = 0.12
 # the END rule's bar is LOWER: it separates the plateau from mask
 # bleed (a ~20:1 contrast), while the cross rule separates competing
@@ -599,7 +601,7 @@ def snap_box_faces(box: OrientedBox,
     debug = []
 
     def _peaks(win_lo: float, win_hi: float, side: int,
-               empty_face: bool = False) -> np.ndarray:
+               inward: bool = False) -> np.ndarray:
         # Keep each face on its own side of the box centre. Without this
         # guard, an under-measured front face can see the back sheet in its
         # large inward window and produce an invalid negative depth.
@@ -608,12 +610,9 @@ def snap_box_faces(box: OrientedBox,
                      else (centers <= cross_c)))
         if not in_win.any():
             return np.empty(0, dtype=np.int64)
-        if empty_face:
-            # A grossly oversized seed can have almost no points on its
-            # current face. In that case, recover the strongest interior
-            # device sheet without requiring the absent face to provide a
-            # meaningful local-density reference.
-            thr = max(0.15 * float(band[in_win].max()), 0.10 * gmax)
+        if inward:
+            thr = max(_INWARD_SNAP_WINDOW_FRAC * float(band[in_win].max()),
+                      _INWARD_SNAP_GLOBAL_FRAC * gmax)
         else:
             thr = max(_FACE_SNAP_TAU * float(band[in_win].max()),
                       _FACE_SNAP_ABS * gmax)
@@ -630,7 +629,7 @@ def snap_box_faces(box: OrientedBox,
         current_face_density = (float(band[face_zone].max())
                                 if face_zone.any() else 0.0)
         empty_face = current_face_density <= _FACE_EMPTY_FACE_FRAC * gmax
-        cand = _peaks(*inward, side, empty_face=empty_face)
+        cand = _peaks(*inward, side, inward=True)
         is_inward = bool(len(cand))
         searched = "inward"
         if not is_inward:
@@ -862,6 +861,11 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
             return face_pos
         fi = int(np.argmin(np.abs(centers - face_pos)))
         run = next((r for r in runs if r[0] <= fi <= r[1]), None)
+        inward_window = in_win & ((centers <= face_pos) if outer_sign > 0
+                                 else (centers >= face_pos))
+        inward_threshold = max(
+            _INWARD_SNAP_WINDOW_FRAC * float(hist[inward_window].max()),
+            _INWARD_SNAP_GLOBAL_FRAC * gmax)
         if (run is not None and hist[fi] >= 0.5 * gmax):
             # genuinely ON the main structure (the face bin's density
             # is at least half the PROFILE's peak -- the row's own
@@ -878,7 +882,8 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
             # only to a run whose density is >= the on-mass bar (a
             # sparse bridge/ladder run never attracts the face)
             if outer_sign > 0:
-                inward = [r for r in runs if centers[r[1]] < face_pos]
+                inward = [r for r in runs if centers[r[1]] < face_pos
+                          and hist[r[0]:r[1] + 1].max() >= inward_threshold]
                 if inward:
                     run = max(inward, key=lambda r: centers[r[1]])
                     edge = run[1]
@@ -894,7 +899,8 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
                     run = min(outward, key=lambda r: centers[r[0]])
                     edge = run[0]
             else:
-                inward = [r for r in runs if centers[r[0]] > face_pos]
+                inward = [r for r in runs if centers[r[0]] > face_pos
+                          and hist[r[0]:r[1] + 1].max() >= inward_threshold]
                 if inward:
                     run = min(inward, key=lambda r: centers[r[0]])
                     edge = run[0]
@@ -913,6 +919,16 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
         if outer_sign < 0 and centers[edge] <= win_lo + _FACE_BIN:
             return face_pos
         inward_snap = (centers[edge] - face_pos) * outer_sign < 0.0
+        if inward_snap:
+            # Run detection locates plateau edges; its peak must pass the
+            # same inward candidate-strength gate used by front/back sheets.
+            # Include the immediately adjacent body bins: a partial edge bin
+            # can form a short run due to sampling noise, without representing
+            # a separate weak structure. This does not change edge selection.
+            body_peak = float(hist[max(0, run[0] - 2):
+                                   min(len(hist), run[1] + 3)].max())
+            if body_peak < inward_threshold:
+                return face_pos
         if (not inward_snap
                 and not _height_boundary_ok(box, pts, axis, cross,
                                             float(centers[edge]), cross_c,

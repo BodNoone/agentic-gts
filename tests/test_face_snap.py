@@ -189,9 +189,8 @@ def test_face_snap_recovers_when_initial_face_has_no_points():
     print("PASS face snap recovers empty oversized initial faces")
 
 
-def test_face_snap_recovers_sparse_surface_with_borderline_empty_face():
-    """A face at about 10.5% of the profile peak is treated as empty so
-    its sparse inward device sheet can pass the recovery threshold."""
+def test_face_snap_rejects_weak_surface_even_with_borderline_empty_face():
+    """An empty old face must not bypass the shared inward strength gate."""
     rng = np.random.default_rng(34)
     pts = np.vstack([
         _sheet(rng, -0.55, n=3000),   # strong opposite device face
@@ -201,9 +200,9 @@ def test_face_snap_recovers_sparse_surface_with_borderline_empty_face():
     box = _box(0.70)
     nb, info = snap_box_faces(box, pts)
     assert info["moved"], info
-    assert abs(info["front"][1] - 0.50) < 0.07, info
+    assert info["front"][1] == info["front"][0], info
     assert nb.size[1] < box.size[1], (box.size, nb.size)
-    print("PASS face snap recovers sparse sheet at borderline empty face")
+    print("PASS face snap rejects weak sheet at borderline empty face")
 
 
 def test_low_device_does_not_snap_to_partial_tall_ladder():
@@ -354,6 +353,26 @@ def test_end_snap_trims_mask_bleed():
         "the clean left end must not move"
     print(f"PASS end snap trims bleed (right 3.30 -> "
           f"{info['right'][1]:.2f})")
+
+
+def test_all_horizontal_faces_use_shared_inward_threshold(monkeypatch):
+    from agentic_gts.tools import geometry as geo
+
+    rng = np.random.default_rng(37)
+    face_points = np.vstack([_sheet(rng, 0.55), _sheet(rng, -0.55)])
+    end_points = _row(rng, -3.0, 3.0)
+    _, face_info = snap_box_faces(_box(0.70), face_points)
+    _, end_info = snap_box_ends(_end_box(-3.30, 3.30), end_points)
+    assert face_info["moved"]
+    assert end_info["moved"]
+
+    # An impossible inward gate disables both axes, proving neither path
+    # silently falls back to the old weaker acceptance threshold.
+    monkeypatch.setattr(geo, "_INWARD_SNAP_WINDOW_FRAC", 1.01)
+    _, face_info = snap_box_faces(_box(0.70), face_points)
+    _, end_info = snap_box_ends(_end_box(-3.30, 3.30), end_points)
+    assert not face_info["moved"]
+    assert not end_info["moved"]
 
 
 def test_end_snap_extends_under_measured():
