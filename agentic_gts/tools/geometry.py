@@ -440,6 +440,7 @@ _FACE_SNAP_OUT = 0.15
 # under the face sheets
 _FACE_SNAP_TAU = 0.50
 _FACE_SNAP_ABS = 0.25
+_FACE_EMPTY_FACE_FRAC = 0.12
 # the END rule's bar is LOWER: it separates the plateau from mask
 # bleed (a ~20:1 contrast), while the cross rule separates competing
 # peaks (2:1) -- 50% of a fluctuating window max sits inside the
@@ -632,7 +633,7 @@ def snap_box_faces(box: OrientedBox,
         face_zone = np.abs(centers - face_pos) <= _FACE_BAND
         current_face_density = (float(band[face_zone].max())
                                 if face_zone.any() else 0.0)
-        empty_face = current_face_density <= 0.10 * gmax
+        empty_face = current_face_density <= _FACE_EMPTY_FACE_FRAC * gmax
         cand = _peaks(*inward, side, empty_face=empty_face)
         is_inward = bool(len(cand))
         searched = "inward"

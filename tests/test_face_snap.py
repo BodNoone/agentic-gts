@@ -189,6 +189,23 @@ def test_face_snap_recovers_when_initial_face_has_no_points():
     print("PASS face snap recovers empty oversized initial faces")
 
 
+def test_face_snap_recovers_sparse_surface_with_borderline_empty_face():
+    """A face at about 10.5% of the profile peak is treated as empty so
+    its sparse inward device sheet can pass the recovery threshold."""
+    rng = np.random.default_rng(34)
+    pts = np.vstack([
+        _sheet(rng, -0.55, n=3000),   # strong opposite device face
+        _sheet(rng, 0.50, n=340),     # sparse true front device sheet
+        _sheet(rng, 0.70, n=300),     # weak points at oversized old face
+        _floor(rng)])
+    box = _box(0.70)
+    nb, info = snap_box_faces(box, pts)
+    assert info["moved"], info
+    assert abs(info["front"][1] - 0.50) < 0.07, info
+    assert nb.size[1] < box.size[1], (box.size, nb.size)
+    print("PASS face snap recovers sparse sheet at borderline empty face")
+
+
 def test_low_device_does_not_snap_to_partial_tall_ladder():
     """A nearby tall ladder may be only a small part of the slice, but
     its high local z extent must still reject the face candidate."""
