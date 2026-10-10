@@ -630,10 +630,36 @@ def snap_box_faces(box: OrientedBox,
                                 if face_zone.any() else 0.0)
         empty_face = current_face_density <= _FACE_EMPTY_FACE_FRAC * gmax
         cand = _peaks(*inward, side, inward=True)
+        exterior = _peaks(*outward, side)
+        near_surface = np.concatenate([cand, exterior])
+        side_peak = (float(band[near_surface].max())
+                     if len(near_surface) else 0.0)
+        near_surface = near_surface[
+            (np.abs(centers[near_surface] - face_pos) <= _FACE_BIN)
+            & (band[near_surface] >= _INWARD_SNAP_WINDOW_FRAC * side_peak)]
         is_inward = bool(len(cand))
         searched = "inward"
-        if not is_inward:
-            cand = _peaks(*outward, side)
+        direction_reason = "inward_surface"
+        if len(near_surface):
+            # A supported surface already at the old face takes precedence
+            # over denser internal shelves/panels.
+            cand = near_surface
+            is_inward = False
+            searched = "keep"
+            direction_reason = "existing_surface_supported"
+        elif len(exterior):
+            exterior = exterior[
+                (centers[exterior] - face_pos) * side > _FACE_SNAP_MIN_MOVE]
+            inner_peak = float(band[cand].max()) if len(cand) else 0.0
+            if (len(exterior) and (not len(cand)
+                    or float(band[exterior].max()) >= 1.25 * inner_peak)):
+                cand = exterior
+                is_inward = False
+                searched = "outward"
+                direction_reason = "stronger_exterior_surface"
+        if not len(cand):
+            cand = exterior
+            is_inward = False
             searched = "outward"
         rec = {
             "face": "front" if side > 0 else "back",
@@ -647,6 +673,7 @@ def snap_box_faces(box: OrientedBox,
             "face_density": round(current_face_density, 1),
             "empty_face": bool(empty_face),
             "searched": searched,
+            "direction_reason": direction_reason,
             "candidate_count": int(len(cand)),
         }
         if len(cand):
@@ -659,6 +686,11 @@ def snap_box_faces(box: OrientedBox,
                 chosen = int(cand[int(np.argmin(d))])
             rec["candidate_peak"] = int(band[chosen])
             rec["candidate"] = round(float(centers[chosen]), 3)
+            if searched == "keep":
+                rec["accepted"] = False
+                rec["reason"] = "existing_surface_supported"
+                debug.append(rec)
+                return face_pos
             # Inward candidates are already inside the current box and
             # identify its device surface. Overhead geometry must not veto
             # this recovery path; the height guard is for outward growth.
@@ -919,6 +951,14 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
         if outer_sign < 0 and centers[edge] <= win_lo + _FACE_BIN:
             return face_pos
         inward_snap = (centers[edge] - face_pos) * outer_sign < 0.0
+        if inward_snap:
+            # A plateau still supported at and beyond the old end means
+            # this face is inside the device, not an oversized empty end.
+            beyond = ((centers - face_pos) * outer_sign > _FACE_SNAP_MIN_MOVE)
+            beyond &= np.abs(centers - face_pos) <= _FACE_SNAP_OUT
+            if (hist[fi] >= inward_threshold and beyond.any()
+                    and float(hist[beyond].max()) >= inward_threshold):
+                return face_pos
         if inward_snap:
             # Run detection locates plateau edges; its peak must pass the
             # same inward candidate-strength gate used by front/back sheets.

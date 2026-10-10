@@ -77,6 +77,34 @@ def test_face_snap_noop_on_clean_box():
     print("PASS face snap no-op on a clean box")
 
 
+def test_supported_outer_faces_ignore_denser_internal_panels():
+    rng = np.random.default_rng(38)
+    pts = np.vstack([_sheet(rng, 0.55, n=1500),
+                     _sheet(rng, -0.55, n=1500),
+                     _sheet(rng, 0.30, n=2200),
+                     _sheet(rng, -0.30, n=2200)])
+    box = _box(0.55)
+    snapped, info = snap_box_faces(box, pts)
+    assert not info["moved"], info
+    assert snapped is box
+    assert all(r["reason"] == "existing_surface_supported"
+               for r in info["debug"])
+
+
+def test_undersized_faces_extend_instead_of_snapping_to_internal_panels():
+    rng = np.random.default_rng(39)
+    pts = np.vstack([_sheet(rng, 0.55, n=2400),
+                     _sheet(rng, -0.55, n=2400),
+                     _sheet(rng, 0.25, n=1500),
+                     _sheet(rng, -0.25, n=1500)])
+    box = _box(0.45)
+    snapped, info = snap_box_faces(box, pts)
+    assert info["moved"], info
+    assert snapped.size[1] > box.size[1]
+    assert abs(snapped.size[1] - 1.10) < 0.06
+    assert all(r["searched"] == "outward" for r in info["debug"])
+
+
 def test_face_snap_extends_under_measured():
     """An under-measured box (faces inside the device) extends out to
     its sheets through the tight outward window."""
