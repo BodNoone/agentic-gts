@@ -294,6 +294,8 @@ class LayoutAgent:
         refit.source = BoxSource.AGENT_FIX
         refit.row_id = old.row_id
         refit.meta = old.meta
+        if refit.meta.get("sam_refined"):
+            refit.meta.setdefault("sam_split_seed", old.box_id)
         refit.confidence = old.confidence
         scene.remove_box(old.box_id)
         scene.boxes.append(refit)

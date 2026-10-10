@@ -754,6 +754,20 @@ def _row_continues(boxes, box, side: int) -> bool:
     return False
 
 
+def _same_split_continues(boxes, box: OrientedBox, side: int) -> bool:
+    """Whether this side is an internal seam from the same SAM split."""
+    split_seed = box.meta.get("sam_split_seed")
+    if not split_seed:
+        return False
+    for other in boxes:
+        if (other.box_id == box.box_id
+                or other.meta.get("sam_split_seed") != split_seed):
+            continue
+        if _row_continues([box, other], box, side):
+            return True
+    return False
+
+
 def snap_box_ends(box: OrientedBox, pts: np.ndarray,
                    snap_left: bool = True,
                    snap_right: bool = True) -> tuple[OrientedBox, dict]:
@@ -1137,8 +1151,11 @@ def snap_faces_to_mesh(scene: Scene) -> int:
             own = _own_points(pts, scene.boxes, cur)
             nb, einfo = snap_box_ends(
                 cur, pts[own],
-                snap_left=not _row_continues(snapshot, b, -1),
-                snap_right=not _row_continues(snapshot, b, +1))
+                # Every independent grounding box gets both side faces
+                # checked. Only a seam between pieces from the SAME SAM
+                # split is reserved for Stage C's seam regularisation.
+                snap_left=not _same_split_continues(snapshot, b, -1),
+                snap_right=not _same_split_continues(snapshot, b, +1))
             if einfo.get("moved"):
                 nb.meta["end_snap"] = einfo
                 print(f"[stageF] {nb.box_id[:6]} end snap: length "

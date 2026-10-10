@@ -382,6 +382,8 @@ def test_end_snap_row_pieces_only_outer_ends():
         _bleed(rng, 3.02, 3.28)])       # bleed past B's right (outer) face
     a = _end_box(-3.0, 0.15)            # A: left free, right = seam
     b = _end_box(0.0, 3.30)             # B: left = seam, right free
+    a.meta["sam_split_seed"] = "same-seed"
+    b.meta["sam_split_seed"] = "same-seed"
     scene = Scene(points=pts)
     scene.boxes = [a, b]
     n = snap_faces_to_mesh(scene)
@@ -398,6 +400,34 @@ def test_end_snap_row_pieces_only_outer_ends():
         "B's internal seam face must stay at 0.0"
     assert "end_snap" in eb.meta and "end_snap" not in ea.meta
     print("PASS end snap: split row -- only the outer ends move")
+
+
+def test_independent_adjacent_boxes_attempt_both_facing_sides(monkeypatch):
+    """Separate detections are not a shared SAM seam, so Stage F must
+    offer both facing sides to the profile snapper."""
+    from agentic_gts.tools import geometry as geo
+
+    rng = np.random.default_rng(35)
+    pts = np.vstack([_row(rng, -3.0, 3.0), _floor(rng)])
+    left = _end_box(-3.0, 0.0)
+    right = _end_box(0.0, 3.0)
+    left.meta["sam_split_seed"] = "seed-left"
+    right.meta["sam_split_seed"] = "seed-right"
+    scene = Scene(points=pts)
+    scene.boxes = [left, right]
+    calls = []
+    real_snap = geo.snap_box_ends
+
+    def record_snap(box, points, snap_left=True, snap_right=True):
+        calls.append((box.box_id, snap_left, snap_right))
+        return real_snap(box, points, snap_left=snap_left,
+                         snap_right=snap_right)
+
+    monkeypatch.setattr(geo, "snap_box_ends", record_snap)
+    snap_faces_to_mesh(scene)
+    assert calls == [(left.box_id, True, True),
+                     (right.box_id, True, True)], calls
+    print("PASS independent adjacent boxes attempt both facing ends")
 
 
 def test_end_snap_no_move_when_edge_not_visible():
