@@ -519,6 +519,25 @@ def _trim_sparse_top(box: OrientedBox, pts: np.ndarray):
     # it is treated as reconstruction haze/overhead structure, never as a
     # reason to grow the box.
     supported = np.where(hist >= max(5, 0.15 * peak))[0]
+    # Point counts alone let a dense ladder on one side define the top.
+    # Require upper slices to cover the same footprint cells as the body.
+    column = local[m]
+    cells = np.clip(((column[:, :2] + half[:2]) /
+                     (2.0 * half[:2]) * 4).astype(int), 0, 3)
+    keys = cells[:, 0] * 4 + cells[:, 1]
+    reference = ((z >= lo + 0.20 * (hi - lo))
+                 & (z <= lo + 0.55 * (hi - lo)))
+    reference_counts = np.bincount(keys[reference], minlength=16)
+    body_cells = reference_counts >= 3
+    if int(body_cells.sum()) < 4:
+        return box, {"moved": False, "reason": "insufficient body coverage"}
+    coverage = []
+    for i in supported:
+        near = (z >= edges[i] - 0.05) & (z <= edges[i + 1] + 0.05)
+        counts = np.bincount(keys[near], minlength=16)
+        coverage.append(float(((counts >= 3) & body_cells).sum())
+                        / int(body_cells.sum()))
+    supported = supported[np.asarray(coverage) >= 0.65]
     if not len(supported):
         return box, {"moved": False, "reason": "no supported top"}
     new_top = float(edges[int(supported[-1]) + 1])

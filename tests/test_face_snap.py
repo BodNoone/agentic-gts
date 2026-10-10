@@ -299,6 +299,30 @@ def _trim_sparse_top_for_test(box, pts):
     return _trim_sparse_top(box, pts)
 
 
+def test_top_trim_rejects_dense_ladder_confined_to_one_side():
+    rng = np.random.default_rng(40)
+    body = np.vstack([_sheet(rng, 0.55, n=4000, z_hi=2.0),
+                      _sheet(rng, -0.55, n=4000, z_hi=2.0)])
+    ladder = _sheet(rng, 0.55, n=4000, z_lo=1.8, z_hi=2.50)
+    box = _box(0.55, z=1.25)
+    box.size = (2.0, 1.1, 2.5)
+    snapped, info = _trim_sparse_top_for_test(box, np.vstack([body, ladder]))
+    assert info["moved"], info
+    assert abs(snapped.size[2] - 2.0) <= 0.10, info
+    assert abs(snapped.center[2] - snapped.size[2] / 2) < 1e-9
+
+
+def test_top_trim_keeps_full_height_body_with_same_height_ladder():
+    rng = np.random.default_rng(41)
+    body = np.vstack([_sheet(rng, 0.55, n=4000, z_hi=2.5),
+                      _sheet(rng, -0.55, n=4000, z_hi=2.5)])
+    box = _box(0.55, z=1.25)
+    box.size = (2.0, 1.1, 2.5)
+    snapped, info = _trim_sparse_top_for_test(box, body)
+    assert not info["moved"], info
+    assert snapped is box
+
+
 def test_face_snap_depth_bounds_guard():
     """Sheets that would snap the box below the minimum device depth
     are rejected -- the box is returned unchanged."""
