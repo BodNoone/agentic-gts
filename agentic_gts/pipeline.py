@@ -684,6 +684,13 @@ def run_pipeline(scene: Scene,
     # Final confidence-only check: retain weak boxes for review in all outputs.
     from agentic_gts.tools.geometry import flag_insufficient_face_support
     flag_insufficient_face_support(scene)
+    from agentic_gts.tools.geometry import filter_outer_wall_boxes
+    n_wall_fp = filter_outer_wall_boxes(scene)
+    if n_wall_fp:
+        with open(os.path.join(out_dir, "wall_filter_audit.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(scene.meta["wall_filter_audit"], f, indent=2)
+        print(f"[out] dropped {n_wall_fp} outer-wall false-positive box(es)")
 
     # --- final frame: back to the INPUT coordinates (user report) ---
     # (see _map_outputs_to_input_frame)

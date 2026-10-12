@@ -83,6 +83,52 @@ def flag_insufficient_face_support(scene: Scene, tolerance: float = 0.05,
     return flagged
 
 
+def filter_outer_wall_boxes(scene: Scene, edge_margin: float = 0.35,
+                            thin_axis: float = 0.45) -> int:
+    """Remove thin outer-wall false positives with an empty inner face."""
+    if not len(scene.points):
+        return 0
+    keep, removed = [], 0
+    for b in scene.boxes:
+        support = b.meta.get("face_support", {})
+        faces = support.get("faces", {})
+        wall_face = None
+        for axis in (0, 1):
+            if b.size[axis] > thin_axis:
+                continue
+            direction = b.rotation[:2, axis]
+            projected = scene.points[:, :2] @ direction
+            center = float(np.asarray(b.center[:2]) @ direction)
+            for sign, name, opposite in ((-1, "left", "right"),
+                                         (1, "right", "left")) if axis == 0 else (
+                                             (-1, "back", "front"),
+                                             (1, "front", "back")):
+                outer = faces.get(name, {})
+                inner = faces.get(opposite, {})
+                face_pos = center + sign * float(b.size[axis]) / 2.0
+                limit = float(projected.min() if sign < 0 else projected.max())
+                if (abs(face_pos - limit) <= edge_margin
+                        and outer.get("passed", False)
+                        and inner.get("coverage", 1.0) < 0.05
+                        and support.get("matched_faces", 5) < 3):
+                    wall_face = name
+                    break
+            if wall_face:
+                break
+        if wall_face:
+            b.meta["wall_false_positive"] = {
+                "outer_face": wall_face,
+                "reason": "thin outer-boundary box with supported outer face "
+                          "and empty room-facing face"}
+            scene.meta.setdefault("wall_filter_audit", []).append(b.to_dict())
+            print(f"[wall-filter] {b.box_id} removed: outer={wall_face}")
+            removed += 1
+            continue
+        keep.append(b)
+    scene.boxes = keep
+    return removed
+
+
 def _region_of_box(box: OrientedBox, expand: float) -> tuple[float, float, float, float]:
     c = np.asarray(box.center[:2])
     half = np.asarray(box.size[:2]) / 2.0 + expand
