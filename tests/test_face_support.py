@@ -96,9 +96,30 @@ def test_outer_thin_wall_with_empty_inner_face_is_removed(yaw):
     assert scene.meta["wall_filter_audit"][0]["box_id"] == wall.box_id
 
 
-def test_thick_box_is_not_removed_as_outer_wall():
+def test_thick_box_containing_only_wall_and_air_is_removed():
     box = OrientedBox(center=(0.3, 1.0, 1.0), size=(1.0, 2.0, 2.0))
     scene = Scene(points=surface(box, 0, -1), boxes=[box])
+    flag_insufficient_face_support(scene)
+    assert filter_outer_wall_boxes(scene) == 1
+    assert scene.boxes == []
+
+
+@pytest.mark.parametrize("yaw", [0, 0.37, math.pi / 2])
+def test_partial_outer_wall_face_is_removed(yaw):
+    box = OrientedBox(center=(0, 0, 1), size=(1, 2, 2), yaw=yaw)
+    wall = surface(box, 0, -1)
+    local = box.world_to_local(wall)
+    wall = wall[(np.abs(local[:, 1]) < 0.4) & (local[:, 2] < 0)]
+    scene = Scene(points=wall, boxes=[box])
+    flag_insufficient_face_support(scene)
+    assert not box.meta["face_support"]["faces"]["left"]["passed"]
+    assert filter_outer_wall_boxes(scene) == 1
+
+
+def test_one_empty_face_does_not_remove_body_supported_equipment():
+    box = OrientedBox(center=(0, 0, 1), size=(1, 2, 2))
+    scene = Scene(points=np.vstack([surface(box, 0, -1), surface(box, 2, 1)]),
+                  boxes=[box])
     flag_insufficient_face_support(scene)
     assert filter_outer_wall_boxes(scene) == 0
     assert scene.boxes == [box]

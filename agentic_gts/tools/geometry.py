@@ -100,19 +100,21 @@ def flag_insufficient_face_support(scene: Scene, tolerance: float = 0.05,
     return flagged
 
 
-def filter_outer_wall_boxes(scene: Scene, edge_margin: float = 0.35,
-                            thin_axis: float = 0.45) -> int:
-    """Remove thin outer-wall false positives with an empty inner face."""
+def filter_outer_wall_boxes(scene: Scene, edge_margin: float = 0.35) -> int:
+    """Remove outer-wall patches boxed together with empty room space."""
     if not len(scene.points):
         return 0
     keep, removed = [], 0
     for b in scene.boxes:
         support = b.meta.get("face_support", {})
         faces = support.get("faces", {})
+        tolerance = float(support.get("tolerance_m", 0.05))
+        local = b.world_to_local(scene.points_in_region(_region_of_box(b, tolerance)))
+        half = np.asarray(b.size, dtype=float) / 2.0
+        body = local[np.all(np.abs(local) <= half + tolerance, axis=1)
+                     & (local[:, 2] > -half[2] + 0.30)]
         wall_face = None
         for axis in (0, 1):
-            if b.size[axis] > thin_axis:
-                continue
             direction = b.rotation[:2, axis]
             projected = scene.points[:, :2] @ direction
             center = float(np.asarray(b.center[:2]) @ direction)
@@ -124,9 +126,13 @@ def filter_outer_wall_boxes(scene: Scene, edge_margin: float = 0.35,
                 inner = faces.get(opposite, {})
                 face_pos = center + sign * float(b.size[axis]) / 2.0
                 limit = float(projected.min() if sign < 0 else projected.max())
+                concentration = (float((np.abs(body[:, axis] - sign * half[axis])
+                                        <= tolerance).mean()) if len(body) else 0.0)
                 if (abs(face_pos - limit) <= edge_margin
-                        and outer.get("passed", False)
+                        and outer.get("points", 0) >= 10
+                        and outer.get("coverage", 0.0) >= 0.05
                         and inner.get("coverage", 1.0) < 0.05
+                        and concentration >= 0.90
                         and support.get("matched_faces", 5) < 3):
                     wall_face = name
                     break
@@ -135,7 +141,8 @@ def filter_outer_wall_boxes(scene: Scene, edge_margin: float = 0.35,
         if wall_face:
             b.meta["wall_false_positive"] = {
                 "outer_face": wall_face,
-                "reason": "thin outer-boundary box with supported outer face "
+                "wall_point_fraction": round(concentration, 4),
+                "reason": "outer-boundary box with wall-concentrated points "
                           "and empty room-facing face"}
             scene.meta.setdefault("wall_filter_audit", []).append(b.to_dict())
             print(f"[wall-filter] {b.box_id} removed: outer={wall_face}")
