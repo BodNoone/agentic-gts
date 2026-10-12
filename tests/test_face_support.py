@@ -143,3 +143,38 @@ def test_supported_room_facing_face_is_not_mistaken_for_outer_wall():
     flag_insufficient_face_support(scene)
     assert filter_outer_wall_boxes(scene) == 0
     assert scene.boxes == [box]
+
+
+@pytest.mark.parametrize("yaw", [0, 0.37, math.pi / 2])
+def test_long_thin_interior_wall_with_empty_top_is_removed(yaw):
+    box = OrientedBox(center=(0, 0, 1), size=(3, 0.4, 2), yaw=yaw)
+    points = surface(box, 1, 1)
+    points = points[box.world_to_local(points)[:, 2] < 0.8]
+    # Room extends past the candidate on every side: the older boundary
+    # rule cannot remove this interior wall strip.
+    points = np.vstack([points, box.local_to_world(np.array([
+        [-5, -5, 1], [5, 5, 1]]))])
+    scene = Scene(points=points, boxes=[box])
+    flag_insufficient_face_support(scene)
+    assert box.meta["face_support"]["faces"]["top"]["points"] == 0
+    assert filter_outer_wall_boxes(scene) == 1
+    assert not scene.boxes
+    assert box.meta["wall_false_positive"]["top_points"] == 0
+
+
+@pytest.mark.parametrize("size, with_top", [
+    ((3, 1.1, 2), False),   # normal-depth joined cabinets
+    ((1, 0.4, 2), False),   # short equipment
+    ((3, 0.4, 2), True),    # thin equipment with a real top
+])
+def test_long_thin_rule_keeps_equipment_outside_its_conditions(size, with_top):
+    box = OrientedBox(center=(0, 0, 1), size=size)
+    points = surface(box, 1, 1)
+    points = points[box.world_to_local(points)[:, 2] < 0.8]
+    if with_top:
+        points = np.vstack([points, surface(box, 2, 1)])
+    points = np.vstack([points, [[-5, -5, 1], [5, 5, 1]]])
+    scene = Scene(points=points, boxes=[box])
+    flag_insufficient_face_support(scene)
+    assert filter_outer_wall_boxes(scene) == 0
+    assert scene.boxes == [box]

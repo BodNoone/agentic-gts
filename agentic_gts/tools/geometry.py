@@ -101,13 +101,27 @@ def flag_insufficient_face_support(scene: Scene, tolerance: float = 0.05,
 
 
 def filter_outer_wall_boxes(scene: Scene, edge_margin: float = 0.35) -> int:
-    """Remove outer-wall patches boxed together with empty room space."""
+    """Remove wall-and-air boxes and long thin strips with no top support."""
     if not len(scene.points):
         return 0
     keep, removed = [], 0
     for b in scene.boxes:
         support = b.meta.get("face_support", {})
         faces = support.get("faces", {})
+        long_side = max(float(b.size[0]), float(b.size[1]))
+        short_side = min(float(b.size[0]), float(b.size[1]))
+        top_points = faces.get("top", {}).get("points")
+        if (long_side >= 2.0 and 0 < short_side <= 0.45
+                and long_side / short_side >= 5.0 and top_points == 0):
+            b.meta["wall_false_positive"] = {
+                "length": long_side, "thickness": short_side,
+                "aspect_ratio": long_side / short_side,
+                "top_points": 0,
+                "reason": "long thin box with no points on its top face"}
+            scene.meta.setdefault("wall_filter_audit", []).append(b.to_dict())
+            print(f"[wall-filter] {b.box_id} removed: long thin box, empty top")
+            removed += 1
+            continue
         tolerance = float(support.get("tolerance_m", 0.05))
         local = b.world_to_local(scene.points_in_region(_region_of_box(b, tolerance)))
         half = np.asarray(b.size, dtype=float) / 2.0
