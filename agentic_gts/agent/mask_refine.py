@@ -1591,7 +1591,8 @@ def _apply_depth_from_side(instances: list, pts: np.ndarray,
         inst["fitted"] = _rebuild(
             f, center=(float(cxy[0]), float(cxy[1]), float(fc[2])),
             size=(float(f.size[0]), depth, float(f.size[2])))
-        inst["pts"] = sel
+        # Side masks measure depth only: a far cabinet may be vertically
+        # occluded. Keep front/back mask points as the height authority.
         inst["depth_ok"] = "side"
         rec["accepted"] = True
         rec["depth"] = round(depth, 3)
@@ -2343,6 +2344,9 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                       {"score": round(e["score"], 4), "view": e["view"],
                        "points": len(e["pts"]) if e["pts"] is not None else 0,
                        "sam_score": round(e["mask_score"], 4),
+                       "z_mask_top": e.get("z_mask_top"),
+                       "z_col_top": e.get("z_col_top"),
+                       "height_source": e.get("z_src"),
                        "label": e["label"], "box": e["fitted"].to_dict()}
                       for e in instances]})
     return instances, audit

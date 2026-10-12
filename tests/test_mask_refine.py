@@ -1384,6 +1384,31 @@ def test_parse_rack_confirm():
     assert VLMJudge._parse_rack_confirm("cannot tell") is None
     assert VLMJudge._parse_rack_confirm('{"confidence": 0.9}') is None
     print("PASS rack confirm parse (string bools, clamp, None on no verdict)")
+
+
+def test_partial_side_depth_preserves_full_face_height():
+    from agentic_gts.agent.mask_refine import (
+        _apply_depth_from_side, _apply_height_and_geom_depth)
+
+    rng = np.random.default_rng(52)
+    seed = OrientedBox(center=(0, 0, 1), size=(8, 1.4, 2))
+    face = np.column_stack([rng.uniform(2.5, 3.5, 1200),
+                            np.full(1200, 0.4),
+                            rng.uniform(0.05, 2.0, 1200)])
+    side = np.column_stack([rng.uniform(2.5, 3.5, 800),
+                            rng.uniform(-0.4, 0.4, 800),
+                            rng.uniform(0.05, 1.0, 800)])
+    inst = {"fitted": OrientedBox(center=(3, 0, 1), size=(1, 1.4, 2)),
+            "pts": face}
+    records = _apply_depth_from_side([inst], side, seed)
+    assert records[0]["accepted"]
+    assert inst["pts"] is face
+    assert inst["fitted"].size[1] < 1.0
+    scene = Scene(points=np.vstack([face, side]),
+                  meta={"geometry_is_mesh": True})
+    _apply_height_and_geom_depth([inst], seed, scene)
+    assert inst["z_mask_top"] > 1.9
+    assert inst["fitted"].size[2] > 1.9
 def test_type_confirm_marks_low_not_deleted():
     """A VLM 'not a rack' verdict must mark LOW + unresolved and NEVER
     delete the box -- false-positive deletion is the dangerous
