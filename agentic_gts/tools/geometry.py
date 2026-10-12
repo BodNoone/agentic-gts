@@ -36,6 +36,53 @@ def support_fraction(scene: Scene, box: OrientedBox, expand: float = 0.0) -> flo
     return float(occupied.sum() / max(nb.prod(), 1))
 
 
+def flag_insufficient_face_support(scene: Scene, tolerance: float = 0.05,
+                                   cell: float = 0.10,
+                                   min_coverage: float = 0.30,
+                                   min_points: int = 10) -> int:
+    """Mark LOW when fewer than three of five non-bottom faces are fitted.
+
+    Density is occupied face-grid area, rather than raw point count, so a
+    dense ladder fragment cannot qualify an otherwise empty face.
+    """
+    flagged = 0
+    for box in scene.boxes:
+        region = _region_of_box(box, tolerance)
+        local = box.world_to_local(scene.points_in_region(region))
+        half = np.asarray(box.size, dtype=float) / 2.0
+        faces = {}
+        for name, axis, sign in (("front", 1, 1), ("back", 1, -1),
+                                 ("left", 0, -1), ("right", 0, 1),
+                                 ("top", 2, 1)):
+            tangent = [i for i in range(3) if i != axis]
+            lengths = 2.0 * half[tangent]
+            mask = np.abs(local[:, axis] - sign * half[axis]) <= tolerance
+            mask &= np.all(np.abs(local[:, tangent]) <= half[tangent], axis=1)
+            selected = local[mask][:, tangent]
+            bins = np.maximum(np.ceil(lengths / cell).astype(int), 1)
+            idx = np.clip(((selected + half[tangent]) / cell).astype(int),
+                          0, bins - 1)
+            occupied = len(np.unique(idx, axis=0))
+            coverage = float(occupied / int(np.prod(bins)))
+            faces[name] = {"points": int(len(selected)),
+                           "coverage": round(coverage, 4),
+                           "passed": bool(len(selected) >= min_points
+                                          and coverage >= min_coverage)}
+        matched = sum(face["passed"] for face in faces.values())
+        box.meta["face_support"] = {
+            "faces": faces, "matched_faces": matched, "required_faces": 3,
+            "tolerance_m": tolerance, "grid_m": cell,
+            "min_coverage": min_coverage, "min_points": min_points,
+            "passed": matched >= 3,
+        }
+        if matched < 3:
+            box.confidence = Confidence.LOW
+            flagged += 1
+        print(f"[face-support] {box.box_id} fitted={matched}/5 "
+              + ("-> LOW" if matched < 3 else "-> confidence kept"))
+    return flagged
+
+
 def _region_of_box(box: OrientedBox, expand: float) -> tuple[float, float, float, float]:
     c = np.asarray(box.center[:2])
     half = np.asarray(box.size[:2]) / 2.0 + expand

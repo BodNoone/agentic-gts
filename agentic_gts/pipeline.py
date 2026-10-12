@@ -681,6 +681,10 @@ def run_pipeline(scene: Scene,
         print(f"[out] dropped {n_furniture} low-furniture box(es) "
               f"(low height + no overhead device infrastructure)")
 
+    # Final confidence-only check: retain weak boxes for review in all outputs.
+    from agentic_gts.tools.geometry import flag_insufficient_face_support
+    flag_insufficient_face_support(scene)
+
     # --- final frame: back to the INPUT coordinates (user report) ---
     # (see _map_outputs_to_input_frame)
     _map_outputs_to_input_frame(scene)

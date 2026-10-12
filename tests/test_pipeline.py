@@ -38,6 +38,11 @@ def test_pipeline_local_empty_reply_smoke(monkeypatch, tmp_path):
     assert len(scene.boxes) > 0, \
         "the pipeline should retain geometry-bootstrap boxes when VLM is empty"
     assert (tmp_path / "grounded.png").is_file()
+    with open(tmp_path / "boxes.json", encoding="utf-8") as f:
+        saved = __import__("json").load(f)
+    assert all("face_support" in b["meta"] for b in saved)
+    assert all(b["confidence"] == "low" for b in saved
+               if b["meta"]["face_support"]["matched_faces"] < 3)
     print(f"PASS pipeline local empty-reply smoke ({len(scene.boxes)} boxes out)")
 
 
