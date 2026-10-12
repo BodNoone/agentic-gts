@@ -40,7 +40,7 @@ def flag_insufficient_face_support(scene: Scene, tolerance: float = 0.05,
                                    cell: float = 0.10,
                                    min_coverage: float = 0.30,
                                    min_points: int = 10) -> int:
-    """Mark LOW when fewer than three of five non-bottom faces are fitted.
+    """Adjust confidence one level using five non-bottom fitted faces.
 
     Density is occupied face-grid area, rather than raw point count, so a
     dense ladder fragment cannot qualify an otherwise empty face.
@@ -69,17 +69,34 @@ def flag_insufficient_face_support(scene: Scene, tolerance: float = 0.05,
                            "passed": bool(len(selected) >= min_points
                                           and coverage >= min_coverage)}
         matched = sum(face["passed"] for face in faces.values())
+        audit = box.meta.get("face_support", {})
+        base_name = audit.get("base_confidence", box.confidence.value)
+        base_conf = Confidence(base_name)
+        ranks = {Confidence.LOW: 0, Confidence.MID: 1, Confidence.HIGH: 2}
+        delta = 1 if matched >= 3 else -1
+        levels = (Confidence.LOW, Confidence.MID, Confidence.HIGH)
+        adjusted = levels[int(np.clip(ranks[base_conf] + delta, 0, 2))]
+        # Semantic/structural rejection flags are stronger evidence than
+        # geometric face support and must never be promoted by this check.
+        protected_low = any(box.meta.get(k) for k in
+                            ("type_suspect", "structural_geom",
+                             "low_furniture_geom"))
+        if protected_low:
+            adjusted = Confidence.LOW
+        box.confidence = adjusted
         box.meta["face_support"] = {
+            "base_confidence": base_conf.value,
+            "confidence_before": base_conf.value,
+            "confidence_after": adjusted.value,
             "faces": faces, "matched_faces": matched, "required_faces": 3,
             "tolerance_m": tolerance, "grid_m": cell,
             "min_coverage": min_coverage, "min_points": min_points,
             "passed": matched >= 3,
         }
         if matched < 3:
-            box.confidence = Confidence.LOW
             flagged += 1
         print(f"[face-support] {box.box_id} fitted={matched}/5 "
-              + ("-> LOW" if matched < 3 else "-> confidence kept"))
+              f"confidence={base_conf.value}->{adjusted.value}")
     return flagged
 
 

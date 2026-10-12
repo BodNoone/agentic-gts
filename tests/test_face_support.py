@@ -35,7 +35,7 @@ def test_three_supported_faces_required_without_deletion(yaw, face_count):
     assert scene.boxes == [box]
     assert flagged == (face_count < 3)
     assert box.meta["face_support"]["matched_faces"] == face_count
-    assert box.confidence == (Confidence.LOW if face_count < 3
+    assert box.confidence == (Confidence.MID if face_count < 3
                               else Confidence.HIGH)
     json.dumps(box.to_dict())
 
@@ -49,12 +49,37 @@ def test_dense_fragment_and_floor_do_not_qualify_faces():
     assert box.meta["face_support"]["matched_faces"] == 0
 
 
-def test_three_faces_do_not_promote_existing_low_confidence():
+def test_three_faces_promote_low_confidence_once():
     box = OrientedBox(center=(0, 0, 1), size=(1, 1, 2),
                       confidence=Confidence.LOW)
     scene = Scene(points=np.vstack([surface(box, *s) for s in
                                     [(1, 1), (1, -1), (2, 1)]]), boxes=[box])
     assert flag_insufficient_face_support(scene) == 0
+    assert box.confidence == Confidence.MID
+    flag_insufficient_face_support(scene)
+    assert box.confidence == Confidence.MID
+
+
+@pytest.mark.parametrize("initial, expected", [
+    (Confidence.HIGH, Confidence.MID),
+    (Confidence.MID, Confidence.LOW),
+    (Confidence.LOW, Confidence.LOW),
+])
+def test_missing_faces_demote_once(initial, expected):
+    box = OrientedBox(center=(0, 0, 1), size=(1, 1, 2), confidence=initial)
+    scene = Scene(points=np.empty((0, 3)), boxes=[box])
+    flag_insufficient_face_support(scene)
+    flag_insufficient_face_support(scene)
+    assert box.confidence == expected
+
+
+@pytest.mark.parametrize("flag", ["type_suspect", "structural_geom"])
+def test_supported_faces_cannot_override_rejection(flag):
+    box = OrientedBox(center=(0, 0, 1), size=(1, 1, 2),
+                       confidence=Confidence.LOW, meta={flag: True})
+    scene = Scene(points=np.vstack([surface(box, *s) for s in
+                                    [(1, 1), (1, -1), (2, 1)]]), boxes=[box])
+    flag_insufficient_face_support(scene)
     assert box.confidence == Confidence.LOW
 
 
