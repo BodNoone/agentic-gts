@@ -217,6 +217,28 @@ def test_face_snap_recovers_when_initial_face_has_no_points():
     print("PASS face snap recovers empty oversized initial faces")
 
 
+def test_inward_faces_can_cross_old_center_with_opposite_spacing():
+    rng = np.random.default_rng(50)
+    pts = np.vstack([_sheet(rng, -0.60), _sheet(rng, -0.95)])
+    box = _box(1.0)
+    snapped, info = snap_box_faces(box, pts)
+    assert info["moved"], info
+    assert info["front"][1] < 0.0
+    assert snapped.size[1] >= 0.30
+    assert abs(snapped.size[1] - 0.35) < 0.07
+    front = info["debug"][0]
+    assert front["inward_range"] == [-0.7, 1.0]
+
+
+def test_side_search_has_no_old_fraction_or_three_meter_cap():
+    rng = np.random.default_rng(51)
+    box = _end_box(-5.0, 5.0)
+    snapped, info = snap_box_ends(box, _row(rng, -5.0, 1.0))
+    assert info["moved"], info
+    assert abs(info["right"][1] - 1.0) < 0.06
+    assert snapped.size[0] >= 0.30
+
+
 def test_face_snap_rejects_weak_surface_even_with_borderline_empty_face():
     """An empty old face must not bypass the shared inward strength gate."""
     rng = np.random.default_rng(34)
@@ -324,13 +346,16 @@ def test_top_trim_keeps_full_height_body_with_same_height_ladder():
 
 
 def test_face_snap_depth_bounds_guard():
-    """Sheets that would snap the box below the minimum device depth
-    are rejected -- the box is returned unchanged."""
+    """An invalid two-face pair retains one valid correction and never
+    shrinks the box below the minimum remaining depth."""
     rng = np.random.default_rng(8)
     pts = np.vstack([_sheet(rng, 0.12), _sheet(rng, -0.12), _floor(rng)])
     b = _box(0.35)
     nb, info = snap_box_faces(b, pts)
-    assert not info["moved"] and "bounds" in info.get("reason", ""), info
+    assert info["moved"], info
+    assert nb.size[1] >= 0.30
+    assert (info["front"][0] == info["front"][1]
+            or info["back"][0] == info["back"][1]), info
     print("PASS face snap depth bounds guard")
 
 

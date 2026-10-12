@@ -546,8 +546,7 @@ _FACE_BAND = 0.06
 # the face out). END faces:
 # the inflation source is mask BLEED, not doors -- the window stays
 # bleed-sized
-_FACE_SNAP_IN_FRAC = 2.0 / 3.0
-_END_SNAP_IN = 0.35
+_SNAP_MIN_REMAINING = 0.30
 _FACE_SNAP_OUT = 0.15
 # a candidate peak must reach this fraction of the window's strongest
 # peak AND of the box profile's global max. The window bar alone would
@@ -568,8 +567,6 @@ _FACE_EMPTY_FACE_FRAC = 0.12
 # snap a bin inside
 _FACE_END_TAU = 0.30
 # END inward search range: 1/3 of the box's along extent, capped at 3m.
-_END_SNAP_IN_FRAC = 1.0 / 3.0
-_END_SNAP_IN_MAX = 3.0
 # moves below this are noise -> no-op
 _FACE_SNAP_MIN_MOVE = 0.02
 # device depth bounds for the snapped result
@@ -735,15 +732,11 @@ def snap_box_faces(box: OrientedBox,
         return box, {"moved": False, "reason": "empty profile"}
 
     debug = []
+    inward_options = {}
 
     def _peaks(win_lo: float, win_hi: float, side: int,
                inward: bool = False) -> np.ndarray:
-        # Keep each face on its own side of the box centre. Without this
-        # guard, an under-measured front face can see the back sheet in its
-        # large inward window and produce an invalid negative depth.
-        in_win = ((centers >= win_lo) & (centers <= win_hi)
-                  & ((centers >= cross_c) if side > 0
-                     else (centers <= cross_c)))
+        in_win = (centers >= win_lo) & (centers <= win_hi)
         if not in_win.any():
             return np.empty(0, dtype=np.int64)
         if inward:
@@ -813,6 +806,8 @@ def snap_box_faces(box: OrientedBox,
             "candidate_count": int(len(cand)),
         }
         if len(cand):
+            if is_inward:
+                inward_options[side] = cand
             d = np.abs(centers[cand] - face_pos)
             if is_inward:
                 peak = band[cand]
@@ -846,13 +841,43 @@ def snap_box_faces(box: OrientedBox,
         return face_pos
 
     front, back = cross_c + half_d, cross_c - half_d
-    inward_range = float(box.size[1]) * _FACE_SNAP_IN_FRAC
+    inward_range = max(float(box.size[1]) - _SNAP_MIN_REMAINING, 0.0)
     f1 = _snap(front,
                (front - inward_range, front),
                (front, front + _FACE_SNAP_OUT), +1)
     b1 = _snap(back,
                (back, back + inward_range),
                (back - _FACE_SNAP_OUT, back), -1)
+    if 1 in inward_options and -1 in inward_options:
+        # The expanded windows may overlap. Choose a supported pair jointly
+        # so the two faces cannot collapse onto the same strongest sheet.
+        pairs = [(f, b) for f in inward_options[1]
+                 for b in inward_options[-1]
+                 if _SNAP_MIN_REMAINING <= centers[f] - centers[b]
+                 <= _FACE_SNAP_MAX_D]
+        if pairs:
+            f, b = max(pairs, key=lambda pair: (
+                int(band[pair[0]]) + int(band[pair[1]]),
+                -abs(centers[pair[0]] - front)
+                - abs(centers[pair[1]] - back)))
+            f1, b1 = float(centers[f]), float(centers[b])
+            for rec, idx in zip(debug, (f, b)):
+                rec["candidate"] = round(float(centers[idx]), 3)
+                rec["candidate_peak"] = int(band[idx])
+        else:
+            # Keep one measured face if no two-sheet pair is wide enough.
+            # This preserves the opposite original face instead of rejecting
+            # both independent corrections.
+            single = [(f1, back), (front, b1)]
+            single = [p for p in single if _SNAP_MIN_REMAINING <= p[0] - p[1]
+                      <= _FACE_SNAP_MAX_D]
+            if single:
+                f1, b1 = max(single, key=lambda p: p[0] - p[1])
+                for rec, pos, original in zip(debug, (f1, b1), (front, back)):
+                    rec["candidate"] = round(pos, 3)
+                    if pos == original:
+                        rec["accepted"] = False
+                        rec["reason"] = "opposite_face_minimum_spacing"
     mf = abs(f1 - front) >= _FACE_SNAP_MIN_MOVE
     mb = abs(b1 - back) >= _FACE_SNAP_MIN_MOVE
     if not mf:
@@ -1010,8 +1035,7 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
 
     def _snap_end(face_pos: float, outer_sign: int) -> float:
         # outer_sign=+1: the right face (outward = +along); -1: left
-        in_range = min(float(box.size[0]) * _END_SNAP_IN_FRAC,
-                       _END_SNAP_IN_MAX)
+        in_range = max(float(box.size[0]) - _SNAP_MIN_REMAINING, 0.0)
         if outer_sign > 0:
             win_lo = face_pos - in_range
             win_hi = face_pos + _FACE_SNAP_OUT
@@ -1133,6 +1157,12 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
         return box, {"moved": False,
                      "reason": "already on the plateau edges"}
     length, old_length = r1 - l1, 2.0 * half_len
+    if length < _SNAP_MIN_REMAINING:
+        single = [(r1, left), (right, l1)]
+        single = [p for p in single if p[0] - p[1] >= _SNAP_MIN_REMAINING]
+        if single:
+            r1, l1 = max(single, key=lambda p: p[0] - p[1])
+            length = r1 - l1
     if length < 0.30:
         return box, {"moved": False,
                      "reason": f"snapped length {length:.2f} too short"}
