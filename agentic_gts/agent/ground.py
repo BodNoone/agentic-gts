@@ -640,25 +640,29 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
                   f"-> scatter")
     if img is None:
         img = _projected_scatter(band, cam, W, H)
-    # ---- crop the NADIR view to the tile's projected footprint ----
+    # ---- crop global views to the tile's projected footprint ----
     # The camera is fitted so the tile at z_top_ring FITS the frame; on
     # the non-binding axis the tile fills only ~1.19/a of the image and
     # the rest is empty (user report: long-thin tiles rendered with a
     # very high camera, the room a thin band, the VLM misjudging).
     # Cropping the image to the tile's projected bbox removes exactly
     # that whitespace; all tile content (at or below z_top_ring) stays
-    # inside. Tilt views keep the full frame (their ground footprint
-    # projects to a trapezoid an AABB crop cannot tighten). `off` is the
+    # inside. Tilt views bound both bottom and top footprint projections
+    # so perspective shifts across device heights cannot clip content. `off` is the
     # crop origin in FULL-frame pixels: callers ADD it to VLM rects
     # before unprojecting through cam (cam still maps world ->
     # full-frame pixels).
     off = (0, 0)
-    if lo is not None and not (tilt_deg and tilt_dir):
+    if lo is not None:
         try:
             zr = max(2.0, float(pts_rot[:, 2].max())) if len(pts_rot) else 2.0
             corners_r = np.array([[lo[0], lo[1]], [hi[0], lo[1]],
                                   [hi[0], hi[1]], [lo[0], hi[1]]])
             cw = _rot_xy(np.column_stack([corners_r, np.full(4, zr)]), yaw)
+            if tilt_deg and tilt_dir:
+                zb = float(band[:, 2].min()) if len(band) else 0.0
+                cw = np.vstack([cw, _rot_xy(np.column_stack(
+                    [corners_r, np.full(4, zb)]), yaw)])
             uv = cam.project_cv(cw)
             _pad = 6
             x0 = max(int(np.floor(uv[:, 0].min())) - _pad, 0)
@@ -671,7 +675,8 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
                 img = img[y0:y1, x0:x1]
                 off = (x0, y0)
                 W, H = int(x1 - x0), int(y1 - y0)
-                print(f"[ground] nadir view cropped to the tile footprint "
+                print(f"[ground] {'tilt' if tilt_deg and tilt_dir else 'nadir'} "
+                      f"view cropped to the tile footprint "
                       f"{W}x{H} (was {_ow}x{_oh}), crop offset {off}")
         except Exception as e:
             print(f"[ground] nadir crop failed ({type(e).__name__}: {e}) "

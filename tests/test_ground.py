@@ -54,12 +54,13 @@ def test_render_topdown_tilt_camera_geometry():
     scene.meta["yaw"] = 0.0
     _bootstrap_meta(scene, (-0.5, -0.8, 6.5, 3.8))
     _, cam0, _, _, _ = ground._render_topdown(scene, 0.0)
-    # W/H from a TILT render: tilt views keep the full frame, so the
-    # roundtrip bounds below test against the real frame dims
-    _, camL, W, H, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
+    # Each tilt render now has its own cropped dimensions and offset.
+    _, camL, WL, HL, offL = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
                                               tilt_dir=-1)
-    _, camR, _, _, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
+    _, camR, WR, HR, offR = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
                                               tilt_dir=+1)
+    assert WL * HL < camL.W * camL.H
+    assert WR * HR < camR.W * camR.H
     # eyes sit on opposite sides of the layout, across the rows
     assert camL.eye[1] < cam0.eye[1] - 0.5, "L eye must sit toward -y"
     assert camR.eye[1] > cam0.eye[1] + 0.5, "R eye must sit toward +y"
@@ -77,10 +78,11 @@ def test_render_topdown_tilt_camera_geometry():
     # unproject onto the SAME z-plane -> the same XY
     world = np.column_stack([rng.uniform(-0.5, 6.5, 40),
                             rng.uniform(-0.8, 3.8, 40), np.full(40, 1.0)])
-    for cam in (camL, camR):
+    for cam, W, H, off in ((camL, WL, HL, offL), (camR, WR, HR, offR)):
         uv = cam.project_cv(world)
-        assert ((uv[:, 0] >= 0) & (uv[:, 0] < W)
-                & (uv[:, 1] >= 0) & (uv[:, 1] < H)).all(), \
+        cropped = uv - np.asarray(off)
+        assert ((cropped[:, 0] >= 0) & (cropped[:, 0] < W)
+                & (cropped[:, 1] >= 0) & (cropped[:, 1] < H)).all(), \
             "the whole layout must stay in the tilted frame"
         back = unproject_ground(cam, uv, z_plane=1.0)
         assert np.allclose(back[:, :2], world[:, :2], atol=0.01), \
@@ -106,14 +108,13 @@ def test_ground_stage_tilt_views_add_recall():
     _bootstrap_meta(scene, (-0.5, -0.8, 9.5, 3.8))
     scene.boxes = []
     _, cam0, _, _, off0 = ground._render_topdown(scene, 0.0)
-    _, camL, _, _, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
+    _, camL, _, _, offL = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
                                               tilt_dir=-1)
-    _, camR, _, _, _ = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
+    _, camR, _, _, offR = ground._render_topdown(scene, 0.0, tilt_deg=20.0,
                                               tilt_dir=+1)
-    # the nadir view may be CROPPED to the tile footprint; tilt views
-    # keep the full frame -- the fake reply must carry each view's crop
+    # All global views may be cropped; fake replies use their own offsets.
     view_offs = {"groundview.png": off0,
-                 "groundview_L.png": (0, 0), "groundview_R.png": (0, 0)}
+                  "groundview_L.png": offL, "groundview_R.png": offR}
     view_rects = {
         "groundview.png": (cam0, [((-0.2, 6.2), (-0.6, 0.6))]),
         # the L view repeats the nadir rect (a duplicate): the recall
