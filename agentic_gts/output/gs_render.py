@@ -368,16 +368,19 @@ def _try_gsplat(means, quats, scales, opac, rgb, V_cv, K, W, H,
     # Squeeze to a 1-D opac so shape mismatches from older (N,1) conventions
     # don't silently break; rasterization broadcasts a 1-D opacity fine.
     op = t(opac).squeeze(-1)
-    kwargs = {} if background is None else {
-        "backgrounds": t(background).reshape(1, 3)}
     out = rasterization(
         t(means), t(quats), t(scales),
         op, t(rgb),
         viewmats=t(V_cv).unsqueeze(0), Ks=t(K).unsqueeze(0),
         width=W, height=H, render_mode="RGB",
-        **kwargs,
     )
     img = out[0][0].detach().cpu().numpy()
+    if background is not None:
+        # Keep the original backend API: older gsplat installations do not
+        # accept `backgrounds`. Composite using returned alpha, never by
+        # replacing dark RGB pixels (opaque black cabinets are foreground).
+        alpha = out[1][0].detach().cpu().numpy()
+        img = img[..., :3] + (1.0 - alpha) * np.asarray(background)
     return np.clip(img[..., :3], 0.0, 1.0)
 
 
