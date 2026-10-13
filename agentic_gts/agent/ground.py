@@ -247,6 +247,10 @@ _TILE_OVERLAP = 2.5
 # devices stay inside while far background does not inflate the camera.
 _FRAME_MARGIN = 0.5
 
+# Distinguish dark cabinets from the floor-removed background, without
+# recoloring real black equipment pixels. Local SAM views keep their default.
+_GROUND_BACKGROUND = (0.30, 0.10, 0.10)
+
 # recall tilt views (user direction 1): the extra L/R cameras deviate
 # from vertical by this much -- small enough to keep the nadir's
 # layout fidelity (rows stay near-axis-aligned, rects back-project
@@ -630,7 +634,7 @@ def _render_topdown(scene, yaw: float, W: int = 1280, H: int = 1024,
             img = render_gs_view(gs, (), cam,
                                  cut_z=float("inf"),
                                  cut_z_low=float("-inf"),
-                                 keep_mask=keep)
+                                  keep_mask=keep, background=_GROUND_BACKGROUND)
         except Exception as e:
             print(f"[ground] GS render failed ({type(e).__name__}: {e}) "
                   f"-> scatter")
@@ -718,7 +722,9 @@ def _projected_scatter(points: np.ndarray, cam, W: int, H: int) -> np.ndarray:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     fig = plt.figure(figsize=(W / 100.0, H / 100.0), dpi=100)
+    fig.patch.set_facecolor(_GROUND_BACKGROUND)
     ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_facecolor(_GROUND_BACKGROUND)
     ax.set_xlim(0, W)
     ax.set_ylim(H, 0)          # pixel coords, y down
     ax.axis("off")

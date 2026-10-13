@@ -213,6 +213,27 @@ def test_local_cam_front_face():
     assert (uv[:, 0].min() > 0 and uv[:, 0].max() < cam.W and
             uv[:, 1].min() > 0 and uv[:, 1].max() < cam.H), f"box off-frame: {uv}"
     print(f"PASS local cam front-face view (tilt {tilt:.1f} deg, box framed)")
+def test_horizontal_face_cameras_frame_rotated_long_rows():
+    from agentic_gts.output.gs_render import make_local_cam
+    for yaw in (0.0, 0.37, np.pi / 2):
+        box = OrientedBox(center=(5.0, -3.0, 1.2),
+                          size=(12.0, 1.1, 2.4), yaw=yaw)
+        face = np.array([[-6, 0.55, -1.2], [6, 0.55, -1.2],
+                         [6, 0.55, 1.2], [-6, 0.55, 1.2]])
+        for azim in (0.0, 180.0):
+            cam = make_local_cam(box, elev_deg=0.0, azim_deg=azim,
+                                 standoff=0.6)
+            assert cam.eye[2] == box.center[2]
+            assert cam.target[2] == box.center[2]
+            uv = cam.project_cv(box.local_to_world(face))
+            assert np.allclose(uv[0, 1], uv[1, 1])
+            assert np.allclose(uv[2, 1], uv[3, 1])
+            assert np.allclose(uv[0, 0], uv[3, 0])
+            assert np.allclose(uv[1, 0], uv[2, 0])
+            assert (uv[:, 0].min() > 0 and uv[:, 0].max() < cam.W
+                    and uv[:, 1].min() > 0 and uv[:, 1].max() < cam.H)
+
+
 def test_local_cam_steep_oblique_measures_thickness():
     """The 'oblique' slot runs near-top-down (~70 deg): the look direction
     is steep enough that the row-direction depth of the box projects with

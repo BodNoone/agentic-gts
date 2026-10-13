@@ -242,6 +242,8 @@ def make_local_cam(boxes, extent: float = 1.2, W: int = 768, H: int = 768,
     fy = math.tan(math.radians(60.0 / 2.0))
     fx = fy * (W / H)
     spans = corners.max(axis=0) - corners.min(axis=0)
+    screen_right = np.array([-horiz[1], horiz[0]])
+    horizontal_span = float(np.ptp(corners[:, :2] @ screen_right))
 
     def _framed(cam):
         pc = np.hstack([corners, np.ones((len(corners), 1))]) @ cam.view_cv().T
@@ -278,12 +280,12 @@ def make_local_cam(boxes, extent: float = 1.2, W: int = 768, H: int = 768,
         # UNFRAMED camera and the box wireframe overflowed the image
         # (user report: mask_prompt views with the row not fully
         # observed).
-        dist0 = max(dist, (spans[0] + extent) / 2.0 / fx,
+        dist0 = max(dist, (horizontal_span + extent) / 2.0 / fx,
                     spans[2] / 2.0 / fy)
     else:
         # first-guess distance from the union's extent (plus margin), then
         # verify by projection and back off until every corner is in frame
-        dist0 = max(spans[2] / 2.0 / fy, (spans[0] + extent) / 2.0 / fx)
+        dist0 = max(spans[2] / 2.0 / fy, (horizontal_span + extent) / 2.0 / fx)
         cam = None
     for f in (1.0, 1.1, 1.25, 1.4, 1.6, 1.9, 2.2, 2.6, 3.0, 3.5):
         dist = dist0 * f
@@ -356,7 +358,8 @@ def _subset_gs(gs: GaussianData, mask: np.ndarray) -> GaussianData:
 
 
 
-def _try_gsplat(means, quats, scales, opac, rgb, V_cv, K, W, H):
+def _try_gsplat(means, quats, scales, opac, rgb, V_cv, K, W, H,
+                background=None):
     import torch
     from gsplat.rendering import rasterization
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -365,11 +368,14 @@ def _try_gsplat(means, quats, scales, opac, rgb, V_cv, K, W, H):
     # Squeeze to a 1-D opac so shape mismatches from older (N,1) conventions
     # don't silently break; rasterization broadcasts a 1-D opacity fine.
     op = t(opac).squeeze(-1)
+    kwargs = {} if background is None else {
+        "backgrounds": t(background).reshape(1, 3)}
     out = rasterization(
         t(means), t(quats), t(scales),
         op, t(rgb),
         viewmats=t(V_cv).unsqueeze(0), Ks=t(K).unsqueeze(0),
         width=W, height=H, render_mode="RGB",
+        **kwargs,
     )
     img = out[0][0].detach().cpu().numpy()
     return np.clip(img[..., :3], 0.0, 1.0)
@@ -387,7 +393,8 @@ def _getPerspective(znear, zfar, fovy, W, H):
     return P
 
 
-def _try_official(means, quats, scales, opac, rgb, cam: Cam):
+def _try_official(means, quats, scales, opac, rgb, cam: Cam,
+                  background=None):
     """diff_gaussian_rasterization (the official 3DGS repo's CUDA lib).
 
     Mirrors gaussian_renderer/render() from INRIA's repo: tensors are stored
@@ -404,7 +411,8 @@ def _try_official(means, quats, scales, opac, rgb, cam: Cam):
         image_height=cam.H, image_width=cam.W,
         tanfovx_y=math.tan(math.radians(cam.fovy_deg) / 2.0),
         tanfovx_x=math.tan(math.radians(cam.fovy_deg) / 2.0) * cam.W / cam.H,
-        bg=torch.zeros(3, device=dev), scale_modifier=1.0,
+        bg=(torch.zeros(3, device=dev) if background is None else t(background)),
+        scale_modifier=1.0,
         viewmatrix=t(V_off).T, projmatrix=t(full).T,
         sh_degree=0, campos=t(cam.eye), prefiltered=False, debug=False)
     rasterizer = GaussianRasterizer(raster_settings=settings)
@@ -422,8 +430,8 @@ def _try_official(means, quats, scales, opac, rgb, cam: Cam):
 
 
 def rasterize_gs(gs: GaussianData, cam: Cam, cut_z: float = float("inf"),
-                 cut_z_low: float = float("-inf"),
-                 keep_mask: np.ndarray | None = None):
+                  cut_z_low: float = float("-inf"),
+                  keep_mask: np.ndarray | None = None, background=None):
     """(H,W,3) float image or None if no CUDA rasterizer is available.
 
     keep_mask: optional boolean mask over gs (e.g. _near_boxes_mask) to
@@ -435,16 +443,17 @@ def rasterize_gs(gs: GaussianData, cam: Cam, cut_z: float = float("inf"),
     means, quats, scales, opac, rgb = _prep(gs, cut_z, cut_z_low)
     if len(means) == 0:
         return None
+    kwargs = {} if background is None else {"background": background}
     try:
         return _try_gsplat(means, quats, scales, opac, rgb,
-                           cam.view_cv(), cam.K(), cam.W, cam.H)
+                            cam.view_cv(), cam.K(), cam.W, cam.H, **kwargs)
     except ImportError:
         pass
     except Exception as e:
         print(f"[gs] gsplat rasterization failed ({type(e).__name__}: {e}) "
               f"-> trying official rasterizer")
     try:
-        return _try_official(means, quats, scales, opac, rgb, cam)
+        return _try_official(means, quats, scales, opac, rgb, cam, **kwargs)
     except ImportError:
         print("[gs] neither gsplat nor diff_gaussian_rasterization installed "
               "-> falling back to scatter render "
@@ -534,7 +543,7 @@ def render_gs_view(gs: GaussianData, boxes, cam: Cam,
                    overlay: str = "footprint",
                    isolate_boxes: bool = False,
                    isolate_margin: float = 0.6,
-                   keep_mask: np.ndarray | None = None):
+                    keep_mask: np.ndarray | None = None, background=None):
     """Full render: gaussians + numbered box overlay. None if no backend.
 
     isolate_boxes: keep ONLY the gaussians near `boxes` (their inflated
@@ -546,8 +555,9 @@ def render_gs_view(gs: GaussianData, boxes, cam: Cam,
     """
     keep = _near_boxes_mask(gs, boxes, margin=isolate_margin) \
         if (isolate_boxes and boxes) else keep_mask
+    kwargs = {} if background is None else {"background": background}
     img = rasterize_gs(gs, cam, cut_z=cut_z, cut_z_low=cut_z_low,
-                       keep_mask=keep)
+                       keep_mask=keep, **kwargs)
     if img is None:
         return None
     if boxes and overlay:

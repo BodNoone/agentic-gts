@@ -1828,8 +1828,13 @@ def test_side_view_vlm_arbitration_overrides_rule():
     try:
         views = mr.render_local_views(scene, box, None, judge=judge)
         names = [v["name"] for v in views]
+        for view in views:
+            if view["name"] in ("front", "back"):
+                assert view["cam"].eye[2] == box.center[2]
+                assert view["cam"].target[2] == box.center[2]
         assert "back" not in names, names
         side = next(v for v in views if v["name"] == "side")
+        assert side["cam"].eye[2] > side["cam"].target[2]
         eye_c = np.asarray(side["cam"].eye)
         assert eye_c[0] * eye_rule[0] < 0, \
             (f"VLM pick 'B' (opposite end) must flip the side camera: "

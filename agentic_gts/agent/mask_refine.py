@@ -870,8 +870,11 @@ def render_local_views(scene: Scene, box: OrientedBox,
         return path, prompt_path
 
     out = []
-    for name, elev, azim, so in (("front", 18.0, azim_front, standoff),
-                                 ("back", 18.0, azim_front + 180.0,
+    # Face voters look horizontally at cabinet mid-height: perspective
+    # rectangles remain rectangular when the seed yaw matches the face.
+    # Side depth views retain their oblique placement below.
+    for name, elev, azim, so in (("front", 0.0, azim_front, standoff),
+                                 ("back", 0.0, azim_front + 180.0,
                                   standoff)):
         raw, prompt_img, cam = _render_one(elev, azim, so)
         if raw is None:

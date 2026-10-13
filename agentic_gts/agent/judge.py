@@ -271,9 +271,11 @@ class VLMJudge:
     # second-guess.
     _GROUND_PROMPT = (
         "This is a top-down view of a data-center room with the ceiling "
-        "removed: rows of tall server racks appear as solid bright "
-        "bands, aisles are dark, walls are thin lines at the room "
-        "boundary.\n"
+        "and floor removed. The muted dark-red background is empty space, "
+        "not equipment. Cabinets may be black, grey, white, or other colors; "
+        "locate equipment by its structure and contours rather than brightness. "
+        "Aisles are gaps between structures, and walls are thin lines at "
+        "the room boundary.\n"
         "Locate every instance that belongs to the following categories: "
         '"cabinet, server rack, air conditioning". A continuous row of '
         "joined cabinets is ONE instance whose box covers the WHOLE row "
