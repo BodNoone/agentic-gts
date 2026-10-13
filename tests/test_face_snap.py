@@ -195,6 +195,34 @@ def test_faces_extend_to_supported_sheet_beyond_fifteen_cm():
     assert all(r["searched"] == "outward_extended" for r in info["debug"])
 
 
+def test_reused_projection_preserves_extended_snap_results():
+    rng = np.random.default_rng(57)
+    pts = np.vstack([_sheet(rng, 0.70, n=3000),
+                     _sheet(rng, -0.70, n=3000)])
+    box = _box(0.45)
+    mask = ((np.abs(pts[:, 0]) <= 1.05)
+            & (pts[:, 2] > 0.30) & (pts[:, 2] <= 2.10))
+    profile = (int(mask.sum()), pts[mask, 1])
+    expected, expected_info = snap_box_faces(box, pts)
+    actual, actual_info = snap_box_faces(box, pts, _profile=profile)
+    assert np.allclose(actual.center, expected.center)
+    assert np.allclose(actual.size, expected.size)
+    assert actual_info == expected_info
+
+    end_box = _end_box(-3, 2.75)
+    ends = np.vstack([_row(rng, -3, 3), np.column_stack([
+        np.full(3000, 3.0), rng.uniform(-0.55, 0.55, 3000),
+        rng.uniform(0.35, 2.0, 3000)])])
+    mask = ((np.abs(ends[:, 1]) <= 0.60)
+            & (ends[:, 2] > 0.30) & (ends[:, 2] <= 2.10))
+    expected, expected_info = snap_box_ends(end_box, ends)
+    actual, actual_info = snap_box_ends(
+        end_box, ends, _profile=(int(mask.sum()), ends[mask, 0]))
+    assert np.allclose(actual.center, expected.center)
+    assert np.allclose(actual.size, expected.size)
+    assert actual_info == expected_info
+
+
 def test_extended_face_does_not_override_supported_original_surface():
     rng = np.random.default_rng(54)
     pts = np.vstack([_sheet(rng, 0.55, n=1500),

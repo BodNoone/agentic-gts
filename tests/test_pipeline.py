@@ -39,6 +39,11 @@ def test_pipeline_local_empty_reply_smoke(monkeypatch, tmp_path):
         "the pipeline should retain geometry-bootstrap boxes when VLM is empty"
     assert (tmp_path / "grounded.png").is_file()
     assert (tmp_path / "output.json").is_file()
+    with open(tmp_path / "perf.json", encoding="utf-8") as f:
+        timings = __import__("json").load(f)["stages"]
+    assert all(timings[name] >= 0 for name in (
+        "structural_filter", "furniture_filter", "face_support",
+        "wall_filter", "outputs"))
     assert not (tmp_path / "boxes_objects.json").exists()
     with open(tmp_path / "boxes.json", encoding="utf-8") as f:
         saved = __import__("json").load(f)

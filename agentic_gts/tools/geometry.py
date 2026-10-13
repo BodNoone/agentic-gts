@@ -105,6 +105,7 @@ def filter_outer_wall_boxes(scene: Scene, edge_margin: float = 0.35) -> int:
     if not len(scene.points):
         return 0
     keep, removed = [], 0
+    projection_bounds = {}
     for b in scene.boxes:
         support = b.meta.get("face_support", {})
         faces = support.get("faces", {})
@@ -122,35 +123,41 @@ def filter_outer_wall_boxes(scene: Scene, edge_margin: float = 0.35) -> int:
             print(f"[wall-filter] {b.box_id} removed: long thin box, empty top")
             removed += 1
             continue
+        if support.get("matched_faces", 5) >= 3:
+            keep.append(b)
+            continue
+        possible = [(axis, sign, name) for axis, pairs in (
+            (0, ((-1, "left", "right"), (1, "right", "left"))),
+            (1, ((-1, "back", "front"), (1, "front", "back"))))
+            for sign, name, opposite in pairs
+            if faces.get(name, {}).get("points", 0) >= 10
+            and faces.get(name, {}).get("coverage", 0.0) >= 0.05
+            and faces.get(opposite, {}).get("coverage", 1.0) < 0.05]
+        if not possible:
+            keep.append(b)
+            continue
         tolerance = float(support.get("tolerance_m", 0.05))
         local = b.world_to_local(scene.points_in_region(_region_of_box(b, tolerance)))
         half = np.asarray(b.size, dtype=float) / 2.0
         body = local[np.all(np.abs(local) <= half + tolerance, axis=1)
                      & (local[:, 2] > -half[2] + 0.30)]
         wall_face = None
-        for axis in (0, 1):
+        for axis, sign, name in possible:
+            concentration = (float((np.abs(body[:, axis] - sign * half[axis])
+                                    <= tolerance).mean()) if len(body) else 0.0)
+            if concentration < 0.90:
+                continue
             direction = b.rotation[:2, axis]
-            projected = scene.points[:, :2] @ direction
+            key = tuple(direction)
+            if key not in projection_bounds:
+                projected = scene.points[:, :2] @ direction
+                projection_bounds[key] = (float(projected.min()),
+                                          float(projected.max()))
             center = float(np.asarray(b.center[:2]) @ direction)
-            for sign, name, opposite in ((-1, "left", "right"),
-                                         (1, "right", "left")) if axis == 0 else (
-                                             (-1, "back", "front"),
-                                             (1, "front", "back")):
-                outer = faces.get(name, {})
-                inner = faces.get(opposite, {})
-                face_pos = center + sign * float(b.size[axis]) / 2.0
-                limit = float(projected.min() if sign < 0 else projected.max())
-                concentration = (float((np.abs(body[:, axis] - sign * half[axis])
-                                        <= tolerance).mean()) if len(body) else 0.0)
-                if (abs(face_pos - limit) <= edge_margin
-                        and outer.get("points", 0) >= 10
-                        and outer.get("coverage", 0.0) >= 0.05
-                        and inner.get("coverage", 1.0) < 0.05
-                        and concentration >= 0.90
-                        and support.get("matched_faces", 5) < 3):
-                    wall_face = name
-                    break
-            if wall_face:
+            face_pos = center + sign * float(b.size[axis]) / 2.0
+            limit = projection_bounds[key][0 if sign < 0 else 1]
+            if abs(face_pos - limit) <= edge_margin:
+                wall_face = name
                 break
         if wall_face:
             b.meta["wall_false_positive"] = {
@@ -704,7 +711,8 @@ def _extended_face_supported(box: OrientedBox, pts: np.ndarray,
 
 
 def snap_box_faces(box: OrientedBox,
-                   pts: np.ndarray, outward_limit: float = _FACE_SNAP_OUT
+                   pts: np.ndarray, outward_limit: float = _FACE_SNAP_OUT,
+                   _profile=None
                    ) -> tuple[OrientedBox, dict]:
     """Snap ONE box's front/back (cross-axis) faces onto the densest
     mesh sheets in its own column (user direction: a final thickness
@@ -742,11 +750,13 @@ def snap_box_faces(box: OrientedBox,
     # the box's own column: along-slice + a floor-excluding z band
     # (floor points span the whole cross range and would flatten the
     # face peaks into a uniform background)
-    m = ((np.abs(pts[:, :2] @ axis - along_c) <= half_len + 0.05)
-         & (pts[:, 2] > bottom + 0.30) & (pts[:, 2] <= top))
-    if int(m.sum()) < 50:
+    if _profile is None:
+        m = ((np.abs(pts[:, :2] @ axis - along_c) <= half_len + 0.05)
+             & (pts[:, 2] > bottom + 0.30) & (pts[:, 2] <= top))
+        _profile = (int(m.sum()), pts[m, :2] @ cross)
+    profile_points, cc = _profile
+    if profile_points < 50:
         return box, {"moved": False, "reason": "too few profile points"}
-    cc = pts[m, :2] @ cross
     prof_lo = cross_c - half_d - outward_limit
     prof_hi = cross_c + half_d + outward_limit
     # explicit bin COUNT, not arange(stop): arange's ceil drifts in fp
@@ -761,7 +771,7 @@ def snap_box_faces(box: OrientedBox,
     if gmax <= 0:
         if outward_limit == _FACE_SNAP_OUT:
             fallback_box, fallback = snap_box_faces(
-                box, pts, outward_limit=_FACE_SNAP_OUT_MAX)
+                box, pts, outward_limit=_FACE_SNAP_OUT_MAX, _profile=_profile)
             if fallback.get("moved"):
                 front_pos, back_pos = cross_c + half_d, cross_c - half_d
                 new_front, new_back = fallback["front"][1], fallback["back"][1]
@@ -845,7 +855,7 @@ def snap_box_faces(box: OrientedBox,
                              round(float(inward[1]), 3)],
             "outward_range": [round(float(outward[0]), 3),
                               round(float(outward[1]), 3)],
-            "profile_points": int(m.sum()),
+            "profile_points": profile_points,
             "gmax": int(gmax),
             "face_density": round(current_face_density, 1),
             "empty_face": bool(empty_face),
@@ -899,7 +909,8 @@ def snap_box_faces(box: OrientedBox,
     if outward_limit == _FACE_SNAP_OUT and any(
             r.get("reason") in ("no_qualifying_peak", "outward_height_guard")
             for r in debug):
-        _, fallback = snap_box_faces(box, pts, outward_limit=_FACE_SNAP_OUT_MAX)
+        _, fallback = snap_box_faces(box, pts, outward_limit=_FACE_SNAP_OUT_MAX,
+                                     _profile=_profile)
         for index, original in enumerate((front, back)):
             if debug[index].get("reason") not in (
                     "no_qualifying_peak", "outward_height_guard"):
@@ -1026,7 +1037,8 @@ def _same_split_continues(boxes, box: OrientedBox, side: int) -> bool:
 def snap_box_ends(box: OrientedBox, pts: np.ndarray,
                     snap_left: bool = True,
                     snap_right: bool = True,
-                    outward_limit: float = _FACE_SNAP_OUT) -> tuple[OrientedBox, dict]:
+                    outward_limit: float = _FACE_SNAP_OUT,
+                    _profile=None) -> tuple[OrientedBox, dict]:
     """Snap the FREE row ends (along-axis faces) of one box onto the
     plateau edges of its own column (user direction: joined rows are
     fine-tuned only at their outmost ends -- the caller gates the
@@ -1066,11 +1078,13 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
         return box, {"moved": False, "reason": "too few points"}
     # the box's own row line: cross-slice + the same floor-excluding
     # z band as the face snap
-    m = ((np.abs(pts[:, :2] @ cross - cross_c) <= half_d + 0.05)
-         & (pts[:, 2] > bottom + 0.30) & (pts[:, 2] <= top))
-    if int(m.sum()) < 50:
+    if _profile is None:
+        m = ((np.abs(pts[:, :2] @ cross - cross_c) <= half_d + 0.05)
+             & (pts[:, 2] > bottom + 0.30) & (pts[:, 2] <= top))
+        _profile = (int(m.sum()), pts[m, :2] @ axis)
+    profile_points, aa = _profile
+    if profile_points < 50:
         return box, {"moved": False, "reason": "too few profile points"}
-    aa = pts[m, :2] @ axis
     prof_lo = along_c - half_len - outward_limit
     prof_hi = along_c + half_len + outward_limit
     nb = int(np.floor((prof_hi - prof_lo) / _FACE_BIN)) + 2
@@ -1088,7 +1102,7 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
         if outward_limit == _FACE_SNAP_OUT:
             fallback_box, fallback = snap_box_ends(
                 box, pts, snap_left, snap_right,
-                outward_limit=_FACE_SNAP_OUT_MAX)
+                outward_limit=_FACE_SNAP_OUT_MAX, _profile=_profile)
             if fallback.get("moved"):
                 right_pos, left_pos = along_c + half_len, along_c - half_len
                 valid = all(
@@ -1237,7 +1251,8 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
             (snap_right and abs(r1 - right) < _FACE_SNAP_MIN_MOVE)
             or (snap_left and abs(l1 - left) < _FACE_SNAP_MIN_MOVE)):
         _, fallback = snap_box_ends(box, pts, snap_left, snap_right,
-                                    outward_limit=_FACE_SNAP_OUT_MAX)
+                                    outward_limit=_FACE_SNAP_OUT_MAX,
+                                    _profile=_profile)
         if fallback.get("moved"):
             r2, l2 = fallback["right"][1], fallback["left"][1]
             if (snap_right and abs(r1 - right) < _FACE_SNAP_MIN_MOVE

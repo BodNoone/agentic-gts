@@ -668,12 +668,15 @@ def run_pipeline(scene: Scene,
     # mesh points in the band above its top (real device rows always
     # have overhead cable infrastructure; walls/pillars have nothing).
     from agentic_gts.tools.geometry import filter_structural_by_geometry
+    stage_t0 = time.perf_counter()
     n_struct = filter_structural_by_geometry(scene)
+    perf["stages"]["structural_filter"] = round(time.perf_counter() - stage_t0, 4)
     if n_struct:
         print(f"[stageF] structural geometry filter: {n_struct} "
               f"box(es) flagged (tall + no overhead trays)")
 
     from agentic_gts.tools.geometry import filter_low_furniture_by_geometry
+    stage_t0 = time.perf_counter()
     n_furniture = filter_low_furniture_by_geometry(scene)
     if n_furniture:
         scene.boxes = [b for b in scene.boxes
@@ -681,10 +684,15 @@ def run_pipeline(scene: Scene,
         print(f"[out] dropped {n_furniture} low-furniture box(es) "
               f"(low height + no overhead device infrastructure)")
 
+    perf["stages"]["furniture_filter"] = round(time.perf_counter() - stage_t0, 4)
+
     # Final confidence-only check: retain weak boxes for review in all outputs.
     from agentic_gts.tools.geometry import flag_insufficient_face_support
+    stage_t0 = time.perf_counter()
     flag_insufficient_face_support(scene)
+    perf["stages"]["face_support"] = round(time.perf_counter() - stage_t0, 4)
     from agentic_gts.tools.geometry import filter_outer_wall_boxes
+    stage_t0 = time.perf_counter()
     n_wall_fp = filter_outer_wall_boxes(scene)
     if n_wall_fp:
         with open(os.path.join(out_dir, "wall_filter_audit.json"), "w",
@@ -692,11 +700,14 @@ def run_pipeline(scene: Scene,
             json.dump(scene.meta["wall_filter_audit"], f, indent=2)
         print(f"[out] dropped {n_wall_fp} outer-wall false-positive box(es)")
 
+    perf["stages"]["wall_filter"] = round(time.perf_counter() - stage_t0, 4)
+
     # --- final frame: back to the INPUT coordinates (user report) ---
     # (see _map_outputs_to_input_frame)
     _map_outputs_to_input_frame(scene)
 
     # --- outputs ---
+    stage_t0 = time.perf_counter()
     scene.save_boxes(os.path.join(out_dir, "boxes.json"))
     # Compact name-keyed layout for downstream consumers.
     try:
@@ -726,6 +737,7 @@ def run_pipeline(scene: Scene,
         print(f"[warn] visualization failed: {type(e).__name__}: {e}")
     with open(os.path.join(out_dir, "agent_report.json"), "w", encoding="utf-8") as f:
         json.dump(report.to_dict(), f, ensure_ascii=False, indent=2)
+    perf["stages"]["outputs"] = round(time.perf_counter() - stage_t0, 4)
     perf["total_seconds"] = round(time.time() - t0, 4)
     perf["box_count_final"] = len(scene.boxes)
     perf["agent"] = getattr(report, "performance", {})
