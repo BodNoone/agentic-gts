@@ -226,7 +226,7 @@ def _map_outputs_to_input_frame(scene: Scene) -> None:
     +0.51m shift was long mistaken for the floor step itself, the boxes
     "floating" whenever boxes.json was laid over the original cloud
     (user report). After this, every output artifact (boxes.json,
-    boxes_objects.json, cloud_with_boxes.ply, overlay, the `view`
+    output.json, cloud_with_boxes.ply, overlay, the `view`
     subcommand) shares the input's coordinates: the render /
     export paths read scene.meta['align_tf'] and, with it dropped, use
     the raw gaussian file unchanged. Box ORIENTATION is kept: the align
@@ -698,15 +698,11 @@ def run_pipeline(scene: Scene,
 
     # --- outputs ---
     scene.save_boxes(os.path.join(out_dir, "boxes.json"))
-    # also persist the final layout in the detector-style 'objects' schema
-    # (the format the 'view' sub-command accepts as --boxes), so the result
-    # feeds downstream viewers directly
+    # Compact name-keyed layout for downstream consumers.
     try:
-        from agentic_gts.core.models import save_boxes_as_objects
-        save_boxes_as_objects(scene.boxes,
-                               os.path.join(out_dir, "boxes_objects.json"))
-        print(f"[out] {len(scene.boxes)} boxes -> boxes_objects.json "
-              f"(input 'objects' format)")
+        from agentic_gts.core.models import save_boxes_output
+        save_boxes_output(scene.boxes, os.path.join(out_dir, "output.json"))
+        print(f"[out] {len(scene.boxes)} boxes -> output.json")
     except Exception as e:  # extra format must never break the run
         print(f"[warn] objects-format save failed: {type(e).__name__}: {e}")
     with open(os.path.join(out_dir, "layout.svg"), "w", encoding="utf-8") as f:

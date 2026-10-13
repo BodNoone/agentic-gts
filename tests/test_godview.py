@@ -38,15 +38,14 @@ def test_extract_json_variants():
     assert _extract_json("no json at all") is None
     assert _extract_json("broken { not json") is None
     print("PASS json extraction")
-def test_objects_format_roundtrip():
-    """boxes_objects.json must round-trip with the --boxes input schema:
-    save -> load -> same center/size/yaw (within float precision)."""
+def test_output_format():
+    """Name-keyed output preserves geometry, rotations and confidence."""
     import json
     import math
     import tempfile
     import shutil
     from agentic_gts.core.models import (OrientedBox, Scene,
-                                         save_boxes_as_objects)
+                                          save_boxes_output)
     scene = _scene_with_racks()
     # arbitrary yaw (not axis-aligned) + a device_type-derived name
     boxes = [OrientedBox(center=(k * 0.62, 0.3 * k, 1.0),
@@ -55,22 +54,40 @@ def test_objects_format_roundtrip():
              for k in range(4)]
     out = tempfile.mkdtemp(prefix="obj_rt_")
     try:
-        p = os.path.join(out, "boxes_objects.json")
-        save_boxes_as_objects(boxes, p)
+        p = os.path.join(out, "output.json")
+        save_boxes_output(boxes, p)
         data = json.load(open(p, encoding="utf-8"))
-        assert "objects" in data and len(data["objects"]) == 4
-        # load through the normal CLI path (Scene.load_boxes)
-        s2 = Scene(points=scene.points)
-        s2.load_boxes(p)
-        assert len(s2.boxes) == 4
-        for a, b in zip(boxes, s2.boxes):
-            assert np.allclose(a.center, b.center, atol=1e-6), "center drifted"
-            assert np.allclose(a.size, b.size, atol=1e-6), "size drifted"
-            dyaw = (a.yaw - b.yaw + np.pi) % (2 * np.pi) - np.pi
-            assert abs(dyaw) < 1e-6, f"yaw drifted {dyaw}"
-        print("PASS objects-format roundtrip (center/size/yaw exact)")
+        assert list(data) == ["rack", "rack_2", "rack_3", "rack_4"]
+        for box, entry in zip(boxes, data.values()):
+            assert set(entry) == {"center", "extent", "rotation", "confidence"}
+            assert np.allclose(entry["center"], box.center)
+            assert np.allclose(entry["extent"], box.size)
+            assert np.allclose(entry["rotation"], box.rotation)
+            assert entry["confidence"] == box.confidence.value
     finally:
         shutil.rmtree(out, ignore_errors=True)
+def test_output_names_preserve_custom_names_and_avoid_collisions(tmp_path):
+    import json
+    from agentic_gts.core.models import (Confidence, DeviceType, OrientedBox,
+                                        save_boxes_output)
+
+    boxes = [OrientedBox(center=(0, 0, 1), size=(1, 1, 2),
+                         device_type=DeviceType.RACK,
+                         confidence=Confidence.LOW),
+             OrientedBox(center=(1, 0, 1), size=(1, 1, 2)),
+             OrientedBox(center=(2, 0, 1), size=(1, 1, 2),
+                         meta={"object_name": "rack_2"}),
+             OrientedBox(center=(3, 0, 1), size=(1, 1, 2),
+                         device_type=DeviceType.RACK)]
+    path = tmp_path / "output.json"
+    save_boxes_output(boxes, str(path))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert list(data) == ["rack", "unknown", "rack_2", "rack_3"]
+    assert data["rack"]["confidence"] == "low"
+    save_boxes_output([], str(path))
+    assert json.loads(path.read_text(encoding="utf-8")) == {}
+
+
 def test_ply_artifacts():
     """Output PLYs: boxes_only.ply (no cloud) + cloud_with_boxes.ply
     (height-tinted when no GS, SH-DC colored when GS available)."""

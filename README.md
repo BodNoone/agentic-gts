@@ -99,6 +99,7 @@ python -m agentic_gts.cli run --point-cloud room.ply \
 ```
 runs/xxx/
 ├── boxes.json            最终 box（带置信度：high 自动接受 / mid / low 建议人工复核）
+├── output.json           按名称索引的最终框：center / extent / rotation / confidence
 ├── layout.svg            矢量布局图（按置信度着色）
 ├── layout.png            布局预览图
 ├── overlay.png           点云 + 检测框叠加图（点云按高度着色；框按置信度着色；
