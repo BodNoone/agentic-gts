@@ -184,6 +184,51 @@ def test_face_snap_outward_fallback_when_inward_sheet_missing():
     print("PASS face snap outward fallback")
 
 
+def test_faces_extend_to_supported_sheet_beyond_fifteen_cm():
+    rng = np.random.default_rng(53)
+    pts = np.vstack([_sheet(rng, 0.70, n=3000),
+                     _sheet(rng, -0.70, n=3000)])
+    box = _box(0.45)
+    snapped, info = snap_box_faces(box, pts)
+    assert info["moved"], info
+    assert abs(snapped.size[1] - 1.40) < 0.06
+    assert all(r["searched"] == "outward_extended" for r in info["debug"])
+
+
+def test_extended_face_does_not_override_supported_original_surface():
+    rng = np.random.default_rng(54)
+    pts = np.vstack([_sheet(rng, 0.55, n=1500),
+                     _sheet(rng, -0.55, n=1500),
+                     _sheet(rng, 0.80, n=3000)])
+    box = _box(0.55)
+    snapped, info = snap_box_faces(box, pts)
+    assert not info["moved"], info
+    assert snapped is box
+
+
+def test_extended_faces_reject_tall_ladder():
+    rng = np.random.default_rng(55)
+    body = np.vstack([_sheet(rng, 0.70, n=3000, z_hi=0.95),
+                      _sheet(rng, -0.70, n=3000, z_hi=0.95)])
+    high = _sheet(rng, 0.70, n=200, z_lo=1.2, z_hi=2.0)
+    box = OrientedBox(center=(0, 0, 0.5), size=(2, 0.9, 1))
+    _, info = snap_box_faces(box, np.vstack([body, high]))
+    assert info.get("front", [0.45, 0.45])[1] == 0.45
+
+
+def test_end_extends_beyond_fifteen_cm_with_distributed_side_surface():
+    rng = np.random.default_rng(56)
+    end_sheet = np.column_stack([np.full(3000, 3.0),
+                                 rng.uniform(-0.55, 0.55, 3000),
+                                 rng.uniform(0.35, 2.0, 3000)])
+    pts = np.vstack([_row(rng, -3, 3), end_sheet])
+    box = _end_box(-3, 2.75)
+    snapped, info = snap_box_ends(box, pts)
+    assert info["moved"], info
+    assert abs(info["right"][1] - 3) < 0.04, info
+    assert snapped.size[0] > box.size[0]
+
+
 def test_face_snap_uses_strongest_qualifying_inward_peak():
     """Inward search uses the strongest qualifying device sheet, with
     proximity only resolving equal-strength candidates."""

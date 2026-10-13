@@ -562,6 +562,7 @@ _FACE_BAND = 0.06
 # bleed-sized
 _SNAP_MIN_REMAINING = 0.30
 _FACE_SNAP_OUT = 0.15
+_FACE_SNAP_OUT_MAX = 0.30
 # a candidate peak must reach this fraction of the window's strongest
 # peak AND of the box profile's global max. The window bar alone would
 # let a door-only window snap onto its own plateau; the global bar
@@ -688,8 +689,23 @@ def _trim_sparse_top(box: OrientedBox, pts: np.ndarray):
                      "top": [round(old_top, 3), round(new_top, 3)]}
 
 
+def _extended_face_supported(box: OrientedBox, pts: np.ndarray,
+                             axis: int, position: float) -> bool:
+    """Require distributed surface evidence for growth beyond 15cm."""
+    local = box.world_to_local(pts)
+    tangent = [i for i in range(3) if i != axis]
+    half = np.asarray(box.size) / 2.0
+    mask = np.abs(local[:, axis] - position) <= 0.05
+    mask &= np.all(np.abs(local[:, tangent]) <= half[tangent], axis=1)
+    selected = local[mask][:, tangent]
+    bins = np.maximum(np.ceil(2 * half[tangent] / 0.1).astype(int), 1)
+    idx = np.clip(((selected + half[tangent]) / 0.1).astype(int), 0, bins - 1)
+    return len(selected) >= 20 and len(np.unique(idx, axis=0)) / bins.prod() >= 0.30
+
+
 def snap_box_faces(box: OrientedBox,
-                   pts: np.ndarray) -> tuple[OrientedBox, dict]:
+                   pts: np.ndarray, outward_limit: float = _FACE_SNAP_OUT
+                   ) -> tuple[OrientedBox, dict]:
     """Snap ONE box's front/back (cross-axis) faces onto the densest
     mesh sheets in its own column (user direction: a final thickness
     polish -- the side-view chain has real holes, wall-masked /
@@ -731,8 +747,8 @@ def snap_box_faces(box: OrientedBox,
     if int(m.sum()) < 50:
         return box, {"moved": False, "reason": "too few profile points"}
     cc = pts[m, :2] @ cross
-    prof_lo = cross_c - half_d - _FACE_SNAP_OUT
-    prof_hi = cross_c + half_d + _FACE_SNAP_OUT
+    prof_lo = cross_c - half_d - outward_limit
+    prof_hi = cross_c + half_d + outward_limit
     # explicit bin COUNT, not arange(stop): arange's ceil drifts in fp
     # and an edge landing a hair below the sheet drops its points
     nb = int(np.floor((prof_hi - prof_lo) / _FACE_BIN)) + 2
@@ -743,6 +759,22 @@ def snap_box_faces(box: OrientedBox,
     band = np.convolve(hist, np.ones(k, dtype=int), mode="same")
     gmax = int(band.max())
     if gmax <= 0:
+        if outward_limit == _FACE_SNAP_OUT:
+            fallback_box, fallback = snap_box_faces(
+                box, pts, outward_limit=_FACE_SNAP_OUT_MAX)
+            if fallback.get("moved"):
+                front_pos, back_pos = cross_c + half_d, cross_c - half_d
+                new_front, new_back = fallback["front"][1], fallback["back"][1]
+                valid = all(
+                    abs(new - old) < _FACE_SNAP_MIN_MOVE
+                    or (0 < (new - old) * sign <= _FACE_SNAP_OUT_MAX
+                        and _extended_face_supported(box, pts, 1, new - cross_c))
+                    for old, new, sign in ((front_pos, new_front, 1),
+                                           (back_pos, new_back, -1)))
+                if valid:
+                    for rec in fallback["debug"]:
+                        rec["searched"] = "outward_extended"
+                    return fallback_box, fallback
         return box, {"moved": False, "reason": "empty profile"}
 
     debug = []
@@ -757,8 +789,10 @@ def snap_box_faces(box: OrientedBox,
             thr = max(_INWARD_SNAP_WINDOW_FRAC * float(band[in_win].max()),
                       _INWARD_SNAP_GLOBAL_FRAC * gmax)
         else:
-            thr = max(_FACE_SNAP_TAU * float(band[in_win].max()),
-                      _FACE_SNAP_ABS * gmax)
+            thr = max((0.65 if outward_limit > _FACE_SNAP_OUT else _FACE_SNAP_TAU)
+                      * float(band[in_win].max()),
+                      (0.35 if outward_limit > _FACE_SNAP_OUT else _FACE_SNAP_ABS)
+                      * gmax)
         is_peak = np.ones(len(band), dtype=bool)
         is_peak[1:-1] = ((band[1:-1] >= band[:-2])
                          & (band[1:-1] >= band[2:]))
@@ -858,10 +892,29 @@ def snap_box_faces(box: OrientedBox,
     inward_range = max(float(box.size[1]) - _SNAP_MIN_REMAINING, 0.0)
     f1 = _snap(front,
                (front - inward_range, front),
-               (front, front + _FACE_SNAP_OUT), +1)
+               (front, front + outward_limit), +1)
     b1 = _snap(back,
-               (back, back + inward_range),
-               (back - _FACE_SNAP_OUT, back), -1)
+                (back, back + inward_range),
+                (back - outward_limit, back), -1)
+    if outward_limit == _FACE_SNAP_OUT and any(
+            r.get("reason") in ("no_qualifying_peak", "outward_height_guard")
+            for r in debug):
+        _, fallback = snap_box_faces(box, pts, outward_limit=_FACE_SNAP_OUT_MAX)
+        for index, original in enumerate((front, back)):
+            if debug[index].get("reason") not in (
+                    "no_qualifying_peak", "outward_height_guard"):
+                continue
+            record = fallback.get("debug", [{}, {}])[index]
+            candidate = record.get("candidate", original)
+            sign = 1 if index == 0 else -1
+            if (record.get("accepted") and record.get("searched") == "outward"
+                    and _FACE_SNAP_OUT < (candidate - original) * sign <= _FACE_SNAP_OUT_MAX
+                    and _extended_face_supported(box, pts, 1, candidate - cross_c)):
+                if index == 0:
+                    f1 = candidate
+                else:
+                    b1 = candidate
+                debug[index] = {**record, "searched": "outward_extended"}
     if 1 in inward_options and -1 in inward_options:
         # The expanded windows may overlap. Choose a supported pair jointly
         # so the two faces cannot collapse onto the same strongest sheet.
@@ -971,8 +1024,9 @@ def _same_split_continues(boxes, box: OrientedBox, side: int) -> bool:
 
 
 def snap_box_ends(box: OrientedBox, pts: np.ndarray,
-                   snap_left: bool = True,
-                   snap_right: bool = True) -> tuple[OrientedBox, dict]:
+                    snap_left: bool = True,
+                    snap_right: bool = True,
+                    outward_limit: float = _FACE_SNAP_OUT) -> tuple[OrientedBox, dict]:
     """Snap the FREE row ends (along-axis faces) of one box onto the
     plateau edges of its own column (user direction: joined rows are
     fine-tuned only at their outmost ends -- the caller gates the
@@ -1017,8 +1071,8 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
     if int(m.sum()) < 50:
         return box, {"moved": False, "reason": "too few profile points"}
     aa = pts[m, :2] @ axis
-    prof_lo = along_c - half_len - _FACE_SNAP_OUT
-    prof_hi = along_c + half_len + _FACE_SNAP_OUT
+    prof_lo = along_c - half_len - outward_limit
+    prof_hi = along_c + half_len + outward_limit
     nb = int(np.floor((prof_hi - prof_lo) / _FACE_BIN)) + 2
     edges = prof_lo + _FACE_BIN * np.arange(nb + 1)
     hist, _ = np.histogram(aa, bins=edges)
@@ -1031,6 +1085,20 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
     # sheets; the plateau needs no aggregation.
     gmax = int(hist.max())
     if gmax <= 0:
+        if outward_limit == _FACE_SNAP_OUT:
+            fallback_box, fallback = snap_box_ends(
+                box, pts, snap_left, snap_right,
+                outward_limit=_FACE_SNAP_OUT_MAX)
+            if fallback.get("moved"):
+                right_pos, left_pos = along_c + half_len, along_c - half_len
+                valid = all(
+                    abs(new - old) < _FACE_SNAP_MIN_MOVE
+                    or (0 < (new - old) * sign <= _FACE_SNAP_OUT_MAX
+                        and _extended_face_supported(box, pts, 0, new - along_c))
+                    for old, new, sign in ((right_pos, fallback["right"][1], 1),
+                                           (left_pos, fallback["left"][1], -1)))
+                if valid:
+                    return fallback_box, fallback
         return box, {"moved": False, "reason": "empty profile"}
 
     def _runs(q):
@@ -1052,9 +1120,9 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
         in_range = max(float(box.size[0]) - _SNAP_MIN_REMAINING, 0.0)
         if outer_sign > 0:
             win_lo = face_pos - in_range
-            win_hi = face_pos + _FACE_SNAP_OUT
+            win_hi = face_pos + outward_limit
         else:
-            win_lo = face_pos - _FACE_SNAP_OUT
+            win_lo = face_pos - outward_limit
             win_hi = face_pos + in_range
         in_win = (centers >= win_lo) & (centers <= win_hi)
         if not in_win.any():
@@ -1125,6 +1193,10 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
         if outer_sign < 0 and centers[edge] <= win_lo + _FACE_BIN:
             return face_pos
         inward_snap = (centers[edge] - face_pos) * outer_sign < 0.0
+        if not inward_snap and outward_limit > _FACE_SNAP_OUT:
+            if hist[run[0]:run[1] + 1].max() < max(
+                    0.65 * hist[in_win].max(), 0.35 * gmax):
+                return face_pos
         if inward_snap:
             # A plateau still supported at and beyond the old end means
             # this face is inside the device, not an oversized empty end.
@@ -1161,6 +1233,21 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
     right, left = along_c + half_len, along_c - half_len
     r1 = _snap_end(right, +1) if snap_right else right
     l1 = _snap_end(left, -1) if snap_left else left
+    if outward_limit == _FACE_SNAP_OUT and (
+            (snap_right and abs(r1 - right) < _FACE_SNAP_MIN_MOVE)
+            or (snap_left and abs(l1 - left) < _FACE_SNAP_MIN_MOVE)):
+        _, fallback = snap_box_ends(box, pts, snap_left, snap_right,
+                                    outward_limit=_FACE_SNAP_OUT_MAX)
+        if fallback.get("moved"):
+            r2, l2 = fallback["right"][1], fallback["left"][1]
+            if (snap_right and abs(r1 - right) < _FACE_SNAP_MIN_MOVE
+                    and _FACE_SNAP_OUT < r2 - right <= _FACE_SNAP_OUT_MAX
+                    and _extended_face_supported(box, pts, 0, r2 - along_c)):
+                r1 = r2
+            if (snap_left and abs(l1 - left) < _FACE_SNAP_MIN_MOVE
+                    and _FACE_SNAP_OUT < left - l2 <= _FACE_SNAP_OUT_MAX
+                    and _extended_face_supported(box, pts, 0, l2 - along_c)):
+                l1 = l2
     mr = abs(r1 - right) >= _FACE_SNAP_MIN_MOVE
     ml = abs(l1 - left) >= _FACE_SNAP_MIN_MOVE
     if not mr:
