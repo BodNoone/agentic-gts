@@ -2222,6 +2222,29 @@ def test_face_views_ladder_only_rejects_seed_before_side_rescue():
     print("PASS face-only ladder seed rejected before side rescue")
 
 
+def test_no_front_back_span_marks_seed_for_removal():
+    from agentic_gts.agent import mask_refine as mr
+    from agentic_gts.agent.judge import VLMJudge
+
+    box = OrientedBox(center=(0, 0, 1), size=(2, 1, 2))
+    scene = Scene(points=np.zeros((0, 3)))
+    views = [
+        {"name": "front", "image": _quality_image(), "path": None},
+        {"name": "back", "image": _quality_image(), "path": None},
+    ]
+    old = mr._voter_spans
+    mr._voter_spans = lambda *args, **kwargs: []
+    try:
+        pieces, audit = mr.refine_box(
+            scene, box, VLMJudge(backend="local"),
+            SamPredictorAdapter(checkpoint="fake.pt"), views=views)
+    finally:
+        mr._voter_spans = old
+    assert pieces == []
+    assert audit["rejected_no_face_grounding"]
+    print("PASS no front/back span marks seed for removal")
+
+
 def test_neighbour_suppression_ownership():
     """Ownership-resolved neighbour suppression (user report: a clutter
     seed whose rect ate the device's edge -- the local view rendered

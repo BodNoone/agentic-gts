@@ -2224,6 +2224,12 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         return [], audit
     spans = _merge_cross_view(spans, axis, along0)
     front_ok = bool(spans)
+    if voters and not front_ok:
+        audit["reason"] = "no valid front/back device span"
+        audit["rejected_no_face_grounding"] = True
+        print(f"[mask-refine] {box.box_id[:6]} rejected: front/back "
+              "views produced no valid device span")
+        return [], audit
     if not front_ok:
         # no usable front division: the seed stays WHOLE and is still
         # eligible for the side-view thickness correction below

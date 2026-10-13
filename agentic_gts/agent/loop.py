@@ -172,6 +172,15 @@ class LayoutAgent:
                 else:
                     audits.append(audit)
                     if not instances:
+                        if audit.get("rejected_no_face_grounding"):
+                            scene.remove_box(old.box_id)
+                            report.unresolved.append({
+                                "issue": {"type": "no_face_grounding",
+                                           "box_id": old.box_id},
+                                "ok": False})
+                            print(f"[mask-refine] {old.box_id[:6]} removed: "
+                                  "front/back grounding found no device")
+                            continue
                         print(f"[mask-refine] {old.box_id[:6]} no valid "
                               f"mask -> keep")
             # ---- type-level guard (no SAM needed) ----
