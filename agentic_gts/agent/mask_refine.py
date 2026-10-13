@@ -2053,6 +2053,28 @@ def _side_ladder_retry(scene: Scene, box: OrientedBox, side: dict,
     return retry_view, groups2, pool2, pool_ms2
 
 
+def _mask_grounding_fit(mask: np.ndarray, box_pix: np.ndarray) -> dict:
+    """Measure mask completeness and spill against the local VLM rectangle.
+
+    Rectangle IoU balances inside coverage against outside leakage: neither a
+    tiny clean panel nor a large neighbour-covering mask wins by size alone.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    H, W = mask.shape
+    x0, y0 = np.floor(box_pix[:2]).astype(int)
+    x1, y1 = np.ceil(box_pix[2:]).astype(int)
+    x0, x1 = np.clip([x0, x1], 0, W)
+    y0, y1 = np.clip([y0, y1], 0, H)
+    area = max(int(x1 - x0), 0) * max(int(y1 - y0), 0)
+    inside = int(mask[y0:y1, x0:x1].sum())
+    total = int(mask.sum())
+    outside = total - inside
+    return {"inside_pixels": inside, "outside_pixels": outside,
+            "coverage": inside / area if area else 0.0,
+            "leakage": outside / total if total else 0.0,
+            "grounding_fit": inside / (area + outside) if area + outside else 0.0}
+
+
 def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
                  sam: SamPredictorAdapter, out_dir: str | None,
                  audit: dict) -> list[dict]:
@@ -2106,23 +2128,32 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
             continue                  # degenerate/absent box
         masks, scores = sam.predict(voter["image"], box_pix)
         best = None
+        selection = {"group_index": gi, "box_pixels": box_pix.tolist(),
+                     "candidates": [], "selected_mask_index": None}
+        va.setdefault("mask_selection", []).append(selection)
         for mi, (mask, ms) in enumerate(zip(masks, scores)):
+            metrics = _mask_grounding_fit(mask, box_pix)
             # surface only (z-buffer): the face the VLM grounded; door
             # pixels subtracted so the open door never stretches the
             # span (user report: door interference on box size)
             pts3 = _mask_to_points(scene, box, mask, voter["cam"],
-                                    exclude=doors)
+                                     exclude=doors)
+            selection["candidates"].append({
+                "mask_index": mi, "sam_score": float(ms), **metrics,
+                "points": len(pts3), "valid": len(pts3) >= 20})
             if out_dir:
                 _save_sam_debug(voter, box_pix, mask, pts3, box,
                                 None, out_dir,
                                 f"{box.box_id}_{voter['name']}_g{gi}_m{mi}")
             if len(pts3) < 20:
                 continue
-            if best is None or ms > best[0]:
-                best = (float(ms), pts3)
+            rank = (metrics["grounding_fit"], float(ms))
+            if best is None or rank > best[0]:
+                best = (rank, float(ms), pts3)
+                selection["selected_mask_index"] = mi
         if best is None:
             continue
-        ms, pts3 = best
+        _, ms, pts3 = best
         along = pts3[:, :2] @ axis - along0
         lo, hi = np.percentile(along, [2.0, 98.0])
         spans.append({"lo": float(lo), "hi": float(hi), "pts": pts3,
