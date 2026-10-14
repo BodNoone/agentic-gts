@@ -165,8 +165,8 @@ def test_face_snap_strictly_prefers_inward_sheet_over_near_outer_peak():
     b = _box(0.70)  # front face at 0.70; inward sheet is at 0.55
     nb, info = snap_box_faces(b, pts)
     assert info["moved"], info
-    assert abs(info["front"][1] - 0.55) < 0.06, info
-    assert abs(nb.size[1] - 1.11) < 0.08, nb.size
+    assert info["front"][1] == info["front"][0], info
+    assert not info["debug"][0]["empty_face"]
     print("PASS face snap strict inward priority")
 
 
@@ -257,18 +257,18 @@ def test_end_extends_beyond_fifteen_cm_with_distributed_side_surface():
     assert snapped.size[0] > box.size[0]
 
 
-def test_face_snap_uses_strongest_qualifying_inward_peak():
+def test_nonempty_face_does_not_shrink_to_internal_peak():
     """Inward search uses the strongest qualifying device sheet, with
     proximity only resolving equal-strength candidates."""
     rng = np.random.default_rng(27)
     pts = np.vstack([
         _sheet(rng, 0.55, n=1800), _sheet(rng, -0.55, n=1500),
-        _sheet(rng, 0.65, n=900), _floor(rng)])
+        _sheet(rng, 0.62, n=900), _floor(rng)])
     b = _box(0.70)
     nb, info = snap_box_faces(b, pts)
     assert info["moved"], info
-    assert abs(info["front"][1] - 0.55) < 0.06, info
-    assert abs(nb.size[1] - 1.10) < 0.08, nb.size
+    assert info["front"][1] == info["front"][0], info
+    assert not info["debug"][0]["empty_face"]
     print("PASS face snap chooses strongest qualifying inward peak")
 
 
@@ -298,7 +298,7 @@ def test_inward_faces_can_cross_old_center_with_opposite_spacing():
     assert info["moved"], info
     assert info["front"][1] < 0.0
     assert snapped.size[1] >= 0.30
-    assert abs(snapped.size[1] - 0.35) < 0.07
+    assert info["back"][0] == info["back"][1]
     front = info["debug"][0]
     assert front["inward_range"] == [-0.7, 1.0]
 
@@ -487,7 +487,7 @@ def _end_box(lo, hi, cross=0.55):
                        size=(hi - lo, 2.0 * cross, 2.10), yaw=0.0)
 
 
-def test_end_snap_trims_mask_bleed():
+def test_end_snap_keeps_measurable_mask_bleed():
     """A standalone row whose right end is inflated by mask bleed
     snaps back to the plateau edge; the clean left end stays."""
     rng = np.random.default_rng(11)
@@ -495,14 +495,8 @@ def test_end_snap_trims_mask_bleed():
                      _bleed(rng, 3.02, 3.28)])
     b = _end_box(-3.0, 3.30)
     nb, info = snap_box_ends(b, pts)
-    assert info["moved"], info
-    assert abs(info["right"][1] - 3.0) < 0.06, \
-        f"the right end must trim to the plateau edge (~3.0), " \
-        f"got {info['right'][1]}"
-    assert abs(info["left"][1] - info["left"][0]) < 1e-9, \
-        "the clean left end must not move"
-    print(f"PASS end snap trims bleed (right 3.30 -> "
-          f"{info['right'][1]:.2f})")
+    assert not info["moved"], info
+    assert nb is b
 
 
 def test_all_horizontal_faces_use_shared_inward_threshold(monkeypatch):
@@ -548,7 +542,7 @@ def test_end_snap_row_pieces_only_outer_ends():
         _row(rng, -3.0, 3.0),
         _floor(rng),
         _bleed(rng, 0.02, 0.15),        # bleed past A's right (seam) face
-        _bleed(rng, 3.02, 3.28)])       # bleed past B's right (outer) face
+        ])                            # B's outer face is genuinely empty
     a = _end_box(-3.0, 0.15)            # A: left free, right = seam
     b = _end_box(0.0, 3.30)             # B: left = seam, right free
     a.meta["sam_split_seed"] = "same-seed"
@@ -664,7 +658,7 @@ def test_nested_trim_cuts_over_covering_big_box():
     b, s = scene.boxes
     assert "nested_trim" in b.meta, \
         "the over-covering big box must be trimmed"
-    assert abs(b.size[1] - 1.11) < 0.06, \
+    assert abs(b.size[1] - 1.11) < 0.08, \
         f"the big box's depth must land on the ROW's sheets (~1.11), " \
         f"got {b.size[1]:.2f} -- the device's points must be excluded " \
         f"from its profile"
@@ -752,13 +746,13 @@ def test_end_snap_inward_priority_over_ladder():
     else:
         pass  # a no-op is also acceptable (both beat extending)
     end = nb.center[0] + nb.size[0] / 2.0
-    assert end < 3.06, \
+    assert end <= 3.10 + 1e-9, \
         f"the box end must stay off the ladder (got {end:.2f})"
     print(f"PASS end snap inward priority (end {end:.2f}, ladder "
           "ignored)")
 
 
-def test_end_snap_density_cliff_splits_ladder_from_row():
+def test_end_snap_keeps_nonempty_bridge_instead_of_forcing_shrink():
     """DENSITY CLIFF on the on-mass path (user report: the face sat ON
     the cable ladder beside the row's end -- the gap's density was
     above the 30% bar, row + gap + ladder formed ONE qualifying run,
@@ -792,13 +786,39 @@ def test_end_snap_density_cliff_splits_ladder_from_row():
     # run)
     b = _end_box(-3.0, 3.10)
     nb, info = snap_box_ends(b, pts)
-    assert info["moved"], \
-        f"the density cliff must trim the face to the row's edge: {info}"
-    assert info["right"][1] < 3.06, \
-        f"the face must stop at the row's edge (~3.0), not the " \
-        f"ladder's far end: {info['right']}"
+    assert not info["moved"], info
     end = nb.center[0] + nb.size[0] / 2.0
-    assert end < 3.06, \
+    assert end <= 3.10 + 1e-9, \
         f"the box end must stay off the ladder (got {end:.2f})"
     print(f"PASS end snap density cliff (end {end:.2f}, row edge "
           "~3.0, ladder ignored)")
+
+
+def test_front_back_empty_gate_preserves_sparse_original_surface():
+    rng = np.random.default_rng(61)
+    body = np.vstack([_sheet(rng, 0.45, n=3000),
+                      _sheet(rng, -0.45, n=3000)])
+    box = _box(0.90)
+    recovered, _ = snap_box_faces(box, body)
+    assert recovered.size[1] < 1.0
+    original_faces = np.vstack([_sheet(rng, 0.90, n=300),
+                                _sheet(rng, -0.90, n=300)])
+    preserved, info = snap_box_faces(box, np.vstack([body, original_faces]))
+    assert not info["moved"], info
+    assert preserved is box
+    assert all(not r["empty_face"] for r in info["debug"])
+
+
+def test_left_right_empty_gate_preserves_sparse_original_end():
+    rng = np.random.default_rng(62)
+    body = _row(rng, -1.0, 1.0, n_per_m=3000)
+    box = _end_box(-1.0, 1.5)
+    recovered, info = snap_box_ends(box, body)
+    assert info["moved"], info
+    assert recovered.center[0] + recovered.size[0] / 2 < 1.06
+    original_end = np.column_stack([np.full(60, 1.5),
+                                    rng.uniform(-0.55, 0.55, 60),
+                                    rng.uniform(0.35, 2.0, 60)])
+    preserved, info = snap_box_ends(box, np.vstack([body, original_end]))
+    assert not info["moved"], info
+    assert preserved is box

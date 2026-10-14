@@ -583,7 +583,7 @@ _FACE_SNAP_TAU = 0.50
 _FACE_SNAP_ABS = 0.25
 _INWARD_SNAP_WINDOW_FRAC = 0.55
 _INWARD_SNAP_GLOBAL_FRAC = 0.25
-_FACE_EMPTY_FACE_FRAC = 0.12
+_FACE_EMPTY_FACE_FRAC = 0.05
 # the END rule's bar is LOWER: it separates the plateau from mask
 # bleed (a ~20:1 contrast), while the cross rule separates competing
 # peaks (2:1) -- 50% of a fluctuating window max sits inside the
@@ -828,9 +828,10 @@ def snap_box_faces(box: OrientedBox,
         current_face_density = (float(band[face_zone].max())
                                 if face_zone.any() else 0.0)
         empty_face = current_face_density <= _FACE_EMPTY_FACE_FRAC * gmax
-        cand = _peaks(*inward, side, inward=True)
+        interior_peaks = _peaks(*inward, side, inward=True)
+        cand = interior_peaks if empty_face else np.empty(0, dtype=np.int64)
         exterior = _peaks(*outward, side)
-        near_surface = np.concatenate([cand, exterior])
+        near_surface = np.concatenate([interior_peaks, exterior])
         side_peak = (float(band[near_surface].max())
                      if len(near_surface) else 0.0)
         near_surface = near_surface[
@@ -838,7 +839,8 @@ def snap_box_faces(box: OrientedBox,
             & (band[near_surface] >= _INWARD_SNAP_WINDOW_FRAC * side_peak)]
         is_inward = bool(len(cand))
         searched = "inward"
-        direction_reason = "inward_surface"
+        direction_reason = ("empty_face_inward_recovery" if empty_face
+                            else "inward_blocked_face_has_support")
         if len(near_surface):
             # A supported surface already at the old face takes precedence
             # over denser internal shelves/panels.
@@ -849,15 +851,15 @@ def snap_box_faces(box: OrientedBox,
         elif len(exterior):
             exterior = exterior[
                 (centers[exterior] - face_pos) * side > _FACE_SNAP_MIN_MOVE]
-            inner_peak = float(band[cand].max()) if len(cand) else 0.0
-            if (len(exterior) and (not len(cand)
+            inner_peak = float(band[interior_peaks].max()) if len(interior_peaks) else 0.0
+            if (len(exterior) and (not len(interior_peaks)
                     or float(band[exterior].max()) >= 1.25 * inner_peak)):
                 cand = exterior
                 is_inward = False
                 searched = "outward"
                 direction_reason = "stronger_exterior_surface"
         if not len(cand):
-            cand = exterior
+            cand = exterior if empty_face or not len(interior_peaks) else cand
             is_inward = False
             searched = "outward"
         rec = {
@@ -906,7 +908,8 @@ def snap_box_faces(box: OrientedBox,
             debug.append(rec)
             return float(centers[chosen])
         rec["accepted"] = False
-        rec["reason"] = "no_qualifying_peak"
+        rec["reason"] = ("no_qualifying_peak" if empty_face
+                         else "inward_blocked_face_has_support")
         debug.append(rec)
         return face_pos
 
@@ -1230,6 +1233,10 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
         if outer_sign < 0 and centers[edge] <= win_lo + _FACE_BIN:
             return face_pos
         inward_snap = (centers[edge] - face_pos) * outer_sign < 0.0
+        face_zone = np.abs(centers - face_pos) <= _FACE_BAND
+        face_density = float(hist[face_zone].max()) if face_zone.any() else 0.0
+        if inward_snap and face_density > _FACE_EMPTY_FACE_FRAC * gmax:
+            return face_pos
         if not inward_snap and outward_limit > _FACE_SNAP_OUT:
             if hist[run[0]:run[1] + 1].max() < max(
                     0.65 * hist[in_win].max(), 0.35 * gmax):
