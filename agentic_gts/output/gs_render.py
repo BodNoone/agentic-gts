@@ -384,6 +384,58 @@ def _try_gsplat(means, quats, scales, opac, rgb, V_cv, K, W, H,
     return np.clip(img[..., :3], 0.0, 1.0)
 
 
+def rasterize_surface_view(gs: GaussianData, cam: Cam):
+    """Render matched RGB, expected camera-Z depth and alpha with gsplat.
+
+    Expected depth is not a mesh intersection. Consumers must validate
+    alpha and geometry before treating it as a visible device surface.
+    Return None when this capability is unavailable, preserving RGB fallback.
+    """
+    try:
+        import torch
+        from gsplat.rendering import rasterization
+        means, quats, scales, opac, rgb = _prep(gs, float("inf"))
+        if not len(means):
+            return None
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        t = lambda a: torch.tensor(a, dtype=torch.float32, device=dev)
+        with torch.inference_mode():
+            rendered, alpha, _ = rasterization(
+                t(means), t(quats), t(scales), t(opac).squeeze(-1), t(rgb),
+                viewmats=t(cam.view_cv()).unsqueeze(0),
+                Ks=t(cam.K()).unsqueeze(0), width=cam.W, height=cam.H,
+                render_mode="RGB+ED")
+        image = rendered[0].detach().cpu().numpy()
+        return {"image": np.clip(image[..., :3], 0, 1),
+                "depth": image[..., 3],
+                "alpha": alpha[0, ..., 0].detach().cpu().numpy()}
+    except ImportError:
+        return None
+    except Exception as e:
+        print(f"[surface-depth] unavailable ({type(e).__name__}: {e}) "
+              "-> point-projection fallback")
+        return None
+
+
+def unproject_depth_mask(cam: Cam, depth: np.ndarray, alpha: np.ndarray,
+                         mask: np.ndarray, exclude=None,
+                         min_alpha: float = 0.80) -> np.ndarray:
+    """Unproject valid mask pixels using camera-Z depth, not ray length."""
+    valid = (np.asarray(mask, dtype=bool) & np.isfinite(depth)
+             & (depth > 0.05) & np.isfinite(alpha) & (alpha >= min_alpha))
+    if exclude is not None:
+        valid &= ~exclude
+    y, x = np.nonzero(valid)
+    if not len(x):
+        return np.empty((0, 3), dtype=np.float64)
+    K = cam.K()
+    z = depth[y, x]
+    camera = np.column_stack([(x - K[0, 2]) * z / K[0, 0],
+                              (y - K[1, 2]) * z / K[1, 1], z])
+    V = cam.view_cv()
+    return (camera - V[:3, 3]) @ V[:3, :3]
+
+
 def _getPerspective(znear, zfar, fovy, W, H):
     tanFovY = math.tan(math.radians(fovy) / 2.0)
     tanFovX = tanFovY * W / H

@@ -78,6 +78,12 @@ python -m agentic_gts.cli run --point-cloud room.ply \
 
 ## 输入输出格式
 
+局部 front/back 在 gsplat 支持 `RGB+ED` 时使用同次渲染的 RGB、相机 Z 期望深度和 alpha：
+mask 内 alpha ≥ 0.80 的有效深度恢复可见表面点，并要求距离几何点云不超过 6cm。
+通过单层表面检查的测量可约束每个单体的前后面；双面有效时测量完整深度，
+单面有效时保留 side/几何估计的对立面。可靠测得的面和单体沿排范围不会在 Stage F 再次吸附。
+后端缺少深度能力时回退到原点云投影路径；有深度但低 alpha 或几何不一致的点不会被当作可靠表面。
+
 **输入点云**：`.ply` / `.pcd`（open3d 可读）或 `.npy`（Nx3 float，单位米，z 向上，地面 z≈0）。
 
 **box JSON**（输入与输出同格式）：

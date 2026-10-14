@@ -838,11 +838,21 @@ def render_local_views(scene: Scene, box: OrientedBox,
         print(f"[mask-refine] side z-cap failed "
               f"({type(e).__name__}: {e}) -> full-height side render")
 
+    surface_views = {}
+
     def _render_one(elev: float, azim: float, so: float, s=None):
         cam = make_local_cam([box], W=768, H=768, elev_deg=elev,
                              azim_deg=azim, standoff=so)
         pool_gs = sub if s is None else s
-        raw = rasterize_gs(pool_gs, cam) if pool_gs is not None else None
+        surface = None
+        if elev == 0.0 and pool_gs is not None:
+            from agentic_gts.output.gs_render import rasterize_surface_view
+            surface = rasterize_surface_view(pool_gs, cam)
+        if surface is not None:
+            raw = surface["image"]
+            surface_views[id(cam)] = surface
+        else:
+            raw = rasterize_gs(pool_gs, cam) if pool_gs is not None else None
         if raw is None:
             raw = render_gs_view(gs, [box], cam, overlay=None,
                                  isolate_boxes=True, isolate_margin=0.8)
@@ -899,7 +909,9 @@ def render_local_views(scene: Scene, box: OrientedBox,
         out.append({"name": name, "image": raw,
                     "prompt_image": prompt_img if prompt_img is not None
                     else raw,
-                    "cam": cam, "path": path, "prompt_path": prompt_path})
+                    "cam": cam, "path": path, "prompt_path": prompt_path,
+                    **{k: v for k, v in surface_views.get(id(cam), {}).items()
+                       if k in ("depth", "alpha")}})
 
     # ---- SIDE view: oblique candidates + VLM arbitration ----
     # The side slot looks along the row from beyond one end; every
@@ -1195,6 +1207,10 @@ def _merge_cross_view(spans: list, axis=None, along0: float = 0.0) -> list:
             if j in kept_set and j not in used:
                 used.add(j)
                 p = spans[j]
+                if p.get("surface_measurements"):
+                    s["surface_measurements"] = (
+                        s.get("surface_measurements", [])
+                        + p["surface_measurements"])
                 s["lo"] = min(s["lo"], p["lo"])
                 s["hi"] = max(s["hi"], p["hi"])
                 if p["pts"] is not None:
@@ -1256,6 +1272,8 @@ def _merge_spans(spans: list) -> list:
             dup["lo"] = min(dup["lo"], s["lo"])
             dup["hi"] = max(dup["hi"], s["hi"])
             dup["pts"] = np.vstack([dup["pts"], s["pts"]])
+            dup["surface_measurements"] = (dup.get("surface_measurements", [])
+                                            + s.get("surface_measurements", []))
             dup["ms"] = max(dup["ms"], s["ms"])
             continue
         for p in out:                      # distinct instances: cut the
@@ -1834,7 +1852,8 @@ def _build_split_pieces(spans: list, seed: "OrientedBox") -> list:
                             # type-confirm (label unknown, score < 0.6)
         out.append({"score": score, "pts": s["pts"], "fitted": piece,
                     "mask_score": float(s["ms"]), "label": s["label"],
-                    "view": "front"})
+                    "view": "front",
+                    "surface_measurements": s.get("surface_measurements", [])})
     return out
 
 
@@ -2075,6 +2094,81 @@ def _mask_grounding_fit(mask: np.ndarray, box_pix: np.ndarray) -> dict:
             "grounding_fit": inside / (area + outside) if area + outside else 0.0}
 
 
+def _visible_mask_points(scene, box, mask, view, exclude=None):
+    """Use matched depth only when its points agree with scene geometry."""
+    if "depth" not in view or "alpha" not in view:
+        return _mask_to_points(scene, box, mask, view["cam"], exclude=exclude), "projection"
+    from agentic_gts.output.gs_render import unproject_depth_mask
+    points = unproject_depth_mask(view["cam"], view["depth"], view["alpha"],
+                                  mask, exclude=exclude)
+    points = points[box.contains(points, margin=0.25)]
+    if not len(points):
+        return points, "gs_depth"
+    # Expected GS depth can lie between layers. Retain only points near
+    # the metric geometry source; never snap them onto hidden nearest points.
+    from scipy.spatial import cKDTree
+    geometry = scene.points[box.contains(scene.points, margin=0.30)]
+    if not len(geometry):
+        return points[:0], "gs_depth"
+    distance, _ = cKDTree(geometry).query(points)
+    return points[distance <= 0.06], "gs_depth"
+
+
+def _measure_face_surface(points, seed, view):
+    """Measure the observed cross-axis sheet, allowing staggered cabinets."""
+    if len(points) < 40:
+        return None
+    eye = seed.world_to_local(np.asarray(view["cam"].eye).reshape(1, 3))[0]
+    horizontal = float(np.linalg.norm(eye[:2]))
+    if horizontal < 1e-6 or abs(eye[1]) / horizontal < 0.95:
+        return None  # a short-box camera may face local X, not depth Y
+    local = seed.world_to_local(points)
+    cross = local[:, 1]
+    q05, q95 = np.percentile(cross, [5, 95])
+    if q95 - q05 > 0.12:
+        return None  # multiple layers / door surface is not a clean sheet
+    along = np.percentile(local[:, 0], [2, 98])
+    if along[1] - along[0] < 0.30:
+        return None
+    side = float(eye[1])
+    return {"face": "front" if side > 0 else "back",
+            "cross_local": float(np.median(cross)),
+            "spread_m": float(q95 - q05), "points": len(points),
+            "view": view["name"], "along_local": along.tolist()}
+
+
+def _apply_face_surface_constraints(instances, seed):
+    """Apply observed front/back planes after side/fallback depth measurement."""
+    for inst in instances:
+        measurements = inst.get("surface_measurements", [])
+        f = inst["fitted"]
+        along_center = seed.world_to_local(np.asarray(f.center).reshape(1, 3))[0, 0]
+        observations = {}
+        for name in ("front", "back"):
+            available = [m for m in measurements if m["face"] == name
+                         and m["along_local"][0] <= along_center <= m["along_local"][1]]
+            if available:
+                observations[name] = max(available, key=lambda m: m["points"])
+        if not observations:
+            continue
+        local_center = seed.world_to_local(np.asarray(f.center).reshape(1, 3))[0]
+        front = local_center[1] + f.size[1] / 2
+        back = local_center[1] - f.size[1] / 2
+        if "front" in observations:
+            front = observations["front"]["cross_local"]
+        if "back" in observations:
+            back = observations["back"]["cross_local"]
+        if not 0.30 <= front - back <= 2.50:
+            inst["surface_rejected"] = "incompatible observed planes"
+            continue
+        local_center[1] = (front + back) / 2
+        center = seed.local_to_world(local_center.reshape(1, 3))[0]
+        inst["fitted"] = _rebuild(f, center=center,
+                                  size=(f.size[0], front - back, f.size[2]))
+        inst["fitted"].meta["observed_faces"] = observations
+        inst["fitted"].meta["surface_span_measured"] = True
+
+
 def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
                  sam: SamPredictorAdapter, out_dir: str | None,
                  audit: dict) -> list[dict]:
@@ -2136,11 +2230,12 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
             # surface only (z-buffer): the face the VLM grounded; door
             # pixels subtracted so the open door never stretches the
             # span (user report: door interference on box size)
-            pts3 = _mask_to_points(scene, box, mask, voter["cam"],
-                                     exclude=doors)
+            pts3, point_source = _visible_mask_points(scene, box, mask, voter,
+                                                       exclude=doors)
             selection["candidates"].append({
                 "mask_index": mi, "sam_score": float(ms), **metrics,
-                "points": len(pts3), "valid": len(pts3) >= 20})
+                "points": len(pts3), "valid": len(pts3) >= 20,
+                "point_source": point_source})
             if out_dir:
                 _save_sam_debug(voter, box_pix, mask, pts3, box,
                                 None, out_dir,
@@ -2149,17 +2244,20 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
                 continue
             rank = (metrics["grounding_fit"], float(ms))
             if best is None or rank > best[0]:
-                best = (rank, float(ms), pts3)
+                best = (rank, float(ms), pts3, point_source)
                 selection["selected_mask_index"] = mi
         if best is None:
             continue
-        _, ms, pts3 = best
+        _, ms, pts3, point_source = best
         along = pts3[:, :2] @ axis - along0
         lo, hi = np.percentile(along, [2.0, 98.0])
+        measurement = (_measure_face_surface(pts3, box, voter)
+                       if point_source == "gs_depth" else None)
         spans.append({"lo": float(lo), "hi": float(hi), "pts": pts3,
                       "ms": ms, "label": group.hypothesis,
                       "pix": tuple(float(v) for v in box_pix),
-                      "view": voter["name"]})
+                       "view": voter["name"],
+                       "surface_measurements": [measurement] if measurement else []})
     spans = _merge_spans(spans)
     # clip each span's points to its (possibly seam-cut) extent: the
     # bleed points past the seam belong to the NEIGHBOUR piece, not
@@ -2172,7 +2270,8 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
     spans = [s for s in spans
              if (s["hi"] - s["lo"]) >= 0.30 and len(s["pts"]) >= 40]
     va["spans"] = [{"lo": round(s["lo"], 3), "hi": round(s["hi"], 3),
-                    "points": len(s["pts"]), "label": s["label"]}
+                    "points": len(s["pts"]), "label": s["label"],
+                    "surface_measurements": s.get("surface_measurements", [])}
                    for s in spans]
     if out_dir:
         try:
@@ -2358,6 +2457,7 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     # gets its thickness from the raw cloud instead of the seed's
     # union-footprint depth (staggered rows, user report).
     _apply_height_and_geom_depth(instances, box, scene)
+    _apply_face_surface_constraints(instances, box)
 
     if not front_ok and not depth_ok:
         # nothing was measured: keep the seed untouched
@@ -2372,7 +2472,9 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     # average so adjacent cabinets share one edge (user request).
     from agentic_gts.tools.geometry import snap_row_seams
     n_seams = snap_row_seams([e["fitted"] for e in instances],
-                             float(box.yaw))
+                             float(box.yaw),
+                             preserve_cross=any(e["fitted"].meta.get("observed_faces")
+                                                for e in instances))
     if n_seams:
         print(f"[mask-refine] seam regularisation: {n_seams} split "
               f"seam(s) snapped")
@@ -2387,6 +2489,7 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                        "z_mask_top": e.get("z_mask_top"),
                        "z_col_top": e.get("z_col_top"),
                        "height_source": e.get("z_src"),
+                       "surface_rejected": e.get("surface_rejected"),
                        "label": e["label"], "box": e["fitted"].to_dict()}
                       for e in instances]})
     return instances, audit

@@ -302,7 +302,7 @@ class LayoutAgent:
         refit.device_type = old.device_type
         refit.source = BoxSource.AGENT_FIX
         refit.row_id = old.row_id
-        refit.meta = old.meta
+        refit.meta = {**old.meta, **refit.meta}
         if refit.meta.get("sam_refined"):
             refit.meta.setdefault("sam_split_seed", old.box_id)
         refit.confidence = old.confidence

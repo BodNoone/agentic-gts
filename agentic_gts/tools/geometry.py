@@ -349,8 +349,8 @@ def complete_row_gaps(scene: Scene, width_unit: float = 0.6,
 
 
 def snap_row_seams(boxes: list[OrientedBox], yaw: float,
-                   seam_tol: float = 0.12, vertex_tol: float = 0.12,
-                   height_tol: float = 0.05) -> int:
+                    seam_tol: float = 0.12, vertex_tol: float = 0.12,
+                    height_tol: float = 0.05, preserve_cross: bool = False) -> int:
     """Snap the facing edges of adjacent cabinets in a row together.
 
     A joined row split into single cabinets gets each piece's along-row
@@ -392,6 +392,9 @@ def snap_row_seams(boxes: list[OrientedBox], yaw: float,
     snapped = 0
     for i, j in zip(order[:-1], order[1:]):
         a, b = boxes[i], boxes[j]
+        if (a.meta.get("surface_span_measured")
+                and b.meta.get("surface_span_measured")):
+            continue  # visible instance boundaries outrank seam averaging
         a_lo, a_hi, a_x, a_d = _span(a)
         b_lo, b_hi, b_x, b_d = _span(b)
         gap = b_lo - a_hi
@@ -411,7 +414,7 @@ def snap_row_seams(boxes: list[OrientedBox], yaw: float,
         seam = 0.5 * (a_hi + b_lo)
         # merge the shared edge's cross vertices only when both facing
         # corner pairs are close (see docstring)
-        if (abs(a_clo - b_clo) <= vertex_tol
+        if (not preserve_cross and abs(a_clo - b_clo) <= vertex_tol
                 and abs(a_chi - b_chi) <= vertex_tol):
             new_clo = 0.5 * (a_clo + b_clo)
             new_chi = 0.5 * (a_chi + b_chi)
@@ -734,6 +737,13 @@ def snap_box_faces(box: OrientedBox,
     Idempotent: a face already on its sheet has its peak at distance ~0
     and does not move. Returns
     (box, info); the box is unchanged unless info["moved"]."""
+    observed = box.meta.get("observed_faces", {})
+    if "front" in observed and "back" in observed:
+        return box, {"moved": False, "reason": "observed surfaces locked",
+                     "debug": [{"face": name, "accepted": False,
+                                "reason": "observed_surface_locked",
+                                "searched": "keep"}
+                               for name in ("front", "back")]}
     yaw = float(box.yaw)
     axis = np.array([math.cos(yaw), math.sin(yaw)])
     cross = np.array([-math.sin(yaw), math.cos(yaw)])
@@ -769,6 +779,8 @@ def snap_box_faces(box: OrientedBox,
     band = np.convolve(hist, np.ones(k, dtype=int), mode="same")
     gmax = int(band.max())
     if gmax <= 0:
+        if observed:
+            return box, {"moved": False, "reason": "empty unmeasured profile"}
         if outward_limit == _FACE_SNAP_OUT:
             fallback_box, fallback = snap_box_faces(
                 box, pts, outward_limit=_FACE_SNAP_OUT_MAX, _profile=_profile)
@@ -906,6 +918,17 @@ def snap_box_faces(box: OrientedBox,
     b1 = _snap(back,
                 (back, back + inward_range),
                 (back - outward_limit, back), -1)
+    observed = box.meta.get("observed_faces", {})
+    if "front" in observed:
+        f1 = front
+        inward_options.pop(1, None)
+        debug[0].update(accepted=False, reason="observed_surface_locked",
+                        searched="keep")
+    if "back" in observed:
+        b1 = back
+        inward_options.pop(-1, None)
+        debug[1].update(accepted=False, reason="observed_surface_locked",
+                        searched="keep")
     if outward_limit == _FACE_SNAP_OUT and any(
             r.get("reason") in ("no_qualifying_peak", "outward_height_guard")
             for r in debug):
@@ -1488,8 +1511,10 @@ def snap_faces_to_mesh(scene: Scene) -> int:
                 # Every independent grounding box gets both side faces
                 # checked. Only a seam between pieces from the SAME SAM
                 # split is reserved for Stage C's seam regularisation.
-                snap_left=not _same_split_continues(snapshot, b, -1),
-                snap_right=not _same_split_continues(snapshot, b, +1))
+                snap_left=not cur.meta.get("surface_span_measured")
+                          and not _same_split_continues(snapshot, b, -1),
+                snap_right=not cur.meta.get("surface_span_measured")
+                           and not _same_split_continues(snapshot, b, +1))
             if einfo.get("moved"):
                 nb.meta["end_snap"] = einfo
                 print(f"[stageF] {nb.box_id[:6]} end snap: length "
