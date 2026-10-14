@@ -35,6 +35,7 @@ def test_three_supported_faces_required_without_deletion(yaw, face_count):
     assert scene.boxes == [box]
     assert flagged == (face_count < 3)
     assert box.meta["face_support"]["matched_faces"] == face_count
+    assert box.meta["face_support"]["min_coverage"] == 0.90
     assert box.confidence == (Confidence.MID if face_count < 3
                               else Confidence.HIGH)
     json.dumps(box.to_dict())
@@ -47,6 +48,18 @@ def test_dense_fragment_and_floor_do_not_qualify_faces():
                   boxes=[box])
     assert flag_insufficient_face_support(scene) == 1
     assert box.meta["face_support"]["matched_faces"] == 0
+
+
+def test_partial_face_coverage_below_ninety_percent_fails():
+    box = OrientedBox(center=(0, 0, 1), size=(1, 1, 2))
+    face = surface(box, 1, 1)
+    local = box.world_to_local(face)
+    face = face[local[:, 0] < 0.0]  # cover only half the front face
+    scene = Scene(points=face, boxes=[box])
+    flag_insufficient_face_support(scene)
+    front = box.meta["face_support"]["faces"]["front"]
+    assert front["coverage"] < 0.90
+    assert not front["passed"]
 
 
 def test_three_faces_promote_low_confidence_once():

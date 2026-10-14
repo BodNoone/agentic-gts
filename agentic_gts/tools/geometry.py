@@ -38,7 +38,7 @@ def support_fraction(scene: Scene, box: OrientedBox, expand: float = 0.0) -> flo
 
 def flag_insufficient_face_support(scene: Scene, tolerance: float = 0.05,
                                    cell: float = 0.10,
-                                   min_coverage: float = 0.30,
+                                   min_coverage: float = 0.90,
                                    min_points: int = 10) -> int:
     """Adjust confidence one level using five non-bottom fitted faces.
 
