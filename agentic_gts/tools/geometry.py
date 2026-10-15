@@ -87,6 +87,11 @@ def flag_insufficient_face_support(scene: Scene, tolerance: float = 0.03,
                             ("type_suspect", "structural_geom",
                              "low_furniture_geom", "single_view_support"))
         if protected_low:
+            # Debug: show which flag triggered the protection
+            active_flags = [k for k in ("type_suspect", "structural_geom",
+                                        "low_furniture_geom", "single_view_support")
+                           if box.meta.get(k)]
+            print(f"[face-support] {box.box_id[:6]} protected LOW by: {', '.join(active_flags)}")
             adjusted = Confidence.LOW
         box.confidence = adjusted
         box.meta["face_support"] = {
