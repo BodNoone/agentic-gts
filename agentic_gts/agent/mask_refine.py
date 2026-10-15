@@ -2512,8 +2512,18 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     # Mark boxes supported by only a single face view as low confidence
     # and lock them from future confidence promotion (user report: single
     # front-view grounding with no back/side corroboration is often a
-    # misidentified clutter object)
-    single_view_support = (face_views_with_grounding == 1 and not depth_ok)
+    # misidentified clutter object). However, if the side view DID identify
+    # a device (even if depth measurement failed), that counts as corroboration.
+    side_has_device = any(
+        v.get("view") in ("left_side", "right_side")
+        and v.get("role") == "depth_profile"
+        and any(not _is_subtractive(g.get("hypothesis"))
+                for g in v.get("groups", []))
+        for v in audit["views"]
+    )
+    single_view_support = (face_views_with_grounding == 1 
+                          and not depth_ok 
+                          and not side_has_device)
     if single_view_support:
         for inst in instances:
             inst["fitted"].confidence = Confidence.LOW
