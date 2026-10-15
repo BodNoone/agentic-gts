@@ -1550,6 +1550,26 @@ def _rebuild(f: "OrientedBox", center=None, size=None) -> "OrientedBox":
         meta=dict(f.meta))
 
 
+def _side_supported_span(v: np.ndarray, lo: float, hi: float,
+                         cell: float = 0.05, min_points: int = 3):
+    """Measure supported mask extent inside the seed, independent of peak density.
+
+    Ignore isolated points in boundary bins without penalizing a sparse panel
+    next to a dense face. Use actual point extrema in supported bins rather
+    than bin edges, which could expand the measured body by one cell.
+    """
+    v = np.asarray(v, dtype=float)
+    v = v[np.isfinite(v) & (v >= lo) & (v <= hi)]
+    if len(v) < min_points:
+        return None
+    bins = np.floor((v - lo) / cell).astype(np.int64)
+    _, inverse, counts = np.unique(bins, return_inverse=True, return_counts=True)
+    supported = v[counts[inverse] >= min_points]
+    if not len(supported):
+        return None
+    return float(supported.min()), float(supported.max())
+
+
 def _apply_depth_from_side(instances: list, pts: np.ndarray,
                            seed: "OrientedBox",
                            min_pts: int = 20) -> list[dict]:
@@ -1565,10 +1585,10 @@ def _apply_depth_from_side(instances: list, pts: np.ndarray,
     * it is a true PROFILE (90 deg off the front), where an open
       door sticks out horizontally beyond the cabinet body -- the front
       view cannot separate it (user report), the side view can;
-    * thickness is the full cross-axis extent of the mask-selected points.
-      Door masks are subtracted before this pool is built. A peak-relative
-      density threshold would discard valid sparse side panels whenever
-      a front/back sheet dominates the point count.
+    * thickness is the supported cross-axis extent of mask-selected points
+      inside the seed's depth bounds. Door masks are subtracted upstream.
+      Isolated boundary bins are ignored using an absolute point-count
+      threshold, so a dense face cannot suppress a valid sparse panel.
 
     Along/height stay seed-measured: the side view corrects ONLY the
     thickness and the cross-axis centre of each piece.
@@ -1597,10 +1617,19 @@ def _apply_depth_from_side(instances: list, pts: np.ndarray,
             rec["reason"] = "too few side points in along span"
             continue
         cross_sel = cross_all[m]
-        c_lo, c_hi = float(cross_sel.min()), float(cross_sel.max())
+        rec["raw_cross_range"] = [float(cross_sel.min()),
+                                  float(cross_sel.max())]
+        rec["seed_cross_range"] = [seed_cross_c - seed_half_d,
+                                   seed_cross_c + seed_half_d]
+        span = _side_supported_span(cross_sel, *rec["seed_cross_range"])
+        if span is None:
+            rec["reason"] = "no supported side extent inside seed depth"
+            continue
+        c_lo, c_hi = span
         depth = float(c_hi - c_lo)
         rec.update({"cross_range": [c_lo, c_hi],
-                    "depth": round(depth, 3), "estimator": "mask_extent"})
+                    "depth": round(depth, 3),
+                    "estimator": "supported_mask_extent"})
         if not (0.3 <= depth <= 2.5):
             rec["reason"] = f"implausible depth {depth:.2f}m"
             continue
@@ -2405,7 +2434,7 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     # ---- pass 2 (side): thickness correction per piece ----
     # The side pool spans all pieces at once (profile view, no
     # z-buffer -- see _apply_depth_from_side). Door masks are subtracted
-    # before measuring each piece's full cross-axis extent.
+    # before measuring each piece's supported cross-axis extent in the seed.
     depth_ok = False
     if side is not None:
         verdict = judge.adjudicate_sam_boxes(

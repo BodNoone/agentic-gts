@@ -1362,7 +1362,7 @@ def test_apply_depth_from_side_uses_mask_extent():
     recs = _apply_depth_from_side([inst_c], thin, seed)
     assert not recs[0].get("accepted"), recs
     assert abs(inst_c["fitted"].size[1] - 0.15) < 1e-9
-    print("PASS side depth application (merged pool, door tail dropped)")
+    print("PASS side depth application (mask extent, thin pool rejected)")
 
 
 def test_side_depth_keeps_sparse_panel_extent_with_dominant_face():
@@ -1388,6 +1388,53 @@ def test_side_depth_keeps_sparse_panel_extent_with_dominant_face():
         assert np.allclose(inst["fitted"].center, seed.center)
         assert inst["fitted"].size[0] == seed.size[0]
         assert inst["fitted"].size[2] == seed.size[2]
+
+
+def test_side_depth_ignores_outside_seed_and_isolated_boundary_points():
+    """Mask bleed and a few stray centers must not widen a measured device."""
+    from agentic_gts.agent.mask_refine import _apply_depth_from_side
+
+    rng = np.random.default_rng(82)
+    for yaw in (0.0, math.radians(30), math.pi / 2):
+        seed = OrientedBox(center=(2, 3, 1), size=(1, 1.4, 2), yaw=yaw)
+        body = np.column_stack([
+            rng.uniform(-0.4, 0.4, 3000),
+            rng.uniform(-0.5, 0.5, 3000),
+            rng.uniform(-0.9, 0.9, 3000),
+        ])
+        # A substantial neighbouring sheet is outside the seed; two stray
+        # points on each side are inside its slack but outside the body.
+        outside = np.column_stack([
+            rng.uniform(-0.4, 0.4, 100), np.full(100, 0.85),
+            rng.uniform(-0.9, 0.9, 100),
+        ])
+        stray = np.array([[0, -0.66, 0], [0, -0.65, 0.1],
+                          [0, 0.65, 0], [0, 0.66, 0.1]])
+        inst = {"fitted": OrientedBox(center=seed.center, size=seed.size,
+                                    yaw=yaw)}
+        rec = _apply_depth_from_side(
+            [inst], seed.local_to_world(np.vstack([body, outside, stray])),
+            seed)[0]
+        assert rec.get("accepted"), rec
+        assert 0.98 < inst["fitted"].size[1] <= 1.0
+        assert np.allclose(inst["fitted"].center, seed.center, atol=0.01)
+        assert rec["raw_cross_range"][1] > rec["seed_cross_range"][1]
+
+
+def test_side_supported_extent_cannot_expand_seed_depth():
+    from agentic_gts.agent.mask_refine import _apply_depth_from_side
+
+    seed = OrientedBox(center=(0, 0, 1), size=(1, 1, 2))
+    y = np.linspace(-0.7, 0.7, 1000)
+    points = np.column_stack([np.zeros(len(y)), y, np.ones(len(y))])
+    inst = {"fitted": OrientedBox(center=seed.center, size=seed.size)}
+    rec = _apply_depth_from_side([inst], points, seed)[0]
+    assert rec.get("accepted"), rec
+    assert inst["fitted"].size[1] <= seed.size[1]
+    assert rec["cross_range"][0] >= -0.5
+    assert rec["cross_range"][1] <= 0.5
+
+
 def test_parse_rack_confirm():
     from agentic_gts.agent.judge import VLMJudge
     p = VLMJudge._parse_rack_confirm(
