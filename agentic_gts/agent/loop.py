@@ -181,6 +181,15 @@ class LayoutAgent:
                             print(f"[mask-refine] {old.box_id[:6]} removed: "
                                   "front/back grounding found no device")
                             continue
+                        if audit.get("rejected_ladder_seed"):
+                            scene.remove_box(old.box_id)
+                            report.unresolved.append({
+                                "issue": {"type": "ladder_only_seed",
+                                           "box_id": old.box_id},
+                                "ok": False})
+                            print(f"[mask-refine] {old.box_id[:6]} removed: "
+                                  "ladder-only identification")
+                            continue
                         print(f"[mask-refine] {old.box_id[:6]} no valid "
                               f"mask -> keep")
             # ---- type-level guard (no SAM needed) ----
