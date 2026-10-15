@@ -68,7 +68,7 @@ def test_visible_depth_uses_geometry_only_as_validation_not_hidden_points():
     depth = np.full((32, 32), 2.5)
     alpha = np.ones((32, 32))
     mask = np.zeros((32, 32), bool)
-    mask[10:20, 10:20] = True
+    mask[5:27, 5:27] = True  # larger mask for better coverage
     surface = unproject_depth_mask(cam, depth, alpha, mask)
     hidden = surface + np.array([0, -0.5, 0])
     box = OrientedBox(center=(0, 0, 1), size=(2, 2, 2))
@@ -131,7 +131,7 @@ def test_side_end_surface_measurement_from_visible_points():
     depth = np.full((32, 32), 2.5)
     alpha = np.ones((32, 32))
     mask = np.zeros((32, 32), bool)
-    mask[10:20, 10:20] = True
+    mask[5:27, 5:27] = True  # larger mask for better coverage
     surface = unproject_depth_mask(cam, depth, alpha, mask)
     box = OrientedBox(center=(0, 0, 1), size=(4, 2, 2))
     view = {"cam": cam, "depth": depth, "alpha": alpha, "name": "side"}

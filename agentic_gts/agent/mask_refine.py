@@ -2106,13 +2106,21 @@ def _measure_face_surface(points, seed, view):
     if q95 - q05 > 0.12:
         return None  # multiple layers / door surface is not a clean sheet
     along = np.percentile(local[:, 0], [2, 98])
-    if along[1] - along[0] < 0.30:
+    along_span = float(along[1] - along[0])
+    if along_span < 0.30:
         return None
+    # Coverage check: observed span must cover most of the box's along dimension
+    # (sparse but complete surface beats dense but partial coverage)
+    seed_along = float(seed.size[0])
+    coverage = along_span / seed_along if seed_along > 0 else 0.0
+    if coverage < 0.65:
+        return None  # surface must cover at least 65% of box length
     side = float(eye[1])
     return {"face": "front" if side > 0 else "back",
             "cross_local": float(np.median(cross)),
             "spread_m": float(q95 - q05), "points": len(points),
-            "view": view["name"], "along_local": along.tolist()}
+            "view": view["name"], "along_local": along.tolist(),
+            "coverage": round(coverage, 2)}
 
 
 def _measure_end_surface(points, seed, view):
@@ -2129,13 +2137,20 @@ def _measure_end_surface(points, seed, view):
     if q95 - q05 > 0.15:
         return None  # multiple cabinets or spread structure, not a clean sheet
     cross = np.percentile(local[:, 1], [2, 98])
-    if cross[1] - cross[0] < 0.25:
+    cross_span = float(cross[1] - cross[0])
+    if cross_span < 0.25:
         return None
+    # Coverage check: observed span must cover most of the box's cross dimension
+    seed_cross = float(seed.size[1])
+    coverage = cross_span / seed_cross if seed_cross > 0 else 0.0
+    if coverage < 0.60:
+        return None  # surface must cover at least 60% of box depth
     side = float(eye[0])
     return {"face": "left" if side < 0 else "right",
             "along_local": float(np.median(along)),
             "spread_m": float(q95 - q05), "points": len(points),
-            "view": view["name"], "cross_local": cross.tolist()}
+            "view": view["name"], "cross_local": cross.tolist(),
+            "coverage": round(coverage, 2)}
 
 
 def _apply_face_surface_constraints(instances, seed):
