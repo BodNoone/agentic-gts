@@ -686,7 +686,8 @@ def _side_panel_image(imgs: list, scale: int = 16,
 
 def render_local_views(scene: Scene, box: OrientedBox,
                        out_dir: str | None = None,
-                       judge=None) -> list[dict]:
+                       judge=None, include_side: bool = True,
+                       include_faces: bool = True) -> list[dict]:
     """Render front + side local views: ONE device, isolated.
 
     The views feed the VLM and SAM, which only need the target box --
@@ -884,8 +885,10 @@ def render_local_views(scene: Scene, box: OrientedBox,
     # rectangles remain rectangular when the seed yaw matches the face.
     # Side depth views retain their oblique placement below.
     for name, elev, azim, so in (("front", 0.0, azim_front, standoff),
-                                 ("back", 0.0, azim_front + 180.0,
-                                  standoff)):
+                                  ("back", 0.0, azim_front + 180.0,
+                                   standoff)):
+        if not include_faces:
+            break
         raw, prompt_img, cam = _render_one(elev, azim, so)
         if raw is None:
             continue
@@ -912,6 +915,9 @@ def render_local_views(scene: Scene, box: OrientedBox,
                     "cam": cam, "path": path, "prompt_path": prompt_path,
                     **{k: v for k, v in surface_views.get(id(cam), {}).items()
                        if k in ("depth", "alpha")}})
+
+    if not include_side:
+        return out
 
     # ---- SIDE view: oblique candidates + VLM arbitration ----
     # The side slot looks along the row from beyond one end; every
@@ -2184,7 +2190,7 @@ def _visible_mask_points(scene, box, mask, view, exclude=None):
 
 def _measure_face_surface(points, seed, view):
     """Measure the observed cross-axis sheet, allowing staggered cabinets."""
-    if len(points) < 40:
+    if len(points) < 40 or view.get("cam") is None:
         return None
     eye = seed.world_to_local(np.asarray(view["cam"].eye).reshape(1, 3))[0]
     horizontal = float(np.linalg.norm(eye[:2]))
@@ -2235,6 +2241,8 @@ def _apply_face_surface_constraints(instances, seed):
                                   size=(f.size[0], front - back, f.size[2]))
         inst["fitted"].meta["observed_faces"] = observations
         inst["fitted"].meta["surface_span_measured"] = True
+        if len(observations) == 2:
+            inst["depth_ok"] = "front_back"
 
 
 def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
@@ -2319,8 +2327,7 @@ def _voter_spans(scene: Scene, box: OrientedBox, view: dict, judge,
         _, ms, pts3, point_source = best
         along = pts3[:, :2] @ axis - along0
         lo, hi = np.percentile(along, [2.0, 98.0])
-        measurement = (_measure_face_surface(pts3, box, voter)
-                       if point_source == "gs_depth" else None)
+        measurement = _measure_face_surface(pts3, box, voter)
         spans.append({"lo": float(lo), "hi": float(hi), "pts": pts3,
                       "ms": ms, "label": group.hypothesis,
                       "pix": tuple(float(v) for v in box_pix),
@@ -2385,7 +2392,8 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     all of them.
     """
     if views is None:
-        views = render_local_views(scene, box, out_dir, judge=judge)
+        views = render_local_views(scene, box, out_dir, judge=judge,
+                                   include_side=False)
     audit = {"box_id": box.box_id, "views": [], "accepted": False}
     if not views or not sam.available:
         audit["reason"] = "no local GS views or SAM checkpoint"
@@ -2423,7 +2431,13 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
               "views identified only cable ladder; side evidence cannot "
               "promote it to a device")
         return [], audit
+    # Preserve surface evidence even when a whole-row span is discarded
+    # in favour of a finer split from the opposite face.
+    face_measurements = [m for s in spans
+                         for m in s.get("surface_measurements", [])]
     spans = _merge_cross_view(spans, axis, along0)
+    for s in spans:
+        s["surface_measurements"] = face_measurements
     front_ok = bool(spans)
     if voters and not front_ok:
         audit["reason"] = "no valid front/back device span"
@@ -2450,8 +2464,18 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     # ---- pass 2 (side): thickness correction per piece ----
     # Only visible points enter the side pool. Select each piece's nearest
     # depth-parallel end sheet before measuring its cross-axis extent.
-    depth_ok = False
-    if side is not None:
+    instances = _build_split_pieces(spans, box)
+    _apply_face_surface_constraints(instances, box)
+    needs_side = [inst for inst in instances
+                  if inst.get("depth_ok") != "front_back"]
+    audit["depth_policy"] = {"front_back": len(instances) - len(needs_side),
+                              "needs_side": len(needs_side)}
+    if needs_side and side is None:
+        side = next((v for v in render_local_views(
+            scene, box, out_dir, judge=judge, include_faces=False)
+                     if v["name"] == "side"), None)
+    depth_ok = any(inst.get("depth_ok") for inst in instances)
+    if side is not None and needs_side:
         verdict = judge.adjudicate_sam_boxes(
             side["image"], box, side["name"], png_path=side["path"])
         groups = verdict.params.get("groups", []) if verdict.params else []
@@ -2491,19 +2515,17 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                 dva["retry"] = {"image": retry_view["path"],
                                 "groups": len(groups)}
         if pool:
-            instances = _build_split_pieces(spans, box)
             recs = _apply_depth_from_side(
-                instances, np.vstack(pool), box, cam=side["cam"])
+                needs_side, np.vstack(pool), box, cam=side["cam"])
             dva["instances"] = recs
-            depth_ok = any(r.get("accepted") for r in recs)
-            for inst, rec in zip(instances, recs):
+            depth_ok = depth_ok or any(r.get("accepted") for r in recs)
+            for inst, rec in zip(needs_side, recs):
                 if not rec.get("accepted"):
                     continue    # thickness rejected: seed depth stands
                 inst["view"] = inst["view"] + f'+{side["name"]}(depth)'
                 inst["mask_score"] = 0.5 * (inst["mask_score"] + pool_ms)
                 inst["score"] = min(inst["score"] + 0.08, 1.0)
         else:
-            instances = _build_split_pieces(spans, box)
             if ladder_dom:
                 # graceful degradation (user direction: the failure
                 # must be VISIBLE, not silent): the side view could not
@@ -2522,9 +2544,6 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
             except OSError:
                 pass
         audit["views"].append(dva)
-    else:
-        instances = _build_split_pieces(spans, box)
-
     # ---- pass 3: per-piece height + geometry thickness fallback ----
     # Heights are NEVER seed-inherited past this point when the piece
     # has its own points, and a piece the side view left uncorrected

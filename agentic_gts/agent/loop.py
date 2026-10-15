@@ -121,7 +121,7 @@ class LayoutAgent:
                 continue
             # one render per box, shared by both questions
             views = render_local_views(scene, old, self.out_dir,
-                                       judge=self.judge)
+                                       judge=self.judge, include_side=False)
             # ---- type gate for CLUSTER-proposed boxes (BEFORE SAM) ----
             # The recall-first net proposes every density clump with NO
             # VLM label behind it; a pillar / UPS / junk block would

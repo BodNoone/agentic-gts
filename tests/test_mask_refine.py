@@ -534,7 +534,7 @@ def test_back_view_rescues_poor_front_end_to_end():
               "image": img}]
     _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
              mr.SamPredictorAdapter.predict)
-    mr.render_local_views = lambda scene, box, out_dir, judge=None: views
+    mr.render_local_views = lambda scene, box, out_dir, judge=None, **kwargs: views
     j = VLMJudge(backend="local")
     j._local_image_call = lambda *args, **kwargs: ""
     def fake_ground(image, box, view_name, png_path=None):
@@ -607,7 +607,7 @@ def test_cluster_box_type_gate_skips_sam():
              for n in ("front", "back", "side")]
     _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
              mr.SamPredictorAdapter.predict)
-    mr.render_local_views = lambda scene, box, out_dir, judge=None: views
+    mr.render_local_views = lambda scene, box, out_dir, judge=None, **kwargs: views
     mr.SamPredictorAdapter._load = lambda self: None
     def fake_predict(self, image, box_pix):
         m = np.zeros(image.shape[:2], bool)
@@ -680,7 +680,7 @@ def test_vlm_quality_verdict_drops_garbage_view():
              for n in ("front", "back", "side")]
     _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
              mr.SamPredictorAdapter.predict)
-    mr.render_local_views = lambda scene, box, out_dir, judge=None: views
+    mr.render_local_views = lambda scene, box, out_dir, judge=None, **kwargs: views
     j = VLMJudge(backend="local")
     j._local_image_call = lambda *args, **kwargs: ""
     def fake_ground(image, box, view_name, png_path=None):
@@ -1261,7 +1261,7 @@ def test_local_refine_splits_joined_row_end_to_end():
                   "prompt_path": None, "image": img}]
         _real = (mr.render_local_views, mr.SamPredictorAdapter._load,
                  mr.SamPredictorAdapter.predict)
-        mr.render_local_views = lambda scene, box, out_dir, judge=None: views
+        mr.render_local_views = lambda scene, box, out_dir, judge=None, **kwargs: views
         # VLM grounding: TWO device instances on the front view, ONE on
         # the side profile; SAM segments exactly the prompted rectangle
         j = VLMJudge(backend="local")
@@ -1491,6 +1491,34 @@ def test_side_pool_keeps_nearest_surface_per_pixel():
     assert len(pool) == 1
     assert len(pool[0]) == len(visible)
     assert np.allclose(pool[0][:, 0], 0.6)
+
+
+def test_front_back_depth_skips_side_and_preserves_coarse_face(monkeypatch):
+    from types import SimpleNamespace
+    from agentic_gts.agent import mask_refine as mr
+
+    seed = OrientedBox(center=(0, 0, 1), size=(2, 1.4, 2))
+    points = np.column_stack([np.linspace(-1, 1, 100),
+                              np.zeros(100), np.ones(100)])
+    def voter(scene, box, view, *args):
+        ranges = [(-1, 1)] if view["name"] == "front" else [(-1, 0), (0, 1)]
+        return [{"lo": lo, "hi": hi, "pts": points, "ms": .9,
+                 "label": "rack", "view": view["name"],
+                 "surface_measurements": [{
+                     "face": view["name"], "points": 100,
+                     "cross_local": .45 if view["name"] == "front" else -.45,
+                     "along_local": [lo, hi]}]} for lo, hi in ranges]
+    monkeypatch.setattr(mr, "_voter_spans", voter)
+    def unexpected_side(*args, **kwargs):
+        raise AssertionError("two measured faces must skip side rendering")
+    monkeypatch.setattr(mr, "render_local_views", unexpected_side)
+    instances, audit = mr.refine_box(
+        Scene(points=points), seed, None, SimpleNamespace(available=True),
+        views=[{"name": "front"}, {"name": "back"}])
+    assert len(instances) == 2
+    assert audit["depth_policy"] == {"front_back": 2, "needs_side": 0}
+    assert all(abs(i["fitted"].size[1] - .9) < 1e-9 for i in instances)
+    assert all(i["depth_ok"] == "front_back" for i in instances)
 
 
 def test_parse_rack_confirm():
