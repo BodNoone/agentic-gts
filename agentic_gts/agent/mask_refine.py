@@ -1883,13 +1883,33 @@ def _is_subtractive(label) -> bool:
 
 
 def _face_views_ladder_only(view_audits: list[dict]) -> bool:
-    """True when front/back views see ladders but no device instances."""
-    groups = [g for v in view_audits
-              if v.get("view") in ("front", "back")
-              for g in v.get("groups", [])]
-    return (any(_is_ladder(g.get("hypothesis")) for g in groups)
-            and not any(not _is_subtractive(g.get("hypothesis"))
-                        for g in groups))
+    """True when any front/back view sees only ladders with no device instances.
+    
+    If ANY front or back view has grounding results but they're all cable
+    ladders (no actual device instances), the box is likely a misidentified
+    ladder and should be rejected. Rationale (user): a clear view will
+    cleanly identify only the ladder; blurry views might misidentify it as
+    equipment, so one clear ladder-only view is grounds for rejection.
+    """
+    # Group all grounding results by view name
+    view_groups = {}
+    for v in view_audits:
+        view_name = v.get("view")
+        if view_name not in ("front", "back"):
+            continue
+        if view_name not in view_groups:
+            view_groups[view_name] = []
+        view_groups[view_name].extend(v.get("groups", []))
+    
+    # Check each view: if it has grounding but only ladders, reject
+    for view_name, groups in view_groups.items():
+        if not groups:
+            continue  # no grounding in this view, not a rejection signal
+        has_ladder = any(_is_ladder(g.get("hypothesis")) for g in groups)
+        has_device = any(not _is_subtractive(g.get("hypothesis")) for g in groups)
+        if has_ladder and not has_device:
+            return True  # this view sees only ladder, reject the box
+    return False
 
 
 def _door_union(image: np.ndarray, groups: list, sam: SamPredictorAdapter

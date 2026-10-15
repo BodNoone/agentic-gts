@@ -2175,11 +2175,13 @@ def test_side_ladder_fallback_marks_unavailable():
 
 
 def test_face_views_ladder_only_rejects_seed_before_side_rescue():
-    """A side-view device false positive cannot rescue a seed that both
-    face views identified exclusively as cable ladder."""
+    """Any front/back view that identifies exclusively cable ladder rejects
+    the seed (user: a clear view identifies only the ladder; blurry views
+    might misidentify it as equipment, so one ladder-only view suffices)."""
     from agentic_gts.agent.mask_refine import (
         _face_views_ladder_only, refine_box)
 
+    # Front is ladder-only -> reject
     audits = [
         {"view": "front", "groups": [
             {"hypothesis": "cable ladder"}]},
@@ -2187,9 +2189,32 @@ def test_face_views_ladder_only_rejects_seed_before_side_rescue():
             {"hypothesis": "vertical cable tray"}]},
     ]
     assert _face_views_ladder_only(audits)
+    
+    # Back has ladder + device -> still reject because front is ladder-only
+    assert _face_views_ladder_only([
+        {"view": "front", "groups": [{"hypothesis": "cable ladder"}]},
+        {"view": "back", "groups": [
+            {"hypothesis": "vertical cable tray"},
+            {"hypothesis": "server rack"}]},
+    ])
+    
+    # Back is ladder-only -> still reject even though front has device
+    assert _face_views_ladder_only([
+        {"view": "front", "groups": [
+            {"hypothesis": "cable ladder"},
+            {"hypothesis": "server rack"}]},
+        {"view": "back", "groups": [
+            {"hypothesis": "vertical cable tray"}]},
+    ])
+    
+    # Both views have devices -> don't reject
     assert not _face_views_ladder_only([
-        *audits,
-        {"view": "back", "groups": [{"hypothesis": "server rack"}]},
+        {"view": "front", "groups": [
+            {"hypothesis": "cable ladder"},
+            {"hypothesis": "server rack"}]},
+        {"view": "back", "groups": [
+            {"hypothesis": "vertical cable tray"},
+            {"hypothesis": "IT cabinet"}]},
     ])
 
     # Verify the early exit occurs before side grounding is called.
