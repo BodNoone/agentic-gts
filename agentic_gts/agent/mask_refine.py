@@ -1068,10 +1068,9 @@ def _mask_to_points(scene: Scene, box: OrientedBox, mask: np.ndarray, cam,
     center whose projection lands in the mask also selects surfaces
     hidden behind the visible rack, inflating the fitted box.
 
-    z_buffer=False (side view): every region point projecting into the
-    mask, at ANY depth. The side camera looks ALONG the row, so all
-    cabinets of the seed overlap in projection; keeping only the nearest
-    surface would starve the inner cabinets of depth-measurement points.
+    z_buffer=False is available for callers needing all projected points.
+    Side thickness uses visible points and then selects the camera-facing
+    end sheet; hidden cabinets must not vote on a visible end's thickness.
 
     exclude (pixel mask, same shape): points whose projection lands in
     this mask are DROPPED -- the open-door subtraction. The door class
@@ -1572,15 +1571,14 @@ def _side_supported_span(v: np.ndarray, lo: float, hi: float,
 
 def _apply_depth_from_side(instances: list, pts: np.ndarray,
                            seed: "OrientedBox",
-                           min_pts: int = 20) -> list[dict]:
+                           min_pts: int = 20, cam=None) -> list[dict]:
     """Correct each split piece's THICKNESS (cross-axis extent) from
     side-view back-projected points.
 
-    The side camera looks ALONG the row axis, so the (depth, height)
-    profile of every cabinet projects into the same image region; the
-    pool contains ALL pieces' points (lifted WITHOUT the z-buffer) and
-    is sliced per piece by along-row span. Two properties make the
-    side view the thickness authority:
+    Visible points are sliced per piece along the row. With a camera,
+    only the nearest supported end sheet, parallel to the seed's depth
+    axis, measures thickness. Obliquely visible longitudinal faces and
+    farther layers must not enlarge its cross-axis extent.
 
     * it is a true PROFILE (90 deg off the front), where an open
       door sticks out horizontally beyond the cabinet body -- the front
@@ -1600,7 +1598,6 @@ def _apply_depth_from_side(instances: list, pts: np.ndarray,
     if pts is None or len(pts) == 0:
         return recs
     along_all = pts[:, :2] @ axis
-    cross_all = pts[:, :2] @ cross
     sc = np.asarray(seed.center, dtype=float)
     seed_cross_c = float(sc[:2] @ cross)
     seed_half_d = float(np.asarray(seed.size)[1]) / 2.0
@@ -1613,10 +1610,30 @@ def _apply_depth_from_side(instances: list, pts: np.ndarray,
         sel = pts[m]
         rec = {"points": int(len(sel))}
         recs.append(rec)
+        if cam is not None and len(sel) >= min_pts:
+            # Rank planes by the eye's position on the row axis, rather
+            # than camera Z: an oblique view makes camera Z vary across
+            # the valid depth-parallel end sheet itself.
+            eye_along = float(np.asarray(cam.eye)[:2] @ axis)
+            sign = 1.0 if eye_along >= along_c else -1.0
+            along_sel = sel[:, :2] @ axis
+            origin = float(along_sel.min())
+            keys = np.floor((along_sel - origin) / 0.05).astype(np.int64)
+            bins, counts = np.unique(keys, return_counts=True)
+            supported = bins[counts >= min_pts]
+            rec["surface_selection"] = "nearest_depth_parallel_end"
+            if not len(supported):
+                rec["reason"] = "no supported visible side end sheet"
+                continue
+            near_bin = supported[-1] if sign > 0 else supported[0]
+            plane = float(np.median(along_sel[keys == near_bin]))
+            sel = sel[np.abs(along_sel - plane) <= 0.06]
+            rec.update({"end_along": plane, "camera_end_sign": sign,
+                        "end_sheet_points": int(len(sel))})
         if len(sel) < min_pts:
             rec["reason"] = "too few side points in along span"
             continue
-        cross_sel = cross_all[m]
+        cross_sel = sel[:, :2] @ cross
         rec["raw_cross_range"] = [float(cross_sel.min()),
                                   float(cross_sel.max())]
         rec["seed_cross_range"] = [seed_cross_c - seed_half_d,
@@ -1629,7 +1646,7 @@ def _apply_depth_from_side(instances: list, pts: np.ndarray,
         depth = float(c_hi - c_lo)
         rec.update({"cross_range": [c_lo, c_hi],
                     "depth": round(depth, 3),
-                    "estimator": "supported_mask_extent"})
+                    "estimator": "supported_visible_end_extent"})
         if not (0.3 <= depth <= 2.5):
             rec["reason"] = f"implausible depth {depth:.2f}m"
             continue
@@ -1972,9 +1989,9 @@ def _side_thickness_pool(scene: Scene, box: OrientedBox, view: dict,
                          groups: list, doors, sam: SamPredictorAdapter,
                          out_dir: str | None, tag: str) -> tuple:
     """Side-view SAM back-projection pool: every non-subtractive VLM
-    box -> best-scoring SAM mask -> points lifted WITHOUT the z-buffer
-    (from along the row every piece overlaps in projection -- all of
-    them must contribute). Returns (pool, pool_ms); an EMPTY pool means
+    box -> best-scoring SAM mask -> nearest visible points per pixel.
+    The depth-parallel camera-facing end sheet is selected downstream.
+    Returns (pool, pool_ms); an EMPTY pool means
     the view grounded no device (all-subtractive or every mask lifted
     <20 points).
     """
@@ -1992,10 +2009,9 @@ def _side_thickness_pool(scene: Scene, box: OrientedBox, view: dict,
         masks, scores = sam.predict(view["image"], box_pix)
         best = None
         for mi, (mask, ms) in enumerate(zip(masks, scores)):
-            # NO z-buffer: from along the row, every piece overlaps
-            # in projection -- all of them must contribute points
+            # Hidden layers inside the mask cannot measure the visible end.
             pts3 = _mask_to_points(scene, box, mask, view["cam"],
-                                   z_buffer=False, exclude=doors)
+                                   z_buffer=True, exclude=doors)
             if out_dir:
                 _save_sam_debug(view, box_pix, mask, pts3, box,
                                 None, out_dir,
@@ -2432,9 +2448,8 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
                   "pts": None, "ms": 0.5, "label": "unknown"}]
 
     # ---- pass 2 (side): thickness correction per piece ----
-    # The side pool spans all pieces at once (profile view, no
-    # z-buffer -- see _apply_depth_from_side). Door masks are subtracted
-    # before measuring each piece's supported cross-axis extent in the seed.
+    # Only visible points enter the side pool. Select each piece's nearest
+    # depth-parallel end sheet before measuring its cross-axis extent.
     depth_ok = False
     if side is not None:
         verdict = judge.adjudicate_sam_boxes(
@@ -2478,7 +2493,7 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         if pool:
             instances = _build_split_pieces(spans, box)
             recs = _apply_depth_from_side(
-                instances, np.vstack(pool), box)
+                instances, np.vstack(pool), box, cam=side["cam"])
             dva["instances"] = recs
             depth_ok = any(r.get("accepted") for r in recs)
             for inst, rec in zip(instances, recs):

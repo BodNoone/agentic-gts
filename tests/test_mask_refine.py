@@ -1435,6 +1435,64 @@ def test_side_supported_extent_cannot_expand_seed_depth():
     assert rec["cross_range"][1] <= 0.5
 
 
+def test_side_depth_uses_nearest_depth_parallel_end_sheet():
+    """Only the camera-facing row end can provide the side thickness span."""
+    from types import SimpleNamespace
+    from agentic_gts.agent.mask_refine import _apply_depth_from_side
+
+    seed = OrientedBox(center=(0, 0, 1), size=(1, 1.4, 2))
+    rng = np.random.default_rng(83)
+    # Camera is beyond +X. The visible end spans the true depth [-.5, .5].
+    front = np.column_stack([
+        np.full(1200, 0.50) + rng.normal(0, 0.008, 1200),
+        rng.uniform(-0.5, 0.5, 1200),
+        rng.uniform(0.1, 1.9, 1200),
+    ])
+    # A hidden layer behind the end has a wider, invalid cross extent. It
+    # must not participate even though it is inside the SAM projection.
+    hidden = np.column_stack([
+        np.full(1200, 0.10) + rng.normal(0, 0.008, 1200),
+        rng.uniform(-0.7, 0.7, 1200),
+        rng.uniform(0.1, 1.9, 1200),
+    ])
+    cam = SimpleNamespace(eye=np.array([3.0, 0.3, 1.4]))
+    inst = {"fitted": OrientedBox(center=seed.center, size=seed.size)}
+    rec = _apply_depth_from_side([inst], np.vstack([front, hidden]),
+                                 seed, cam=cam)[0]
+    assert rec.get("accepted"), rec
+    assert 0.90 < inst["fitted"].size[1] < 1.10, inst["fitted"].size
+    assert rec["surface_selection"] == "nearest_depth_parallel_end"
+    assert rec["end_sheet_points"] >= 1000
+
+
+def test_side_pool_keeps_nearest_surface_per_pixel():
+    """A SAM mask must not lift hidden centers behind the visible side."""
+    from agentic_gts.agent.mask_refine import _side_thickness_pool
+    from agentic_gts.output.gs_render import Cam
+
+    seed = OrientedBox(center=(0, 0, 1), size=(1.6, 1.4, 2))
+    cam = Cam(eye=np.array([3., 0., 1.]), target=np.array([0., 0., 1.]),
+              up=np.array([0., 0., 1.]), fovy_deg=60, W=128, H=128)
+    y, z = np.meshgrid(np.linspace(-0.45, 0.45, 20),
+                       np.linspace(0.3, 1.7, 20))
+    visible = np.column_stack([np.full(y.size, 0.6), y.ravel(), z.ravel()])
+    # Put a farther point on exactly the same ray as each visible one.
+    hidden = cam.eye + (visible - cam.eye) * 1.4
+    scene = Scene(points=np.vstack([visible, hidden]))
+
+    class Sam:
+        def predict(self, image, bbox):
+            return np.ones((1, 128, 128), dtype=bool), np.array([0.9])
+
+    view = {"image": np.zeros((128, 128, 3)), "cam": cam}
+    groups = [{"bbox": [0, 0, 1000, 1000], "hypothesis": "rack"}]
+    pool, _ = _side_thickness_pool(scene, seed, view, groups,
+                                    None, Sam(), None, "side")
+    assert len(pool) == 1
+    assert len(pool[0]) == len(visible)
+    assert np.allclose(pool[0][:, 0], 0.6)
+
+
 def test_parse_rack_confirm():
     from agentic_gts.agent.judge import VLMJudge
     p = VLMJudge._parse_rack_confirm(
