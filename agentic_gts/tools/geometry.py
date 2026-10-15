@@ -76,11 +76,12 @@ def flag_insufficient_face_support(scene: Scene, tolerance: float = 0.03,
         delta = 1 if matched >= 3 else -1
         levels = (Confidence.LOW, Confidence.MID, Confidence.HIGH)
         adjusted = levels[int(np.clip(ranks[base_conf] + delta, 0, 2))]
-        # Semantic/structural rejection flags are stronger evidence than
-        # geometric face support and must never be promoted by this check.
+        # Semantic/structural rejection flags and single-view support are
+        # stronger evidence than geometric face support and must never be
+        # promoted by this check.
         protected_low = any(box.meta.get(k) for k in
                             ("type_suspect", "structural_geom",
-                             "low_furniture_geom"))
+                             "low_furniture_geom", "single_view_support"))
         if protected_low:
             adjusted = Confidence.LOW
         box.confidence = adjusted

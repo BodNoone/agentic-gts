@@ -2363,6 +2363,15 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         print(f"[mask-refine] {box.box_id[:6]} rejected: front/back "
               "views produced no valid device span")
         return [], audit
+    
+    # Check how many face views produced valid device grounding
+    face_views_with_grounding = sum(
+        1 for v in audit["views"]
+        if v.get("view") in ("front", "back")
+        and any(not _is_subtractive(g.get("hypothesis"))
+                for g in v.get("groups", []))
+    )
+    
     if not front_ok:
         # no usable front division: the seed stays WHOLE and is still
         # eligible for the side-view thickness correction below
@@ -2479,6 +2488,19 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
         print(f"[mask-refine] seam regularisation: {n_seams} split "
               f"seam(s) snapped")
     audit["seams_snapped"] = n_seams
+    
+    # Mark boxes supported by only a single face view as low confidence
+    # and lock them from future confidence promotion (user report: single
+    # front-view grounding with no back/side corroboration is often a
+    # misidentified clutter object)
+    single_view_support = (face_views_with_grounding == 1 and not depth_ok)
+    if single_view_support:
+        for inst in instances:
+            inst["fitted"].confidence = Confidence.LOW
+            inst["fitted"].meta["single_view_support"] = True
+        audit["single_view_support"] = True
+        print(f"[mask-refine] {box.box_id[:6]} marked LOW: supported by "
+              f"only one face view, no side depth correction")
 
     instances.sort(key=lambda e: e["score"], reverse=True)
     audit.update({"accepted": True,
