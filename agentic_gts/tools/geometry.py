@@ -1112,16 +1112,8 @@ def snap_box_ends(box: OrientedBox, pts: np.ndarray,
     must be VISIBLE: a run reaching the window's outer boundary means
     the structure continues past the window -- the true end is beyond
     reach and the face does not move."""
-    debug = []
-    observed = box.meta.get("observed_faces", {})
-    if "left" in observed and snap_left:
-        debug.append({"face": "left", "reason": "observed_surface_locked"})
-        snap_left = False
-    if "right" in observed and snap_right:
-        debug.append({"face": "right", "reason": "observed_surface_locked"})
-        snap_right = False
     if not (snap_left or snap_right):
-        return box, {"moved": False, "reason": "no free ends", "debug": debug}
+        return box, {"moved": False, "reason": "no free ends"}
     yaw = float(box.yaw)
     axis = np.array([math.cos(yaw), math.sin(yaw)])
     cross = np.array([-math.sin(yaw), math.cos(yaw)])
@@ -1551,14 +1543,10 @@ def snap_faces_to_mesh(scene: Scene) -> int:
                 # Every independent grounding box gets both side faces
                 # checked. Only a seam between pieces from the SAME SAM
                 # split is reserved for Stage C's seam regularisation.
-                # Additionally, observed end surfaces (left/right from side
-                # view) lock their respective faces.
-                snap_left=(not cur.meta.get("surface_span_measured")
-                           and "left" not in cur.meta.get("observed_faces", {})
-                           and not _same_split_continues(snapshot, b, -1)),
-                snap_right=(not cur.meta.get("surface_span_measured")
-                            and "right" not in cur.meta.get("observed_faces", {})
-                            and not _same_split_continues(snapshot, b, +1)))
+                snap_left=not cur.meta.get("surface_span_measured")
+                          and not _same_split_continues(snapshot, b, -1),
+                snap_right=not cur.meta.get("surface_span_measured")
+                           and not _same_split_continues(snapshot, b, +1))
             if einfo.get("moved"):
                 nb.meta["end_snap"] = einfo
                 print(f"[stageF] {nb.box_id[:6]} end snap: length "
