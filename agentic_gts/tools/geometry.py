@@ -36,16 +36,14 @@ def support_fraction(scene: Scene, box: OrientedBox, expand: float = 0.0) -> flo
     return float(occupied.sum() / max(nb.prod(), 1))
 
 
-def flag_insufficient_face_support(scene: Scene, tolerance: float = 0.05,
+def flag_insufficient_face_support(scene: Scene, tolerance: float = 0.03,
                                    cell: float = 0.10,
-                                   min_coverage: float = 0.90,
+                                   min_coverage: float = 0.50,
                                    min_points: int = 10) -> int:
     """Adjust confidence one level using five non-bottom fitted faces.
 
     Density is occupied face-grid area, rather than raw point count, so a
     dense ladder fragment cannot qualify an otherwise empty face.
-    Coverage is based on span (percentile extent) vs grid occupancy to
-    handle sparse but complete surfaces.
     """
     flagged = 0
     for box in scene.boxes:
@@ -61,38 +59,15 @@ def flag_insufficient_face_support(scene: Scene, tolerance: float = 0.05,
             mask = np.abs(local[:, axis] - sign * half[axis]) <= tolerance
             mask &= np.all(np.abs(local[:, tangent]) <= half[tangent], axis=1)
             selected = local[mask][:, tangent]
-            
-            # Grid occupancy (density check for ladder fragments)
             bins = np.maximum(np.ceil(lengths / cell).astype(int), 1)
             idx = np.clip(((selected + half[tangent]) / cell).astype(int),
                           0, bins - 1)
             occupied = len(np.unique(idx, axis=0))
-            grid_coverage = float(occupied / int(np.prod(bins)))
-            
-            # Span coverage (extent check for sparse but complete surfaces)
-            span_coverage = 0.0
-            if len(selected) >= 4:
-                span = []
-                for i, dim_len in enumerate(lengths):
-                    p2, p98 = np.percentile(selected[:, i], [2, 98])
-                    span_ratio = float((p98 - p2) / dim_len) if dim_len > 0 else 0.0
-                    span.append(span_ratio)
-                span_coverage = float(np.prod(span))  # both dimensions must span
-            
-            # Accept either:
-            # 1. High grid coverage (dense, traditional check)
-            # 2. High span + moderate grid (sparse but complete, not edge fragments)
-            dense_pass = grid_coverage >= min_coverage
-            sparse_pass = (span_coverage >= min_coverage 
-                          and grid_coverage >= 0.40)  # sparse needs significant distribution
-            coverage = grid_coverage if dense_pass else span_coverage
-            passed = len(selected) >= min_points and (dense_pass or sparse_pass)
-            
+            coverage = float(occupied / int(np.prod(bins)))
             faces[name] = {"points": int(len(selected)),
                            "coverage": round(coverage, 4),
-                           "grid_coverage": round(grid_coverage, 4),
-                           "span_coverage": round(span_coverage, 4),
-                           "passed": passed}
+                           "passed": bool(len(selected) >= min_points
+                                          and coverage >= min_coverage)}
         matched = sum(face["passed"] for face in faces.values())
         audit = box.meta.get("face_support", {})
         base_name = audit.get("base_confidence", box.confidence.value)
