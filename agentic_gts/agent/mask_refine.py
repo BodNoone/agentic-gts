@@ -1565,9 +1565,10 @@ def _apply_depth_from_side(instances: list, pts: np.ndarray,
     * it is a true PROFILE (90 deg off the front), where an open
       door sticks out horizontally beyond the cabinet body -- the front
       view cannot separate it (user report), the side view can;
-    * the depth estimator is the strong-bin span (_robust_span), which
-      drops the door's spread-out tail that a P2-P98 percentile cut
-      kept inflating the thickness.
+    * thickness is the full cross-axis extent of the mask-selected points.
+      Door masks are subtracted before this pool is built. A peak-relative
+      density threshold would discard valid sparse side panels whenever
+      a front/back sheet dominates the point count.
 
     Along/height stay seed-measured: the side view corrects ONLY the
     thickness and the cross-axis centre of each piece.
@@ -1592,12 +1593,14 @@ def _apply_depth_from_side(instances: list, pts: np.ndarray,
         sel = pts[m]
         rec = {"points": int(len(sel))}
         recs.append(rec)
-        span = _robust_span(cross_all[m])
-        if span is None or len(sel) < min_pts:
+        if len(sel) < min_pts:
             rec["reason"] = "too few side points in along span"
             continue
-        c_lo, c_hi = span
+        cross_sel = cross_all[m]
+        c_lo, c_hi = float(cross_sel.min()), float(cross_sel.max())
         depth = float(c_hi - c_lo)
+        rec.update({"cross_range": [c_lo, c_hi],
+                    "depth": round(depth, 3), "estimator": "mask_extent"})
         if not (0.3 <= depth <= 2.5):
             rec["reason"] = f"implausible depth {depth:.2f}m"
             continue
@@ -2401,9 +2404,8 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
 
     # ---- pass 2 (side): thickness correction per piece ----
     # The side pool spans all pieces at once (profile view, no
-    # z-buffer -- see _apply_depth_from_side); the VLM prompt already
-    # excludes open doors and the strong-bin estimator drops any tail
-    # that still leaks through.
+    # z-buffer -- see _apply_depth_from_side). Door masks are subtracted
+    # before measuring each piece's full cross-axis extent.
     depth_ok = False
     if side is not None:
         verdict = judge.adjudicate_sam_boxes(
@@ -2425,8 +2427,7 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
             dva["groups"] = groups = []
         # the side view is where an open door sticks out HORIZONTALLY
         # beyond the body -- subtract its mask before any thickness
-        # point enters the pool (belt and braces on top of the
-        # strong-bin estimator)
+        # point enters the pool
         doors = _door_union(side["image"], groups, sam)
         pool, pool_ms = _side_thickness_pool(
             scene, box, side, groups, doors, sam, out_dir, side["name"])
@@ -2515,7 +2516,7 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
     # misidentified clutter object). However, if the side view DID identify
     # a device (even if depth measurement failed), that counts as corroboration.
     side_has_device = any(
-        v.get("view") in ("left_side", "right_side")
+        v.get("view") == "side"
         and v.get("role") == "depth_profile"
         and any(not _is_subtractive(g.get("hypothesis"))
                 for g in v.get("groups", []))

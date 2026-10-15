@@ -1315,13 +1315,12 @@ def test_local_refine_splits_joined_row_end_to_end():
                  "across the THICKNESS is the yaw-axis bug")
         print(f"PASS local refine splits a {'y' if along_y else 'x'}-running"
               " joined row end-to-end")
-def test_apply_depth_from_side_excludes_open_door():
+def test_apply_depth_from_side_uses_mask_extent():
     """The side-view thickness rule: pieces keep along/height (seed-
     trusted); the side pool -- ONE merged cloud over the whole row,
     lifted without the z-buffer -- is sliced per piece by along span
-    and measures ONLY that cabinet's depth. The strong-bin estimator
-    must drop an open door's spread-out tail beyond the cabinet body,
-    which a P2-P98 percentile cut kept inflating the thickness."""
+    and measures ONLY that cabinet's depth. Door points have already
+    been excluded by the side mask before this measurement."""
     from agentic_gts.agent.mask_refine import _apply_depth_from_side
     seed = OrientedBox(center=(0.0, 0.0, 1.05), size=(2.0, 1.0, 2.1),
                        yaw=0.0)
@@ -1341,9 +1340,6 @@ def test_apply_depth_from_side_excludes_open_door():
             rng.uniform(0.1, 1.9, n)])
     # body shells: dense, y within [-0.4, 0.4] (true depth 0.8 m)
     pool = np.vstack([slab(-0.3, -0.4, 0.4, 300), slab(0.3, -0.4, 0.4, 300)])
-    # open door on cabinet A: a SPREAD-OUT tail beyond the front face
-    # (y in [0.4, 1.1], sparse compared to the shells)
-    pool = np.vstack([pool, slab(-0.3, 0.42, 1.1, 60)])
     recs = _apply_depth_from_side([inst_a, inst_b], pool, seed)
     assert len(recs) == 2 and all(r.get("accepted") for r in recs), recs
     for inst in (inst_a, inst_b):
@@ -1352,8 +1348,7 @@ def test_apply_depth_from_side_excludes_open_door():
         assert abs(fb.size[0] - 0.5) < 1e-9
         assert abs(fb.size[2] - 2.0) < 1e-9
         assert abs(fb.center[0] - (0.3 if inst is inst_b else -0.3)) < 1e-9
-        # thickness measured from the body shells, door tail EXCLUDED:
-        # a percentile cut would have stretched cabinet A to ~1.05m
+        # thickness is the full extent of the mask-selected body points
         assert 0.6 < fb.size[1] < 0.95, fb.size[1]
         assert abs(fb.center[1]) < 0.1, fb.center[1]
     # rejection: a pool with an implausible depth (thin sliver) leaves
@@ -1368,6 +1363,31 @@ def test_apply_depth_from_side_excludes_open_door():
     assert not recs[0].get("accepted"), recs
     assert abs(inst_c["fitted"].size[1] - 0.15) < 1e-9
     print("PASS side depth application (merged pool, door tail dropped)")
+
+
+def test_side_depth_keeps_sparse_panel_extent_with_dominant_face():
+    """A dense face must not collapse a full-depth SAM pool to one bin."""
+    from agentic_gts.agent.mask_refine import _apply_depth_from_side
+
+    rng = np.random.default_rng(81)
+    for yaw in (0.0, math.radians(30), math.pi / 2):
+        seed = OrientedBox(center=(2, 3, 1), size=(1, 1.4, 2), yaw=yaw)
+        local = np.column_stack([
+            rng.uniform(-0.4, 0.4, 2400),
+            np.concatenate([np.full(2000, -0.5),
+                            np.linspace(-0.5, 0.5, 300),
+                            np.full(100, 0.5)]),
+            rng.uniform(-0.9, 0.9, 2400),
+        ])
+        inst = {"fitted": OrientedBox(center=seed.center, size=seed.size,
+                                    yaw=yaw)}
+        records = _apply_depth_from_side(
+            [inst], seed.local_to_world(local), seed)
+        assert records[0].get("accepted"), records
+        assert abs(inst["fitted"].size[1] - 1.0) < 1e-9
+        assert np.allclose(inst["fitted"].center, seed.center)
+        assert inst["fitted"].size[0] == seed.size[0]
+        assert inst["fitted"].size[2] == seed.size[2]
 def test_parse_rack_confirm():
     from agentic_gts.agent.judge import VLMJudge
     p = VLMJudge._parse_rack_confirm(
