@@ -1550,73 +1550,55 @@ def _rebuild(f: "OrientedBox", center=None, size=None) -> "OrientedBox":
         meta=dict(f.meta))
 
 
-def _apply_depth_from_side(instances: list, pts: np.ndarray,
-                           seed: "OrientedBox",
-                           min_pts: int = 20) -> list[dict]:
-    """Correct each split piece's THICKNESS (cross-axis extent) from
-    side-view back-projected points.
+def _apply_ends_from_side(instances: list, measurements: list[dict],
+                          seed: "OrientedBox") -> list[dict]:
+    """Apply left/right end-surface constraints from side-view measurements.
 
-    The side camera looks ALONG the row axis, so the (depth, height)
-    profile of every cabinet projects into the same image region; the
-    pool contains ALL pieces' points (lifted WITHOUT the z-buffer) and
-    is sliced per piece by along-row span. Two properties make the
-    side view the thickness authority:
-
-    * it is a true PROFILE (90 deg off the front), where an open
-      door sticks out horizontally beyond the cabinet body -- the front
-      view cannot separate it (user report), the side view can;
-    * the depth estimator is the strong-bin span (_robust_span), which
-      drops the door's spread-out tail that a P2-P98 percentile cut
-      kept inflating the thickness.
-
-    Along/height stay seed-measured: the side view corrects ONLY the
-    thickness and the cross-axis centre of each piece.
+    Each piece receives end measurements that overlap its cross (depth)
+    range. If both left and right are measured, the length comes from
+    their separation; otherwise the piece keeps its seed length.
     """
     recs = []
-    yaw = float(seed.yaw)
-    axis = np.array([math.cos(yaw), math.sin(yaw)])
-    cross = np.array([-math.sin(yaw), math.cos(yaw)])
-    if pts is None or len(pts) == 0:
-        return recs
-    along_all = pts[:, :2] @ axis
-    cross_all = pts[:, :2] @ cross
-    sc = np.asarray(seed.center, dtype=float)
-    seed_cross_c = float(sc[:2] @ cross)
-    seed_half_d = float(np.asarray(seed.size)[1]) / 2.0
     for inst in instances:
         f = inst["fitted"]
-        fc = np.asarray(f.center, dtype=float)
-        along_c = float(fc[:2] @ axis)
-        half = float(f.size[0]) / 2.0
-        m = np.abs(along_all - along_c) <= half + 0.05
-        sel = pts[m]
-        rec = {"points": int(len(sel))}
+        local_center = seed.world_to_local(np.asarray(f.center).reshape(1, 3))[0]
+        cross_c = local_center[1]
+        cross_half = f.size[1] / 2.0
+        rec = {"measurements": 0}
         recs.append(rec)
-        span = _robust_span(cross_all[m])
-        if span is None or len(sel) < min_pts:
-            rec["reason"] = "too few side points in along span"
+        observations = {}
+        for name in ("left", "right"):
+            available = [m for m in measurements if m["face"] == name
+                         and m["cross_local"][0] <= cross_c + cross_half
+                         and m["cross_local"][1] >= cross_c - cross_half]
+            if available:
+                observations[name] = max(available, key=lambda m: m["points"])
+        if not observations:
+            rec["reason"] = "no end measurements overlap this piece"
             continue
-        c_lo, c_hi = span
-        depth = float(c_hi - c_lo)
-        if not (0.3 <= depth <= 2.5):
-            rec["reason"] = f"implausible depth {depth:.2f}m"
+        rec["measurements"] = len(observations)
+        left = local_center[0] - f.size[0] / 2
+        right = local_center[0] + f.size[0] / 2
+        if "left" in observations:
+            left = observations["left"]["along_local"]
+        if "right" in observations:
+            right = observations["right"]["along_local"]
+        length = right - left
+        if not (0.30 <= length <= 3.50):
+            rec["reason"] = f"incompatible end separation {length:.2f}m"
             continue
-        mid = 0.5 * (c_lo + c_hi)
-        # the measured cabinet centre must still live inside the seed's
-        # cross span (padded) -- the stageG seed box bounds the device
-        if abs(mid - seed_cross_c) > seed_half_d + 0.30:
-            rec["reason"] = "depth centre too far from seed"
-            continue
-        # rebuild: seed's along/height, side-measured thickness + centre
-        cxy = axis * along_c + cross * mid
-        inst["fitted"] = _rebuild(
-            f, center=(float(cxy[0]), float(cxy[1]), float(fc[2])),
-            size=(float(f.size[0]), depth, float(f.size[2])))
-        # Side masks measure depth only: a far cabinet may be vertically
-        # occluded. Keep front/back mask points as the height authority.
-        inst["depth_ok"] = "side"
+        local_center[0] = (left + right) / 2
+        center = seed.local_to_world(local_center.reshape(1, 3))[0]
+        inst["fitted"] = _rebuild(f, center=center,
+                                  size=(length, f.size[1], f.size[2]))
+        inst["depth_ok"] = "side_ends"
         rec["accepted"] = True
-        rec["depth"] = round(depth, 3)
+        rec["length"] = round(length, 3)
+        # Store end measurements in surface_measurements for later Stage F protection
+        for obs in observations.values():
+            if "surface_measurements" not in inst:
+                inst["surface_measurements"] = []
+            inst["surface_measurements"].append(obs)
     return recs
 
 
@@ -1916,21 +1898,18 @@ def _door_union(image: np.ndarray, groups: list, sam: SamPredictorAdapter
     return u
 
 
-def _side_thickness_pool(scene: Scene, box: OrientedBox, view: dict,
-                         groups: list, doors, sam: SamPredictorAdapter,
-                         out_dir: str | None, tag: str) -> tuple:
-    """Side-view SAM back-projection pool: every non-subtractive VLM
-    box -> best-scoring SAM mask -> points lifted WITHOUT the z-buffer
-    (from along the row every piece overlaps in projection -- all of
-    them must contribute). Returns (pool, pool_ms); an EMPTY pool means
-    the view grounded no device (all-subtractive or every mask lifted
-    <20 points).
-    """
-    pool, pool_ms = [], 0.0
+def _side_end_measurements(scene: Scene, box: OrientedBox, view: dict,
+                           groups: list, doors, sam: SamPredictorAdapter,
+                           out_dir: str | None, tag: str) -> list[dict]:
+    """Side-view SAM surface measurement: every non-subtractive VLM box ->
+    best-scoring SAM mask -> visible surface points -> left/right end
+    measurements. Returns a list of end-surface measurements (each with
+    'face', 'along_local', 'cross_local', 'points', etc.)."""
+    measurements = []
     H, W = view["image"].shape[:2]
     for gi, g in enumerate(groups):
         if _is_subtractive(g.get("hypothesis")):
-            continue          # subtraction only, never a pool
+            continue          # subtraction only, never a measurement
         group = BoxGroup(tuple(g["bbox"]), g.get("hypothesis", "rack"),
                          float(g.get("confidence", 0.5)))
         box_pix = group.pixel_box(W, H)
@@ -1938,24 +1917,23 @@ def _side_thickness_pool(scene: Scene, box: OrientedBox, view: dict,
                 and box_pix[3] - box_pix[1] > 4):
             continue                  # degenerate/absent box
         masks, scores = sam.predict(view["image"], box_pix)
-        best = None
+        best_pts, best_ms = None, -1.0
         for mi, (mask, ms) in enumerate(zip(masks, scores)):
-            # NO z-buffer: from along the row, every piece overlaps
-            # in projection -- all of them must contribute points
-            pts3 = _mask_to_points(scene, box, mask, view["cam"],
-                                   z_buffer=False, exclude=doors)
+            pts3, method = _visible_mask_points(scene, box, mask, view, exclude=doors)
             if out_dir:
                 _save_sam_debug(view, box_pix, mask, pts3, box,
                                 None, out_dir,
                                 f"{box.box_id}_{tag}_g{gi}_m{mi}")
             if len(pts3) < 20:
                 continue
-            if best is None or ms > best[1]:
-                best = (pts3, float(ms))
-        if best is not None:
-            pool.append(best[0])
-            pool_ms = max(pool_ms, best[1])
-    return pool, pool_ms
+            if best_pts is None or ms > best_ms:
+                best_pts, best_ms = pts3, float(ms)
+        if best_pts is not None:
+            m = _measure_end_surface(best_pts, box, view)
+            if m is not None:
+                m["sam_score"] = best_ms
+                measurements.append(m)
+    return measurements
 
 
 def _side_ladder_retry(scene: Scene, box: OrientedBox, side: dict,
@@ -2064,12 +2042,12 @@ def _side_ladder_retry(scene: Scene, box: OrientedBox, side: dict,
     retry_view = {"name": "side_retry", "image": raw, "prompt_image": raw,
                   "cam": side["cam"], "path": path, "prompt_path": path}
     doors2 = _door_union(raw, groups2, sam)
-    pool2, pool_ms2 = _side_thickness_pool(scene, box, retry_view,
+    measurements2 = _side_end_measurements(scene, box, retry_view,
                                            groups2, doors2, sam,
                                            out_dir, "side_retry")
-    if not pool2:
+    if not measurements2:
         return None
-    return retry_view, groups2, pool2, pool_ms2
+    return retry_view, groups2, measurements2
 
 
 def _mask_grounding_fit(mask: np.ndarray, box_pix: np.ndarray) -> dict:
@@ -2137,34 +2115,79 @@ def _measure_face_surface(points, seed, view):
             "view": view["name"], "along_local": along.tolist()}
 
 
+def _measure_end_surface(points, seed, view):
+    """Measure the observed along-axis end sheet from side view."""
+    if len(points) < 20:
+        return None
+    eye = seed.world_to_local(np.asarray(view["cam"].eye).reshape(1, 3))[0]
+    horizontal = float(np.linalg.norm(eye[:2]))
+    if horizontal < 1e-6 or abs(eye[0]) / horizontal < 0.85:
+        return None  # camera must primarily face local along axis (X)
+    local = seed.world_to_local(points)
+    along = local[:, 0]
+    q05, q95 = np.percentile(along, [5, 95])
+    if q95 - q05 > 0.15:
+        return None  # multiple cabinets or spread structure, not a clean sheet
+    cross = np.percentile(local[:, 1], [2, 98])
+    if cross[1] - cross[0] < 0.25:
+        return None
+    side = float(eye[0])
+    return {"face": "left" if side < 0 else "right",
+            "along_local": float(np.median(along)),
+            "spread_m": float(q95 - q05), "points": len(points),
+            "view": view["name"], "cross_local": cross.tolist()}
+
+
 def _apply_face_surface_constraints(instances, seed):
-    """Apply observed front/back planes after side/fallback depth measurement."""
+    """Apply observed front/back/left/right surface planes after side/fallback
+    depth measurement. Front/back constrain depth (cross axis); left/right
+    constrain length (along axis)."""
     for inst in instances:
         measurements = inst.get("surface_measurements", [])
         f = inst["fitted"]
-        along_center = seed.world_to_local(np.asarray(f.center).reshape(1, 3))[0, 0]
+        local_center = seed.world_to_local(np.asarray(f.center).reshape(1, 3))[0]
+        along_center = local_center[0]
+        cross_center = local_center[1]
         observations = {}
+        # Front/back (cross-axis constraints, depth measurement)
         for name in ("front", "back"):
             available = [m for m in measurements if m["face"] == name
                          and m["along_local"][0] <= along_center <= m["along_local"][1]]
             if available:
                 observations[name] = max(available, key=lambda m: m["points"])
+        # Left/right (along-axis constraints, length measurement)
+        for name in ("left", "right"):
+            available = [m for m in measurements if m["face"] == name
+                         and m["cross_local"][0] <= cross_center <= m["cross_local"][1]]
+            if available:
+                observations[name] = max(available, key=lambda m: m["points"])
         if not observations:
             continue
-        local_center = seed.world_to_local(np.asarray(f.center).reshape(1, 3))[0]
         front = local_center[1] + f.size[1] / 2
         back = local_center[1] - f.size[1] / 2
+        left = local_center[0] - f.size[0] / 2
+        right = local_center[0] + f.size[0] / 2
         if "front" in observations:
             front = observations["front"]["cross_local"]
         if "back" in observations:
             back = observations["back"]["cross_local"]
-        if not 0.30 <= front - back <= 2.50:
-            inst["surface_rejected"] = "incompatible observed planes"
+        if "left" in observations:
+            left = observations["left"]["along_local"]
+        if "right" in observations:
+            right = observations["right"]["along_local"]
+        length = right - left
+        depth = front - back
+        if not (0.30 <= length <= 3.50):
+            inst["surface_rejected"] = f"incompatible observed length {length:.2f}m"
             continue
+        if not (0.30 <= depth <= 2.50):
+            inst["surface_rejected"] = f"incompatible observed depth {depth:.2f}m"
+            continue
+        local_center[0] = (left + right) / 2
         local_center[1] = (front + back) / 2
         center = seed.local_to_world(local_center.reshape(1, 3))[0]
         inst["fitted"] = _rebuild(f, center=center,
-                                  size=(f.size[0], front - back, f.size[2]))
+                                  size=(length, depth, f.size[2]))
         inst["fitted"].meta["observed_faces"] = observations
         inst["fitted"].meta["surface_span_measured"] = True
 
@@ -2395,38 +2418,37 @@ def refine_box(scene: Scene, box: OrientedBox, judge, sam: SamPredictorAdapter,
             dva["role"] = "depth_profile-dropped"
             dva["groups"] = groups = []
         # the side view is where an open door sticks out HORIZONTALLY
-        # beyond the body -- subtract its mask before any thickness
-        # point enters the pool (belt and braces on top of the
-        # strong-bin estimator)
+        # beyond the body -- subtract its mask before any end measurement
         doors = _door_union(side["image"], groups, sam)
-        pool, pool_ms = _side_thickness_pool(
+        measurements = _side_end_measurements(
             scene, box, side, groups, doors, sam, out_dir, side["name"])
         # LADDER-DOMINATION RETRY (user report: a short device beside a
         # long cable ladder -- the side view grounds ONLY the ladder,
-        # no device instance, and the thickness correction dies): the
+        # no device instance, and the end measurement fails): the
         # ladder the VLM DID find is cut from the render and the VLM is
-        # asked again. Triggered ONLY on the failing path -- a pool
-        # from the first pass skips it entirely.
-        ladder_dom = (not pool and any(_is_subtractive(g.get("hypothesis"))
-                                       for g in groups))
+        # asked again. Triggered ONLY on the failing path -- measurements
+        # from the first pass skip it entirely.
+        ladder_dom = (not measurements and any(_is_subtractive(g.get("hypothesis"))
+                                               for g in groups))
         if ladder_dom:
             r = _side_ladder_retry(scene, box, side, groups, sam,
                                    judge, out_dir)
             if r is not None:
-                retry_view, groups, pool, pool_ms = r
+                retry_view, groups, measurements = r
                 dva["retry"] = {"image": retry_view["path"],
                                 "groups": len(groups)}
-        if pool:
+        if measurements:
             instances = _build_split_pieces(spans, box)
-            recs = _apply_depth_from_side(
-                instances, np.vstack(pool), box)
+            recs = _apply_ends_from_side(instances, measurements, box)
             dva["instances"] = recs
             depth_ok = any(r.get("accepted") for r in recs)
             for inst, rec in zip(instances, recs):
                 if not rec.get("accepted"):
-                    continue    # thickness rejected: seed depth stands
-                inst["view"] = inst["view"] + f'+{side["name"]}(depth)'
-                inst["mask_score"] = 0.5 * (inst["mask_score"] + pool_ms)
+                    continue    # end constraint rejected: seed length stands
+                inst["view"] = inst["view"] + f'+{side["name"]}(ends)'
+                # Inherit best SAM score from measurements
+                best_score = max((m.get("sam_score", 0.5) for m in measurements), default=0.5)
+                inst["mask_score"] = 0.5 * (inst["mask_score"] + best_score)
                 inst["score"] = min(inst["score"] + 0.08, 1.0)
         else:
             instances = _build_split_pieces(spans, box)
