@@ -39,11 +39,15 @@ def support_fraction(scene: Scene, box: OrientedBox, expand: float = 0.0) -> flo
 def flag_insufficient_face_support(scene: Scene, tolerance: float = 0.03,
                                    cell: float = 0.10,
                                    min_coverage: float = 0.70,
-                                   min_points: int = 10) -> int:
+                                   min_points: int = 10,
+                                   required_faces: int = 2) -> int:
     """Adjust confidence one level using five non-bottom fitted faces.
 
     Density is occupied face-grid area, rather than raw point count, so a
     dense ladder fragment cannot qualify an otherwise empty face.
+    
+    Required faces defaults to 2 to accommodate middle cabinets in a row
+    (only front/back + top visible; left/right occluded by neighbours).
     """
     flagged = 0
     for box in scene.boxes:
@@ -73,7 +77,7 @@ def flag_insufficient_face_support(scene: Scene, tolerance: float = 0.03,
         base_name = audit.get("base_confidence", box.confidence.value)
         base_conf = Confidence(base_name)
         ranks = {Confidence.LOW: 0, Confidence.MID: 1, Confidence.HIGH: 2}
-        delta = 1 if matched >= 3 else -1
+        delta = 1 if matched >= required_faces else -1
         levels = (Confidence.LOW, Confidence.MID, Confidence.HIGH)
         adjusted = levels[int(np.clip(ranks[base_conf] + delta, 0, 2))]
         # Semantic/structural rejection flags and single-view support are
@@ -89,12 +93,12 @@ def flag_insufficient_face_support(scene: Scene, tolerance: float = 0.03,
             "base_confidence": base_conf.value,
             "confidence_before": base_conf.value,
             "confidence_after": adjusted.value,
-            "faces": faces, "matched_faces": matched, "required_faces": 3,
+            "faces": faces, "matched_faces": matched, "required_faces": required_faces,
             "tolerance_m": tolerance, "grid_m": cell,
             "min_coverage": min_coverage, "min_points": min_points,
-            "passed": matched >= 3,
+            "passed": matched >= required_faces,
         }
-        if matched < 3:
+        if matched < required_faces:
             flagged += 1
         print(f"[face-support] {box.box_id} fitted={matched}/5 "
               f"confidence={base_conf.value}->{adjusted.value}")

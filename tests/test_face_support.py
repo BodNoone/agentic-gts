@@ -25,6 +25,8 @@ def surface(box, axis, sign):
 @pytest.mark.parametrize("yaw", [0, math.pi / 2, 0.37])
 @pytest.mark.parametrize("face_count", [2, 3])
 def test_three_supported_faces_required_without_deletion(yaw, face_count):
+    """Two or more supported faces promote confidence (accommodates middle
+    cabinets in rows where left/right are occluded)."""
     box = OrientedBox(center=(3, -2, 1), size=(1, 1, 2), yaw=yaw,
                       confidence=Confidence.HIGH)
     specifications = [(1, 1), (1, -1), (2, 1)]
@@ -33,11 +35,10 @@ def test_three_supported_faces_required_without_deletion(yaw, face_count):
                   boxes=[box])
     flagged = flag_insufficient_face_support(scene)
     assert scene.boxes == [box]
-    assert flagged == (face_count < 3)
+    assert flagged == (face_count < 2)  # now requires ≥2 faces
     assert box.meta["face_support"]["matched_faces"] == face_count
     assert box.meta["face_support"]["min_coverage"] == 0.70
-    assert box.confidence == (Confidence.MID if face_count < 3
-                              else Confidence.HIGH)
+    assert box.confidence == Confidence.HIGH  # both 2 and 3 faces promote
     json.dumps(box.to_dict())
 
 
