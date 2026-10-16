@@ -924,12 +924,9 @@ def snap_box_faces(box: OrientedBox,
             if is_inward:
                 inward_options[side] = cand
             d = np.abs(centers[cand] - face_pos)
-            if is_inward:
-                peak = band[cand]
-                strongest = np.flatnonzero(peak == peak.max())
-                chosen = int(cand[strongest[int(np.argmin(d[strongest]))]])
-            else:
-                chosen = int(cand[int(np.argmin(d))])
+            # Strength qualifies a surface; distance selects among qualified
+            # surfaces so a denser internal panel cannot steal the body face.
+            chosen = int(cand[int(np.argmin(d))])
             rec["candidate_peak"] = int(band[chosen])
             rec["candidate"] = round(float(centers[chosen]), 3)
             if searched == "keep":
@@ -1006,10 +1003,10 @@ def snap_box_faces(box: OrientedBox,
                  if _SNAP_MIN_REMAINING <= centers[f] - centers[b]
                  <= _FACE_SNAP_MAX_D]
         if pairs:
-            f, b = max(pairs, key=lambda pair: (
-                int(band[pair[0]]) + int(band[pair[1]]),
-                -abs(centers[pair[0]] - front)
-                - abs(centers[pair[1]] - back)))
+            f, b = min(pairs, key=lambda pair: (
+                abs(centers[pair[0]] - front)
+                + abs(centers[pair[1]] - back),
+                -int(band[pair[0]]) - int(band[pair[1]])))
             f1, b1 = float(centers[f]), float(centers[b])
             for rec, idx in zip(debug, (f, b)):
                 rec["candidate"] = round(float(centers[idx]), 3)

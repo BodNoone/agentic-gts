@@ -285,8 +285,7 @@ def test_end_extends_beyond_fifteen_cm_with_distributed_side_surface():
 
 
 def test_nonempty_face_does_not_shrink_to_internal_peak():
-    """Inward search uses the strongest qualifying device sheet, with
-    proximity only resolving equal-strength candidates."""
+    """The closest qualifying body sheet wins over a denser inner sheet."""
     rng = np.random.default_rng(27)
     pts = np.vstack([
         _sheet(rng, 0.55, n=1800), _sheet(rng, -0.55, n=1500),
@@ -296,7 +295,29 @@ def test_nonempty_face_does_not_shrink_to_internal_peak():
     assert info["moved"], info
     assert .60 < info["front"][1] < .65, info
     assert info["debug"][0]["reason"] == "poor_current_face_body_recovery"
-    print("PASS face snap chooses strongest qualifying inward peak")
+    print("PASS face snap chooses closest qualifying inward peak")
+
+
+def test_inward_peak_selection_prefers_nearest_on_both_faces(monkeypatch):
+    from agentic_gts.tools import geometry as geo
+
+    monkeypatch.setattr(geo, "_body_face_candidates",
+                        lambda *a: {"faces": {}, "checks": {}})
+    rng = np.random.default_rng(93)
+    points = np.vstack([_sheet(rng, y, n=n)
+                        for y, n in ((.60, 2200), (-.60, 2200),
+                                     (.30, 3200), (-.30, 3200))])
+    for observed in ({}, {"back": {}}):
+        box = _box(.80)
+        box.meta["observed_faces"] = observed
+        result, info = snap_box_faces(box, points)
+        assert info["moved"], info
+        assert abs(info["front"][1] - .60) < .03, info
+        if observed:
+            assert info["back"][1] == -.80
+        else:
+            assert abs(info["back"][1] + .60) < .03, info
+            assert result.size[1] > 1.1
 
 
 def test_face_snap_recovers_when_initial_face_has_no_points():
