@@ -748,12 +748,6 @@ def snap_box_faces(box: OrientedBox,
     and does not move. Returns
     (box, info); the box is unchanged unless info["moved"]."""
     observed = box.meta.get("observed_faces", {})
-    if "front" in observed and "back" in observed:
-        return box, {"moved": False, "reason": "observed surfaces locked",
-                     "debug": [{"face": name, "accepted": False,
-                                "reason": "observed_surface_locked",
-                                "searched": "keep"}
-                               for name in ("front", "back")]}
     yaw = float(box.yaw)
     axis = np.array([math.cos(yaw), math.sin(yaw)])
     cross = np.array([-math.sin(yaw), math.cos(yaw)])
@@ -811,6 +805,7 @@ def snap_box_faces(box: OrientedBox,
 
     debug = []
     inward_options = {}
+    body_check = _body_face_candidates(box, pts)
 
     def _peaks(win_lo: float, win_hi: float, side: int,
                inward: bool = False) -> np.ndarray:
@@ -832,6 +827,16 @@ def snap_box_faces(box: OrientedBox,
 
     def _snap(face_pos: float, inward: tuple[float, float],
               outward: tuple[float, float], side: int) -> float:
+        name = "front" if side > 0 else "back"
+        body_face = body_check["faces"].get(name)
+        if body_face is not None:
+            candidate = cross_c + body_face["after"]
+            debug.append({"face": name, "old": face_pos,
+                          "candidate": candidate, "accepted": True,
+                          "searched": "inward",
+                          "reason": "poor_current_face_body_recovery",
+                          "coverage_check": body_check["checks"][name]})
+            return candidate
         # Strict shrink-first: a valid inward sheet wins even if an
         # exterior peak is closer to the current face.
         face_zone = np.abs(centers - face_pos) <= _FACE_BAND
@@ -929,8 +934,11 @@ def snap_box_faces(box: OrientedBox,
                (front - inward_range, front),
                (front, front + outward_limit), +1)
     b1 = _snap(back,
-                (back, back + inward_range),
-                (back - outward_limit, back), -1)
+                 (back, back + inward_range),
+                 (back - outward_limit, back), -1)
+    for rec in debug:
+        rec.setdefault("coverage_check", body_check.get("checks", {}).get(
+            rec["face"], {}))
     observed = box.meta.get("observed_faces", {})
     if "front" in observed:
         f1 = front
@@ -992,8 +1000,10 @@ def snap_box_faces(box: OrientedBox,
                     if pos == original:
                         rec["accepted"] = False
                         rec["reason"] = "opposite_face_minimum_spacing"
-    mf = abs(f1 - front) >= _FACE_SNAP_MIN_MOVE
-    mb = abs(b1 - back) >= _FACE_SNAP_MIN_MOVE
+    mf = abs(f1 - front) >= (.01 - 1e-9 if "front" in body_check["faces"]
+                             else _FACE_SNAP_MIN_MOVE)
+    mb = abs(b1 - back) >= (.01 - 1e-9 if "back" in body_check["faces"]
+                            else _FACE_SNAP_MIN_MOVE)
     if not mf:
         f1 = front
     if not mb:
@@ -1497,19 +1507,18 @@ def trim_nested_boxes(scene: Scene) -> int:
     return n
 
 
-def shrink_local_face_protrusions(box: OrientedBox, pts: np.ndarray):
-    """Shrink a face only when its exterior is local and an inner body sheet
-    covers both the box height and length. Never expand either face.
-    """
+def _body_face_candidates(box: OrientedBox, pts: np.ndarray):
+    """Coverage evidence for snap_box_faces; does not modify boxes."""
     local = box.world_to_local(np.asarray(pts, dtype=float))
+    all_local = local
     half = np.asarray(box.size, dtype=float) / 2
     mask = ((np.abs(local[:, 0]) <= half[0])
             & (np.abs(local[:, 2]) <= half[2])
             & (np.abs(local[:, 1]) <= half[1] + 0.03))
     local = local[mask]
     audit = {"moved": False, "faces": {}}
-    if len(local) < 50:
-        return box, audit
+    if len(local) < 50 or _INWARD_SNAP_WINDOW_FRAC > 1:
+        return audit
     nx = max(1, int(np.ceil(box.size[0] / 0.10)))
     nz = max(1, int(np.ceil(box.size[2] / 0.10)))
 
@@ -1524,6 +1533,12 @@ def shrink_local_face_protrusions(box: OrientedBox, pts: np.ndarray):
     back, front = -half[1], half[1]
     for name, sign in (("front", 1.), ("back", -1.)):
         signed = sign * local[:, 1]
+        outside = all_local[(sign * all_local[:, 1] > half[1] + .03)
+                            & (np.abs(all_local[:, 0]) <= half[0])
+                            & (np.abs(all_local[:, 2]) <= half[2])]
+        ox, oz, oa = coverage(outside)
+        if ox >= .35 and oz >= .35:
+            continue
         # Search inward from the current boundary, stopping well before the
         # opposite face; a cabinet interior is not a replacement outer sheet.
         limit = min(0.30, box.size[1] * 0.25)
@@ -1538,6 +1553,9 @@ def shrink_local_face_protrusions(box: OrientedBox, pts: np.ndarray):
                         "height_coverage": current_z,
                         "area_coverage": current_area},
             "candidates": []}
+        if current_area >= .40 and current_z >= .60 and current_x >= .60:
+            audit["checks"][name]["reason"] = "current face adequately supported"
+            continue
         for candidate in candidates:
             sheet = local[np.abs(signed - candidate) <= .005]
             cx, cz, area = coverage(sheet)
@@ -1559,6 +1577,9 @@ def shrink_local_face_protrusions(box: OrientedBox, pts: np.ndarray):
                 continue
             exterior = local[signed > candidate + .008]
             ex, ez, ea = coverage(exterior)
+            if ea < .02:
+                entry["reason"] = "no local protrusion to remove"
+                continue
             # A second broad sheet is ambiguous (e.g. a door): keep the face.
             if len(exterior) and (ez >= .35 and ex >= .35):
                 audit["checks"][name]["reason"] = "broad exterior structure"
@@ -1586,20 +1607,9 @@ def shrink_local_face_protrusions(box: OrientedBox, pts: np.ndarray):
             entry["reason"] = "accepted"
             audit["checks"][name]["reason"] = "accepted"
             break
-    if not audit["faces"] or front - back < .30:
-        return box, {**audit, "moved": False}
-    import copy
-    result = copy.deepcopy(box)
-    center = box.local_to_world(np.array([[0., (front + back) / 2, 0.]]))[0]
-    result.center = tuple(float(v) for v in center)
-    result.size = (box.size[0], float(front - back), box.size[2])
-    audit["moved"] = True
-    # Subsequent face snapping must respect these validated body boundaries.
-    observed = result.meta.setdefault("observed_faces", {})
-    for name in audit["faces"]:
-        observed[name] = {"source": "stageF_body_shrink", **audit["faces"][name]}
-    result.meta["body_face_shrink"] = audit
-    return result, audit
+    if front - back < .30:
+        audit["faces"] = {}
+    return audit
 
 
 def snap_faces_to_mesh(scene: Scene) -> int:
@@ -1628,12 +1638,6 @@ def snap_faces_to_mesh(scene: Scene) -> int:
                       f"{tinfo['height'][0]:.2f} -> "
                       f"{tinfo['height'][1]:.2f}m")
             own = _own_points(pts, scene.boxes, cur)
-            cur, shrink_info = shrink_local_face_protrusions(cur, pts[own])
-            cur.meta["body_face_shrink_check"] = shrink_info
-            if shrink_info["moved"]:
-                scene.boxes[i] = cur
-                print(f"[stageF] {cur.box_id[:6]} body face shrink: "
-                      f"{shrink_info['faces']}")
             nb, einfo = snap_box_ends(
                 cur, pts[own],
                 # Every independent grounding box gets both side faces
@@ -1660,7 +1664,7 @@ def snap_faces_to_mesh(scene: Scene) -> int:
                       f"(front {finfo['front'][0]:.2f} -> "
                       f"{finfo['front'][1]:.2f}, back "
                       f"{finfo['back'][0]:.2f} -> {finfo['back'][1]:.2f})")
-            if shrink_info["moved"] or einfo.get("moved") or finfo.get("moved"):
+            if einfo.get("moved") or finfo.get("moved"):
                 scene.boxes[i] = nb2
                 n += 1
         except Exception as e:

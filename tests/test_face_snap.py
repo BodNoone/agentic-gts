@@ -267,8 +267,8 @@ def test_nonempty_face_does_not_shrink_to_internal_peak():
     b = _box(0.70)
     nb, info = snap_box_faces(b, pts)
     assert info["moved"], info
-    assert info["front"][1] == info["front"][0], info
-    assert not info["debug"][0]["empty_face"]
+    assert .60 < info["front"][1] < .65, info
+    assert info["debug"][0]["reason"] == "poor_current_face_body_recovery"
     print("PASS face snap chooses strongest qualifying inward peak")
 
 
