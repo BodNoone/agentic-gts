@@ -1465,6 +1465,56 @@ def test_side_depth_uses_nearest_depth_parallel_end_sheet():
     assert rec["end_sheet_points"] >= 1000
 
 
+def test_side_depth_ignores_dense_bottom_lip():
+    """A shallow protrusion must not set the body's full-height front face."""
+    from types import SimpleNamespace
+    from agentic_gts.agent.mask_refine import _apply_depth_from_side
+    from agentic_gts.tools.geometry import shrink_local_face_protrusions
+
+    rng = np.random.default_rng(84)
+    for yaw in (0.0, math.radians(30), math.pi / 2):
+        seed = OrientedBox(center=(2, 3, 1), size=(1, 1.4, 2), yaw=yaw)
+        # Include the front/back body sheets across the cabinet width.
+        y, z = np.meshgrid(np.linspace(-0.5, 0.5, 61),
+                           np.linspace(-0.9, 0.9, 37))
+        body = np.column_stack([np.full(y.size, 0.5), y.ravel(), z.ravel()])
+        x, h = np.meshgrid(np.linspace(-0.5, 0.5, 31),
+                           np.linspace(-0.9, 0.9, 37))
+        sheets = np.vstack([np.column_stack([x.ravel(),
+                            np.full(x.size, side), h.ravel()])
+                            for side in (-0.5, 0.5)])
+        # Oversample the lip so point density would favour it over the body.
+        lip = np.column_stack([np.full(10000, 0.5),
+                               rng.uniform(0.5, 0.65, 10000),
+                               rng.uniform(-0.9, -0.75, 10000)])
+        inst = {"fitted": OrientedBox(center=seed.center, size=seed.size,
+                                    yaw=yaw)}
+        eye = seed.local_to_world(np.array([[3., 0.3, 0.4]]))[0]
+        rec = _apply_depth_from_side(
+            [inst], seed.local_to_world(np.vstack([body, lip])), seed,
+            cam=SimpleNamespace(eye=eye))[0]
+        assert rec.get("accepted"), rec
+        assert inst["fitted"].size[1] > 1.1
+        result, info = shrink_local_face_protrusions(
+            inst["fitted"], seed.local_to_world(np.vstack([body, sheets, lip])))
+        assert info["moved"]
+        assert abs(result.size[1] - 1.0) < 1e-8
+        assert np.allclose(result.center, seed.center)
+
+
+def test_body_shrink_keeps_broad_exterior_sheet():
+    from agentic_gts.tools.geometry import shrink_local_face_protrusions
+
+    box = OrientedBox(center=(0, 0, 1), size=(1, 1.3, 2))
+    x, z = np.meshgrid(np.linspace(-.5, .5, 31),
+                       np.linspace(.1, 1.9, 37))
+    points = np.vstack([np.column_stack([x.ravel(), np.full(x.size, y),
+                                        z.ravel()]) for y in (-.65, .5, .65)])
+    result, audit = shrink_local_face_protrusions(box, points)
+    assert not audit["moved"]
+    assert result is box
+
+
 def test_side_pool_keeps_nearest_surface_per_pixel():
     """A SAM mask must not lift hidden centers behind the visible side."""
     from agentic_gts.agent.mask_refine import _side_thickness_pool
