@@ -1515,6 +1515,26 @@ def test_body_shrink_keeps_broad_exterior_sheet():
     assert result is box
 
 
+def test_body_shrink_small_bottom_lip_below_four_cm():
+    from agentic_gts.tools.geometry import shrink_local_face_protrusions
+
+    for extension in (.015, .025, .035):
+        box = OrientedBox(center=(0, extension / 2, 1),
+                          size=(1, 1 + extension, 2))
+        x, z = np.meshgrid(np.linspace(-.5, .5, 31),
+                           np.linspace(.1, 1.9, 37))
+        body = np.vstack([np.column_stack([x.ravel(), np.full(x.size, y),
+                                           z.ravel()]) for y in (-.5, .5)])
+        lx, lz = np.meshgrid(np.linspace(-.5, .5, 31),
+                             np.linspace(.1, .2, 5))
+        lip = np.column_stack([lx.ravel(), np.full(lx.size, .5 + extension),
+                               lz.ravel()])
+        result, audit = shrink_local_face_protrusions(box, np.vstack([body, lip]))
+        assert audit["moved"], (extension, audit)
+        assert abs(result.size[1] - 1) < 1e-8
+        assert abs(result.center[1]) < 1e-8
+
+
 def test_side_pool_keeps_nearest_surface_per_pixel():
     """A SAM mask must not lift hidden centers behind the visible side."""
     from agentic_gts.agent.mask_refine import _side_thickness_pool

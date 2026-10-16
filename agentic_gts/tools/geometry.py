@@ -1527,22 +1527,27 @@ def shrink_local_face_protrusions(box: OrientedBox, pts: np.ndarray):
         # Search inward from the current boundary, stopping well before the
         # opposite face; a cabinet interior is not a replacement outer sheet.
         limit = min(0.30, box.size[1] * 0.25)
-        candidates = np.arange(half[1] - .04, half[1] - limit, -.02)
+        candidates = np.arange(half[1] - .01, half[1] - limit, -.005)
+        audit.setdefault("checks", {})[name] = {
+            "reason": "no broad inner sheet", "max_area_coverage": 0.0}
         for candidate in candidates:
-            sheet = local[np.abs(signed - candidate) <= .02]
+            sheet = local[np.abs(signed - candidate) <= .005]
             cx, cz, area = coverage(sheet)
+            audit["checks"][name]["max_area_coverage"] = max(
+                audit["checks"][name]["max_area_coverage"], area)
             if len(sheet) < 40 or cx < .60 or cz < .60 or area < .40:
                 continue
-            exterior = local[signed > candidate + .03]
+            exterior = local[signed > candidate + .008]
             ex, ez, ea = coverage(exterior)
             # A second broad sheet is ambiguous (e.g. a door): keep the face.
             if len(exterior) and (ez >= .35 and ex >= .35):
+                audit["checks"][name]["reason"] = "broad exterior structure"
                 continue
             levels = np.floor((sheet[:, 2] + half[2]) / .10).astype(int)
             boundary = float(np.median([
                 np.median(sign * sheet[levels == level, 1])
                 for level in np.unique(levels)]))
-            if half[1] - boundary < .04:
+            if half[1] - boundary < .01 - 1e-9:
                 continue
             new_face = sign * boundary
             if name == "front":
@@ -1554,6 +1559,7 @@ def shrink_local_face_protrusions(box: OrientedBox, pts: np.ndarray):
                 "height_coverage": cz, "length_coverage": cx,
                 "area_coverage": area, "exterior_height_coverage": ez,
                 "exterior_length_coverage": ex, "exterior_area_coverage": ea}
+            audit["checks"][name]["reason"] = "accepted"
             break
     if not audit["faces"] or front - back < .30:
         return box, {**audit, "moved": False}
@@ -1598,8 +1604,11 @@ def snap_faces_to_mesh(scene: Scene) -> int:
                       f"{tinfo['height'][1]:.2f}m")
             own = _own_points(pts, scene.boxes, cur)
             cur, shrink_info = shrink_local_face_protrusions(cur, pts[own])
+            cur.meta["body_face_shrink_check"] = shrink_info
             if shrink_info["moved"]:
                 scene.boxes[i] = cur
+                print(f"[stageF] {cur.box_id[:6]} body face shrink: "
+                      f"{shrink_info['faces']}")
             nb, einfo = snap_box_ends(
                 cur, pts[own],
                 # Every independent grounding box gets both side faces
