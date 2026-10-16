@@ -1535,6 +1535,43 @@ def test_body_shrink_small_bottom_lip_below_four_cm():
         assert abs(result.center[1]) < 1e-8
 
 
+def test_body_shrink_sparse_inner_sheet_beats_local_current_face():
+    from agentic_gts.tools.geometry import shrink_local_face_protrusions
+
+    for sign in (-1, 1):
+        box = OrientedBox(center=(0, sign * .04, 1), size=(1, 1.08, 2))
+        # Sparse checkerboard: about 33% area, with every height/length
+        # represented rather than a dense patch confined to the bottom.
+        x, z = np.meshgrid(np.arange(-.45, .5, .1),
+                           .05 + .1 * np.arange(20))
+        iz, ix = np.indices(x.shape)
+        sparse = (ix + iz) % 3 == 0
+        x, z = x[sparse], z[sparse]
+        inner = np.column_stack([x.ravel(), np.full(x.size, sign * .5),
+                                 z.ravel()])
+        lx, lz = np.meshgrid(np.arange(-.45, .5, .1), [.05, .15, .25])
+        outer = np.column_stack([lx.ravel(), np.full(lx.size, sign * .58),
+                                 lz.ravel()])
+        result, audit = shrink_local_face_protrusions(box, np.vstack([inner, outer]))
+        assert audit["moved"], audit
+        name = "front" if sign > 0 else "back"
+        assert audit["faces"][name]["support_rule"] == "relative"
+        assert audit["faces"][name]["area_coverage"] < .4
+        assert abs(result.size[1] - 1) < 1e-8
+
+
+def test_body_shrink_rejects_weak_relative_gain():
+    from agentic_gts.tools.geometry import shrink_local_face_protrusions
+
+    box = OrientedBox(center=(0, .04, 1), size=(1, 1.08, 2))
+    x, z = np.meshgrid(np.arange(-.45, .5, .1), [.05, .15, .25])
+    points = np.vstack([np.column_stack([x.ravel(), np.full(x.size, y),
+                                        z.ravel()]) for y in (.5, .58)])
+    result, audit = shrink_local_face_protrusions(box, points)
+    assert not audit["moved"]
+    assert result is box
+
+
 def test_side_pool_keeps_nearest_surface_per_pixel():
     """A SAM mask must not lift hidden centers behind the visible side."""
     from agentic_gts.agent.mask_refine import _side_thickness_pool

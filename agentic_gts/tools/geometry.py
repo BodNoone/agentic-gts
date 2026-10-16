@@ -1528,26 +1528,48 @@ def shrink_local_face_protrusions(box: OrientedBox, pts: np.ndarray):
         # opposite face; a cabinet interior is not a replacement outer sheet.
         limit = min(0.30, box.size[1] * 0.25)
         candidates = np.arange(half[1] - .01, half[1] - limit, -.005)
+        current_sheet = local[np.abs(signed - half[1]) <= .005]
+        current_x, current_z, current_area = coverage(current_sheet)
         audit.setdefault("checks", {})[name] = {
-            "reason": "no broad inner sheet", "max_area_coverage": 0.0}
+            "reason": "no broad inner sheet", "max_area_coverage": 0.0,
+            "tolerance_m": .005, "grid_m": .10,
+            "current": {"points": len(current_sheet),
+                        "length_coverage": current_x,
+                        "height_coverage": current_z,
+                        "area_coverage": current_area},
+            "candidates": []}
         for candidate in candidates:
             sheet = local[np.abs(signed - candidate) <= .005]
             cx, cz, area = coverage(sheet)
             audit["checks"][name]["max_area_coverage"] = max(
                 audit["checks"][name]["max_area_coverage"], area)
-            if len(sheet) < 40 or cx < .60 or cz < .60 or area < .40:
+            absolute_support = area >= .40
+            relative_support = (area >= .20 and area >= current_area + .08
+                                and area >= 1.35 * current_area)
+            entry = {"position_local": sign * float(candidate),
+                     "points": len(sheet), "length_coverage": cx,
+                     "height_coverage": cz, "area_coverage": area,
+                     "area_gain": area - current_area,
+                     "support_rule": "absolute" if absolute_support else
+                                     "relative" if relative_support else None,
+                     "reason": "insufficient body support"}
+            audit["checks"][name]["candidates"].append(entry)
+            if (len(sheet) < 40 or cx < .60 or cz < .60
+                    or not (absolute_support or relative_support)):
                 continue
             exterior = local[signed > candidate + .008]
             ex, ez, ea = coverage(exterior)
             # A second broad sheet is ambiguous (e.g. a door): keep the face.
             if len(exterior) and (ez >= .35 and ex >= .35):
                 audit["checks"][name]["reason"] = "broad exterior structure"
+                entry["reason"] = "broad exterior structure"
                 continue
             levels = np.floor((sheet[:, 2] + half[2]) / .10).astype(int)
             boundary = float(np.median([
                 np.median(sign * sheet[levels == level, 1])
                 for level in np.unique(levels)]))
             if half[1] - boundary < .01 - 1e-9:
+                entry["reason"] = "below minimum shrink"
                 continue
             new_face = sign * boundary
             if name == "front":
@@ -1557,8 +1579,11 @@ def shrink_local_face_protrusions(box: OrientedBox, pts: np.ndarray):
             audit["faces"][name] = {
                 "before": sign * float(half[1]), "after": new_face,
                 "height_coverage": cz, "length_coverage": cx,
-                "area_coverage": area, "exterior_height_coverage": ez,
+                "area_coverage": area, "current_area_coverage": current_area,
+                "support_rule": entry["support_rule"],
+                "exterior_height_coverage": ez,
                 "exterior_length_coverage": ex, "exterior_area_coverage": ea}
+            entry["reason"] = "accepted"
             audit["checks"][name]["reason"] = "accepted"
             break
     if not audit["faces"] or front - back < .30:
