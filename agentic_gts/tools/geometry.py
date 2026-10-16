@@ -806,6 +806,19 @@ def snap_box_faces(box: OrientedBox,
     debug = []
     inward_options = {}
     body_check = _body_face_candidates(box, pts)
+    height_mask = ((np.abs(pts[:, :2] @ axis - along_c) <= half_len + .05)
+                   & (pts[:, 2] > bottom + .30) & (pts[:, 2] <= top))
+    height_points = pts[height_mask]
+    height_cross = height_points[:, :2] @ cross
+    height_bins = max(1, int(np.ceil((top - bottom - .30) / .10)))
+
+    def _face_height_coverage(position):
+        selected = height_points[np.abs(height_cross - position) <= _FACE_BAND]
+        if len(selected) < 10:
+            return 0.0
+        bins = np.clip(((selected[:, 2] - bottom - .30) / .10).astype(int),
+                       0, height_bins - 1)
+        return float(len(np.unique(bins)) / height_bins)
 
     def _peaks(win_lo: float, win_hi: float, side: int,
                inward: bool = False) -> np.ndarray:
@@ -842,8 +855,17 @@ def snap_box_faces(box: OrientedBox,
         face_zone = np.abs(centers - face_pos) <= _FACE_BAND
         current_face_density = (float(band[face_zone].max())
                                 if face_zone.any() else 0.0)
-        empty_face = current_face_density <= _FACE_EMPTY_FACE_FRAC * gmax
+        height_coverage = _face_height_coverage(face_pos)
+        density_empty = current_face_density <= _FACE_EMPTY_FACE_FRAC * gmax
+        low_height_support = not density_empty and height_coverage < .60
+        empty_face = density_empty or low_height_support
         interior_peaks = _peaks(*inward, side, inward=True)
+        if low_height_support:
+            interior_peaks = np.asarray([
+                index for index in interior_peaks
+                if _face_height_coverage(float(centers[index])) >= .60
+                and (face_pos - centers[index]) * side >= _FACE_SNAP_MIN_MOVE
+            ], dtype=np.int64)
         cand = interior_peaks if empty_face else np.empty(0, dtype=np.int64)
         exterior = _peaks(*outward, side)
         near_surface = np.concatenate([interior_peaks, exterior])
@@ -852,10 +874,14 @@ def snap_box_faces(box: OrientedBox,
         near_surface = near_surface[
             (np.abs(centers[near_surface] - face_pos) <= _FACE_BIN)
             & (band[near_surface] >= _INWARD_SNAP_WINDOW_FRAC * side_peak)]
+        if low_height_support:
+            near_surface = np.empty(0, dtype=np.int64)
         is_inward = bool(len(cand))
         searched = "inward"
         direction_reason = ("empty_face_inward_recovery" if empty_face
-                            else "inward_blocked_face_has_support")
+                             else "inward_blocked_face_has_support")
+        if low_height_support:
+            direction_reason = "insufficient_height_inward_recovery"
         if len(near_surface):
             # A supported surface already at the old face takes precedence
             # over denser internal shelves/panels.
@@ -863,7 +889,7 @@ def snap_box_faces(box: OrientedBox,
             is_inward = False
             searched = "keep"
             direction_reason = "existing_surface_supported"
-        elif len(exterior):
+        elif len(exterior) and not (low_height_support and is_inward):
             exterior = exterior[
                 (centers[exterior] - face_pos) * side > _FACE_SNAP_MIN_MOVE]
             inner_peak = float(band[interior_peaks].max()) if len(interior_peaks) else 0.0
@@ -887,6 +913,8 @@ def snap_box_faces(box: OrientedBox,
             "profile_points": profile_points,
             "gmax": int(gmax),
             "face_density": round(current_face_density, 1),
+            "face_height_coverage": height_coverage,
+            "min_face_height_coverage": .60,
             "empty_face": bool(empty_face),
             "searched": searched,
             "direction_reason": direction_reason,

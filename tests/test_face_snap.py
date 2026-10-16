@@ -46,6 +46,33 @@ def _floor(rng, n=800):
                             rng.uniform(0.00, 0.20, n)])
 
 
+def test_low_full_row_obstacle_does_not_block_inward_face(monkeypatch):
+    from agentic_gts.tools import geometry as geo
+
+    # Exercise the density gate itself, independently of coverage proposals.
+    monkeypatch.setattr(geo, "_body_face_candidates",
+                        lambda *a: {"faces": {}, "checks": {}})
+    rng = np.random.default_rng(92)
+    for sign in (-1, 1):
+        for offset in (.08, .15):
+            box = _box(.403, half_len=1.44, z=1.12)
+            panel = sign * (.403 - offset)
+            points = np.vstack([
+                _sheet(rng, panel, n=16000, along=1.44, z_hi=2.20),
+                _sheet(rng, -sign * .403, n=44000, along=1.44, z_hi=2.20),
+                _sheet(rng, sign * .403, n=6500, along=1.44,
+                       z_lo=.31, z_hi=.60)])
+            result, info = snap_box_faces(box, points)
+            assert info["moved"], info
+            name = "front" if sign > 0 else "back"
+            rec = next(r for r in info["debug"] if r["face"] == name)
+            assert rec["face_density"] > .05 * rec["gmax"]
+            assert rec["face_height_coverage"] < .6
+            assert rec["direction_reason"] == "insufficient_height_inward_recovery"
+            assert rec["searched"] == "inward"
+            assert abs(info[name][1] - panel) < .03
+
+
 def test_face_snap_pulls_in_open_door_inflation():
     """The primary case (user direction): a box inflated by an open
     door snaps both faces back onto the device's own sheets; the
