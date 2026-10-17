@@ -1136,6 +1136,143 @@ _ORIENT_MIN_GAIN = 0.10
 _MAX_DEVICE_SPAN = 2.5
 
 
+def _box_frame_rect(box):
+    """Exact AABB of an arbitrary-yaw box in its current coordinate frame."""
+    corners = box.corners_2d()
+    lo, hi = corners.min(axis=0), corners.max(axis=0)
+    return (float(lo[0]), float(lo[1]), float(hi[0]), float(hi[1]))
+
+
+def _refine_layout_directions(boxes, points, frame_yaw, mesh_mode=False):
+    """Measure local surface tangents, then regularize only supported trends.
+
+    Global yaw is a rendering frame, not a constraint on every row. Votes
+    are folded modulo 90 degrees so both long faces and end panels support
+    the same local Manhattan frame. Spatial regression uses measured votes,
+    never the old seed yaw (which may be an arbitrary cropped-rect PCA).
+    """
+    from scipy.spatial import cKDTree
+
+    if not boxes or len(points) < 150:
+        return boxes
+    points = np.asarray(points, dtype=float)
+    # Equalize surface sampling density and bound tangent estimation cost.
+    _, indices = np.unique(np.floor(points[:, :2] / .05).astype(np.int64),
+                           axis=0, return_index=True)
+    cells = points[indices, :2]
+    tree = cKDTree(cells)
+    fit_tree = cKDTree(points[:, :2])
+    votes, strengths, pools = [], [], []
+    wrap = lambda a: (a + math.pi / 4) % (math.pi / 2) - math.pi / 4
+    for box in boxes:
+        radius = .5 * math.hypot(*box.size[:2]) + .20
+        ids = tree.query_ball_point(box.center[:2], radius)
+        sample = cells[ids]
+        if len(sample):
+            rect = _box_frame_rect(box)
+            sample = sample[(sample[:, 0] >= rect[0] - .10)
+                            & (sample[:, 0] <= rect[2] + .10)
+                            & (sample[:, 1] >= rect[1] - .10)
+                            & (sample[:, 1] <= rect[3] + .10)]
+        raw_ids = fit_tree.query_ball_point(box.center[:2], radius)
+        pool = points[raw_ids]
+        if len(pool):
+            rect = _box_frame_rect(box)
+            pool = pool[(pool[:, 0] >= rect[0] - .10)
+                        & (pool[:, 0] <= rect[2] + .10)
+                        & (pool[:, 1] >= rect[1] - .10)
+                        & (pool[:, 1] <= rect[3] + .10)]
+        pools.append(pool)
+        vote, strength = None, 0.
+        if len(sample) >= 40:
+            # Sample deterministically; nearby tangents preserve individual
+            # faces even when the VLM rectangle clips an end or corner.
+            sample = sample[np.linspace(0, len(sample) - 1,
+                                        min(len(sample), 1200)).astype(int)]
+            dist, neighbors = tree.query(sample, k=min(10, len(cells)))
+            neighborhoods = cells[neighbors]
+            q = neighborhoods - neighborhoods.mean(axis=1, keepdims=True)
+            cov = np.einsum('nki,nkj->nij', q, q)
+            values, vectors = np.linalg.eigh(cov)
+            valid = ((values[:, 1] >= 5 * np.maximum(values[:, 0], 1e-9))
+                     & (dist[:, -1] <= .35))
+            angles = np.arctan2(vectors[valid, 1, 1], vectors[valid, 0, 1])
+            folded = wrap(angles - frame_yaw)
+            if len(folded) >= 20:
+                hist, edges = np.histogram(folded, bins=90,
+                                           range=(-math.pi / 4, math.pi / 4))
+                smooth = sum(np.roll(hist, k) for k in (-2, -1, 0, 1, 2))
+                peak = int(np.argmax(smooth))
+                center = .5 * (edges[peak] + edges[peak + 1])
+                agreed = np.abs(wrap(folded - center)) <= math.radians(4)
+                strength = float(agreed.mean())
+                if strength >= .45:
+                    vote = float(center + np.median(wrap(folded[agreed] - center)))
+        votes.append(vote)
+        strengths.append(strength)
+
+    centers = np.array([b.center[:2] for b in boxes])
+    audit = []
+    for i, box in enumerate(boxes):
+        chosen, source = votes[i], "local_tangents"
+        distance = np.linalg.norm(centers - centers[i], axis=1)
+        near = [j for j in np.argsort(distance)
+                if j != i and votes[j] is not None and distance[j] <= 6.][:12]
+        # Fit a local affine direction field only with spatially distributed
+        # neighbors. A straight layout is the constant special case.
+        if len(near) >= 4:
+            xy = centers[near] - centers[i]
+            X = np.column_stack([np.ones(len(near)), xy])
+            y = np.array([votes[j] for j in near])
+            reference = votes[i] if votes[i] is not None else y[0]
+            y = reference + wrap(y - reference)
+            weight = np.array([strengths[j] / (1 + distance[j]) for j in near])
+            keep = np.ones(len(near), dtype=bool)
+            for _ in range(3):
+                if keep.sum() < 4:
+                    break
+                root = np.sqrt(weight[keep])
+                beta = np.linalg.lstsq(X[keep] * root[:, None],
+                                      y[keep] * root, rcond=None)[0]
+                residual = np.abs(wrap(y - X @ beta))
+                keep = residual <= math.radians(3)
+            if keep.sum() >= 4 and keep.mean() >= .65:
+                # Do not extrapolate beyond the sampled spatial support.
+                if (np.all(xy[keep].min(axis=0) <= .25)
+                        and np.all(xy[keep].max(axis=0) >= -.25)
+                        and np.linalg.norm(beta[1:]) <= math.radians(3)):
+                    predicted = float(wrap(beta[0]))
+                    if (chosen is None or strengths[i] < .65
+                            or abs(wrap(chosen - predicted)) <= math.radians(4)):
+                        chosen, source = predicted, "neighbor_trend"
+        if chosen is None or len(pools[i]) < 60:
+            box.meta["orientation_refine"] = {"source": "insufficient_evidence",
+                                               "vote_strength": strengths[i]}
+            continue
+        base = frame_yaw + chosen
+        # Keep the length axis in the seed's nearest orthogonal family.
+        yaw = base + round((box.yaw - base) / (math.pi / 2)) * (math.pi / 2)
+        rotated = _rot_xy(pools[i], -yaw)
+        sx = _region_axis_span(rotated[:, 0], mesh_mode=mesh_mode)
+        sy = _region_axis_span(rotated[:, 1], mesh_mode=mesh_mode)
+        if sx is None or sy is None or sx[1] - sx[0] < .30 or sy[1] - sy[0] < .20:
+            continue
+        old_yaw = box.yaw
+        middle = _rot_xy(np.array([[(sx[0] + sx[1]) / 2,
+                                    (sy[0] + sy[1]) / 2, 0.]]), yaw)[0]
+        box.center = (float(middle[0]), float(middle[1]), box.center[2])
+        box.size = (float(sx[1] - sx[0]), float(sy[1] - sy[0]), box.size[2])
+        box.yaw = yaw
+        record = {"box_id": box.box_id, "source": source,
+                  "old_yaw_deg": math.degrees(old_yaw),
+                  "yaw_deg": math.degrees(yaw), "vote_strength": strengths[i],
+                  "local_delta_deg": None if votes[i] is None else math.degrees(votes[i])}
+        box.meta["orientation_refine"] = record
+        audit.append(record)
+    print(f"[ground] local direction refinement: {len(audit)}/{len(boxes)} seeds")
+    return boxes
+
+
 def _oversized_blob(b, max_span: float = _MAX_DEVICE_SPAN) -> bool:
     """True when a fitted box is far too 'fat' to be a device row: the
     SHORTER horizontal axis exceeds any plausible device depth. Long
@@ -1941,13 +2078,7 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
             # the recall net judges coverage on what was ACTUALLY
             # detected: the fitted footprint (row-frame AABB; a pi/2
             # box swaps its extents), not the raw VLM rect
-            sx, sy = float(bb.size[0]), float(bb.size[1])
-            if abs(float(bb.yaw)) > 1e-6:
-                sx, sy = sy, sx
-            fitted_rects.append((float(bb.center[0]) - 0.5 * sx,
-                                 float(bb.center[1]) - 0.5 * sy,
-                                 float(bb.center[0]) + 0.5 * sx,
-                                 float(bb.center[1]) + 0.5 * sy))
+            fitted_rects.append(_box_frame_rect(bb))
             n_appended += 1
         return n_appended
 
@@ -2119,6 +2250,8 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     #   * tier 2, TILT boxes: they may only fill EMPTY space -- any
     #     overlap with a kept box (IoU >= 0.2 or containment >= 0.3)
     #     drops the tilt box, however many points it carries.
+    world_fit = _rot_xy(pts_fit, yaw)
+    boxes = _refine_layout_directions(boxes, world_fit, yaw, mesh_mode=is_mesh)
     nadir_boxes = [b for b in boxes if b.meta.get("view") != "tilt"]
     tilt_boxes = [b for b in boxes if b.meta.get("view") == "tilt"]
     dedup = []
@@ -2147,6 +2280,15 @@ def ground_stage(scene, judge, out_dir: str | None = None) -> bool:
     # _merge_adjacent_boxes).
     boxes = _merge_adjacent_boxes(boxes, pts_fit, yaw, floor_at=fl_local,
                                   probe_pool=pts_clu, seed_top=fit_top)
+    merged = [b for b in boxes if b.meta.get("merged_from")]
+    if merged:
+        _refine_layout_directions(merged, world_fit, yaw, mesh_mode=is_mesh)
+    if out_dir:
+        import json
+        with open(os.path.join(out_dir, "orientation_refine.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump([{"box_id": b.box_id, **b.meta.get("orientation_refine", {})}
+                       for b in boxes], f, indent=2)
     # drop "fat blob" boxes (user report: a huge box covering aisles and
     # junk): cheap geometric guard BEFORE the expensive local refine --
     # no device row is deeper than _MAX_DEVICE_SPAN on its SHORTER axis.
