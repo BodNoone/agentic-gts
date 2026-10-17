@@ -1257,6 +1257,14 @@ def _refine_layout_directions(boxes, points, frame_yaw, mesh_mode=False):
         sy = _region_axis_span(rotated[:, 1], mesh_mode=mesh_mode)
         if sx is None or sy is None or sx[1] - sx[0] < .30 or sy[1] - sy[0] < .20:
             continue
+        dx, dy = float(sx[1] - sx[0]), float(sy[1] - sy[0])
+        if dy > dx:
+            # OrientedBox.size[0] is the along-row/long axis throughout
+            # Stage C and Stage F. A local PCA can return the orthogonal
+            # family on a clipped or nearly square patch; normalize here so
+            # a valid seed cannot appear rotated by 90 degrees downstream.
+            yaw += math.pi / 2.0
+            sx, sy = sy, sx
         old_yaw = box.yaw
         middle = _rot_xy(np.array([[(sx[0] + sx[1]) / 2,
                                     (sy[0] + sy[1]) / 2, 0.]]), yaw)[0]

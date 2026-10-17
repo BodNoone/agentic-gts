@@ -64,3 +64,13 @@ def test_independent_slanted_structure_keeps_strong_local_evidence():
     _refine_layout_directions(boxes, np.vstack(clouds), math.pi / 2,
                               mesh_mode=True)
     assert abs(math.degrees(boxes[2].yaw - math.pi / 2) - 20) < 2
+
+
+def test_local_refine_normalizes_pca_short_axis_to_long_box_axis():
+    # The cloud is long along local Y while the seed's declared long axis is
+    # X. The corrected OBB must swap size axes and rotate by 90 degrees once.
+    points = _surface(np.array([0., 0.]), math.pi / 2)
+    box = OrientedBox(center=(0, 0, 1), size=(.8, 3.2, 2), yaw=0.0)
+    _refine_layout_directions([box], points, 0.0, mesh_mode=True)
+    assert box.size[0] > box.size[1]
+    assert abs(math.remainder(box.yaw - math.pi / 2, math.pi)) < .02
