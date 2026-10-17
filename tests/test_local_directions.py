@@ -74,3 +74,16 @@ def test_local_refine_normalizes_pca_short_axis_to_long_box_axis():
     _refine_layout_directions([box], points, 0.0, mesh_mode=True)
     assert box.size[0] > box.size[1]
     assert abs(math.remainder(box.yaw - math.pi / 2, math.pi)) < .02
+
+
+def test_local_refine_uses_seed_obb_and_centered_fit_not_neighbor_aabb():
+    own = _surface(np.array([10., 10.]), math.pi / 2)
+    neighbor = _surface(np.array([10., 11.3]), math.pi / 2)
+    box = OrientedBox(center=(10, 10, 1), size=(3.2, .9, 2),
+                      yaw=math.pi / 2)
+    _refine_layout_directions([box], np.vstack([own, neighbor]),
+                              math.pi / 2, mesh_mode=True)
+    assert abs(box.center[0] - 10) < .05
+    assert abs(box.center[1] - 10) < .20
+    assert box.size[1] < 1.1
+    assert box.meta["orientation_refine"]["pool_points"] < len(own) + len(neighbor)

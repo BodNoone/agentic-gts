@@ -1161,36 +1161,37 @@ def _refine_layout_directions(boxes, points, frame_yaw, mesh_mode=False):
                            axis=0, return_index=True)
     cells = points[indices, :2]
     tree = cKDTree(cells)
-    fit_tree = cKDTree(points[:, :2])
     votes, strengths, pools = [], [], []
+    pool_counts = []
     wrap = lambda a: (a + math.pi / 4) % (math.pi / 2) - math.pi / 4
     for box in boxes:
-        radius = .5 * math.hypot(*box.size[:2]) + .20
-        ids = tree.query_ball_point(box.center[:2], radius)
-        sample = cells[ids]
-        if len(sample):
-            rect = _box_frame_rect(box)
-            sample = sample[(sample[:, 0] >= rect[0] - .10)
-                            & (sample[:, 0] <= rect[2] + .10)
-                            & (sample[:, 1] >= rect[1] - .10)
-                            & (sample[:, 1] <= rect[3] + .10)]
-        raw_ids = fit_tree.query_ball_point(box.center[:2], radius)
-        pool = points[raw_ids]
-        if len(pool):
-            rect = _box_frame_rect(box)
-            pool = pool[(pool[:, 0] >= rect[0] - .10)
-                        & (pool[:, 0] <= rect[2] + .10)
-                        & (pool[:, 1] >= rect[1] - .10)
-                        & (pool[:, 1] <= rect[3] + .10)]
+        # Ownership is tested in the seed OBB's local frame. A circular
+        # world-neighborhood plus a world AABB admits adjacent fan rows and
+        # was observed to turn a correct green VLM rect into an oversized,
+        # nearly-90-degree red OBB.
+        center = np.asarray(box.center, dtype=float)
+        local = box.world_to_local(points)
+        half = np.asarray(box.size, dtype=float) / 2.0
+        own = ((np.abs(local[:, 0]) <= half[0] + .12)
+               & (np.abs(local[:, 1]) <= half[1] + .12))
+        pool = points[own]
+        own_cells = box.world_to_local(
+            np.column_stack([cells, np.zeros(len(cells))]))
+        cell_keep = ((np.abs(own_cells[:, 0]) <= half[0] + .12)
+                     & (np.abs(own_cells[:, 1]) <= half[1] + .12))
+        sample = cells[cell_keep]
         pools.append(pool)
+        pool_counts.append((int(own.sum()), int(cell_keep.sum())))
         vote, strength = None, 0.
         if len(sample) >= 40:
             # Sample deterministically; nearby tangents preserve individual
             # faces even when the VLM rectangle clips an end or corner.
             sample = sample[np.linspace(0, len(sample) - 1,
                                         min(len(sample), 1200)).astype(int)]
-            dist, neighbors = tree.query(sample, k=min(10, len(cells)))
-            neighborhoods = cells[neighbors]
+            local_tree = cKDTree(sample)
+            dist, neighbors = local_tree.query(
+                sample, k=min(10, len(sample)))
+            neighborhoods = sample[neighbors]
             q = neighborhoods - neighborhoods.mean(axis=1, keepdims=True)
             cov = np.einsum('nki,nkj->nij', q, q)
             values, vectors = np.linalg.eigh(cov)
@@ -1252,7 +1253,10 @@ def _refine_layout_directions(boxes, points, frame_yaw, mesh_mode=False):
         base = frame_yaw + chosen
         # Keep the length axis in the seed's nearest orthogonal family.
         yaw = base + round((box.yaw - base) / (math.pi / 2)) * (math.pi / 2)
-        rotated = _rot_xy(pools[i], -yaw)
+        # Fit around this seed's center. Rotating world coordinates around the
+        # origin shifts every box in a large room and can pull in a neighbor.
+        relative = pools[i] - np.asarray(box.center, dtype=float)
+        rotated = _rot_xy(relative, -yaw)
         sx = _region_axis_span(rotated[:, 0], mesh_mode=mesh_mode)
         sy = _region_axis_span(rotated[:, 1], mesh_mode=mesh_mode)
         if sx is None or sy is None or sx[1] - sx[0] < .30 or sy[1] - sy[0] < .20:
@@ -1268,13 +1272,17 @@ def _refine_layout_directions(boxes, points, frame_yaw, mesh_mode=False):
         old_yaw = box.yaw
         middle = _rot_xy(np.array([[(sx[0] + sx[1]) / 2,
                                     (sy[0] + sy[1]) / 2, 0.]]), yaw)[0]
+        middle += np.asarray(box.center, dtype=float)
         box.center = (float(middle[0]), float(middle[1]), box.center[2])
         box.size = (float(sx[1] - sx[0]), float(sy[1] - sy[0]), box.size[2])
         box.yaw = yaw
         record = {"box_id": box.box_id, "source": source,
                   "old_yaw_deg": math.degrees(old_yaw),
                   "yaw_deg": math.degrees(yaw), "vote_strength": strengths[i],
-                  "local_delta_deg": None if votes[i] is None else math.degrees(votes[i])}
+                  "local_delta_deg": None if votes[i] is None else math.degrees(votes[i]),
+                  "pool_points": pool_counts[i][0],
+                  "pool_cells": pool_counts[i][1],
+                  "ownership": "seed_obb_margin_0.12m"}
         box.meta["orientation_refine"] = record
         audit.append(record)
     print(f"[ground] local direction refinement: {len(audit)}/{len(boxes)} seeds")
